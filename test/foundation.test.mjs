@@ -13,6 +13,19 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const base = { schemaVersion: 1, listen: { host: '127.0.0.1', port: 0 } };
 const sentinel = 'synthetic-test-value-never-print-0123456789';
 
+function withDeadline(promise, milliseconds, message, onTimeout = () => {}) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onTimeout();
+      reject(new Error(message));
+    }, milliseconds);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 async function fixture(t, content = base) {
   const dir = await mkdtemp(join(tmpdir(), 'bridge-foundation-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -49,13 +62,20 @@ function run(t, args, { cwd = root, env = {} } = {}) {
     }
   });
   child.stderr.on('data', (data) => { stderr += String(data); });
-  const finished = new Promise((resolve, reject) => {
+  const exited = new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr, lines }));
   });
-  t.after(async () => {
+  const kill = () => {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    await finished;
+  };
+  const finished = withDeadline(exited, 10000, 'child exceeded 10000ms deadline', kill);
+  // A lifecycle assertion can fail before the body awaits finished. Cleanup
+  // still awaits actual exit, without introducing an unhandled rejection.
+  finished.catch(() => {});
+  t.after(async () => {
+    kill();
+    await withDeadline(exited, 1000, 'child cleanup exceeded 1000ms deadline');
   });
   return {
     child, finished,
@@ -66,7 +86,10 @@ function run(t, args, { cwd = root, env = {} } = {}) {
         const timer = setTimeout(() => reject(new Error('child lifecycle timeout')), 5000);
         const waiter = { predicate, resolve(value) { clearTimeout(timer); resolve(value); } };
         waiters.push(waiter);
-        finished.then(() => { clearTimeout(timer); reject(new Error('child exited before lifecycle event')); });
+        finished.then(
+          () => { clearTimeout(timer); reject(new Error('child exited before lifecycle event')); },
+          (error) => { clearTimeout(timer); reject(error); },
+        );
       });
     },
   };
@@ -80,6 +103,7 @@ test('help and strict arguments require an explicit configuration', async (t) =>
   for (const args of [[], ['start'], ['start', '--config'], ['unknown'], ['--help', '--extra'], ['start', '--config', 'x', '--extra']]) {
     const result = await run(t, args, { cwd: dir }).finished;
     assert.equal(result.code, 1);
+    assert.equal(result.lines[0].level, 'warning');
     assert.match(result.stdout, /invalid_arguments/);
   }
 });
@@ -116,6 +140,7 @@ test('reject inline secrets, unknown fields, invalid types and malformed JSON wi
     const { path } = await fixture(t, config);
     const result = await run(t, ['check-config', '--config', path]).finished;
     assert.equal(result.code, 1);
+    assert.equal(result.lines[0].level, 'warning');
     assert.equal(result.stdout.includes(sentinel), false);
     assert.equal(result.stderr.includes(sentinel), false);
   }
@@ -130,6 +155,7 @@ test('non-loopback requires explicit opt-in; validation never opens remote socke
     const { path } = await fixture(t, { ...base, listen: { host } });
     const rejected = await run(t, ['check-config', '--config', path]).finished;
     assert.equal(rejected.code, 1);
+    assert.equal(rejected.lines[0].level, 'warning');
     assert.match(rejected.stdout, /remote_listen_not_allowed/);
     const permitted = await fixture(t, { ...base, listen: { host, allowRemote: true } });
     const accepted = await run(t, ['check-config', '--config', permitted.path]).finished;
@@ -189,6 +215,7 @@ test('listen collision exits nonzero with a safe diagnostic', async (t) => {
   const result = await run(t, ['start', '--config', path]).finished;
   assert.equal(result.code, 1);
   assert.equal(result.lines[0].code, 'startup_failed');
+  assert.equal(result.lines[0].level, 'error');
   assert.equal(result.stdout.includes(path), false);
   assert.equal(result.stderr, '');
 });

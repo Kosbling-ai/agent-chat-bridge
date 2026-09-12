@@ -42,7 +42,7 @@ try {
     }
   }
 } catch (error) {
-  log('error', 'startup', 'failed', {
+  log(error instanceof ConfigError ? 'warning' : 'error', 'startup', 'failed', {
     code: error instanceof ConfigError ? error.code : 'startup_failed',
   });
   process.exitCode = 1;
