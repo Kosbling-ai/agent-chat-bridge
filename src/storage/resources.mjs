@@ -44,15 +44,17 @@ export function resourceOperations({ read, write, now, decode }) {
     return job;
   }
   return {
-    listRetirableResources({ connectionId, afterRunId = '', limit = 100 }) {
+    listRetirableResources({ connectionId, kind, afterRunId = '', limit = 100 }) {
+      const column = kindColumn(kind);
+      const statusFilter = kind === 'output' ? "status='succeeded'" : `status IN ${terminal}`;
       field(connectionId);
       if (afterRunId) field(afterRunId,36);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new StoreError('invalid_retirement');
       return read(async c => {
         const [rows] = await c.execute(`WITH candidates AS (SELECT id,connection_id,conversation_id,status,
-          input_resource_state,output_resource_state FROM bridge_jobs
-          WHERE connection_id=? AND kind='agent' AND id>? AND status IN ${terminal}
-          AND (input_resource_state<>'complete' OR output_resource_state<>'complete')
+          input_resource_state,output_resource_state FROM bridge_jobs FORCE INDEX (jobs_${kind}_resources)
+          WHERE connection_id=? AND kind='agent' AND id>? AND ${statusFilter}
+          AND ${column} IN ('pending','sealed')
           ORDER BY id LIMIT ${limit}) ${facts} ORDER BY p.id`, [connectionId,afterRunId]);
         return { items: rows.map(result), nextCursor: rows.length === limit ? rows.at(-1).run_id : null };
       });

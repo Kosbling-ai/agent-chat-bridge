@@ -23,7 +23,7 @@ test('real MySQL resource seals protect native and guidance references while out
     const guidance = await job(); await store.beginSteerAttempt({ ...guidance, agentId: 'codex' });
     await store.finishSteerAttempt({ ...guidance, outcome: 'accepted' });
     await store.finishJobWithOutbox(parent);
-    const page = await store.listRetirableResources({ connectionId: scope.connectionId });
+    const page = await store.listRetirableResources({ connectionId: scope.connectionId, kind: 'output' });
     assert.equal(page.items.length,2);
     for (const row of page.items) {
       assert.equal(row.nativeThreadId,'thread'); assert.equal(row.inputRetirable,false); assert.equal(row.outputRetirable,true);
@@ -51,10 +51,10 @@ test('real MySQL resource seals protect native and guidance references while out
     pool.getConnection = originalGet;
     assert.deepEqual(await store.completeResourceRetirement({runId:guidance.id,kind:'input'}),{state:'complete'});
     assert.equal((await store.sealResourceRetirement({runId:guidance.id,kind:'input'})).state,'complete');
-    const list = await store.listRetirableResources({connectionId:scope.connectionId,limit:1});
+    const list = await store.listRetirableResources({connectionId:scope.connectionId,kind:'input',limit:1});
     assert.equal(list.items.length,1); assert.ok(list.nextCursor);
     assert.equal(list.items[0].runId,parent.id);
-    assert.equal((await store.listRetirableResources({connectionId:scope.connectionId,afterRunId:list.nextCursor,limit:1})).items.length,0);
+    assert.equal((await store.listRetirableResources({connectionId:scope.connectionId,kind:'input',afterRunId:list.nextCursor,limit:1})).items.length,0);
     // Seal versus a concurrent administrative adoption cannot delete a future reference.
     scope.conversationId = 'race';
     const old = await job(); const oldAttempt = await store.beginAgentAttempt({...old,agentId:'codex'});

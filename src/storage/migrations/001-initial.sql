@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS bridge_jobs (
   KEY jobs_claim (kind, status, next_attempt_at, created_at),
   KEY jobs_lease (status, lease_expires_at),
   KEY jobs_conversation (connection_id, conversation_id, hook_id, kind, sequence, status),
-  KEY jobs_resources (connection_id,kind,id,status),
+  KEY jobs_output_resources (connection_id,kind,status,output_resource_state,id),
+  KEY jobs_input_resources (connection_id,kind,input_resource_state,id,status),
   KEY jobs_event (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
