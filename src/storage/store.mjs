@@ -74,7 +74,22 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
   async function insertOutbox(c, input) {
     const [connectionId, conversationId] = scope(input);
     const key = text(input.idempotencyKey);
-    if (!['create','reply','reaction','upload','update'].includes(input.kind)) throw new StoreError('invalid_outbox_kind');
+    if (!['create','reply','reaction','upload','update','artifact_upload','artifact_send'].includes(input.kind)) throw new StoreError('invalid_outbox_kind');
+    if (input.kind.startsWith('artifact_')) {
+      const artifactScope = input.payload?.scope;
+      const ref = input.payload?.ref;
+      if (!input.jobId || !artifactScope || !ref || artifactScope.connectionId !== connectionId
+          || artifactScope.conversationId !== conversationId || artifactScope.runId !== input.jobId
+          || ref.connectionId !== connectionId || ref.conversationId !== conversationId
+          || ref.runId !== input.jobId) throw new StoreError('invalid_artifact_effect');
+      text(ref.artifactId);
+      if (input.kind === 'artifact_send') {
+        const [[predecessor]] = await c.execute(`SELECT kind,job_id,payload FROM bridge_outbox
+          WHERE id=? AND connection_id=? AND conversation_id=?`, [text(input.predecessorId,36),connectionId,conversationId]);
+        if (!predecessor || predecessor.kind !== 'artifact_upload' || predecessor.job_id !== input.jobId
+            || hash(predecessor.payload.ref) !== hash(ref)) throw new StoreError('invalid_artifact_effect');
+      }
+    }
     const payloadHash = hash({ conversationId, kind: input.kind, payload: input.payload });
     const id = randomUUID();
     await c.execute(`INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,job_id,predecessor_id,platform_uuid,next_attempt_at,created_at,updated_at)
@@ -123,7 +138,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
         // An expired send lease is ambiguous, including after process death.
         await c.execute("UPDATE bridge_outbox SET status='unknown',lease_token=NULL,lease_owner=NULL WHERE status='running' AND lease_expires_at<=? ORDER BY lease_expires_at,id LIMIT 100", [now()]);
         condition = `((j.status='pending' AND j.next_attempt_at<=?) OR
-          (j.status='unknown' AND j.kind IN ('create','reply') AND j.first_attempt_at>? AND j.next_attempt_at<=?))
+          (j.status='unknown' AND j.kind IN ('create','reply','artifact_send') AND j.first_attempt_at>? AND j.next_attempt_at<=?))
           AND (j.predecessor_id IS NULL OR EXISTS (
             SELECT 1 FROM bridge_outbox predecessor WHERE predecessor.id=j.predecessor_id AND predecessor.status='sent'
           ))`;
@@ -290,9 +305,9 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
           throw new StoreError('invalid_outbox_status');
         }
         await c.execute(`UPDATE bridge_outbox SET status=?,result=?,error_code=?,next_attempt_at=?,
-          lease_token=NULL,lease_owner=NULL,updated_at=? WHERE id=?`, [
+          cleanup_pending=IF(kind='artifact_send' AND ?='sent',TRUE,cleanup_pending),lease_token=NULL,lease_owner=NULL,updated_at=? WHERE id=?`, [
           input.status, json(input.result ?? null), input.errorCode ?? null,
-          input.nextAttemptAt ?? now(), now(), input.id,
+          input.nextAttemptAt ?? now(), input.status, now(), input.id,
         ]);
         if (row.job_id && input.status === 'sent') {
           await c.execute(`UPDATE bridge_jobs SET status='succeeded',updated_at=?
@@ -374,12 +389,34 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
     }),
     getJob: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_jobs WHERE id=?',[text(input.id,36)]);return decode(row) ?? null;}),
     getOutbox: (input) => read(async (c) => {
-      const [[row]] = await c.execute(`SELECT effect.*, predecessor.status AS predecessor_status,
+      const [[row]] = await c.execute(`SELECT effect.*, predecessor.status AS predecessor_status, predecessor.result AS predecessor_result,
         (effect.predecessor_id IS NOT NULL AND (predecessor.id IS NULL OR predecessor.status<>'sent')) AS blocked
         FROM bridge_outbox effect LEFT JOIN bridge_outbox predecessor ON predecessor.id=effect.predecessor_id
         WHERE effect.id=?`, [text(input.id, 36)]);
-      return row ? { ...decode(row), blocked: Boolean(row.blocked) } : null;
+      return row ? { ...decode(row), blocked: Boolean(row.blocked), predecessorResult: row.predecessor_status === 'sent' ? row.predecessor_result : null } : null;
     }),
+    listPendingCleanup(input = {}) {
+      const take = limit(input.limit);
+      const cursor = input.afterId == null ? '' : text(input.afterId,36);
+      return read(async (c) => {
+        const [rows] = await c.execute(`SELECT id,connection_id,conversation_id,job_id,payload
+          FROM bridge_outbox WHERE cleanup_pending=TRUE AND id>?
+          ORDER BY id LIMIT ${take + 1}`, [cursor]);
+        const items = rows.slice(0,take).map(decode);
+        return {items,nextCursor:rows.length>take ? items.at(-1).id : null};
+      });
+    },
+    completeOutboxCleanup(input) {
+      const key = [text(input.id,36),...scope(input)];
+      return write(async (c) => {
+        const [[row]] = await c.execute(`SELECT id FROM bridge_outbox WHERE id=? AND connection_id=?
+          AND conversation_id=? AND status='sent' AND kind='artifact_send'`, key);
+        if (!row) throw new StoreError('cleanup_conflict');
+        await c.execute(`UPDATE bridge_outbox SET cleanup_pending=FALSE WHERE id=?
+          AND connection_id=? AND conversation_id=? AND status='sent' AND kind='artifact_send'`, key);
+        return {completed:true};
+      });
+    },
     getSession: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_sessions WHERE connection_id=? AND conversation_id=? AND agent_id=?',[...scope(input),text(input.agentId,128)]);return decode(row) ?? null;}),
     setSession(input) {
       return write(async (c) => {

@@ -67,12 +67,14 @@ CREATE TABLE IF NOT EXISTS bridge_outbox (
   lease_owner VARCHAR(128) NULL,
   lease_token CHAR(36) CHARACTER SET ascii NULL,
   lease_expires_at BIGINT UNSIGNED NULL,
+  cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE,
   result JSON NULL,
   error_code VARCHAR(64) NULL,
   created_at BIGINT UNSIGNED NOT NULL,
   updated_at BIGINT UNSIGNED NOT NULL,
   UNIQUE KEY outbox_key (connection_id, idempotency_key),
   KEY outbox_job (job_id, status),
+  KEY outbox_cleanup (cleanup_pending,id),
   KEY outbox_claim (status, next_attempt_at, created_at),
   KEY outbox_lease (status, lease_expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
