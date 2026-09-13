@@ -8,7 +8,7 @@ Independent Feishu + Codex bridge process. Business code, Skills/MCP and documen
 
 The runtime assembles an independent MySQL schema, one Codex app-server/executor, one Feishu bot and WebSocket owner, scoped hooks and authenticated run/chat APIs. Version 0.2.0 moves the production-derived forward lease, reply-pending delivery, native recovery, bounded group context, execution card, Typing, stop callback and replies into the bridge. Business parsing, polling, cron scheduling, lark-cli queries and document/table/contact tools remain outside it. See the [forward runtime contract](docs/runtime.md) and [Chinese supplement](docs/zh-CN/forward-runtime.md).
 
-Synthetic tests and a disposable MySQL container cover the new runtime and storage paths. Final implementation review remains open. No real bot/model acceptance, deployment, business-producer adaptation, or production replacement has been completed.
+Synthetic tests, a disposable MySQL container, and offline implementation review cover the new runtime and storage paths. No real bot/model acceptance, deployment, business-producer adaptation, or production replacement has been completed.
 
 Requires Node.js 24.x, npm and MySQL 8.4. Dependencies are pinned in package-lock.json. No real provider or business database is used by default tests.
 

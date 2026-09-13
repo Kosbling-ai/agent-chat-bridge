@@ -12,7 +12,7 @@
 
 `deliveryMode:'bridge'` 由 bridge 发卡片、Typing、答案和附件；`deliveryMode:'caller'` 只执行并保存 `rawAnswer`、安全进度和受控附件资源，不自动发消息。原生或投递结果未知时保留 `unknown` 供核对，不自动重跑模型或重发不确定效果。依赖旧 generation ledger 的 attempt 查询及 recovery/reset 写接口明确返回 `409 unsupported_execution_model`，普通 run/events/resource 契约继续可用。
 
-当前只完成公开 bridge 代码和合成测试，最终实现复审仍在进行。没有真实飞书/Codex 验收、部署、打 tag、发布或 Kosbling 业务 producer 切换；现有 P 实例保持不动。详细契约见[中文补充](docs/zh-CN/forward-runtime.md)和英文[运行说明](docs/runtime.md)。
+当前只完成公开 bridge 代码、合成测试和离线实现审阅。没有真实飞书/Codex 验收、部署、打 tag、发布或 Kosbling 业务 producer 切换；现有 P 实例保持不动。详细契约见[中文补充](docs/zh-CN/forward-runtime.md)和英文[运行说明](docs/runtime.md)。
 
 ```sh
 npm ci

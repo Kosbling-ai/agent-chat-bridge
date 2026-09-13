@@ -322,7 +322,8 @@ test('migration contains only the two first-ticket production tables', async () 
   const sql = await readFile(new URL('../src/storage/migrations/002-codex-sessions.sql', import.meta.url), 'utf8');
   const tables = [...sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+([A-Za-z0-9_]+)/g)].map((match) => match[1]);
   assert.deepEqual(tables, ['assistant_codex_sessions', 'assistant_codex_events']);
-  assert.match(sql, /idx_assistant_codex_events_public/);
+  assert.match(sql, /idx_assistant_codex_events_public \(feishu_open_id, chat_id, codex_session_id, message_id, id\)/);
+  assert.match(sql, /idx_assistant_codex_events_progress \(feishu_open_id, chat_id, codex_session_id, message_id, created_at, id\)/);
 });
 
 test('child exit, RPC reset, and close settle active observers as unknown without replay', async (t) => {

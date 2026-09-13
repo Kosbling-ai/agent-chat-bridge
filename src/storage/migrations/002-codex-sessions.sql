@@ -33,5 +33,6 @@ CREATE TABLE IF NOT EXISTS assistant_codex_events (
   UNIQUE KEY ux_assistant_codex_events_key (codex_session_id, event_key),
   KEY idx_assistant_codex_events_session (codex_session_id, created_at, id),
   KEY idx_assistant_codex_events_chat (chat_id, created_at),
-  KEY idx_assistant_codex_events_public (feishu_open_id, chat_id, codex_session_id, message_id, created_at, id)
+  KEY idx_assistant_codex_events_public (feishu_open_id, chat_id, codex_session_id, message_id, id),
+  KEY idx_assistant_codex_events_progress (feishu_open_id, chat_id, codex_session_id, message_id, created_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
