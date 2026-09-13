@@ -10,6 +10,8 @@ import { createCodexAdapter } from './agents/codex/adapter.mjs';
 import { createFeishuAdapter } from './channels/feishu/adapter.mjs';
 import { createFeishuChatClient } from './channels/feishu/chat-client.mjs';
 import { createRuntime } from './core/runtime.mjs';
+import { createCatchup } from './core/catchup.mjs';
+import { listCatchupConversations } from './core/conversations.mjs';
 import { createApi } from './core/api.mjs';
 import { startServer } from './server.mjs';
 import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
@@ -49,9 +51,9 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, catchup: createCatchup, sdk, ...dependencies };
   const pool = factories.pool(config.storage, env);
-  let store, codex, feishu, runtime, http;
+  let store, codex, feishu, runtime, catchup, http;
   let writerHealthy = true;
   let closing;
   let rejectCancelled;
@@ -67,7 +69,7 @@ export async function startService({ config, configPath, env = process.env, log,
   const close = () => closing ??= (async () => {
     signal?.removeEventListener('abort', abort);
     const failures = [];
-    for (const operation of [() => http?.close(), () => feishu?.stop(), () => runtime?.stop(), () => codex?.close(), () => store ? store.close() : pool.end(), () => reporter?.close()]) {
+    for (const operation of [() => http?.close(), () => feishu?.stop(), () => catchup?.stop(), () => runtime?.stop(), () => codex?.close(), () => store ? store.close() : pool.end(), () => reporter?.close()]) {
       try { await operation(); } catch { failures.push(true); }
     }
     if (failures.length) throw new Error('service_shutdown_failed');
@@ -90,7 +92,9 @@ export async function startService({ config, configPath, env = process.env, log,
     checkCancelled();
     await Promise.race([feishu.start(), cancelled]);
     checkCancelled();
+    if (config.feishu.catchup !== false) catchup = factories.catchup({ connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, chat, store, onEvent: runtime.ingest, listConversations: () => listCatchupConversations({ config, store }), log });
     runtime.start();
+    catchup?.start();
     http = await startServer({ config, log, api, readiness: async () => {
       let storeReady = writerHealthy;
       try { await store.assertCurrent(); } catch { storeReady = false; }

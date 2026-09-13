@@ -6,6 +6,8 @@ import { createMysqlStore } from '../src/storage/store.mjs';
 import { createRuntime } from '../src/core/runtime.mjs';
 import { createApi } from '../src/core/api.mjs';
 import { startServer } from '../src/server.mjs';
+import { createCatchup } from '../src/core/catchup.mjs';
+import { listCatchupConversations } from '../src/core/conversations.mjs';
 
 const enabled = Boolean(process.env.BRIDGE_TEST_PASSWORD);
 const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `BRIDGE_TEST_${key.toUpperCase()}`]));
@@ -55,8 +57,22 @@ test('real Store core: immediate completion, independent hook, API authorization
   const event = { schemaVersion: 1, channel: 'feishu', connectionId: 'fixture', eventId: 'e1', eventKey: 'receive:e1', type: 'message.received', source: 'live', receivedAt: 1, occurredAt: 1, conversationId: 'chat', conversationType: 'p2p', messageId: 'm1', revision: '', actor: { type: 'user', openId: 'human' }, isApp: false, isSelf: false, message: { kind: 'text', parsedContent: { text: 'Synthetic question' }, content: '{"text":"Synthetic question"}', mentions: [] }, platform: { feishu: { eventType: 'receive' } } };
   try {
     runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => { hooks++; return new Response(null, { status: 503 }); } });
+    await assert.rejects(runtime.ingest({ ...event, source: 'history_catchup', eventKey: 'history-incomplete', actor: { type: 'user', userId: 'not-an-open-id' } }), { code: 'history_authorization_identity_missing' });
     const accepted = await runtime.ingest(event);
+    assert(accepted.agentJobId, 'identity-incomplete history must not take canonical first receipt from live');
     assert.equal((await runtime.ingest({ ...event, receivedAt: 99 })).agentJobId, accepted.agentJobId);
+    const caught = [];
+    const catchup = createCatchup({ connectionId: 'fixture', botOpenId: 'bot', store,
+      listConversations: () => listCatchupConversations({ config, store }), wait: async () => {},
+      chat: { listMessages: async () => ({ items: [{ message_id: 'm1', chat_id: 'chat', create_time: String(Date.now()), msg_type: 'text', body: { content: '{"text":"Changed history observation"}' }, sender: { sender_type: 'user', id_type: 'open_id', id: 'human' } }], has_more: false }) },
+      onEvent: async event => { caught.push(await runtime.ingest(event)); },
+    });
+    await catchup.runOnce();
+    await catchup.stop();
+    assert.equal(caught.length, 1);
+    assert.equal(caught[0].agentJobId, accepted.agentJobId);
+    assert.equal(caught[0].duplicateCanonical, true, 'history changes cannot fabricate a second Agent or edit hook');
+    assert.deepEqual(caught[0].hookJobIds, accepted.hookJobIds);
     runtime.start();
     await eventually(() => store.getJob({ id: accepted.agentJobId }), row => row.status === 'succeeded');
     assert.equal(turns, 1); assert.equal(sent.length, 1);

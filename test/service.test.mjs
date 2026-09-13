@@ -21,6 +21,8 @@ const config = {
 };
 test('runtime configuration is explicit and rejects scope/secret overrides', () => {
   assert.equal(validateConfig(config).feishu.connectionId, 'test');
+  assert.equal(validateConfig(config).feishu.catchup, true);
+  assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, catchup: false } }).feishu.catchup, false);
   for (const invalid of [
     { ...config, codex: { ...config.codex, approvalPolicy: 'never' } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
@@ -28,6 +30,21 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, hooks: [{ id: 'h', url: 'https://user:synthetic@example.invalid', tokenEnv: 'TEST_HOOK', conversationIds: [] }] },
     { ...config, errorReporting: { url: 'file:///tmp/report', tokenEnv: 'TEST_REPORT' } },
   ]) assert.throws(() => validateConfig(invalid));
+});
+test('history identity needed for allowlist/mention routing cannot consume canonical receipt', async () => {
+  let accepted = 0;
+  const groups = [{ conversationId: 'group', trigger: 'all', passiveContext: true }];
+  const settings = { ...validateConfig(config), routing: { version: '1', privateUserIds: ['human'], groups } };
+  const runtime = createRuntime({ config: settings, store: { acceptInbound: async () => { accepted++; return {}; } }, codex: {}, chat: {} });
+  const event = { source: 'history_catchup', type: 'message.received', conversationId: 'group', conversationType: 'group', actor: { type: 'user', userId: 'internal' }, message: { kind: 'text', content: '{"text":"fixture"}', parsedContent: { text: 'fixture' }, mentions: [] } };
+  await runtime.ingest(event);
+  assert.equal(accepted, 1, 'group-level admission does not invent an open-id requirement');
+  groups[0].userIds = ['human'];
+  await assert.rejects(runtime.ingest(event), { code: 'history_authorization_identity_missing' });
+  delete groups[0].userIds;
+  groups[0].trigger = 'mention';
+  await assert.rejects(runtime.ingest({ ...event, message: { ...event.message, mentions: [{ userId: 'internal-bot' }] } }), { code: 'history_authorization_identity_missing' });
+  assert.equal(accepted, 1);
 });
 test('API tokens must be distinct and sufficiently long', () => {
   const validated = validateConfig(config);

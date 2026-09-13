@@ -20,6 +20,15 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
   async function ingest(event, context = {}) {
     if (stopping || context.signal?.aborted) throw new Error('ingress_stopped');
     const group = config.routing.groups.find(item => item.conversationId === event.conversationId);
+    // A history user_id/union_id cannot be compared with an open-id allowlist.
+    // Refuse before canonical receipt so a later complete live event can route;
+    // catchup keeps its checkpoint and never guesses identity via a directory.
+    if (event.source === 'history_catchup' && event.type === 'message.received' && !event.isApp && !event.isSelf
+      && (!event.actor.type || event.actor.type === 'unknown' || (event.actor.type === 'user' && !event.actor.openId
+        && (event.conversationType === 'p2p' || group?.userIds !== undefined))
+        || (group?.trigger === 'mention' && event.message?.mentions?.some(mention => !mention.openId)))) {
+      throw Object.assign(new Error('history_authorization_identity_missing'), { code: 'history_authorization_identity_missing' });
+    }
     const human = !event.isApp && !event.isSelf && event.actor.type === 'user';
     const allowed = human && (event.conversationType === 'p2p' ? config.routing.privateUserIds.includes(event.actor.openId) : Boolean(group && (group.userIds === undefined || group.userIds.includes(event.actor.openId))));
     const mentioned = event.message?.mentions?.some(mention => mention.openId === config.feishu.botOpenId);
@@ -28,7 +37,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     // Unsupported attachment-only input is retained in inbox/hooks, never misread as text.
     const agentJob = triggered ? { payload: { text: typeof text === 'string' ? text : '', unsupported: !(typeof text === 'string' && text.trim()), messageId: event.messageId, source: 'chat', event } } : undefined;
     const hooks = config.hooks.filter(hook => hook.conversationIds.includes(event.conversationId) && !event.isSelf && !event.isApp).map(hook => ({ hookId: hook.id, payload: event }));
-    const result = await store.acceptInbound({ ...scope(event.conversationId), eventKey: event.eventKey, eventType: event.type, messageId: event.messageId, ...(event.type === 'message.recalled' ? { recalledMessageId: event.messageId } : {}), revision: event.revision, occurredAt: event.occurredAt, payload: event, semanticPayload: feishuEventIdentity(event), policyVersion: config.routing.version, passiveContext: Boolean(allowed && !triggered && group?.passiveContext && event.type === 'message.received'), agentJob, hooks });
+    const result = await store.acceptInbound({ ...scope(event.conversationId), source: event.source, conversationType: event.conversationType, eventKey: event.eventKey, eventType: event.type, messageId: event.messageId, ...(event.type === 'message.recalled' ? { recalledMessageId: event.messageId } : {}), revision: event.revision, occurredAt: event.occurredAt, payload: event, semanticPayload: feishuEventIdentity(event), policyVersion: config.routing.version, passiveContext: Boolean(allowed && !triggered && group?.passiveContext && event.type === 'message.received'), agentJob, hooks });
     return result;
   }
   async function notification(message) {

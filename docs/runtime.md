@@ -58,7 +58,7 @@ Create/reply retries preserve platform UUID within the Store's conservative 55-m
 | Upload image/file | bounded durable API wired; unknown upload held |
 | Internal resource/history reads | Agent media and catch-up only; business reads remain outside the public bridge API |
 | Business edit/reconcile and recall cancellation | Business edit/reconcile remains outside bridge; old recall did not cancel execution |
-| Reconnect catch-up | pending internal first-receipt gap recovery |
+| Reconnect catch-up | service starts internal first-receipt gap recovery by default; `feishu.catchup:false` disables it |
 | Active steer | deferred-only now; migration must assess behavior difference |
 | Automatic unknown-admission recovery without native ID | explicitly unavailable; operator workflow required |
 
@@ -69,3 +69,9 @@ This matrix is a staging boundary, not a declaration that existing required medi
 Logs contain fixed module/component/operation/status/code/duration fields and no raw payload/SDK errors. Optional errorReporting `{url,tokenEnv}` forwards terminal structured error events to a trusted HTTP endpoint with a 2-second deadline and at most four concurrent requests. Failed/full reporting emits warning without recursion; response bodies are cancelled and redirects rejected. Without this option only structured logs are emitted; configure a production error collector before deployment.
 
 Run `npm test`, `npm run check`, and `node scripts/test-storage.mjs test/core.integration.test.mjs`. The latter creates disposable local MySQL and injects synthetic credentials. It does not contact a real bot/model. Core coverage includes early terminal notifications, duplicate input, independent hooks, authorization, unknown admission no-replay, reset busy rejection and recovery of an already-completed native turn.
+
+## Receive-gap catchup integration
+
+Service starts catchup after native/WS startup and stops it before workers/Store teardown. It combines configured Agent groups and hook group scopes with keyset-paged previously received private chats, with a hard 1000-conversation bound. Known private chats keep their observed type even when also present in hook scope. No bot-wide chat enumeration or public read API is exposed. Default private lookback/overlap remains three hours/five minutes.
+
+Live/history canonical first receipt is atomic in Store. Changed history content never fabricates an edit hook. If a history sender lacks the open ID needed for private/group-member admission, or mention IDs cannot identify the configured bot, core rejects before canonical registration. The page checkpoint remains retryable so incomplete history cannot suppress a later complete live event. Groups allowing all members do not require open IDs merely for membership. SDK 1.60.0 message.list has no user_id_type parameter; this safeguard does not guess or translate identities.
