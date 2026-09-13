@@ -162,7 +162,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
   }
   return {
     ...recoveryOperations({ read, write, now, hash, decode, claimThread }),
-    ...rotationOperations({write,now,hash}),
+    ...rotationOperations({write,now,hash,owned}),
     ...steeringOperations({read,write,now,hash,decode}),
     assertCurrent: () => assertSchemaCurrent(pool),
     async close() { await writer.close(); await pool.end(); },

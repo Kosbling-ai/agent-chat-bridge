@@ -209,8 +209,10 @@ CREATE TABLE IF NOT EXISTS bridge_session_rotations (
   previous_generation BIGINT UNSIGNED NOT NULL,
   generation BIGINT UNSIGNED NOT NULL,
   retired_thread_id VARCHAR(255) NOT NULL,
+  run_id CHAR(36) CHARACTER SET ascii NULL,
   created_at BIGINT UNSIGNED NOT NULL,
-  UNIQUE KEY rotation_idempotency (connection_id,conversation_id,agent_id,idempotency_key)
+  UNIQUE KEY rotation_idempotency (connection_id,conversation_id,agent_id,idempotency_key),
+  KEY rotation_run (run_id,id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 
