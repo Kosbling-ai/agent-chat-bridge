@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS bridge_native_events (
  payload JSON NOT NULL,
  created_at BIGINT UNSIGNED NOT NULL,
  UNIQUE KEY native_event_key (connection_id,event_key),
- KEY native_event_page (connection_id,native_thread_id,sequence)
+ KEY native_event_page (connection_id,native_thread_id,sequence),
+ KEY native_turn_event_page (connection_id,native_thread_id,native_turn_id,sequence)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 CREATE TABLE IF NOT EXISTS bridge_message_tombstones (
  connection_id VARCHAR(128) NOT NULL,
@@ -141,4 +142,18 @@ CREATE TABLE IF NOT EXISTS bridge_registration_scopes (
  connection_id VARCHAR(128) NOT NULL,
  conversation_id VARCHAR(255) NOT NULL,
  PRIMARY KEY (connection_id,conversation_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE IF NOT EXISTS bridge_message_receipts (
+ connection_id VARCHAR(128) NOT NULL,
+ conversation_id VARCHAR(255) NOT NULL,
+ message_id VARCHAR(255) NOT NULL,
+ first_event_id CHAR(36) CHARACTER SET ascii NOT NULL,
+ PRIMARY KEY (connection_id,conversation_id,message_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE IF NOT EXISTS bridge_conversations (
+ connection_id VARCHAR(128) NOT NULL,
+ conversation_id VARCHAR(255) NOT NULL,
+ conversation_type VARCHAR(16) NOT NULL,
+ PRIMARY KEY (connection_id,conversation_id),
+ KEY conversation_type_page (connection_id,conversation_type,conversation_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

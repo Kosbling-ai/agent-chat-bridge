@@ -136,26 +136,82 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
   return {
     assertCurrent: () => assertSchemaCurrent(pool),
     async close() { await writer.close(); await pool.end(); },
-    acceptInbound(input) { return write(async (c) => {
-      const [connectionId, conversationId] = scope(input);
-      await lockRegistration(c,connectionId,conversationId);
-      const payloadHash = hash(input.semanticPayload ?? input.payload);
-      const id = randomUUID();
-      await c.execute(`INSERT INTO bridge_inbox (id,connection_id,event_key,event_type,message_id,revision,conversation_id,occurred_at,payload_hash,payload,policy_version,passive_context,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [id,connectionId,text(input.eventKey),text(input.eventType,64),input.messageId ?? '',input.revision ?? '',conversationId,input.occurredAt ?? now(),payloadHash,json(input.payload),text(input.policyVersion,128),input.passiveContext === true,now()]);
-      const [[row]] = await c.execute('SELECT id,sequence,payload_hash FROM bridge_inbox WHERE connection_id=? AND event_key=?', [connectionId,input.eventKey]);
-      if (row.payload_hash !== payloadHash) throw new StoreError('inbound_conflict');
-      if (row.id !== id) {
-        const [jobs] = await c.execute('SELECT id,kind,hook_id FROM bridge_jobs WHERE event_id=?', [row.id]);
-        return { eventId:row.id,sequence:row.sequence,duplicate:true,agentJobId:jobs.find((j)=>j.kind==='agent')?.id ?? null,hookJobIds:jobs.filter((j)=>j.kind==='hook').map((j)=>j.id) };
-      }
-      if(input.recalledMessageId)await c.execute('INSERT INTO bridge_message_tombstones (connection_id,message_id,created_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE message_id=message_id',[connectionId,text(input.recalledMessageId),now()]);
-      const common = { connectionId,conversationId,eventId:id,sourceSequence:row.sequence,idempotencyKey:input.eventKey };
-      const agent = input.agentJob ? await insertJob(c,{...common,kind:'agent',payload:input.agentJob.payload}) : null;
-      const hooks=[];
-      for (const hook of input.hooks ?? []) hooks.push((await insertJob(c,{...common,kind:'hook',hookId:hook.hookId,payload:hook.payload ?? input.payload})).id);
-      return {eventId:id,sequence:row.sequence,duplicate:false,agentJobId:agent?.id ?? null,hookJobIds:hooks};
-    }); },
+    acceptInbound(input) {
+      return write(async (c) => {
+        const [connectionId, conversationId] = scope(input);
+        const source = input.source ?? input.payload?.source ?? 'live';
+        const conversationType = input.conversationType ?? input.payload?.conversationType ?? 'unknown';
+        if (!['live', 'history_catchup'].includes(source) || !['p2p', 'group', 'unknown'].includes(conversationType)
+          || (input.payload?.source && input.payload.source !== source)
+          || (input.payload?.conversationType && input.payload.conversationType !== conversationType)) {
+          throw new StoreError('invalid_inbound_source');
+        }
+        await lockRegistration(c, connectionId, conversationId);
+        if (conversationType !== 'unknown') {
+          await c.execute(`INSERT INTO bridge_conversations (connection_id,conversation_id,conversation_type)
+            VALUES (?,?,?) ON DUPLICATE KEY UPDATE conversation_id=conversation_id`, [connectionId, conversationId, conversationType]);
+          const [[known]] = await c.execute(`SELECT conversation_type FROM bridge_conversations
+            WHERE connection_id=? AND conversation_id=?`, [connectionId, conversationId]);
+          if (known.conversation_type !== conversationType) throw new StoreError('conversation_type_conflict');
+        }
+        const canonical = input.eventType === 'message.received';
+        let receipt;
+        if (canonical) {
+          text(input.messageId);
+          [[receipt]] = await c.execute(`SELECT first_event_id FROM bridge_message_receipts
+            WHERE connection_id=? AND conversation_id=? AND message_id=?`, [connectionId, conversationId, input.messageId]);
+        }
+        const payloadHash = hash(input.semanticPayload ?? input.payload);
+        const id = randomUUID();
+        await c.execute(`INSERT INTO bridge_inbox (id,connection_id,event_key,event_type,message_id,revision,conversation_id,occurred_at,payload_hash,payload,policy_version,passive_context,created_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [
+          id, connectionId, text(input.eventKey), text(input.eventType,64), input.messageId ?? '', input.revision ?? '',
+          conversationId, input.occurredAt ?? now(), payloadHash, json({...input.payload, source, conversationType}),
+          text(input.policyVersion,128), !receipt && input.passiveContext === true, now(),
+        ]);
+        const [[row]] = await c.execute('SELECT id,sequence,payload_hash FROM bridge_inbox WHERE connection_id=? AND event_key=?', [connectionId,input.eventKey]);
+        // History is a snapshot, not an edit event. A changed later snapshot
+        // cannot replace the first receipt or create another consumer job.
+        if (row.payload_hash !== payloadHash && !(receipt && source === 'history_catchup')) throw new StoreError('inbound_conflict');
+        const duplicateCanonical = Boolean(receipt);
+        if (canonical && !receipt) {
+          await c.execute(`INSERT INTO bridge_message_receipts (connection_id,conversation_id,message_id,first_event_id)
+            VALUES (?,?,?,?)`, [connectionId, conversationId, input.messageId, row.id]);
+        }
+        if (row.id !== id || duplicateCanonical) {
+          const firstEventId = receipt?.first_event_id ?? row.id;
+          const [[first]] = await c.execute('SELECT sequence FROM bridge_inbox WHERE id=?', [firstEventId]);
+          const [jobs] = await c.execute('SELECT id,kind FROM bridge_jobs WHERE event_id=?', [firstEventId]);
+          return {
+            eventId: firstEventId, sequence: first.sequence, duplicate: true, firstReceipt: false, duplicateCanonical,
+            agentJobId: jobs.find(job => job.kind === 'agent')?.id ?? null,
+            hookJobIds: jobs.filter(job => job.kind === 'hook').map(job => job.id),
+          };
+        }
+        if (input.recalledMessageId) {
+          await c.execute(`INSERT INTO bridge_message_tombstones (connection_id,message_id,created_at)
+            VALUES (?,?,?) ON DUPLICATE KEY UPDATE message_id=message_id`, [connectionId,text(input.recalledMessageId),now()]);
+        }
+        const common = { connectionId,conversationId,eventId:id,sourceSequence:row.sequence,idempotencyKey:input.eventKey };
+        const agent = input.agentJob ? await insertJob(c,{...common,kind:'agent',payload:input.agentJob.payload}) : null;
+        const hooks = [];
+        for (const hook of input.hooks ?? []) {
+          hooks.push((await insertJob(c,{...common,kind:'hook',hookId:hook.hookId,payload:hook.payload ?? input.payload})).id);
+        }
+        return {eventId:id,sequence:row.sequence,duplicate:false,firstReceipt:true,duplicateCanonical:false,agentJobId:agent?.id ?? null,hookJobIds:hooks};
+      });
+    },
+    listKnownConversations(input) {
+      return read(async (c) => {
+        const take = limit(input.limit);
+        if (input.conversationType !== 'p2p') throw new StoreError('invalid_conversation_type');
+        const [rows] = await c.execute(`SELECT conversation_id,conversation_type FROM bridge_conversations
+          WHERE connection_id=? AND conversation_type='p2p' AND conversation_id>?
+          ORDER BY conversation_id LIMIT ${take + 1}`, [text(input.connectionId,128), input.afterConversationId === undefined ? '' : text(input.afterConversationId)]);
+        const items = rows.slice(0,take).map(decode);
+        return {items,nextCursor:rows.length>take ? items.at(-1).conversationId : null};
+      });
+    },
     enqueueJob: (input) => write((c)=>insertJob(c,input)),
     recordOutbox: (input) => write((c)=>insertOutbox(c,input)),
     claimJobs: (input) => claim('bridge_jobs',input),
@@ -293,7 +349,17 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
       const digest=hash(input.payload);await c.execute('INSERT INTO bridge_native_events (connection_id,event_key,native_thread_id,native_turn_id,payload_hash,payload,created_at) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE sequence=sequence',[text(input.connectionId,128),text(input.eventKey),input.nativeThreadId ?? null,input.nativeTurnId ?? null,digest,json(input.payload),now()]);
       const [[row]]=await c.execute('SELECT sequence,payload_hash FROM bridge_native_events WHERE connection_id=? AND event_key=?',[input.connectionId,input.eventKey]);if(row.payload_hash!==digest)throw new StoreError('native_event_conflict');return {sequence:row.sequence};
     }); },
-    readNativeEvents: (input)=>read(async(c)=>{const [rows]=await c.execute(`SELECT sequence,native_thread_id,native_turn_id,payload,created_at FROM bridge_native_events WHERE connection_id=? AND native_thread_id=? AND sequence>? ORDER BY sequence LIMIT ${limit(input.limit)}`,[text(input.connectionId,128),text(input.nativeThreadId),input.afterSequence ?? 0]);return rows.map(decode);}),
+    readNativeEvents: (input) => read(async (c) => {
+      const turnFilter = input.nativeTurnId !== undefined;
+      const [rows] = await c.execute(`SELECT sequence,native_thread_id,native_turn_id,payload,created_at
+        FROM bridge_native_events WHERE connection_id=? AND native_thread_id=?
+          ${turnFilter ? 'AND native_turn_id=?' : ''} AND sequence>?
+        ORDER BY sequence LIMIT ${limit(input.limit)}`, [
+        text(input.connectionId,128), text(input.nativeThreadId),
+        ...(turnFilter ? [text(input.nativeTurnId)] : []), input.afterSequence ?? 0,
+      ]);
+      return rows.map(decode);
+    }),
     getJob: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_jobs WHERE id=?',[text(input.id,36)]);return decode(row) ?? null;}),
     getOutbox: (input) => read(async (c) => {
       const [[row]] = await c.execute(`SELECT effect.*, predecessor.status AS predecessor_status,
