@@ -86,15 +86,35 @@ test('observer advances cursor through unrelated rows without exposing them', as
   const { card } = fixture(); const cursors = []; let reads = 0;
   const observer = observeExecutionCard({ card, since: 100, load: async (cursor) => {
     cursors.push({ ...cursor }); reads++;
-    return reads === 1 ? [{ id: 1, created_at: 101, progress_json: null }, { id: 2, created_at: 101, progress_json: JSON.stringify(tool('t')) }] : [];
+    return reads === 1 ? [{ id: 1, created_at: 101, progress_json: null }, { id: 2, event_key: 'tool:start', created_at: 101, progress_json: JSON.stringify(tool('t')) }] : [];
   } });
   await tick(); const snapshot = await observer.stop();
-  assert.deepEqual(cursors[1], { at: 101, id: '2' });
+  assert.deepEqual(cursors[1], { at: 100, id: '0' });
   assert.equal(snapshot.entries[0].id, 't');
   const resumed=[];
   const next=observeExecutionCard({card:fixture(snapshot).card,since:100,cursor:snapshot.observerCursor,load:async cursor=>{resumed.push(cursor);return[];}});
   await next.stop();
-  assert.deepEqual(resumed[0],{at:101,id:'2'});
+  assert.deepEqual(resumed[0],{at:100,id:'0'});
+});
+
+test('observer overlap accepts a smaller late id and an updated event-key version', async () => {
+  const { card } = fixture();
+  let reads = 0;
+  const batches = [
+    [{ id: '101', event_key: 'tool:visible', created_at: 101, progress_json: JSON.stringify(tool('visible')) }],
+    [{ id: '100', event_key: 'tool:late', created_at: 102, progress_json: JSON.stringify(tool('late', 'completed')) }],
+    [{ id: '101', event_key: 'tool:visible', created_at: 103, progress_json: JSON.stringify(tool('visible', 'failed')) }],
+  ];
+  const observer = observeExecutionCard({ card, since: 100, load: async () => batches[reads++] || [] });
+  await tick();
+  const saved = await observer.stop();
+  assert.equal(saved.entries.find(entry => entry.id === 'late').status, 'completed');
+  const resumedCard = fixture(saved).card;
+  const resumed = observeExecutionCard({ card: resumedCard, since: 100, cursor: saved.observerCursor,
+    load: async () => batches[reads++] || [] });
+  await tick(); await resumed.stop();
+  assert.equal(resumedCard.snapshot().entries.find(entry => entry.id === 'visible').status, 'failed');
+  assert(resumedCard.snapshot().observerSeen.some(item => item.key === 'tool:visible'));
 });
 
 test('unknown create persists a hold and restart never creates or falls back', async () => {
@@ -108,6 +128,36 @@ test('unknown create persists a hold and restart never creates or falls back', a
   await assert.rejects(restarted.card.finish('answer'), { code: 'card_create_unknown' });
   assert.equal(creates, 1);
   assert.equal(restarted.card.snapshot().delivery, 'unknown');
+});
+
+test('successful create without a message id remains unknown and never falls back', async () => {
+  let creates = 0;
+  const first = fixture(null, { create: async () => { creates += 1; return { code: 0, data: {} }; } });
+  first.card.push({ kind: 'started' });
+  await first.card.chain;
+  assert.equal(first.card.snapshot().delivery, 'unknown');
+  assert.equal(first.card.snapshot().deliveryState.status, 'unknown');
+  assert.equal(first.persisted.at(-1).delivery, 'unknown');
+  await assert.rejects(first.card.finish('answer'), { code: 'card_create_unknown', outcome: 'unknown' });
+  assert.equal(creates, 1);
+});
+
+test('unknown final patch retains the same card and terminal desired snapshot', async () => {
+  let patches = 0;
+  const targets = [];
+  const first = fixture({ messageId: 'om_card', entries: [] }, {
+    patch: async () => { patches += 1; throw new Error('timeout'); },
+  });
+  await assert.rejects(first.card.finish('complete answer'), { code: 'card_patch_unknown', outcome: 'unknown' });
+  const saved = first.persisted.at(-1);
+  assert.equal(saved.messageId, 'om_card');
+  assert.equal(saved.status, 'completed');
+  assert.equal(saved.delivery, undefined);
+  assert.equal(saved.deliveryState.status, 'unknown');
+  const recovered = fixture(saved, { patch: async input => { patches += 1; targets.push(input.path.message_id); return { code: 0 }; } });
+  assert.equal(await recovered.card.finish('complete answer'), true);
+  assert.deepEqual(targets, ['om_card']);
+  assert.equal(patches, 2);
 });
 
 test('observer read failure cannot reject final delivery', async () => {

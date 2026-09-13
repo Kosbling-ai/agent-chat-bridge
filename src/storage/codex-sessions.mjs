@@ -77,13 +77,16 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
 
   async function readPublicProgress({ binding, threadId, messageId, cursor = 0, limit: pageLimit = 100 }) {
     const bounded = Math.max(1, Math.min(250, Number(pageLimit) || 100));
-    const after = String(cursor || '0');
-    if (!/^\d+$/.test(after)) throw new Error('invalid progress cursor');
+    const objectCursor = cursor && typeof cursor === 'object' ? cursor : null;
+    const afterId = String(objectCursor?.id ?? cursor ?? '0');
+    const afterAt = Number(objectCursor?.at ?? 0);
+    if (!/^\d+$/.test(afterId) || !Number.isSafeInteger(afterAt) || afterAt < 0) throw new Error('invalid progress cursor');
     return rows(`SELECT id, event_key, event_type, role, title, text, detail_json, created_at
       FROM ${table('assistant_codex_events')}
       WHERE feishu_open_id = ? AND chat_id = ? AND codex_session_id = ? AND message_id = ?
-        AND event_type = 'public_progress' AND id > ? ORDER BY id ASC LIMIT ?`, [
-      binding.feishuOpenId, binding.chatId, threadId, messageId, after, bounded,
+        AND event_type = 'public_progress' AND created_at >= ? AND (created_at > ? OR id > ?)
+      ORDER BY created_at ASC,id ASC LIMIT ?`, [
+      binding.feishuOpenId, binding.chatId, threadId, messageId, afterAt, afterAt, afterId, bounded,
     ]);
   }
 

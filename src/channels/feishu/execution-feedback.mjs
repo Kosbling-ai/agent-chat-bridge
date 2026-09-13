@@ -16,13 +16,13 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
   }
 
   async function persist(job, state, key, value) {
-    state.control.assertLease?.();
+    state.control.assertOwned?.();
     await jobs.patchFeedback({ id: job.id, leaseOwner: job.leaseOwner, key, value });
     state.result = { ...state.result, [key]: structuredClone(value) };
   }
 
   async function listTyping(job, state) {
-    state.control.assertLease?.();
+    state.control.assertOwned?.();
     const response = await chat.listReactions({ messageId: job.sourceMessageId, pageSize: 50 });
     return (response?.items || []).filter(reaction => reaction?.operator?.operator_type === 'app'
       && reaction?.reaction_type?.emoji_type === emoji)
@@ -36,7 +36,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     await persist(job, state, 'typing', intent);
     try {
       if (desired) {
-        state.control.assertLease?.();
+        state.control.assertOwned?.();
         const response = await chat.addReaction({ messageId: job.sourceMessageId, emojiType: emoji });
         const reactionId = response?.reaction_id || response?.reactionId || '';
         if (!reactionId) throw Object.assign(new Error('typing add unconfirmed'), { code: 'typing_add_unconfirmed', outcome: 'unknown' });
@@ -55,7 +55,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
         for (const reactionId of await listTyping(job, state)) reactionIds.add(reactionId);
       }
       for (const reactionId of reactionIds) {
-        state.control.assertLease?.();
+        state.control.assertOwned?.();
         await chat.removeReaction({ messageId: job.sourceMessageId, reactionId });
       }
       const confirmed = { ...intent, reactionId: '', removedReactionIds: [...reactionIds], outcome: 'confirmed', confirmedAt: now() };
@@ -102,10 +102,15 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     const cursor = state.result.executionCard?.observerCursor;
     state.observer = observeExecutionCard({
       card: state.card, since: Number(job.createdAt || now()), cursor,
-      load: async next => (await sessions.readPublicProgress({
-        binding: { feishuOpenId: bindingOpenId(job, state.result), chatId: job.chatId },
-        threadId: execution.threadId, messageId: job.messageId, cursor: next.id, limit: 100,
-      })).map(row => ({ ...row, progress_json: row.detail_json })),
+      load: async next => {
+        state.control.assertOwned?.();
+        const rows = await sessions.readPublicProgress({
+          binding: { feishuOpenId: bindingOpenId(job, state.result), chatId: job.chatId },
+          threadId: execution.threadId, messageId: job.messageId, cursor: next, limit: 100,
+        });
+        state.control.assertOwned?.();
+        return rows.map(row => ({ ...row, progress_json: row.detail_json }));
+      },
     });
     return state.observer;
   }
@@ -199,7 +204,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
   }
 
   function abandon(state) {
-    state?.observer?.stop?.().catch(() => {});
+    state?.observer?.cancel?.();
     state?.card?.stop?.();
   }
 

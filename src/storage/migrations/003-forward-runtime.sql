@@ -1,3 +1,7 @@
+ALTER TABLE assistant_codex_events
+  ADD KEY idx_assistant_codex_events_progress
+    (feishu_open_id,chat_id,codex_session_id,message_id,created_at,id);
+
 CREATE TABLE IF NOT EXISTS assistant_codex_forward_jobs (
   id BIGINT NOT NULL AUTO_INCREMENT,
   public_run_id CHAR(36) CHARACTER SET ascii NOT NULL,
@@ -22,6 +26,8 @@ CREATE TABLE IF NOT EXISTS assistant_codex_forward_jobs (
   reply_attempts INT NOT NULL DEFAULT 0,
   lease_owner VARCHAR(191) NOT NULL DEFAULT '',
   lease_expires_at BIGINT NULL,
+  feedback_cleanup_pending TINYINT NOT NULL DEFAULT 0,
+  feedback_cleanup_at BIGINT NULL,
   next_attempt_at BIGINT NULL,
   started_at BIGINT NULL,
   finished_at BIGINT NULL,
@@ -36,6 +42,7 @@ CREATE TABLE IF NOT EXISTS assistant_codex_forward_jobs (
   UNIQUE KEY ux_forward_message (message_id),
   KEY idx_forward_status_next (status,next_attempt_at,id),
   KEY idx_forward_lease (status,lease_expires_at,id),
+  KEY idx_forward_feedback_cleanup (feedback_cleanup_pending,feedback_cleanup_at,id),
   KEY idx_forward_chat_created (chat_id,created_at,id),
   KEY idx_forward_caller_created (caller_id,created_at,id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -53,6 +53,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   const pollMs = Number(config.pollMs || 100);
   const maxAttempts = Number(config.maxAttempts || 3);
   const maxActive = Math.max(1, Math.min(8, Number(config.maxActive || 5)));
+  const claimOwner = () => `${owner.slice(0, 150)}:${randomUUID()}`;
   const active = new Set();
   const leaseControllers = new Set();
   let running = false;
@@ -91,14 +92,14 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     const heartbeatMs = Number(config.heartbeatMs || Math.max(1000, Math.floor(leaseMs / 3)));
     let timer;
     try {
-      await jobs.renew({ id: job.id, leaseOwner: owner, leaseMs });
-      timer = setInterval(() => jobs.renew({ id: job.id, leaseOwner: owner, leaseMs }).catch(lose), heartbeatMs);
+      await jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs });
+      timer = setInterval(() => jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs }).catch(lose), heartbeatMs);
       timer.unref?.();
       const assertOwned = () => {
         if (lost) throw Object.assign(new Error('forward_lease_lost'), { code: 'forward_lease_lost' });
         if (stopping) throw Object.assign(new Error('forward_runtime_stopping'), { code: 'forward_runtime_stopping' });
       };
-      const result = await operation({ signal: controller.signal, assertOwned });
+      const result = await operation({ signal: controller.signal, assertOwned, assertLease: assertOwned });
       assertOwned();
       return result;
     } finally {
@@ -125,8 +126,13 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     try {
       if (execution.threadId && (!execution.turnId || !execution.startedAt)) {
         execution = { ...execution, status: 'unknown', unconfirmed: true, heldReason: 'native_start_unconfirmed' };
-        await jobs.patchExecution({ id: job.id, leaseOwner: owner, execution });
-        await jobs.markRetry({ id: job.id, leaseOwner: owner, held: true, errorCode: 'native_start_unconfirmed' });
+        try { await feedback?.cleanup?.(job, lease); }
+        catch (error) {
+          lease.assertOwned();
+          log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
+        }
+        await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
+        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, held: true, errorCode: 'native_start_unconfirmed' });
         log('warning', 'forward_execution', 'held', { code: 'native_start_unconfirmed' });
         return;
       }
@@ -139,15 +145,15 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         if (prepared.status !== 'ready') {
           const result = { inputStatus: prepared.status, errorCode: prepared.reason || `input_${prepared.status}`, answer: prepared.replyText || '', rawAnswer: '', attachments: [], execution: { ...execution, inputStatus: prepared.status } };
           if (prepared.status === 'ignored') {
-            await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: owner, status: 'completed', result });
+            await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: job.leaseOwner, status: 'completed', result });
           } else {
-            await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result, errorCode: result.errorCode });
+            await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result, errorCode: result.errorCode });
           }
           return;
         }
         prompt = [job.prompt, prepared.addendum].filter(Boolean).join('\n\n');
         execution = { ...execution, preparedPrompt: prompt, inputStatus: 'ready' };
-        await jobs.patchExecution({ id: job.id, leaseOwner: owner, execution });
+        await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
       }
 
       const known = execution.threadId && execution.turnId && execution.startedAt;
@@ -170,12 +176,12 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         onStartIntent: async value => {
           lease.assertOwned();
           execution = { ...execution, bindingOpenId: value.binding.feishuOpenId, threadId: value.threadId, messageId: value.messageId, startedAt: value.startedAt, status: 'start_intent', unconfirmed: true };
-          await jobs.patchExecution({ id: job.id, leaseOwner: owner, execution });
+          await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
         },
         onBound: async value => {
           lease.assertOwned();
           execution = { ...execution, threadId: value.threadId, turnId: value.turnId, startedAt: value.startedAt, status: 'bound', unconfirmed: false };
-          await jobs.patchExecution({ id: job.id, leaseOwner: owner, execution });
+          await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
           feedback?.observe?.(job, state, execution);
         },
       });
@@ -186,37 +192,38 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       if (result.deferred) {
         if (job.deliveryMode === 'bridge') {
           await feedback?.prepare?.(job, result, state);
-          await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result });
+          await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result });
         }
-        else await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: owner, status: 'deferred', result });
+        else await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: job.leaseOwner, status: 'deferred', result });
         return;
       }
       await feedback?.prepare?.(job, result, state);
-      await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result });
+      await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result });
     } catch (error) {
-      if (['forward_lease_lost', 'forward_runtime_stopping'].includes(error?.code)) {
+      if (lease.signal.aborted || ['forward_lease_lost', 'forward_runtime_stopping', 'CODEX_WAIT_ABORTED'].includes(error?.code)) {
         feedback?.abandon?.(state);
+        lease.assertOwned();
         throw error;
       }
       lease.assertOwned();
       if (held(error)) {
         execution = { ...execution, threadId: error.threadId || execution.threadId, turnId: error.turnId || execution.turnId, startedAt: error.startedAt || execution.startedAt, status: 'unknown', unconfirmed: true, heldReason: error.code || 'native_outcome_unknown' };
         await feedback?.prepare?.(job, {}, state).catch(() => {});
-        await jobs.patchExecution({ id: job.id, leaseOwner: owner, execution });
-        await jobs.markRetry({ id: job.id, leaseOwner: owner, held: true, errorCode: error.code || 'native_outcome_unknown' });
+        await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
+        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, held: true, errorCode: error.code || 'native_outcome_unknown' });
         log('warning', 'forward_execution', 'held', { code: error.code || 'native_outcome_unknown' });
         return;
       }
       if (retryable(error) && (error.code === 'CODEX_THREAD_BUSY' || job.attempts < maxAttempts)) {
         await feedback?.prepare?.(job, {}, state).catch(() => {});
-        await jobs.markRetry({ id: job.id, leaseOwner: owner, preserveAttempt: error.code === 'CODEX_THREAD_BUSY', errorCode: error.code || 'forward_execution_failed', nextAttemptAt: now() + 1000 });
+        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, preserveAttempt: error.code === 'CODEX_THREAD_BUSY', errorCode: error.code || 'forward_execution_failed', nextAttemptAt: now() + 1000 });
         log('warning', 'forward_execution', 'retrying', { code: error.code || 'forward_execution_failed' });
         return;
       }
       execution = { ...execution, terminal: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', finishedAt: now() };
       const failed = { failed: true, turnStatus: execution.terminal, answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : '执行未完成，请稍后重试。', rawAnswer: '', attachments: [], execution };
       await feedback?.prepare?.(job, failed, state);
-      await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result: failed, errorCode: error.code || 'forward_execution_failed' });
+      await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: error.code || 'forward_execution_failed' });
       log('error', 'forward_execution', 'failed', { code: error.code || 'forward_execution_failed' });
     }
   }
@@ -234,13 +241,13 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
           lease.assertOwned();
           delivery = await replies.deliver(job, result, { skipText: cardDelivered || result.deferred, signal: lease.signal, assertLease: lease.assertOwned });
           if (delivery.status === 'unknown') {
-            await jobs.markRetry({ id: job.id, leaseOwner: owner, replyPending: true, errorCode: 'reply_delivery_unknown', nextAttemptAt: now() + 300000 });
+            await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, replyPending: true, errorCode: 'reply_delivery_unknown', nextAttemptAt: now() + 300000 });
             return;
           }
         }
         lease.assertOwned();
         const status = result.deferred ? 'deferred' : result.failed ? 'failed' : 'completed';
-        await jobs.markFinished({ id: job.id, leaseOwner: owner, status, result,
+        await jobs.markFinished({ id: job.id, leaseOwner: job.leaseOwner, status, result,
           replySent: job.deliveryMode === 'bridge' && delivery.status === 'sent',
           errorCode: delivery.status === 'failed' ? 'reply_delivery_failed' : job.last_error || result.errorCode });
         if (inbound && job.deliveryMode === 'bridge' && delivery.status === 'sent') {
@@ -252,7 +259,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         log('warning', 'forward_delivery', 'stopped', { code: error.code });
         return;
       }
-      await jobs.markRetry({ id: job.id, leaseOwner: owner, replyPending: true, errorCode: error.code || 'reply_delivery_unknown', nextAttemptAt: now() + 1000 });
+      await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, replyPending: true, errorCode: error.code || 'reply_delivery_unknown', nextAttemptAt: now() + 1000 });
       log('warning', 'forward_delivery', 'pending', { code: error.code || 'reply_delivery_unknown' });
     }
   }
@@ -262,12 +269,12 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       await withLease(job, async lease => {
         await feedback?.cleanup?.(job, lease);
         lease.assertOwned();
-        await jobs.releaseFeedback({ id: job.id, leaseOwner: owner });
+        await jobs.releaseFeedback({ id: job.id, leaseOwner: job.leaseOwner });
       });
     } catch (error) {
       if (['forward_lease_lost', 'forward_runtime_stopping'].includes(error?.code)) return;
       try {
-        await jobs.releaseFeedback({ id: job.id, leaseOwner: owner, nextAttemptAt: now() + 1000 });
+        await jobs.releaseFeedback({ id: job.id, leaseOwner: job.leaseOwner, nextAttemptAt: now() + 1000 });
       } catch { /* another owner or a later terminal write owns recovery */ }
       log('warning', 'forward_feedback_cleanup', 'pending', { code: error?.code || 'feedback_cleanup_pending' });
     }
@@ -286,14 +293,14 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       try {
         const capacity = maxActive - active.size;
         if (capacity > 0) {
-          const replies = await jobs.claimReplyPending({ owner, leaseMs, limit: Math.min(5, capacity) });
+          const replies = await jobs.claimReplyPending({ owner: claimOwner(), leaseMs, limit: Math.min(5, capacity) });
           for (const job of replies) launch(deliverJob(job));
           const remaining = maxActive - active.size;
           if (remaining > 0 && jobs.claimFeedbackPending) {
-            for (const job of await jobs.claimFeedbackPending({ owner, leaseMs, limit: Math.min(5, remaining) })) launch(cleanupFeedback(job));
+            for (const job of await jobs.claimFeedbackPending({ owner: claimOwner(), leaseMs, limit: Math.min(5, remaining) })) launch(cleanupFeedback(job));
           }
           const executionSlots = maxActive - active.size;
-          if (executionSlots > 0) for (const job of await jobs.claim({ owner, leaseMs, limit: Math.min(5, executionSlots) })) launch(executeJob(job));
+          if (executionSlots > 0) for (const job of await jobs.claim({ owner: claimOwner(), leaseMs, limit: Math.min(5, executionSlots) })) launch(executeJob(job));
         }
       } catch {
         healthy = false;

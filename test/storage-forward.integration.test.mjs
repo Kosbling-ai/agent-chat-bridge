@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createPoolFromEnvironment } from '../src/storage/connection.mjs';
 import { migrate } from '../src/storage/migrations.mjs';
 import { createForwardJobStore } from '../src/storage/forward-jobs.mjs';
+import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 import { createMysqlStore } from '../src/storage/store.mjs';
 import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
 import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
@@ -79,6 +80,34 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.deepEqual(events.map(event=>event.title),['Progress']);
     assert.equal(events[0].sequence, events[0].id);
     assert.deepEqual(events[0].payload.progress, {kind:'tool',id:'safe'});
+
+    const progressStore = createCodexSessionStore({
+      pool,
+      schema: process.env.BRIDGE_TEST_DATABASE,
+      now: () => now,
+    });
+    const delayed = await pool.getConnection();
+    try {
+      await delayed.beginTransaction();
+      await delayed.execute(`INSERT INTO assistant_codex_events
+        (id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000001,'late-thread','group:late','late-chat','late-message','tool:late','public_progress','activity','Late','',JSON.stringify({kind:'tool',id:'late',status:'completed'}),1302]);
+      await pool.execute(`INSERT INTO assistant_codex_events
+        (id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000002,'late-thread','group:late','late-chat','late-message','tool:visible','public_progress','activity','Visible','',JSON.stringify({kind:'tool',id:'visible',status:'running'}),1301]);
+      const binding = { feishuOpenId: 'group:late', chatId: 'late-chat' };
+      const visible = await progressStore.readPublicProgress({ binding, threadId: 'late-thread', messageId: 'late-message', cursor: { at: 1300, id: '0' } });
+      assert.deepEqual(visible.map(row => String(row.id)), ['9000002']);
+      await delayed.commit();
+      const late = await progressStore.readPublicProgress({ binding, threadId: 'late-thread', messageId: 'late-message', cursor: { at: 1301, id: '9000002' } });
+      assert.deepEqual(late.map(row => String(row.id)), ['9000001']);
+      await pool.execute(`UPDATE assistant_codex_events SET detail_json=?,created_at=?
+        WHERE codex_session_id=? AND event_key=?`, [JSON.stringify({kind:'tool',id:'visible',status:'failed'}),1303,'late-thread','tool:visible']);
+      const updated = await progressStore.readPublicProgress({ binding, threadId: 'late-thread', messageId: 'late-message', cursor: { at: 1302, id: '9000001' } });
+      assert.deepEqual(updated.map(row => [String(row.id), JSON.parse(row.detail_json).status]), [['9000002','failed']]);
+    } finally {
+      delayed.release();
+    }
 
     const expiring = await store.upsert({ ...input, idempotencyKey: 'expiring', messageId: 'system:expiring' });
     const [expiringClaim] = await store.claim({ owner: 'worker-expiring', leaseMs: 100, limit: 1 });
@@ -197,6 +226,88 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.deepEqual(removedReactions, ['typing-reaction']);
     assert.equal((await store.getRun({ id: deliveryRun.id })).result.typing.outcome, 'confirmed');
     assert.deepEqual(await store.claimFeedbackPending({ owner: 'feedback-worker-2', leaseMs: 100, limit: 1 }), []);
+
+    await pool.execute('DELETE FROM assistant_codex_forward_jobs');
+    const startIntentRun = await store.upsert({
+      ...input, idempotencyKey: 'start-intent-cleanup', messageId: 'start-intent-source',
+      sourceMessageId: 'start-intent-source', deliveryMode: 'bridge',
+    });
+    const startIntentClaim = (await store.claim({ owner: 'crashed-owner', leaseMs: 100, limit: 1 }))[0];
+    assert.equal(startIntentClaim.id, startIntentRun.id);
+    await store.patchFeedback({
+      id: startIntentRun.id, leaseOwner: 'crashed-owner', key: 'typing',
+      value: { desired: true, reactionId: 'persisted-typing', outcome: 'confirmed' },
+    });
+    await store.patchExecution({
+      id: startIntentRun.id, leaseOwner: 'crashed-owner',
+      execution: { bindingOpenId: 'group:binding', threadId: 'uncertain-thread', startedAt: now, status: 'start_intent' },
+    });
+    now += 101;
+    let startIntentExecutions = 0;
+    const startIntentRemoved = [];
+    const startIntentFeedback = createExecutionFeedback({
+      jobs: store, sessions: {}, executor: {},
+      chat: {
+        async removeReaction(value) { startIntentRemoved.push(value.reactionId); },
+        async listReactions() { throw new Error('known reaction id should be removed directly'); },
+      },
+    });
+    const startIntentRuntime = createForwardRuntime({
+      config: { owner: 'restart-worker', pollMs: 2, leaseMs: 10_000 }, jobs: store, sessions: {},
+      executor: { async execute() { startIntentExecutions += 1; } },
+      feedback: startIntentFeedback, replies: {}, authorize: async () => true,
+    });
+    startIntentRuntime.start();
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await store.getRun({ id: startIntentRun.id })).status === 'held') break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    await startIntentRuntime.stop();
+    const heldStartIntent = await store.getRun({ id: startIntentRun.id });
+    assert.equal(startIntentExecutions, 0);
+    assert.deepEqual(startIntentRemoved, ['persisted-typing']);
+    assert.equal(heldStartIntent.status, 'held');
+    assert.equal(heldStartIntent.result.typing.desired, false);
+    assert.equal(heldStartIntent.result.typing.outcome, 'confirmed');
+
+    const leaseRun = await store.upsert({ ...input, idempotencyKey: 'lease-generation', messageId: 'lease-generation' });
+    const oldLease = (await store.claim({ owner: 'same-process:first-claim', leaseMs: 100, limit: 1 }))[0];
+    assert.equal(oldLease.id, leaseRun.id);
+    now += 101;
+    const newLease = (await store.claim({ owner: 'same-process:second-claim', leaseMs: 100, limit: 1 }))[0];
+    assert.equal(newLease.id, leaseRun.id);
+    assert.notEqual(newLease.leaseOwner, oldLease.leaseOwner);
+    await assert.rejects(store.patchFeedback({
+      id: leaseRun.id, leaseOwner: oldLease.leaseOwner, key: 'executionCard', value: { status: 'running' },
+    }), { code: 'forward_lease_lost' });
+
+    await pool.execute('DELETE FROM assistant_codex_forward_jobs');
+    await pool.execute(`INSERT INTO assistant_codex_forward_jobs
+      (public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,chat_id,
+       chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,
+       context_entries_json,status,result_json,last_error,created_at,updated_at)
+      WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM seq WHERE n<1000)
+      SELECT UUID(),SHA2(CONCAT('history-',n),256),SHA2(CONCAT('history-request-',n),256),'history','','bridge',
+       CONCAT('history-',n),'chat','group','text','system:history','','group','history','null','[]','completed',
+       JSON_OBJECT('typing',JSON_OBJECT('desired',false,'outcome','confirmed')),'',?,? FROM seq`, [now, now]);
+    const cleanupRun = await store.upsert({ ...input, idempotencyKey: 'indexed-cleanup', messageId: 'indexed-cleanup', deliveryMode: 'bridge' });
+    const cleanupOwner = (await store.claim({ owner: 'cleanup-seed', leaseMs: 100, limit: 1 }))[0];
+    assert.equal(cleanupOwner.id, cleanupRun.id);
+    await store.patchFeedback({
+      id: cleanupRun.id, leaseOwner: cleanupOwner.leaseOwner, key: 'typing',
+      value: { desired: false, operation: 'remove', outcome: 'unknown', nextRetryAt: now },
+    });
+    await store.markRetry({ id: cleanupRun.id, leaseOwner: cleanupOwner.leaseOwner, held: true, errorCode: 'cleanup_fixture' });
+    const [plan] = await pool.query(`EXPLAIN SELECT id FROM assistant_codex_forward_jobs
+      FORCE INDEX (idx_forward_feedback_cleanup)
+      WHERE feedback_cleanup_pending=1 AND feedback_cleanup_at<=?
+        AND status IN ('held','completed','failed','deferred')
+        AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+      ORDER BY feedback_cleanup_at,id LIMIT 5`, [now, now]);
+    assert.equal(plan[0].key, 'idx_forward_feedback_cleanup');
+    const indexedClaims = await store.claimFeedbackPending({ owner: 'indexed-cleaner', leaseMs: 100, limit: 5 });
+    assert.deepEqual(indexedClaims.map(job => job.id), [cleanupRun.id]);
+    await store.releaseFeedback({ id: cleanupRun.id, leaseOwner: 'indexed-cleaner', nextAttemptAt: now + 1000 });
 
     const stopRun = await store.upsert({ ...input, idempotencyKey: 'stop-once', messageId: 'stop-source' });
     const stopClaim = (await store.claim({ owner: 'stop-worker', leaseMs: 100, limit: 5 }))

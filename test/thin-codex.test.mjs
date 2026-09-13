@@ -252,8 +252,8 @@ test('session store uses injected schema and public progress exact identity filt
   await store.readPublicProgress({ binding: { feishuOpenId: 'system:a', chatId: 'chat-a' }, threadId: 'thread-a', messageId: 'message-a', cursor: '9007199254740993', limit: 999 });
   assert.match(calls[0][0], /`bridge_dev`\.`assistant_codex_events`/);
   assert.match(calls[0][0], /feishu_open_id = \? AND chat_id = \? AND codex_session_id = \? AND message_id = \?/);
-  assert.deepEqual(calls[0][1], ['system:a', 'chat-a', 'thread-a', 'message-a', '3', 250]);
-  assert.deepEqual(calls[1][1], ['system:a', 'chat-a', 'thread-a', 'message-a', '9007199254740993', 250]);
+  assert.deepEqual(calls[0][1], ['system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '3', 250]);
+  assert.deepEqual(calls[1][1], ['system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '9007199254740993', 250]);
 });
 
 test('migration contains only the two first-ticket production tables', async () => {

@@ -223,8 +223,9 @@ test('one forward worker admits another human job while the first turn is active
 });
 
 test('lease loss after binding aborts observation without a terminal write', async () => {
-  const jobs = memoryJobs({ status: 'pending' });
+  const jobs = memoryJobs({ status: 'pending', deliveryMode: 'bridge' });
   let renewals = 0;
+  let abandoned = 0;
   jobs.renew = async () => {
     renewals += 1;
     if (renewals > 1) throw Object.assign(new Error('lost'), { code: 'forward_lease_lost' });
@@ -237,10 +238,32 @@ test('lease loss after binding aborts observation without a terminal write', asy
       await options.onBound({ threadId: 'thread', turnId: 'turn', startedAt: 2 });
       return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(new Error('stopped'), { code: 'CODEX_WAIT_ABORTED', outcome: 'unknown' })), { once: true }));
     } },
+    feedback: {
+      async start() { return { observer: { stop() {} }, card: { stop() {} } }; },
+      observe() {},
+      abandon(state) { abandoned += 1; state.observer = null; state.card = null; },
+    },
     replies: { readResource: async () => null }, authorize: async () => true,
   });
   runtime.start(); await flush(); await runtime.stop();
   assert.ok(renewals > 1);
   assert.deepEqual(jobs.calls.map(([name]) => name), ['execution', 'execution']);
   assert.equal(jobs.job.status, 'running');
+  assert.equal(abandoned, 1);
+});
+
+test('every claim batch gets a distinct lease identity', async () => {
+  const owners = [];
+  let claims = 0;
+  const jobs = {
+    async claimReplyPending({ owner }) { owners.push(owner); return []; },
+    async claim() { claims += 1; if (claims > 1) throw new Error('stop polling'); return []; },
+  };
+  const runtime = createForwardRuntime({
+    config: { owner: 'process-worker', pollMs: 1 }, jobs, sessions: {}, executor: {}, replies: {},
+  });
+  runtime.start(); await flush(); await runtime.stop();
+  assert(owners.length >= 2);
+  assert.equal(new Set(owners).size, owners.length);
+  assert(owners.every(owner => owner.startsWith('process-worker:')));
 });

@@ -145,10 +145,16 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       if (!['executionCard', 'typing', 'stop', 'delivery'].includes(key)) throw new StoreError('invalid_store_input');
       return write(async connection => {
         const at = now();
+        const updatesCleanup = key === 'typing';
+        const cleanupPending = updatesCleanup && input.value?.desired === false
+          && !['confirmed', 'not_applicable'].includes(input.value?.outcome);
+        const cleanupSql = updatesCleanup ? ',feedback_cleanup_pending=?,feedback_cleanup_at=?' : '';
+        const cleanupArgs = updatesCleanup ? [cleanupPending ? 1 : 0, cleanupPending ? Number(input.value?.nextRetryAt || at) : null] : [];
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
-            '$.${key}',CAST(? AS JSON)),updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('running','reply_pending','held','completed','failed','deferred')`, [safeJson(input.value), at, id, owner, at]);
+            '$.${key}',CAST(? AS JSON))${cleanupSql},updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('running','reply_pending','held','completed','failed','deferred')`,
+        [safeJson(input.value), ...cleanupArgs, at, id, owner, at]);
         await assertLease(connection, result);
         return { updated: true };
       });
@@ -281,12 +287,11 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       return write(async connection => {
         const at = now();
         const [candidates] = await connection.execute(`SELECT id FROM assistant_codex_forward_jobs
-          WHERE status IN ('held','completed','failed','deferred')
+          FORCE INDEX (idx_forward_feedback_cleanup)
+          WHERE feedback_cleanup_pending=1 AND feedback_cleanup_at<=?
+            AND status IN ('held','completed','failed','deferred')
             AND (lease_expires_at IS NULL OR lease_expires_at<=?)
-            AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-            AND JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.typing.desired'))='false'
-            AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.typing.outcome')),'') NOT IN ('confirmed','not_applicable')
-          ORDER BY updated_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [at, at]);
+          ORDER BY feedback_cleanup_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [at, at]);
         if (!candidates.length) return [];
         const ids = candidates.map(item => String(item.id));
         const slots = ids.map(() => '?').join(',');
@@ -302,7 +307,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       return write(async connection => {
         const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
-          SET lease_owner='',lease_expires_at=NULL,next_attempt_at=?,updated_at=?
+          SET lease_owner='',lease_expires_at=NULL,feedback_cleanup_at=?,updated_at=?
           WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('held','completed','failed','deferred')`,
         [input.nextAttemptAt ?? null, at, id, owner, at]);
         await assertLease(connection, result);
