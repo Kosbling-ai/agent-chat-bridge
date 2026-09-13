@@ -39,14 +39,14 @@ test('resource worker frees empty output independently and resumes sealed input 
     const release = media.release; let failures = 0;
     media.release = async () => { failures++; throw new Error('synthetic process failure after seal'); };
     await retire(); assert.equal(failures, 1);
-    const candidates = await store.listRetirableResources({ connectionId: scope.connectionId, limit: 10 });
+    const candidates = await store.listRetirableResources({ connectionId: scope.connectionId, kind: 'input', limit: 10 });
     assert.equal(candidates.items.find(row => row.runId === job.id).inputState, 'sealed');
     await assert.rejects(store.setSession({ ...scope, expectedGeneration: Number(attempt.generation) + 1, nativeThreadId: 'retired-thread' }), { code: 'resource_retired' });
     media.release = release;
     retire = createResourceRetirement({ store, media, outbound, guard, connectionId: scope.connectionId });
     await retire();
     await assert.rejects(readFile(prepared.localPaths[0]), { code: 'ENOENT' });
-    assert(!(await store.listRetirableResources({ connectionId: scope.connectionId, limit: 10 })).items.some(row => row.runId === job.id));
+    assert(!(await store.listRetirableResources({ connectionId: scope.connectionId, kind: 'input', limit: 10 })).items.some(row => row.runId === job.id));
     await retire(); // Replay is a no-op once both receipts are complete.
   } finally { if (store) await store.close(); else await pool.end(); await rm(workspace, { recursive: true, force: true }); }
 });

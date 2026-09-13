@@ -286,7 +286,7 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
         if (active.size < 8) {
           if (retireResources && !retirementRunning && Date.now() >= retirementAt) {
             retirementAt = Date.now() + 30000; retirementRunning = true;
-            launch(retireResources().finally(() => { retirementRunning = false; }));
+            launch(retireResources().then(result => { if (result.hasMore) retirementAt = Date.now() + 1000; }).finally(() => { retirementRunning = false; }));
           }
           if (outbound && !cleanupRunning && Date.now() >= cleanupAt) { cleanupAt = Date.now() + 1000; launch(cleanupArtifacts()); }
           if (recover && codex.status().state === 'ready') for (const action of await store.claimRecoveries({ owner, leaseMs, limit: 1 })) launch(conversationGuard.native(guardKey(action), () => stopping ? undefined : recover(action)));
