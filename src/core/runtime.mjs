@@ -40,30 +40,19 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
   }
   async function awaitTurn(job, attempt, turnId) {
     let cursor = 0, renewedAt = Date.now();
-    let lastAgentMessage = '';
-    const itemText = new Map();
     while (!stopping) {
-      const rows = await store.readNativeEvents({ connectionId, nativeThreadId: attempt.nativeThreadId, afterSequence: cursor, limit: 100 });
+      const rows = await store.readNativeEvents({ connectionId, nativeThreadId: attempt.nativeThreadId, nativeTurnId: turnId, afterSequence: cursor, limit: 100 });
       for (const row of rows) {
         cursor = row.sequence;
         const event = parse(row.payload);
         const ids = nativeIds(event);
         if (ids.nativeTurnId !== turnId) continue;
-        if (['agentMessage/delta', 'item/agentMessage/delta'].includes(event.method)) {
-          const itemId = event.params.itemId ?? 'agent-delta';
-          const next = ((itemText.get(itemId) ?? '') + (event.params.delta ?? '')).slice(-12000);
-          itemText.set(itemId, next);
-          if (itemText.size > 128) itemText.delete(itemText.keys().next().value);
-          lastAgentMessage = next;
-        }
-        if (event.method === 'item/completed' && event.params.item?.type === 'agentMessage') lastAgentMessage = event.params.item.text ?? lastAgentMessage;
         await store.appendRunEvent({ runId: job.id, eventKey: `native:${row.sequence}`, type: event.method, payload: event.params });
         if (event.method === 'turn/completed') {
           // Some protocol versions omit item bodies from terminal notifications.
-          if (Array.isArray(event.params.turn?.items) && event.params.turn.items.length) return event.params.turn;
+          if (extractFinalAnswer(event.params.turn)) return event.params.turn;
           const result = await codex.readThread({ threadId: attempt.nativeThreadId, includeTurns: true });
           const recovered = result.thread?.turns?.find(turn => turn.id === turnId);
-          if (recovered && !extractFinalAnswer(recovered) && lastAgentMessage) return { ...recovered, items: [{ type: 'agentMessage', text: lastAgentMessage }] };
           return recovered ?? null;
         }
       }
@@ -76,12 +65,38 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     }
     return null;
   }
-  async function finish(job, turn) {
+  async function durableFinalAnswer(job, attempt, turn) {
+    const final = extractFinalAnswer(turn);
+    if (final) return final;
+    let cursor = 0, lastAgentMessage = '', renewedAt = Date.now();
+    const itemText = new Map();
+    for (let page = 0; page < 1000; page++) {
+      const rows = await store.readNativeEvents({ connectionId, nativeThreadId: attempt.nativeThreadId, nativeTurnId: turn.id, afterSequence: cursor, limit: 100 });
+      for (const row of rows) {
+        cursor = row.sequence;
+        const event = parse(row.payload);
+        if (nativeIds(event).nativeTurnId !== turn.id) continue;
+        if (['agentMessage/delta', 'item/agentMessage/delta'].includes(event.method)) {
+          const itemId = event.params.itemId ?? 'agent-delta';
+          const next = ((itemText.get(itemId) ?? '') + (event.params.delta ?? '')).slice(-12000);
+          itemText.set(itemId, next);
+          if (itemText.size > 128) itemText.delete(itemText.keys().next().value);
+          lastAgentMessage = next;
+        }
+        if (event.method === 'item/completed' && event.params.item?.type === 'agentMessage') lastAgentMessage = event.params.item.text ?? lastAgentMessage;
+      }
+      if (rows.length < 100) return lastAgentMessage;
+      if (Date.now() - renewedAt > 15000) { await store.renewJob({ id: job.id, leaseToken: job.leaseToken, leaseMs }); renewedAt = Date.now(); }
+    }
+    // Do not silently return a prefix when bounded recovery cannot reach the tail.
+    throw new Error('native_history_recovery_limit');
+  }
+  async function finish(job, turn, attempt) {
     if (turn.status !== 'completed') {
       await store.retryJob({ id: job.id, leaseToken: job.leaseToken, terminal: true, errorCode: 'agent_turn_failed' });
       return;
     }
-    const text = extractFinalAnswer(turn);
+    const text = await durableFinalAnswer(job, attempt, turn);
     const payload = parse(job.payload);
     // Independent text effects are small enough for the platform JSON limit.
     const pieces = [];
@@ -107,7 +122,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
         rpcPhase = 'recovery_read';
         const result = await codex.readThread({ threadId: attempt.nativeThreadId, includeTurns: true });
         const turn = result.thread?.turns?.find(item => item.id === attempt.nativeTurnId);
-        if (turn && turn.status !== 'inProgress') { await finish(job, turn); return; }
+        if (turn && turn.status !== 'inProgress') { await finish(job, turn, attempt); return; }
         if (!turn) { await hold(job, 'agent_turn_unresolved'); return; }
       } else {
         rpcPhase = 'thread_admission';
@@ -130,7 +145,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
       }
       rpcPhase = 'observe_turn';
       const turn = await awaitTurn(job, attempt, attempt.nativeTurnId);
-      if (turn) await finish(job, turn);
+      if (turn) await finish(job, turn, attempt);
       else if (attempt.nativeThreadId && attempt.nativeTurnId) {
         // Keep the durable native admission and active session. The next worker
         // must enter recoveryRequired/readThread, never start another turn.

@@ -36,7 +36,7 @@ test('real Store core: immediate completion, independent hook, API authorization
       completed.set(threadId, turn);
       if (mode === 'live') return { turn: { id: turn.id, status: 'inProgress' } };
       if (mode === 'stream-fallback') {
-        turn.items = [];
+        turn.items = [{ type: 'commandExecution', id: 'tool-only', status: 'completed' }];
         await runtime.notification({ method: 'item/agentMessage/delta', params: { threadId, turnId: turn.id, itemId: 'stream', delta: 'Recovered streamed answer' } });
       }
       // The Store commits this notification before RPC admission is returned.
@@ -84,12 +84,14 @@ test('real Store core: immediate completion, independent hook, API authorization
     const recovery = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'recovered', idempotencyKey: 'recovered', payload: { text: 'already admitted' } });
     const [claim] = await store.claimJobs({ kind: 'agent', owner: 'crashed-worker', limit: 1, leaseMs: 100 });
     const attempt = await store.beginAgentAttempt({ id: claim.id, leaseToken: claim.leaseToken, agentId: 'codex' });
-    completed.set('recovery-thread', { id: 'recovery-turn', status: 'completed', items: [{ type: 'agentMessage', text: 'Recovered answer' }] });
+    completed.set('recovery-thread', { id: 'recovery-turn', status: 'completed', items: [{ type: 'commandExecution', id: 'tool-only', status: 'completed' }] });
+    await store.bufferNativeEvent({ connectionId: 'fixture', eventKey: 'recovery-delta', nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn', payload: { method: 'item/agentMessage/delta', params: { threadId: 'recovery-thread', turnId: 'recovery-turn', itemId: 'recovery-message', delta: 'Recovered answer' } } });
     await store.bindAgentAttempt({ id: claim.id, leaseToken: claim.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn' });
     await new Promise(resolve => setTimeout(resolve, 150));
     runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => new Response(null, { status: 204 }) });
     runtime.start();
     await eventually(() => store.getJob({ id: recovery.id }), row => row.status === 'succeeded');
+    assert(sent.some(effect => effect.content.text === 'Recovered answer'), 'restarted completed turn uses persisted stream fallback');
     assert.equal(turns, before, 'unknown admission must not replay on worker restart');
     mode = 'normal';
     const unsupported = await runtime.ingest({ ...event, eventId: 'e2', eventKey: 'receive:e2', conversationId: 'unsupported', messageId: 'm2', message: { kind: 'image', parsedContent: { image_key: 'synthetic' }, mentions: [] } });
