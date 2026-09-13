@@ -1,0 +1,34 @@
+# Agent output files
+
+This module restores the old private-chat output discovery algorithm: a flat per-chat directory, regular files modified since turn start minus one second, modification-time order, newest nine files when more exist. Group output remains text-only. File size is actually bounded to 28 MiB, retaining the old transport's `28 * 1024 * 1024` limit. It does not treat the public upload endpoint's 2 MiB JSON limit as the Agent output limit.
+
+Images are recognized by `.png/.jpg/.jpeg/.gif/.webp/.bmp`, as in the original helper. `.pdf/.doc/.xls/.ppt/.mp4/.opus` use corresponding Feishu upload file types; modern office formats, archives and other extensions use `stream`. Image upload keeps the adapter's separate 10 MiB platform cap. Larger images therefore produce an explicit failed effect and remain available for follow-up. Extension mapping is not MIME inspection and does not expand inbound media support.
+
+## Internal integration contract
+
+`await createOutboundMedia({workspace,outboxDir,spoolDir,chat,maxBytes?,maxTotalBytes?,log?})` returns the following methods. The host selects absolute directories strictly inside the trusted Agent workspace, and must keep outbox, outbound spool and inbound media spool disjoint. Existing symlink ancestors, unsafe writable directories, symlink files and hardlinked files are rejected. The source directory is per connection/conversation; snapshots are per run. This is path validation and integrity checking, not a sandbox against processes sharing the service UID.
+
+`scope = {connectionId,conversationId,runId}` is always derived from the durable authorized run, never HTTP input. `directory(scope)` creates/returns the trusted per-chat path for the initial private-chat prompt. `prepare({...scope,conversationType,sinceMs})` takes the durable original turn-start time and returns `{artifacts:[{ref,kind,fileType,fileName,size}],failures:[{fileName,code}],omitted}`. `ref` contains only `{connectionId,conversationId,runId,artifactId}`, no filesystem path. Every later operation checks the reference against the expected scope and saved manifest. Do not expose these operations or accept artifact fields in public APIs.
+
+Prepare copies bounded bytes into an independent output spool and commits an atomic manifest before returning. Files and manifest are fsynced, then their directory entries are fsynced. Once a manifest exists, restart reuses it without selecting new or changed source files. A changed source is never substituted for a registered artifact. Filesystem failures/oversize are recorded per file, leave the source in place, and do not discard successful files or the separate text reply. The core must preserve failures in its run result; a text reply does not mean every file was delivered.
+
+For each artifact the core creates two separate durable effects in the existing ordered outbox array:
+
+1. An internal `artifact_upload` effect with `{ref}`. Stable idempotency key: `run:<runId>:artifact:<artifactId>:upload`. Worker calls `upload({scope,ref})` exactly once per claimed non-unknown effect. Return value is `{image_key}` or `{file_key}`. Upload has no platform UUID; an unknown result must remain held and must not be automatically uploaded again.
+2. An internal `artifact_send` effect with `{ref}` immediately after its upload. Stable key: `run:<runId>:artifact:<artifactId>:send`. Worker reads only the **confirmed sent upload predecessor** result and calls `send({scope,ref,uploadResult,uuid:row.platformUuid})`. The helper creates a normal image/file message in the run's conversation. Core keeps its bounded same-UUID retry semantics for uncertain message sends; it must explicitly classify this internal kind as a UUID-capable send. Failed/unknown predecessors block later effects through the Store's durable chain.
+
+These are internal kind names for host integration, not new public request kinds. The helper never registers Store effects or marks their result itself, and never combines upload+send into one misleading atomic operation. Append output effects to the same atomic run-completion call as its text effects. Repeated run completion must reuse the manifest and stable effect keys.
+
+## Cleanup and retention
+
+After an artifact send is platform-confirmed, the core must atomically persist `sent` **and** a cleanup-pending marker. Only then call `cleanup({scope,ref,confirmedSent:true})`. A durable cleanup sweep retries pending entries after restart; a cleanup error does not resend the file. Clear the marker only after successful cleanup. This closes the crash gap between send commit and filesystem cleanup; Store/worker support is a separate integration requirement.
+
+Cleanup removes the original source only if inode/device/size/mtime and content hash still match the snapshotted version. A replacement/modified source is retained with a sanitized warning. It deletes the corresponding snapshot and is safe to retry after either deletion. The small manifest stays for replay/audit; no completed run is automatically rescanned. Unknown/failed sends retain snapshots and source. Successful-source unlink failures propagate for cleanup retry rather than being reported as sent again.
+
+The spool has a default 512 MiB budget, configurable up to 1 GiB, plus a bounded entry scan. Source directory scanning is limited to 4096 entries. Per-chat source files are Agent output and are not silently garbage-collected. Old manifests, interrupted preparation files, and held artifacts eventually need a reviewed retention/repair operation; hitting a quota fails explicitly, rather than deleting unknown or active output. Include the spool and manifests alongside durable Store state in backup/migration planning.
+
+## Verification and boundaries
+
+`node --test test/outbound-media.test.mjs test/feishu.test.mjs` validates real local file selection, immutable restart snapshots, type mapping, separate upload/send, unknown retention, confirmation-gated idempotent cleanup, changed-source retention, scope violations, symlinks/hardlinks, size and integrity limits. SDK/HTTP tests use the installed SDK with a no-network transport; no bot or model is contacted.
+
+The host must configure its internal chat client for at least 28 MiB file bytes and HTTP multipart overhead, wire durable upload predecessor results, classify internal send UUID eligibility, persist cleanup markers and sweep them. Standalone module tests do not prove this integrated lifecycle or production migration. No additional filesystem or chat read proxy is exposed publicly.

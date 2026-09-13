@@ -181,6 +181,9 @@ test('uploads accept bounded bytes only, never arbitrary filesystem paths', asyn
   await chat.uploadImage({ bytes: Buffer.from('abc') });
   await chat.uploadFile({ bytes: Buffer.from('abc'), fileName: 'a.txt' });
   assert.equal(calls[1].request.data.file_type, 'stream');
+  await chat.uploadFile({ bytes: Buffer.from('pdf'), fileName: 'a.pdf', fileType: 'pdf' });
+  assert.equal(calls[2].request.data.file_type, 'pdf');
+  assert.throws(() => chat.uploadFile({ bytes: Buffer.from('x'), fileName: 'a.txt', fileType: 'arbitrary' }));
   assert.throws(() => chat.uploadImage({ bytes: '/etc/passwd' }));
   assert.throws(() => chat.uploadImage({ bytes: Buffer.alloc(5) }));
   assert.throws(() => chat.uploadFile({ bytes: Buffer.alloc(1), fileName: '../secret' }));
@@ -227,7 +230,7 @@ test('installed SDK and axios build chat HTTP requests without any network trans
   await chat.listReactions({ messageId: 'm' });
   await chat.removeReaction({ messageId: 'm', reactionId: 'r' });
   await chat.uploadImage({ bytes: Buffer.from('image') });
-  await chat.uploadFile({ bytes: Buffer.from('file'), fileName: 'test.txt' });
+  await chat.uploadFile({ bytes: Buffer.from('file'), fileName: 'test.pdf', fileType: 'pdf' });
   const resource = await chat.downloadResource({ messageId: 'm', fileKey: 'f', type: 'file' });
   let content = '';
   for await (const chunk of resource.stream) content += chunk.toString();
@@ -237,4 +240,6 @@ test('installed SDK and axios build chat HTTP requests without any network trans
   assert.equal(JSON.parse(create.data).uuid, 'stable-effect');
   assert.ok(requests.some((request) => request.url.endsWith('/chats/chat/members')));
   assert.ok(requests.some((request) => request.url.endsWith('/messages/m/resources/f')));
+  const fileUpload = requests.find(request => request.url.endsWith('/im/v1/files'));
+  assert.match(fileUpload.data.getBuffer().toString(), /name="file_type"\r\n\r\npdf/);
 });

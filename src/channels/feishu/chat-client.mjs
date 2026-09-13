@@ -93,11 +93,12 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
       if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > Math.min(maxMediaBytes, 10 * 1024 * 1024)) throw new FeishuChatError('invalid_media_bytes', 'failed');
       return call('image', 'create', { data: { image_type: 'message', image: bytes } }, true, false, 'image_key');
     },
-    uploadFile({ bytes, fileName }) {
+    uploadFile({ bytes, fileName, fileType = 'stream' }) {
       if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > Math.min(maxMediaBytes, 30 * 1024 * 1024)) throw new FeishuChatError('invalid_media_bytes', 'failed');
       required(fileName);
       if (/[\\/\x00-\x1f]/.test(fileName)) throw new FeishuChatError('invalid_file_name', 'failed');
-      return call('file', 'create', { data: { file_type: 'stream', file_name: fileName, file: bytes } }, true, false, 'file_key');
+      if (!['stream', 'pdf', 'doc', 'xls', 'ppt', 'mp4', 'opus'].includes(fileType)) throw new FeishuChatError('invalid_file_type', 'failed');
+      return call('file', 'create', { data: { file_type: fileType, file_name: fileName, file: bytes } }, true, false, 'file_key');
     },
     async downloadResource({ messageId, fileKey, type }) {
       if (!['image', 'file'].includes(type)) throw new FeishuChatError('invalid_resource_type', 'failed');
