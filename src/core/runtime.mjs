@@ -196,9 +196,9 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
     }
   }
   async function deliver(row) {
+    let result;
     try {
       const payload = parse(row.payload);
-      let result;
       if (row.kind === 'reply') result = await chat.replyMessage({ ...payload, uuid: row.platformUuid });
       else if (row.kind === 'create') result = await chat.sendMessage({ ...payload, conversationId: row.conversationId, uuid: row.platformUuid });
       else if (row.kind === 'reaction') result = payload.reactionId ? await chat.removeReaction(payload) : await chat.addReaction(payload);
@@ -210,10 +210,27 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
         result = await outbound.send({ ...payload, uploadResult: parse(effect.predecessorResult), uuid: row.platformUuid });
       }
       else throw Object.assign(new Error('unsupported_delivery'), { outcome: 'failed' });
-      await store.settleOutbox({ id: row.id, leaseToken: row.leaseToken, status: 'sent', result });
     } catch (error) {
-      await store.settleOutbox({ id: row.id, leaseToken: row.leaseToken, status: error.outcome === 'failed' ? 'failed' : 'unknown', errorCode: 'chat_delivery_unconfirmed', nextAttemptAt: Date.now() + 5000 });
+      await settleDelivery(row, { status: error.outcome === 'failed' ? 'failed' : 'unknown', errorCode: 'chat_delivery_unconfirmed', nextAttemptAt: Date.now() + 5000 });
       log('warning', 'chat_delivery', 'unconfirmed', { code: 'chat_delivery_unconfirmed' });
+      return;
+    }
+    // Database settlement is not part of the platform call. In particular a
+    // lost sent COMMIT response cannot justify writing the opposite outcome.
+    await settleDelivery(row, { status: 'sent', result });
+  }
+  async function settleDelivery(row, outcome) {
+    try { await store.settleOutbox({ id: row.id, leaseToken: row.leaseToken, ...outcome }); }
+    catch {
+      const recorded = await store.getOutbox({ id: row.id });
+      if (recorded?.status === 'sent') {
+        log('info', 'chat_delivery', 'succeeded', { code: 'delivery_commit_confirmed' });
+        return;
+      }
+      // Another lease owner or an unconfirmed write is reconciled by durable
+      // outbox claiming. Keep its facts intact; never reclassify a DB error as
+      // an uncertain platform effect or stop unrelated workers for stale lease.
+      log('warning', 'chat_delivery', 'pending', { code: 'delivery_settlement_unconfirmed' });
     }
   }
   async function cleanupArtifacts() {
