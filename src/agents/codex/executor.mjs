@@ -29,8 +29,65 @@ function finalAnswer(turn) {
   const final = [...items].reverse().find((item) => item?.type === 'agentMessage' && item.phase === 'final_answer' && trim(item.text));
   if (final) return trim(final.text);
   const message = [...items].reverse().find((item) => item?.type === 'message' && item.role === 'assistant' && item.phase === 'final_answer');
-  if (message) return trim(message.text || (message.content || []).map((part) => part?.text || part?.output_text || '').join('\n'));
+  if (message) return trim(codexMessageText(message));
   return trim([...items].reverse().find((item) => item?.type === 'agentMessage' && trim(item.text))?.text);
+}
+
+function codexMessageText(item = {}) {
+  if (typeof item.text === 'string') return item.text;
+  const content = Array.isArray(item.content) ? item.content : [];
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (!part || typeof part !== 'object') return '';
+    return part.text || part.input_text || part.output_text || '';
+  }).filter(Boolean).join('\n');
+}
+
+export function projectCodexItem(item) {
+  switch (item?.type) {
+    case 'message': {
+      const text = codexMessageText(item);
+      if (!text.trim()) return null;
+      const role = item.role === 'user' ? 'user' : 'assistant';
+      return { eventType: role === 'user' ? 'user_message' : 'agent_message', role, title: role === 'user' ? '用户' : (item.phase === 'final_answer' ? 'Codex 回复' : 'Codex'), text, detail: { phase: item.phase || '' } };
+    }
+    case 'function_call':
+      return { eventType: 'tool_call', role: 'activity', title: `工具调用 · ${item.name || 'function'}`, text: '', detail: { callId: item.call_id || item.callId || '', name: item.name || '' } };
+    case 'function_call_output':
+      return { eventType: 'tool_output', role: 'activity', title: `工具结果${item.call_id ? ` · ${item.call_id}` : ''}`, text: '', detail: { callId: item.call_id || item.callId || '' } };
+    case 'agentMessage':
+      return { eventType: 'agent_message', role: 'assistant', title: item.phase === 'final_answer' ? 'Codex 回复' : 'Codex', text: item.text || '', detail: { phase: item.phase || '' } };
+    case 'plan':
+      return { eventType: 'plan', role: 'activity', title: '计划更新', text: item.text || '' };
+    case 'reasoning': {
+      const text = [...(item.summary || []), ...(item.content || [])].join('\n');
+      return text.trim() ? { eventType: 'reasoning', role: 'activity', title: '推理摘要', text } : null;
+    }
+    case 'commandExecution':
+      return { eventType: 'command_execution', role: 'activity', title: `运行命令${item.exitCode == null ? '' : ` · exit ${item.exitCode}`}`, text: '', detail: { status: item.status || '', exitCode: item.exitCode ?? null } };
+    case 'fileChange':
+      return { eventType: 'file_change', role: 'activity', title: '文件变更', text: (item.changes || []).map((change) => [change.kind || change.type || 'change', change.path || change.file || change.oldPath || change.newPath || ''].filter(Boolean).join(' ')).join('\n') };
+    case 'mcpToolCall':
+      return { eventType: 'tool_call', role: 'activity', title: `MCP 工具 · ${[item.server, item.tool].filter(Boolean).join('.')}`, text: '' };
+    case 'dynamicToolCall':
+      return { eventType: 'tool_call', role: 'activity', title: `工具调用 · ${[item.namespace, item.tool].filter(Boolean).join('.')}`, text: '' };
+    case 'webSearch':
+      return { eventType: 'web_search', role: 'activity', title: '网页搜索', text: item.query || '' };
+    case 'contextCompaction':
+      return { eventType: 'context_compaction', role: 'activity', title: '上下文压缩', text: 'Codex 已压缩上下文以继续会话。' };
+    default:
+      return null;
+  }
+}
+
+function formatDurationShort(durationMs) {
+  const value = Number(durationMs || 0);
+  if (!Number.isFinite(value) || value <= 0) return '0ms';
+  const dayMs = 24 * 60 * 60 * 1000;
+  const hourMs = 60 * 60 * 1000;
+  if (value % dayMs === 0) return `${Math.round(value / dayMs)} 天`;
+  if (value % hourMs === 0) return `${Math.round(value / hourMs)} 小时`;
+  return `${Math.round(value / 1000)} 秒`;
 }
 
 export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, now = Date.now, onRestartRequired = async () => {} } = {}) {
@@ -50,6 +107,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   const client = new CodexAppServerClient({
     config, childEnv, spawnImpl, log, now,
     eventSink: (event) => handleNotification(event),
+    onDisconnect: (error) => handleDisconnect(error),
   });
 
   async function withKeyLock(key, operation) {
@@ -120,31 +178,47 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   async function maybeRollover(binding, messageId) {
     if (binding.created) return binding;
-    let reason = '';
-    const idleMs = Number(config.rolloverIdleMs || 0);
-    if (idleMs > 0 && binding.lastMessageAt > 0 && now() - binding.lastMessageAt >= idleMs) reason = 'session_idle';
-    if (!reason && config.rolloverOnRulesUpdate !== false && config.rulesPaths?.length) {
+    if (config.rolloverOnRulesUpdate !== false && config.rulesPaths?.length) {
       const rulesMtimeMs = Math.max(0, ...config.rulesPaths.map((path) => { try { return statSync(resolve(config.cwd, path)).mtimeMs || 0; } catch { return 0; } }));
       if (rulesMtimeMs) {
+        let detail;
         try {
           const response = await client.request('thread/read', { threadId: binding.codexSessionId, includeTurns: false }, { timeoutMs: config.rolloverCheckTimeoutMs });
-          const createdAt = codexThreadCreatedAtMs(response?.thread?.createdAt || response?.thread?.created_at);
-          if (shouldRolloverForRules({ rulesMtimeMs, threadCreatedAtMs: createdAt })) reason = 'rules_updated';
+          const thread = response?.thread || {};
+          const threadCreatedAtMs = codexThreadCreatedAtMs(thread.createdAt || thread.created_at);
+          detail = threadCreatedAtMs
+            ? { shouldRollover: shouldRolloverForRules({ rulesMtimeMs, threadCreatedAtMs }), rulesMtimeMs, threadCreatedAtMs, threadPath: String(thread.path || '') }
+            : { shouldRollover: false, rulesMtimeMs, skipped: 'native Codex thread createdAt is unavailable' };
         } catch { log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'rules_check', status: 'failed' }); }
+        if (detail?.shouldRollover) return rollover(binding, messageId, 'rules_updated', {
+          outText: 'Agent 规则文件已更新，后续飞书消息承接到新 Codex 会话。',
+          inText: '因 Agent 规则文件已更新，本会话开始承接后续飞书消息。',
+          detail,
+        });
       }
     }
-    if (!reason) return binding;
-    return rollover(binding, messageId, reason);
+    const thresholdMs = Number(config.rolloverIdleMs || 0);
+    const lastMessageAtMs = Number(binding.lastMessageAt || 0);
+    if (!Number.isFinite(thresholdMs) || thresholdMs <= 0 || !Number.isFinite(lastMessageAtMs) || lastMessageAtMs <= 0) return binding;
+    const nowMs = now();
+    const idleMs = Math.max(0, nowMs - lastMessageAtMs);
+    if (idleMs < thresholdMs) return binding;
+    return rollover(binding, messageId, 'session_idle', {
+      outText: `飞书会话已超过 ${formatDurationShort(thresholdMs)} 无新消息，后续飞书消息承接到新 Codex 会话。`,
+      inText: `因原会话已超过 ${formatDurationShort(thresholdMs)} 无新消息，本会话开始承接后续飞书消息。`,
+      detail: { shouldRollover: true, thresholdMs, lastMessageAtMs, nowMs, idleMs },
+    });
   }
 
-  async function rollover(binding, messageId, reason) {
+  async function rollover(binding, messageId, reason, { outText, inText, detail = {} } = {}) {
     const previous = binding.codexSessionId;
     const started = await startThread(binding);
-    const next = { ...binding, codexSessionId: started.threadId, threadName: started.threadName, created: true, rolledOver: true };
-    const detail = { oldCodexSessionId: previous, newCodexSessionId: started.threadId, reason, messageId };
-    await sessionStore.saveCodexRealtimeEvent(binding, { messageId, eventKey: `rollover-out:${previous}:${started.threadId}`, eventType: 'session_rollover', role: 'activity', title: '会话承接', text: '后续消息承接到新 Codex 会话。', createdAt: now(), detail });
+    const next = { ...binding, codexSessionId: started.threadId, threadName: started.threadName || binding.threadName || '', created: true, rolledOver: true, rolloverFromCodexSessionId: previous };
+    const rolloverDetail = { oldCodexSessionId: previous, newCodexSessionId: started.threadId, reason, messageId, ...detail };
+    await sessionStore.saveCodexRealtimeEvent(binding, { messageId, eventKey: `rollover-out:${previous}:${started.threadId}`, eventType: 'session_rollover', role: 'activity', title: '会话承接', text: outText, createdAt: now(), detail: rolloverDetail });
     await sessionStore.saveCodexBinding(next, { messageId, lastError: '' });
-    await sessionStore.saveCodexRealtimeEvent(next, { messageId, eventKey: `rollover-in:${previous}:${started.threadId}`, eventType: 'session_rollover', role: 'activity', title: '会话承接', text: '本会话开始承接后续消息。', createdAt: now(), detail });
+    await sessionStore.saveCodexRealtimeEvent(next, { messageId, eventKey: `rollover-in:${previous}:${started.threadId}`, eventType: 'session_rollover', role: 'activity', title: '会话承接', text: inText, createdAt: now(), detail: rolloverDetail });
+    log('info', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'session_rollover', status: 'succeeded', oldThreadId: previous, newThreadId: started.threadId, reason });
     return next;
   }
 
@@ -231,6 +305,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       binding, threadId: binding.codexSessionId, turnId, messageId: input.messageId,
       startedAt, outboxScanFromMs: startedAt, itemText: new Map(), publicProgress: createPublicProgressProjector(),
       lastAgentMessage: '', pendingSteerId: null, settled: false, stopRequested: false,
+      finalized: null,
       completed: new Promise((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; }),
       resolve(value) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); resolveCompletion(value); },
       reject(error) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); rejectCompletion(error); },
@@ -249,10 +324,11 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function registerState(state) {
+    state.finalized = finalizeTurn(state);
     activeByBinding.set(bindingKey(state.binding), state);
     activeByTurn.set(state.turnId, state);
     const releaseActivity = client.lifecycle.hold();
-    state.completed.finally(() => {
+    state.finalized.finally(() => {
       releaseActivity();
       activeByTurn.delete(state.turnId);
       if (activeByBinding.get(bindingKey(state.binding)) === state) activeByBinding.delete(bindingKey(state.binding));
@@ -263,6 +339,42 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     for (const event of early) await handleNotification(event);
   }
 
+  function handleDisconnect(error) {
+    loadedThreads.clear();
+    for (const state of activeByTurn.values()) {
+      const lost = coded('Codex app-server connection was lost; native turn status is unknown', 'CODEX_OBSERVATION_LOST', { retryable: true, outcome: 'unknown' });
+      Object.assign(lost, { cause: error, threadId: state.threadId, turnId: state.turnId, startedAt: state.startedAt });
+      state.reject(lost);
+    }
+  }
+
+  function finalizeTurn(state) {
+    return state.completed.then(async ({ turn }) => {
+      const answer = finalAnswer(turn) || state.lastAgentMessage;
+      if (answer) await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `assistant-final:${state.messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId } });
+      await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: '' });
+      return {
+        deferred: false,
+        threadId: state.threadId,
+        turnId: state.turnId,
+        answer: limitText(answer, config.maxOutputChars || 3500),
+        attachments: collectOutboxAttachments(state.binding, state.outboxScanFromMs, { workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, log }),
+      };
+    }, async (error) => {
+      const observationUnknown = error?.outcome === 'unknown';
+      await sessionStore.saveCodexRealtimeEvent(state.binding, {
+        messageId: state.messageId,
+        eventKey: `${observationUnknown ? 'observation-error' : 'error'}:${state.messageId || state.turnId}`,
+        eventType: 'error', role: 'activity',
+        title: observationUnknown ? 'Codex 状态待核对' : 'Codex 会话失败',
+        text: error.message, createdAt: now(),
+        detail: { turnId: state.turnId, turnStatus: observationUnknown ? 'unknown' : (error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed') },
+      });
+      await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: error.message });
+      throw error;
+    });
+  }
+
   async function execute(input, options = {}) {
     if (closing) throw coded('executor is closing', 'CODEX_EXECUTOR_CLOSING', { retryable: true });
     const actor = identity(input);
@@ -271,6 +383,19 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     if (!['steer', 'reject'].includes(normalized.busyPolicy)) throw coded('invalid busy policy', 'CODEX_INVALID_INPUT');
     return client.lifecycle.run(async () => {
       const routed = await withKeyLock(bindingKey(actor), async () => {
+      if (options.resume) {
+        const binding = await sessionStore.loadBinding(actor);
+        if (!binding?.codexSessionId) throw coded('resume has no durable binding', 'CODEX_RESUME_MISMATCH');
+        validateResumeIdentity(binding, normalized, options.resume);
+        const active = activeByBinding.get(bindingKey(actor));
+        if (active) {
+          if (active.threadId !== options.resume.threadId || active.turnId !== options.resume.turnId || active.messageId !== normalized.messageId) {
+            throw coded('another turn currently holds this binding', 'CODEX_THREAD_HELD', { retryable: true });
+          }
+          return { state: active, resume: true };
+        }
+        return { state: await prepareKnownResume(binding, normalized, options.resume), resume: true };
+      }
       const active = activeByBinding.get(bindingKey(actor));
       if (active) {
         if (active.bindingUncertain) {
@@ -278,10 +403,11 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           Object.assign(error, { threadId: active.threadId, turnId: active.turnId, startedAt: active.startedAt });
           throw error;
         }
-        if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', { retryable: true });
         if (normalized.messageId && normalized.messageId === active.messageId) {
           return { completion: waitForTurn(active, normalized.messageId, { takeover: true, signal: options.signal }) };
         }
+        if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', { retryable: true });
+        if (active.settled) return { afterFinal: active.finalized, restart: { input: normalized } };
         const result = await steer(active, normalized);
         return result?.restart ? { restart: result } : { completion: Promise.resolve(result) };
       }
@@ -290,12 +416,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (duplicate) return { completion: Promise.resolve(duplicateResult(binding, duplicate)) };
       const reconciled = await reconcileSteer(binding, normalized.messageId, normalized.prompt);
       if (reconciled) return { completion: Promise.resolve(reconciled) };
-      if (options.resume) return { completion: resumeKnown(binding, normalized, options) };
       binding = await maybeRollover(binding, normalized.messageId);
       try { await ensureThreadReady(binding); }
       catch (error) {
         if (!/session\s+[^\s]+\s+is archived/i.test(error.message)) throw error;
-        binding = await rollover(binding, normalized.messageId, 'codex_session_archived');
+        const archivedSessionId = String(error.message).match(/\bsession\s+([^\s]+)\s+is archived\b/i)?.[1]?.replace(/^[\"']+|[\"'.,;:]+$/g, '') || binding.codexSessionId;
+        binding = await rollover(binding, normalized.messageId, 'codex_session_archived', {
+          outText: 'Codex 原会话已归档，后续飞书消息承接到新 Codex 会话。',
+          inText: '因原 Codex 会话已归档，本会话开始承接后续飞书消息。',
+          detail: { archivedCodexSessionId: archivedSessionId, error: limitText(error.message, 1000) },
+        });
       }
       const prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
       await persistUser(binding, normalized, 'user', prompt);
@@ -334,47 +464,43 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       await sessionStore.saveCodexRealtimeEvent(binding, { messageId: normalized.messageId, eventKey: `public:${turnId}:started`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: startedAt, detail: { kind: 'started', id: turnId, turnId, at: startedAt } });
       return { completion: waitForTurn(state, normalized.messageId, { created: binding.created, signal: options.signal }) };
       });
-      if (routed.restart) return execute(routed.restart.input, options);
+      if (routed.restart) {
+        if (routed.afterFinal) await routed.afterFinal.catch(() => {});
+        return execute(routed.restart.input, options);
+      }
+      if (routed.state) return waitForTurn(routed.state, normalized.messageId, { created: false, signal: options.signal });
       return routed.completion;
     });
   }
 
-  async function resumeKnown(binding, input, options) {
-    const resume = options.resume || {};
+  function validateResumeIdentity(binding, input, resume = {}) {
     if (!trim(resume.threadId) || !trim(resume.turnId)) throw coded('start outcome has no persisted turn identity', 'CODEX_START_UNCONFIRMED', { outcome: 'unknown' });
     if (resume.threadId !== binding.codexSessionId) throw coded('resume thread does not match binding', 'CODEX_RESUME_MISMATCH');
+    if (!input.messageId) throw coded('resume message identity is required', 'CODEX_RESUME_MISMATCH');
+    if (!Number.isFinite(Number(resume.startedAt)) || Number(resume.startedAt) <= 0) throw coded('resume startedAt is required', 'CODEX_RESUME_MISMATCH');
+  }
+
+  async function prepareKnownResume(binding, input, resume) {
     pendingKnownTurns.add(resume.turnId);
     let snapshot;
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }));
       snapshot = exactTurnSnapshot(response?.thread, resume.turnId);
+      loadedThreads.add(resume.threadId);
     }
     catch (error) { pendingKnownTurns.delete(resume.turnId); throw error; }
     if (snapshot.status === 'unknown') { pendingKnownTurns.delete(resume.turnId); throw coded('persisted turn could not be confirmed', 'CODEX_TURN_UNKNOWN', { retryable: true, outcome: 'unknown' }); }
-    if (snapshot.status !== 'inProgress') { pendingKnownTurns.delete(resume.turnId); return resultFromSnapshot(binding, input, snapshot); }
-    const state = createTurnState(binding, input, resume.turnId, Number(resume.startedAt) || now());
+    const state = createTurnState(binding, input, resume.turnId, Number(resume.startedAt));
     await registerState(state);
     pendingKnownTurns.delete(resume.turnId);
-    return waitForTurn(state, input.messageId, { created: false, signal: options.signal });
-  }
-
-  function resultFromSnapshot(binding, input, snapshot) {
-    if (snapshot.status === 'completed') return { deferred: false, threadId: snapshot.threadId, turnId: snapshot.turnId, created: false, answer: limitText(finalAnswer(snapshot.turn), config.maxOutputChars || 3500), attachments: [] };
-    throw coded(`Codex turn ${snapshot.status}`, snapshot.status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED');
+    if (snapshot.status === 'completed') state.resolve({ turn: snapshot.turn });
+    else if (snapshot.status !== 'inProgress') state.reject(coded(snapshot.turn?.error?.message || `Codex turn ${snapshot.status}`, snapshot.status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED'));
+    return state;
   }
 
   async function waitForTurn(state, messageId, { created = false, takeover = false, signal } = {}) {
-    const completion = state.completed.then(async ({ turn }) => {
-      const answer = finalAnswer(turn) || state.lastAgentMessage;
-      if (answer) await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId, eventKey: `assistant-final:${messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId, takeover } });
-      await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: '' });
-      return { deferred: false, threadId: state.threadId, turnId: state.turnId, created, takeover, answer: limitText(answer, config.maxOutputChars || 3500), attachments: collectOutboxAttachments(state.binding, state.outboxScanFromMs, { workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, log }) };
-    }, async (error) => {
-      await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId, eventKey: `error:${messageId || state.turnId}`, eventType: 'error', role: 'activity', title: 'Codex 会话失败', text: error.message, createdAt: now(), detail: { turnId: state.turnId, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' } });
-      await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: error.message });
-      throw error;
-    });
+    const completion = state.finalized.then((result) => ({ ...result, created, takeover }));
     if (!signal) return completion;
     if (signal.aborted) throw coded('caller stopped waiting', 'CODEX_WAIT_ABORTED', { outcome: 'unknown' });
     let abort;
@@ -440,11 +566,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function persistCompletedItem(state, item) {
-    if (item?.type === 'agentMessage' && trim(item.text)) state.lastAgentMessage = item.text;
-    if (!['agentMessage', 'message'].includes(item?.type)) return;
-    const text = trim(item.text || (item.content || []).map((part) => part?.text || part?.output_text || '').join('\n'));
-    if (!text) return;
-    await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `item:${state.turnId}:${item.id || stableKey(JSON.stringify(item))}`, eventType: item.role === 'user' ? 'user_message' : 'agent_message', role: item.role === 'user' ? 'user' : 'assistant', title: item.phase === 'final_answer' ? 'Codex 回复' : 'Codex', text, createdAt: now(), detail: { turnId: state.turnId, itemType: item.type, phase: item.phase || '' } });
+    const projected = projectCodexItem(item);
+    if (!projected) return;
+    if (projected.role === 'assistant' && projected.text) state.lastAgentMessage = projected.text;
+    await sessionStore.saveCodexRealtimeEvent(state.binding, {
+      messageId: state.messageId,
+      eventKey: `item:${state.turnId}:${item.id || stableKey(JSON.stringify(item))}`,
+      ...projected,
+      createdAt: now(),
+      detail: { ...(projected.detail || {}), turnId: state.turnId, itemType: item.type || '' },
+    });
   }
 
   async function maybeNotifyRestart() {
@@ -468,6 +599,12 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   return Object.freeze({
     execute, inspect, interrupt,
     status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), activeTurns: activeByTurn.size, heldNotifications: [...earlyNotifications.values()].reduce((n, list) => n + list.length, 0), restartPending: restartPending || null }),
-    async close() { closing = true; clearInterval(memoryTimer); client.lifecycle.stop(); await client.close('shutdown'); },
+    async close() {
+      closing = true;
+      clearInterval(memoryTimer);
+      client.lifecycle.stop();
+      await client.close('shutdown');
+      await Promise.allSettled([...activeByTurn.values()].map((state) => state.finalized));
+    },
   });
 }

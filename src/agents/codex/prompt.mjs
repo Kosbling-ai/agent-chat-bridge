@@ -11,7 +11,6 @@ export function outboxRelativeDirectory({ outboxRelativeRoot = 'data/feishu-outb
     ? `${outboxRelativeRoot}/system-${scopeHash(bindingOpenId)}/${chatKey(chatId)}`
     : `${outboxRelativeRoot}/${chatKey(chatId)}`;
 }
-
 export function buildInitialPrompt({ binding, prompt, groupChatContext, outboxRelativeRoot, allowedGroupChatIds = new Set() }) {
   if (!binding) return prompt;
   const outbox = outboxRelativeDirectory({ outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
@@ -50,4 +49,3 @@ export function normalizeGroupChatContext(value) {
   const description = clean(value.description || value.introduction || value.intro || value.summary);
   return chatId || name || description ? { chatId, name, description } : null;
 }
-

@@ -10,4 +10,3 @@ export async function stopCardTurn(active, expected, interrupt) {
   }
   return active.stopRequest;
 }
-

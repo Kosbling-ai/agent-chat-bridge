@@ -5,7 +5,6 @@ export function codexThreadCreatedAtMs(rawCreatedAt) {
   if (!Number.isFinite(value) || value <= 0) return 0;
   return value > 1e12 ? value : value * 1000;
 }
-
 export function shouldRolloverForRules({ rulesMtimeMs, threadCreatedAtMs }) {
   const rulesTime = Number(rulesMtimeMs || 0);
   const threadTime = Number(threadCreatedAtMs || 0);
@@ -13,4 +12,3 @@ export function shouldRolloverForRules({ rulesMtimeMs, threadCreatedAtMs }) {
   if (rulesTime <= 0 || threadTime <= 0) return false;
   return rulesTime > threadTime + CODEX_RULES_ROLLOVER_MARGIN_MS;
 }
-

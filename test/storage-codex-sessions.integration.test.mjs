@@ -28,4 +28,3 @@ test('isolated MySQL upgrades v1 and preserves exact Codex session/event queries
     assert.deepEqual(await assertSchemaCurrent(pool), { version: 2 });
   } finally { await pool.end(); }
 });
-

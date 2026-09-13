@@ -14,12 +14,13 @@ export function codexAppServerArgs(config = {}) {
 }
 
 export class CodexAppServerClient {
-  constructor({ config, childEnv = {}, spawnImpl = spawn, eventSink = async () => {}, log = () => {}, now = Date.now } = {}) {
+  constructor({ config, childEnv = {}, spawnImpl = spawn, eventSink = async () => {}, onDisconnect = () => {}, log = () => {}, now = Date.now } = {}) {
     if (!config?.bin || !config?.cwd || !config?.sharedHome) throw new Error('Codex app-server requires bin, cwd and sharedHome');
     if (!childEnv || typeof childEnv !== 'object' || Array.isArray(childEnv)) throw new Error('childEnv must be an object');
     this.config = config;
     this.spawnImpl = spawnImpl;
     this.eventSink = eventSink;
+    this.onDisconnect = onDisconnect;
     this.log = log;
     this.now = now;
     this.childEnv = Object.freeze({ ...childEnv, CODEX_HOME: config.sharedHome });
@@ -31,6 +32,7 @@ export class CodexAppServerClient {
     this.pending = new Map();
     this.stdoutBuffer = '';
     this.notificationChain = Promise.resolve();
+    this.disconnectedChildren = new WeakSet();
     this.lifecycle = new IdleLifecycle({
       idleMs: config.idleCloseMs ?? 60_000,
       close: () => this.close('idle'),
@@ -120,7 +122,9 @@ export class CodexAppServerClient {
       } else if (message.method) {
         const release = this.lifecycle.hold();
         this.notificationChain = this.notificationChain
-          .then(() => this.eventSink({ method: message.method, params: message.params || {}, receivedAt: this.now() }))
+          .then(() => (this.child === child
+            ? this.eventSink({ method: message.method, params: message.params || {}, receivedAt: this.now() })
+            : undefined))
           .catch(() => emitLog(this.log, 'warning', 'notification', 'failed'))
           .finally(release);
       }
@@ -158,6 +162,7 @@ export class CodexAppServerClient {
     if (this.child !== child) return;
     this.ready = false;
     this.rejectAll(error);
+    this.notifyDisconnect(error, child);
     this.close('rpc_failure').catch(() => emitLog(this.log, 'error', 'app_server_close', 'failed'));
   }
 
@@ -169,11 +174,17 @@ export class CodexAppServerClient {
 
   handleExit(error, child) {
     if (this.child !== child) return;
-    this.ready = false; this.child = null; this.rejectAll(error);
+    this.ready = false; this.child = null; this.rejectAll(error); this.notifyDisconnect(error, child);
+  }
+
+  notifyDisconnect(error, child) {
+    if (!child || this.disconnectedChildren.has(child)) return;
+    this.disconnectedChildren.add(child);
+    try { this.onDisconnect(error instanceof Error ? error : new Error(String(error || 'codex app-server exited')), child); }
+    catch { emitLog(this.log, 'error', 'disconnect_callback', 'failed'); }
   }
 
   status() {
     return { ready: this.ready, starting: Boolean(this.starting), closing: Boolean(this.closing), active: this.lifecycle.active, pending: this.pending.size };
   }
 }
-

@@ -10,7 +10,6 @@ export function parseActiveTurnMismatch(error, expectedTurnId = '') {
   if (!expected || !actual || (expectedTurnId && expected !== expectedTurnId)) return null;
   return { expectedTurnId: expected, actualTurnId: actual, text };
 }
-
 export function isNoActiveTurnError(error) {
   return NO_ACTIVE_TURN_RE.test(String(error?.message || error || '').trim());
 }
@@ -99,4 +98,3 @@ export function exactTurnSnapshot(thread, turnId) {
   if (!turn) return { threadId: thread?.id || '', turnId, status: 'unknown' };
   return { threadId: thread?.id || '', turnId, status: turn.status || 'unknown', turn };
 }
-

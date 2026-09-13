@@ -19,7 +19,6 @@ export function resolveSharedHome({ configuredHome = '', inheritedHome = process
   }
   return selected;
 }
-
 export function classifyCodexRpcError(value) {
   const error = new Error(typeof value === 'string' ? value : value?.message || value?.description || 'Codex RPC failed');
   if (/\bactive writer\b/i.test(error.message)) {
@@ -97,4 +96,3 @@ export async function closeOwnedChild(child, { graceMs = DEFAULT_CLOSE_GRACE_MS,
     if (!exited) throw new Error('Owned Codex app-server did not exit after bounded shutdown; restart is blocked');
   } finally { child.removeListener('exit', markExited); }
 }
-
