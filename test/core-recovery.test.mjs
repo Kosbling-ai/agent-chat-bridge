@@ -12,8 +12,9 @@ test('recovery read rejection retains the leased action and never falsely termin
   assert(!JSON.stringify(logs).includes('SYNTHETIC_PROVIDER_SECRET'));
 });
 test('lost management COMMIT response observes applied state instead of contradictory rejection', async () => {
-  const writes = [];
-  const handler = createRecoveryHandler({ workspace: '/workspace', connectionId: 'fixture', store: { getAgentAttempt: async () => attempt, finishRecovery: async value => { writes.push(value); throw Object.assign(new Error('synthetic'), { code: 'commit_unknown' }); }, getRecovery: async () => ({ status: 'applied' }) }, codex: { readThread: async () => ({ thread: { id: 'thread', cwd: '/workspace', turns: [{ id: 'turn', status: 'completed' }] } }) } });
+  const writes = [], logs = [];
+  const handler = createRecoveryHandler({ workspace: '/workspace', connectionId: 'fixture', store: { getAgentAttempt: async () => attempt, finishRecovery: async value => { writes.push(value); throw Object.assign(new Error('synthetic'), { code: 'commit_unknown' }); }, getRecovery: async () => ({ status: 'applied' }) }, codex: { readThread: async () => ({ thread: { id: 'thread', cwd: '/workspace', turns: [{ id: 'turn', status: 'completed' }] } }) }, log: (...entry) => logs.push(entry) });
   await handler(action);
   assert.equal(writes.length, 1); assert.equal(writes[0].outcome, 'applied');
+  assert(logs.some(entry => entry[2] === 'succeeded' && entry[3]?.code === 'recovery_commit_confirmed'));
 });

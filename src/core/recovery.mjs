@@ -43,7 +43,10 @@ export function createRecoveryHandler({ store, codex, workspace, connectionId, l
       await store.finishRecovery({ id: action.id, leaseToken: action.leaseToken, outcome: 'applied', ...(verifiedNative ? { verifiedNative } : {}) });
     } catch (error) {
       const recorded = await store.getRecovery({ id: action.id });
-      if (recorded?.status === 'applied') return;
+      if (recorded?.status === 'applied') {
+        log('info', 'agent_recovery', 'succeeded', { code: 'recovery_commit_confirmed', durationMs: Date.now() - started });
+        return;
+      }
       if (['recovery_conflict', 'thread_scope_conflict'].includes(error.code)) {
         if (recorded?.status !== 'rejected') await store.finishRecovery({ id: action.id, leaseToken: action.leaseToken, outcome: 'rejected', errorCode: error.code });
         log('warning', 'agent_recovery', 'rejected', { code: error.code, durationMs: Date.now() - started });
