@@ -53,7 +53,7 @@ function delay(milliseconds, signal) {
 }
 
 export function createCatchup({ connectionId, botOpenId = '', chat, store, onEvent, listConversations,
-  intervalMs = 60000, initialLookbackMs = 3600000, overlapMs = 120000, maxPagesPerConversation = 20,
+  intervalMs = 60000, initialLookbackMs = 10800000, overlapMs = 300000, maxPagesPerConversation = 20,
   operationTimeoutMs = 15000, log = () => {}, now = Date.now, wait = delay, random = Math.random }) {
   if (typeof connectionId !== 'string' || !connectionId || !chat?.listMessages || !store?.getCursor || !store?.setCursor
       || typeof onEvent !== 'function' || typeof listConversations !== 'function'

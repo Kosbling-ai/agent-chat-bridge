@@ -98,7 +98,7 @@ test('completed windows overlap and app echoes do not reach durable user ingesti
   const requests = [];
   const f = fixture({ chat: { async listMessages(request) { requests.push(request); return { items: [{ ...item('bot'), sender: { sender_type: 'app' } }], has_more: false }; } } });
   const worker = f.create(); await worker.runOnce(); await worker.runOnce(); await worker.stop();
-  assert.equal(f.received.length, 0); assert.equal(Number(requests[1].startTime) * 1000, clock - 120000);
+  assert.equal(f.received.length, 0); assert.equal(Number(requests[1].startTime) * 1000, clock - 300000);
 });
 
 test('lost checkpoint response is reconciled by loading the committed continuation on the next run', async () => {
