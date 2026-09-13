@@ -157,3 +157,39 @@ CREATE TABLE IF NOT EXISTS bridge_conversations (
  PRIMARY KEY (connection_id,conversation_id),
  KEY conversation_type_page (connection_id,conversation_type,conversation_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+
+-- Ownership survives reset/retirement: native history cannot cross conversations.
+CREATE TABLE IF NOT EXISTS bridge_thread_owners (
+  connection_id VARCHAR(128) NOT NULL,
+  native_thread_id VARCHAR(255) NOT NULL,
+  conversation_id VARCHAR(255) NOT NULL,
+  agent_id VARCHAR(128) NOT NULL,
+  PRIMARY KEY (connection_id,native_thread_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS bridge_recoveries (
+  id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  run_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  connection_id VARCHAR(128) NULL,
+  conversation_id VARCHAR(255) NULL,
+  caller_id VARCHAR(128) NOT NULL,
+  idempotency_key VARCHAR(255) NOT NULL,
+  payload_hash CHAR(64) CHARACTER SET ascii NOT NULL,
+  action VARCHAR(32) NOT NULL,
+  expected_generation BIGINT UNSIGNED NOT NULL,
+  native_thread_id VARCHAR(255) NULL,
+  native_turn_id VARCHAR(255) NULL,
+  evidence TEXT NOT NULL,
+  status VARCHAR(16) NOT NULL DEFAULT 'pending',
+  lease_owner VARCHAR(128) NULL,
+  lease_token CHAR(36) CHARACTER SET ascii NULL,
+  lease_expires_at BIGINT UNSIGNED NULL,
+  error_code VARCHAR(64) NULL,
+  result_hash CHAR(64) CHARACTER SET ascii NULL,
+  created_at BIGINT UNSIGNED NOT NULL,
+  updated_at BIGINT UNSIGNED NOT NULL,
+  UNIQUE KEY recovery_idempotency (caller_id,idempotency_key),
+  KEY recovery_claim (status,lease_expires_at,created_at,id),
+  KEY recovery_run (run_id,id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

@@ -3,6 +3,7 @@ import { withConnection } from './connection.mjs';
 import { assertSchemaCurrent } from './migrations.mjs';
 import { acquireWriter } from './writer.mjs';
 import { StoreError } from './errors.mjs';
+import { recoveryOperations } from './recovery.mjs';
 
 const json = (value) => JSON.stringify(value);
 function canonical(value) {
@@ -41,6 +42,15 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
       if (active) activeConnections.delete(active);
     }
   };
+  async function claimThread(c, connectionId, conversationId, agentId, nativeThreadId) {
+    if (nativeThreadId == null) return;
+    text(nativeThreadId);
+    await c.execute(`INSERT INTO bridge_thread_owners (connection_id,native_thread_id,conversation_id,agent_id)
+      VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE native_thread_id=native_thread_id`, [connectionId,nativeThreadId,conversationId,agentId]);
+    const [[owner]] = await c.execute(`SELECT conversation_id,agent_id FROM bridge_thread_owners
+      WHERE connection_id=? AND native_thread_id=?`, [connectionId,nativeThreadId]);
+    if (owner.conversation_id !== conversationId || owner.agent_id !== agentId) throw new StoreError('thread_scope_conflict');
+  }
   async function lockRegistration(c, connectionId, conversationId) {
     // Lock before allocating inbox/job sequences. Otherwise a later transaction
     // may commit first and become runnable while an earlier sequence is hidden.
@@ -134,6 +144,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
     });
   }
   return {
+    ...recoveryOperations({ read, write, now, hash, decode, claimThread }),
     assertCurrent: () => assertSchemaCurrent(pool),
     async close() { await writer.close(); await pool.end(); },
     acceptInbound(input) {
@@ -340,6 +351,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
           attempt.agent_id, input.expectedGeneration, input.id,
         ]);
         if (!result.affectedRows) throw new StoreError('session_conflict');
+        await claimThread(c, attempt.connection_id, attempt.conversation_id, attempt.agent_id, input.nativeThreadId);
         await c.execute(`UPDATE bridge_attempts SET native_thread_id=?,
           native_turn_id=COALESCE(?,native_turn_id) WHERE job_id=?`, [input.nativeThreadId, input.nativeTurnId ?? null, input.id]);
         return { bound: true };
@@ -369,12 +381,30 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
       return row ? { ...decode(row), blocked: Boolean(row.blocked) } : null;
     }),
     getSession: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_sessions WHERE connection_id=? AND conversation_id=? AND agent_id=?',[...scope(input),text(input.agentId,128)]);return decode(row) ?? null;}),
-    setSession(input) { return write(async(c)=>{
-      const key=[...scope(input),text(input.agentId,128)];
-      if (input.expectedGeneration===0) {try {await c.execute('INSERT INTO bridge_sessions (connection_id,conversation_id,agent_id,native_thread_id,active_run_id,updated_at) VALUES (?,?,?,?,?,?)',[...key,input.nativeThreadId ?? null,input.activeRunId ?? null,now()]);} catch(e){if(e.code==='ER_DUP_ENTRY') throw new StoreError('session_conflict');throw e;}return {generation:1};}
-      const [result]=await c.execute('UPDATE bridge_sessions SET native_thread_id=?,active_run_id=?,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id IS NULL',[input.nativeThreadId ?? null,input.activeRunId ?? null,now(),...key,input.expectedGeneration]);
-      if(!result.affectedRows)throw new StoreError('session_conflict'); return {generation:input.expectedGeneration};
-    }); },
+    setSession(input) {
+      return write(async (c) => {
+        const key = [...scope(input), text(input.agentId,128)];
+        if (input.expectedGeneration === 0) {
+          try {
+            await c.execute(`INSERT INTO bridge_sessions
+              (connection_id,conversation_id,agent_id,native_thread_id,active_run_id,updated_at)
+              VALUES (?,?,?,?,?,?)`, [...key,input.nativeThreadId ?? null,input.activeRunId ?? null,now()]);
+          } catch (error) {
+            if (error.code === 'ER_DUP_ENTRY') throw new StoreError('session_conflict');
+            throw error;
+          }
+          await claimThread(c,...key,input.nativeThreadId ?? null);
+          return {generation:1};
+        }
+        const [result] = await c.execute(`UPDATE bridge_sessions SET native_thread_id=?,active_run_id=?,updated_at=?
+          WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id IS NULL`, [
+          input.nativeThreadId ?? null,input.activeRunId ?? null,now(),...key,input.expectedGeneration,
+        ]);
+        if (!result.affectedRows) throw new StoreError('session_conflict');
+        await claimThread(c,...key,input.nativeThreadId ?? null);
+        return {generation:input.expectedGeneration};
+      });
+    },
     resetSession(input) { return write(async(c)=>{const [result]=await c.execute('UPDATE bridge_sessions SET generation=generation+1,native_thread_id=NULL,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id IS NULL',[now(),...scope(input),text(input.agentId,128),input.expectedGeneration]);if(!result.affectedRows)throw new StoreError('session_busy_or_conflict');return {generation:Number(input.expectedGeneration)+1};}); },
     appendRunEvent(input) { return write(async(c)=>{const digest=hash({type:input.type,payload:input.payload}); await c.execute('INSERT INTO bridge_run_events (run_id,event_key,type,payload_hash,payload,created_at) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE sequence=sequence',[text(input.runId,36),text(input.eventKey),text(input.type,64),digest,json(input.payload),now()]);const [[row]]=await c.execute('SELECT sequence,payload_hash FROM bridge_run_events WHERE run_id=? AND event_key=?',[input.runId,input.eventKey]);if(row.payload_hash!==digest)throw new StoreError('run_event_conflict');return {sequence:row.sequence};}); },
     readRunEvents: (input)=>read(async(c)=>{const [rows]=await c.execute(`SELECT sequence,run_id,event_key,type,payload,created_at FROM bridge_run_events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ${limit(input.limit)}`,[text(input.runId,36),input.afterSequence ?? 0]);return rows.map(decode);}),
