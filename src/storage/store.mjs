@@ -222,9 +222,10 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
           const firstEventId = receipt?.first_event_id ?? row.id;
           const [[first]] = await c.execute('SELECT sequence FROM bridge_inbox WHERE id=?', [firstEventId]);
           const [jobs] = await c.execute('SELECT id,kind FROM bridge_jobs WHERE event_id=?', [firstEventId]);
+          const [[forward]] = await c.execute('SELECT public_run_id FROM assistant_codex_forward_jobs WHERE message_id=? LIMIT 1', [input.messageId ?? '']);
           return {
             eventId: firstEventId, sequence: first.sequence, duplicate: true, firstReceipt: false, duplicateCanonical,
-            agentJobId: jobs.find(job => job.kind === 'agent')?.id ?? null,
+            agentJobId: null, forwardRunId: forward?.public_run_id ?? null,
             hookJobIds: jobs.filter(job => job.kind === 'hook').map(job => job.id),
           };
         }
@@ -233,12 +234,24 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
             VALUES (?,?,?) ON DUPLICATE KEY UPDATE message_id=message_id`, [connectionId,text(input.recalledMessageId),now()]);
         }
         const common = { connectionId,conversationId,eventId:id,sourceSequence:row.sequence,idempotencyKey:input.eventKey };
-        const agent = input.agentJob ? await insertJob(c,{...common,kind:'agent',payload:input.agentJob.payload}) : null;
+        let forwardRunId = null;
+        if (input.forwardJob) {
+          const forward = input.forwardJob;
+          forwardRunId = randomUUID();
+          const requestKeyHash = hash(['live', connectionId, conversationId, input.messageId]);
+          const requestHash = hash({ conversationId, text: forward.prompt, deliveryMode: 'bridge' });
+          await c.execute(`INSERT IGNORE INTO assistant_codex_forward_jobs
+            (public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,context_entries_json,status,next_attempt_at,result_json,last_error,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [forwardRunId,requestKeyHash,requestHash,'live','', 'bridge',input.messageId,conversationId,conversationType,forward.messageType||'text',forward.senderOpenId||'',forward.senderName||'',conversationType==='p2p'?'p2p':'group',forward.prompt||'',json(forward.groupChatContext??null),json(forward.contextEntries??[]),'pending',now(),'{}','',now(),now()]);
+          const [[registered]] = await c.execute('SELECT public_run_id,request_hash FROM assistant_codex_forward_jobs WHERE message_id=? LIMIT 1',[input.messageId]);
+          if (!registered || registered.request_hash !== requestHash) throw new StoreError('job_conflict');
+          forwardRunId = registered.public_run_id;
+        }
         const hooks = [];
         for (const hook of input.hooks ?? []) {
           hooks.push((await insertJob(c,{...common,kind:'hook',hookId:hook.hookId,payload:hook.payload ?? input.payload})).id);
         }
-        return {eventId:id,sequence:row.sequence,duplicate:false,firstReceipt:true,duplicateCanonical:false,agentJobId:agent?.id ?? null,hookJobIds:hooks};
+        return {eventId:id,sequence:row.sequence,duplicate:false,firstReceipt:true,duplicateCanonical:false,agentJobId:null,forwardRunId,hookJobIds:hooks};
       });
     },
     listKnownConversations(input) {

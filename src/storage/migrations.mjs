@@ -6,6 +6,7 @@ import { StoreError } from './errors.mjs';
 const MIGRATIONS = await Promise.all([
   [1, './migrations/001-initial.sql'],
   [2, './migrations/002-codex-sessions.sql'],
+  [3, './migrations/003-forward-runtime.sql'],
 ].map(async ([version, path]) => {
   const sql = await readFile(new URL(path, import.meta.url), 'utf8');
   return { version, sql, checksum: createHash('sha256').update(sql).digest('hex') };
