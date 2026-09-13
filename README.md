@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.0` is the current unreleased development version. Version 0.1.1 remains the latest released source. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
+Version: `0.2.0` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 

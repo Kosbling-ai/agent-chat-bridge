@@ -8,7 +8,7 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 普通运行接口为 `POST /v1/runs`，接受可选 `executionNamespace` 与 `deliveryMode:"bridge"|"caller"`，仍返回 `202 {id,duplicate}`。bridge 模式负责 Typing、执行卡片、停止按钮、答案与附件；caller 模式只执行并保存结果，不自动发送这些飞书效果。`GET /v1/runs/:id` 分开暴露执行和投递状态，并保留 `rawAnswer`、native 与 held 事实；事件接口按该 run 的 binding/thread/chat/message 精确过滤且只返回安全公开投影。附件资源接口需通过相同会话授权，且不暴露本机绝对路径。
 
-卡片保存期望/已确认版本、消息 ID、终态快照和十进制字符串游标。明确拒绝才可走完整正文 fallback；创建结果未知时不重建卡片，也不改发正文来假装成功。正文和每个附件在平台调用前持久化 intent，确认后持久化收据；崩溃遗留的 intent 公开为 `unknown`，不会自行重发。明确失败保留事实，后续附件仍各自尝试。文件只在发送收据落库后清理。Typing 结果不明时会按原消息、应用身份和配置 emoji 查询核对，终态清理有独立租约重试。
+卡片保存期望/已确认版本、消息 ID、终态快照和十进制字符串游标。明确拒绝才可走完整正文 fallback；创建结果未知时不重建卡片，也不改发正文来假装成功。正文和每个附件在平台调用前持久化 intent，确认后持久化收据；崩溃遗留的 intent 公开为 `unknown`，不会自行重发。明确失败保留事实，后续附件仍各自尝试。文件只在发送收据落库后清理。Typing 结果不明时只核对原消息返回的前 50 条 reaction，并按 `operator_type=app` 与配置 emoji 匹配；这不能精确证明属于某一个 app，也不能证明后续分页不存在。终态清理有独立租约重试。
 
 bridge 的投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`；caller 终态为 `not_requested`。投递失败或未知不会重跑已经完成的模型 turn。公开附件 `id` 是十进制资源索引，可直接用于 `/v1/runs/:id/resources/:index`。
 
