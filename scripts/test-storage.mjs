@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import mysql from 'mysql2/promise';
 
 // Never use a remote Docker endpoint or inherited database credentials.
 const context = spawnSync('docker', ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], {encoding:'utf8',timeout:5000});
@@ -20,14 +21,21 @@ try {
   // A failed/timeout run may have created this uniquely named container.
   created=true;
   if(result.status!==0)throw new Error('container_start_failed');
+  const port=docker(['port',name,'3306/tcp'],{timeout:5000}).stdout?.trim().split(':').at(-1);
+  if(!/^\d+$/.test(port??''))throw new Error('container_port_missing');
   let ready=false;
   for(let i=0;i<90;i++){
-    if(docker(['exec',name,'mysqladmin','ping','--silent'],{timeout:2000}).status===0){ready=true;break;}
+    let probe;
+    try {
+      probe=await mysql.createConnection({host:'127.0.0.1',port:Number(port),user:'root',password,database:'bridge_test',connectTimeout:1000});
+      await probe.query({sql:'SELECT 1',timeout:1000});
+      ready=true;
+    } catch { /* Entry point's temporary Unix server is not readiness. */ }
+    finally {probe?.destroy();}
+    if(ready)break;
     await new Promise(r=>setTimeout(r,1000));
   }
   if(!ready)throw new Error('mysql_startup_deadline');
-  const port=docker(['port',name,'3306/tcp'],{timeout:5000}).stdout?.trim().split(':').at(-1);
-  if(!/^\d+$/.test(port??''))throw new Error('container_port_missing');
   const files=process.argv.slice(2);
   if(files.some(file=>!/^test\/[a-z0-9_.-]+\.test\.mjs$/i.test(file)))throw new Error('invalid_test_path');
   const run=spawnSync(process.execPath,['--test',...(files.length?files:['test/storage.integration.test.mjs'])],{

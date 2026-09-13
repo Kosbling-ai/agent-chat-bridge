@@ -12,7 +12,7 @@
   },
   "scripts": {
     "start": "node bin/agent-chat-bridge.mjs start",
-    "test": "node --test",
+    "test": "node --test test/*.test.mjs",
     "check": "node scripts/check.mjs",
     "test:storage": "node scripts/test-storage.mjs"
   },

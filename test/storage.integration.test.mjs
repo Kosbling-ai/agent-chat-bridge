@@ -11,9 +11,41 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  const [[version]]=await pool.query('SELECT VERSION() AS version');console.log('Isolated MySQL version:',version.version);
  await assert.rejects(assertSchemaCurrent(pool),{code:'schema_migration_required'});
  assert.equal((await migrate(pool)).applied,true);assert.equal((await migrate(pool)).applied,false);
- let clock=Date.now();const store=await createMysqlStore({pool,now:()=>clock});
+ let clock=Date.now();const store=await createMysqlStore({pool,now:()=>clock,onWriterLost:async()=>{throw new Error('synthetic observer failure');}});
  try{
  const second=createPoolFromEnvironment(refs);await assert.rejects(createMysqlStore({pool:second}),{code:'writer_busy'});await second.end();
+ // Hold the first registration COMMIT while a second registration is in flight.
+ // The second must not become visible/claimable before the first commits.
+ for (const mode of ['enqueue','inbound']) {
+   const originalGet=pool.getConnection.bind(pool);
+   let enter,release;
+   const entered=new Promise(resolve=>{enter=resolve;});
+   const gate=new Promise(resolve=>{release=resolve;});
+   let gateNext=true;
+   pool.getConnection=async()=>{
+     const c=await originalGet();
+     if(gateNext){gateNext=false;const commit=c.commit.bind(c);c.commit=async()=>{c.commit=commit;enter();await gate;return commit();};}
+     return c;
+   };
+   const register=(key)=>mode==='enqueue'
+     ? store.enqueueJob({kind:'hook',connectionId:`ordering-${mode}`,conversationId:mode,hookId:'h',idempotencyKey:key,payload:{}})
+     : store.acceptInbound({connectionId:`ordering-${mode}`,conversationId:mode,eventKey:key,eventType:'message',payload:{},policyVersion:'v',hooks:[{hookId:'h'}]});
+   let first,second;
+   try {
+     first=register('first');await entered;
+     let secondDone=false;
+     second=register('second').then(value=>{secondDone=true;return value;});
+     await new Promise(resolve=>setTimeout(resolve,50));
+     assert.equal(secondDone,false);
+     assert.deepEqual(await store.claimJobs({kind:'hook',owner:'ordering',leaseMs:1000}),[]);
+     release();const firstResult=await first;const secondResult=await second;
+     for(const registered of [firstResult,secondResult]) {
+       const [job]=await store.claimJobs({kind:'hook',owner:'ordering',leaseMs:1000});
+       assert.equal(job.id,registered.id ?? registered.hookJobIds[0]);
+       await store.finishJobWithOutbox({id:job.id,leaseToken:job.leaseToken});
+     }
+   } finally {release();await first?.catch(()=>{});await second?.catch(()=>{});pool.getConnection=originalGet;}
+ }
  const input={connectionId:'c',conversationId:'chat',eventKey:'event',eventType:'message',messageId:'m',payload:{text:'synthetic'},policyVersion:'v1',passiveContext:true,agentJob:{payload:{prompt:'synthetic'}},hooks:[{hookId:'h'}]};
  const event=await store.acceptInbound(input);assert.equal(event.duplicate,false);
  const repeated=await store.acceptInbound({...input,policyVersion:'v2'});assert.equal(repeated.duplicate,true);assert.equal(repeated.agentJobId,event.agentJobId);
@@ -47,6 +79,10 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  await store.excludeMessage({connectionId:'c',messageId:'future'});await store.acceptInbound({...input,eventKey:'future',messageId:'future',agentJob:null,hooks:[]});assert.equal((await store.readPassiveContext(input)).some(row=>row.messageId==='future'),false);
  const unknownJob=await store.enqueueJob({kind:'agent',connectionId:'c',conversationId:'unknown',idempotencyKey:'unknown',payload:{}});const [unknownClaim]=await store.claimJobs({kind:'agent',owner:'one',leaseMs:1000});assert.equal(unknownClaim.id,unknownJob.id);await store.beginAgentAttempt({id:unknownClaim.id,leaseToken:unknownClaim.leaseToken,agentId:'codex'});await store.holdAgentAttempt({id:unknownClaim.id,leaseToken:unknownClaim.leaseToken,errorCode:'rpc_timeout'});assert.equal((await store.getJob({id:unknownClaim.id})).status,'unknown');assert.deepEqual(await store.claimJobs({kind:'agent',owner:'other',leaseMs:1000}),[]);
  const start=Date.now();await assert.rejects(withConnection(pool,c=>c.query('SELECT SLEEP(5)'),{timeoutMs:50}),{code:'store_timeout'});assert.ok(Date.now()-start<1000);await assertSchemaCurrent(pool);
+ const backlog=Array.from({length:105},(_,i)=>[randomUUID(),'batch','chat',`expired-${i}`,'reaction','0'.repeat(64),'{}',randomUUID(),'running',clock-1,clock-1,clock-1,clock,clock]);
+ await pool.query('INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,platform_uuid,status,first_attempt_at,lease_expires_at,next_attempt_at,created_at,updated_at) VALUES ?',[backlog]);
+ await store.claimOutbox({owner:'batch',leaseMs:1000});
+ const [[remaining]]=await pool.query("SELECT COUNT(*) AS n FROM bridge_outbox WHERE connection_id='batch' AND status='running'");assert.equal(Number(remaining.n),5);
  const [[lock]]=await pool.query("SELECT OWNER_THREAD_ID AS owner FROM performance_schema.metadata_locks WHERE OBJECT_TYPE='USER LEVEL LOCK' AND OBJECT_NAME LIKE 'bridge:writer:%'");
  const [[thread]]=await pool.query('SELECT PROCESSLIST_ID AS id FROM performance_schema.threads WHERE THREAD_ID=?',[lock.owner]);
  await pool.query(`KILL CONNECTION ${Number(thread.id)}`);

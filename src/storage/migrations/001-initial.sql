@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS bridge_jobs (
   UNIQUE KEY jobs_key (connection_id, kind, hook_id, idempotency_key),
   KEY jobs_claim (kind, status, next_attempt_at, created_at),
   KEY jobs_lease (status, lease_expires_at),
-  KEY jobs_conversation (connection_id, conversation_id, hook_id, kind, created_at),
+  KEY jobs_conversation (connection_id, conversation_id, hook_id, kind, sequence, status),
   KEY jobs_event (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
@@ -135,4 +135,9 @@ CREATE TABLE IF NOT EXISTS bridge_message_tombstones (
  message_id VARCHAR(255) NOT NULL,
  created_at BIGINT UNSIGNED NOT NULL,
  PRIMARY KEY (connection_id,message_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE IF NOT EXISTS bridge_registration_scopes (
+ connection_id VARCHAR(128) NOT NULL,
+ conversation_id VARCHAR(255) NOT NULL,
+ PRIMARY KEY (connection_id,conversation_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
