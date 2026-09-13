@@ -27,12 +27,15 @@ export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '
   let state = 'idle';
   let probeWarningReported = false;
   const active = new Set();
+  function safeLog(...args) {
+    try { Promise.resolve(log(...args)).catch(() => {}); } catch {}
+  }
   // Observability callbacks must never change ACK semantics or leak raw errors.
   function observe(level, status, code, durationMs) {
-    try { log(level, 'feishu_ingress', status, { code, durationMs }); } catch {}
+    safeLog(level, 'feishu_ingress', status, { code, durationMs });
     if (level === 'error') {
       const reportingFailed = () => {
-        try { log('warning', 'feishu_error_reporting', 'failed', { code: 'feishu_reporting_failed' }); } catch {}
+        safeLog('warning', 'feishu_error_reporting', 'failed', { code: 'feishu_reporting_failed' });
       };
       try {
         Promise.resolve(reportError(new FeishuIngressError(code), { module: 'bridge', component: 'feishu', operation: 'ingress', status })).catch(reportingFailed);

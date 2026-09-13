@@ -105,6 +105,18 @@ test('retryable ingress failures warn, and asynchronous terminal error reporting
   assert.equal(JSON.stringify(logs).includes('secret'), false);
 });
 
+test('asynchronous logger rejection is contained at both ingress and reporting-failure paths', async () => {
+  let count = 0;
+  const { receive, adapter } = ingress(async () => { throw new Error('temporary'); }, {
+    log: async () => { count++; throw new Error('logger failed'); },
+    reportError: async () => { throw new Error('reporting failed'); },
+  });
+  await assert.rejects(receive(event));
+  adapter.status();
+  await new Promise(setImmediate);
+  assert.equal(count, 3);
+});
+
 test('deadline aborts storage and throws even if persistence later resolves', async () => {
   let finish; let signal;
   const { receive } = ingress((_, context) => { signal = context.signal; return new Promise((resolve) => { finish = resolve; }); }, { deadlineMs: 10 });
