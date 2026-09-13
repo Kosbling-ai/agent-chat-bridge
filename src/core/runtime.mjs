@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
+import { safeObserver } from '../logger.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const nativeIds = ({ params = {} }) => ({ nativeThreadId: params.threadId ?? params.thread?.id, nativeTurnId: params.turnId ?? params.turn?.id });
 
 export function createRuntime({ config, store, codex, chat, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
+  log = safeObserver(log);
   const connectionId = config.feishu.connectionId;
   const owner = randomUUID();
   const leaseMs = 60000;
@@ -110,7 +112,12 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
         if (context.length) await store.consumePassiveContext({ ...scope(job.conversationId), runId: job.id, throughSequence: context.at(-1).sequence });
       }
       const turn = await awaitTurn(job, attempt, attempt.nativeTurnId);
-      if (turn) await finish(job, turn); else await hold(job, 'agent_execution_interrupted');
+      if (turn) await finish(job, turn);
+      else if (attempt.nativeThreadId && attempt.nativeTurnId) {
+        // Keep the durable native admission and active session. The next worker
+        // must enter recoveryRequired/readThread, never start another turn.
+        await store.retryJob({ id: job.id, leaseToken: job.leaseToken, errorCode: 'agent_recovery_pending', nextAttemptAt: Date.now() + 1000 });
+      } else await hold(job, 'agent_execution_interrupted');
     } catch (error) {
       if (error.code === 'session_busy') {
         await store.retryJob({ id: job.id, leaseToken: job.leaseToken, errorCode: 'session_busy', nextAttemptAt: Date.now() + 1000 });

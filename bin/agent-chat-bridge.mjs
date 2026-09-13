@@ -35,8 +35,11 @@ try {
       await migrateService({ config });
       log('info', 'migration', 'succeeded');
     } else {
-      const service = await startService({ config, configPath: path, log });
+      const controller = new AbortController();
+      let service;
       const shutdown = () => {
+        controller.abort();
+        if (!service) return;
         service.close().then(() => { if (config.storage) process.exit(0); }).catch(() => {
           log('error', 'shutdown', 'failed', { code: 'shutdown_failed' });
           process.exit(1);
@@ -44,6 +47,13 @@ try {
       };
       process.on('SIGTERM', shutdown);
       process.on('SIGINT', shutdown);
+      try {
+        service = await startService({ config, configPath: path, log, signal: controller.signal });
+        if (controller.signal.aborted) shutdown();
+      } catch (error) {
+        if (!controller.signal.aborted) throw error;
+        process.exit(0);
+      }
     }
   }
 } catch (error) {

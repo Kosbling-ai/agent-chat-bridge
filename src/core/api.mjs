@@ -9,6 +9,13 @@ export function fields(value, allowed, required = []) {
   return value;
 }
 const digest = value => createHash('sha256').update(value).digest();
+function identifier(value, max = 512) {
+  if (typeof value !== 'string' || !value.trim() || value.length > max) throw new ApiError('invalid_identifier');
+  return value;
+}
+function decodePath(value) {
+  try { return identifier(decodeURIComponent(value)); } catch { throw new ApiError('invalid_path'); }
+}
 export function createApi({ config, store, chat, tokens }) {
   const connectionId = config.feishu.connectionId;
   const clients = config.auth.clients.map(client => {
@@ -25,9 +32,11 @@ export function createApi({ config, store, chat, tokens }) {
     return client;
   }
   function authorize(client, conversationId) {
+    identifier(conversationId, 255);
     if (!client.conversationIds.includes(conversationId)) throw new ApiError('forbidden', 403);
   }
   async function ownedMessage(client, messageId) {
+    identifier(messageId);
     const result = await chat.getMessage({ messageId });
     const message = result.items?.find(item => item.message_id === messageId);
     if (!message?.chat_id) throw new ApiError('message_not_found', 404);
@@ -57,7 +66,8 @@ export function createApi({ config, store, chat, tokens }) {
       if (typeof input.text !== 'string' || !input.text.trim()) throw new ApiError('invalid_text');
       if (Buffer.byteLength(input.text) > 64 * 1024) throw new ApiError('text_too_large', 413);
       authorize(client, input.conversationId);
-      const result = await store.enqueueJob({ connectionId, conversationId: input.conversationId, kind: 'agent', idempotencyKey: `api:${client.id}:${input.idempotencyKey}`, payload: { text: input.text, source: 'api', callerId: client.id } });
+      const idempotencyKey = identifier(`api:${client.id}:${input.idempotencyKey}`, 255);
+      const result = await store.enqueueJob({ connectionId, conversationId: input.conversationId, kind: 'agent', idempotencyKey, payload: { text: input.text, source: 'api', callerId: client.id } });
       return { status: 202, body: { id: result.id, duplicate: result.duplicate } };
     }
     const run = /^\/v1\/runs\/([\w-]+)(\/events)?$/.exec(path);
@@ -70,23 +80,29 @@ export function createApi({ config, store, chat, tokens }) {
     if (request.method === 'POST' && path === '/v1/deliveries') {
       const input = fields(await body(request, 3 * 1024 * 1024), ['conversationId', 'idempotencyKey', 'kind', 'messageId', 'content', 'messageKind', 'emojiType', 'reactionId', 'mediaType', 'base64', 'fileName'], ['conversationId', 'idempotencyKey', 'kind']);
       authorize(client, input.conversationId);
+      const idempotencyKey = identifier(`api:${client.id}:${input.idempotencyKey}`, 255);
       if (!['create', 'reply', 'reaction', 'upload'].includes(input.kind)) throw new ApiError('unsupported_delivery_kind', 422);
       let effect;
       if (input.kind === 'reaction') {
         if (typeof input.messageId !== 'string' || (!input.reactionId && typeof input.emojiType !== 'string')) throw new ApiError('invalid_reaction');
+        identifier(input.reactionId ?? input.emojiType);
+        if (input.reactionId !== undefined && input.emojiType !== undefined) throw new ApiError('invalid_reaction');
         const { message } = await ownedMessage(client, input.messageId);
         if (message.chat_id !== input.conversationId) throw new ApiError('conversation_mismatch', 403);
         effect = { messageId: input.messageId, ...(input.reactionId ? { reactionId: input.reactionId } : { emojiType: input.emojiType }) };
       } else if (input.kind === 'upload') {
         if (!['image', 'file'].includes(input.mediaType) || typeof input.base64 !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(input.base64) || input.base64.length % 4 !== 0) throw new ApiError('invalid_media');
         if (Buffer.from(input.base64, 'base64').length > 2 * 1024 * 1024) throw new ApiError('payload_too_large', 413);
-        if (input.mediaType === 'file' && (typeof input.fileName !== 'string' || input.fileName.length > 200)) throw new ApiError('invalid_filename');
+        if (input.mediaType === 'file' && (typeof input.fileName !== 'string' || !input.fileName.trim() || input.fileName.length > 200 || /[\\/\x00-\x1f]/.test(input.fileName))) throw new ApiError('invalid_filename');
         effect = { mediaType: input.mediaType, base64: input.base64, ...(input.fileName ? { fileName: input.fileName } : {}) };
       } else {
       const kind = input.messageKind ?? 'text';
       if (!['text', 'post', 'interactive', 'image', 'file'].includes(kind)) throw new ApiError('invalid_message_kind');
       const content = kind === 'text' && typeof input.content === 'string' ? { text: input.content } : input.content;
       if (!content || typeof content !== 'object' || Array.isArray(content) || Buffer.byteLength(JSON.stringify(content)) > 20000) throw new ApiError('invalid_content');
+      if (kind === 'text' && (typeof content.text !== 'string' || !content.text.trim())) throw new ApiError('invalid_content');
+      if (kind === 'image') identifier(content.image_key);
+      if (kind === 'file') identifier(content.file_key);
       if (input.kind === 'reply') {
         if (typeof input.messageId !== 'string') throw new ApiError('message_id_required');
         const { message } = await ownedMessage(client, input.messageId);
@@ -94,7 +110,7 @@ export function createApi({ config, store, chat, tokens }) {
       } else if (input.messageId !== undefined) throw new ApiError('invalid_payload');
       effect = { kind, content, ...(input.messageId ? { messageId: input.messageId } : {}) };
       }
-      const result = await store.recordOutbox({ connectionId, conversationId: input.conversationId, idempotencyKey: `api:${client.id}:${input.idempotencyKey}`, kind: input.kind, payload: effect });
+      const result = await store.recordOutbox({ connectionId, conversationId: input.conversationId, idempotencyKey, kind: input.kind, payload: effect });
       return { status: 202, body: { id: result.id, duplicate: result.duplicate } };
     }
     const delivery = /^\/v1\/deliveries\/([\w-]+)$/.exec(path);
@@ -102,7 +118,7 @@ export function createApi({ config, store, chat, tokens }) {
       const row = await store.getOutbox({ id: delivery[1] });
       if (!row || row.connectionId !== connectionId) throw new ApiError('not_found', 404);
       authorize(client, row.conversationId);
-      return { status: 200, body: publicJob(row) };
+      return { status: 200, body: { ...publicJob(row), blocked: row.blocked ?? false, predecessorStatus: row.predecessorStatus ?? null } };
     }
     if (request.method === 'POST' && path === '/v1/sessions/reset') {
       const input = fields(await body(request), ['conversationId', 'generation'], ['conversationId']);
@@ -113,19 +129,23 @@ export function createApi({ config, store, chat, tokens }) {
     }
     const list = /^\/v1\/conversations\/([^/]+)\/(messages|members)$/.exec(path);
     if (request.method === 'GET' && list) {
-      const conversationId = decodeURIComponent(list[1]); authorize(client, conversationId);
+      const conversationId = decodePath(list[1]); authorize(client, conversationId);
       const { limit } = pagination(url);
       const pageToken = url.searchParams.get('pageToken') ?? undefined;
-      if (pageToken && pageToken.length > 2048) throw new ApiError('invalid_page');
+      if (pageToken) identifier(pageToken);
       return { status: 200, body: await chat[list[2] === 'messages' ? 'listMessages' : 'listMembers']({ conversationId, pageSize: limit, pageToken }) };
     }
     const message = /^\/v1\/messages\/([^/]+)$/.exec(path);
-    if (request.method === 'GET' && message) return { status: 200, body: (await ownedMessage(client, decodeURIComponent(message[1]))).result };
+    if (request.method === 'GET' && message) return { status: 200, body: (await ownedMessage(client, decodePath(message[1]))).result };
     const resource = /^\/v1\/messages\/([^/]+)\/(resources|reactions)$/.exec(path);
     if (request.method === 'GET' && resource) {
-      const messageId = decodeURIComponent(resource[1]);
+      const messageId = decodePath(resource[1]);
       await ownedMessage(client, messageId);
-      if (resource[2] === 'reactions') return { status: 200, body: await chat.listReactions({ messageId, pageSize: pagination(url).limit, pageToken: url.searchParams.get('pageToken') ?? undefined }) };
+      if (resource[2] === 'reactions') {
+        const pageToken = url.searchParams.get('pageToken') ?? undefined;
+        if (pageToken) identifier(pageToken);
+        return { status: 200, body: await chat.listReactions({ messageId, pageSize: pagination(url).limit, pageToken }) };
+      }
       const fileKey = url.searchParams.get('fileKey');
       const type = url.searchParams.get('type');
       if (!fileKey || fileKey.length > 512 || !['image', 'file'].includes(type)) throw new ApiError('invalid_resource');

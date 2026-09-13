@@ -60,6 +60,11 @@ function strings(value) {
   if (!Array.isArray(value) || value.length > 1000) throw new ConfigError('invalid_scope');
   return [...new Set(value.map(v => string(v)))];
 }
+function identifier(value, max) {
+  const result = string(value);
+  if (result.length > max) throw new ConfigError('invalid_identifier_length');
+  return result;
+}
 function validateRuntime(raw) {
   const enabled = ['storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
@@ -73,13 +78,13 @@ function validateRuntime(raw) {
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(reference) };
   if (raw.codex.model !== undefined) codex.model = string(raw.codex.model);
   object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId'], 'invalid_feishu_fields');
-  const feishu = { connectionId: string(raw.feishu.connectionId), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: string(raw.feishu.botOpenId) };
+  const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };
   object(raw.routing, ['version', 'privateUserIds', 'groups'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
     object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext'], 'invalid_group_fields');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
-    return { conversationId: string(group.conversationId), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, passiveContext: group.passiveContext };
+    return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, passiveContext: group.passiveContext };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), groups };
@@ -87,7 +92,7 @@ function validateRuntime(raw) {
   const clients = raw.auth.clients.map(client => {
     object(client, ['id', 'tokenEnv', 'conversationIds', 'admin'], 'invalid_client_fields');
     if (typeof client.admin !== 'boolean') throw new ConfigError('invalid_client_admin');
-    return { id: string(client.id), tokenEnv: reference(client.tokenEnv), conversationIds: strings(client.conversationIds), admin: client.admin };
+    return { id: identifier(client.id, 128), tokenEnv: reference(client.tokenEnv), conversationIds: strings(client.conversationIds).map(id => identifier(id, 255)), admin: client.admin };
   });
   if (new Set(clients.map(c => c.id)).size !== clients.length) throw new ConfigError('duplicate_client');
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
@@ -95,7 +100,7 @@ function validateRuntime(raw) {
     object(hook, ['id', 'url', 'tokenEnv', 'conversationIds'], 'invalid_hook_fields');
     let url; try { url = new URL(hook.url); } catch { throw new ConfigError('invalid_hook_url'); }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_hook_url');
-    return { id: string(hook.id), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds: strings(hook.conversationIds) };
+    return { id: identifier(hook.id, 128), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds: strings(hook.conversationIds).map(id => identifier(id, 255)) };
   });
   if (new Set(hooks.map(h => h.id)).size !== hooks.length) throw new ConfigError('duplicate_hook');
   let errorReporting;

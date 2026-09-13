@@ -1,7 +1,9 @@
 import http from 'node:http';
 import { ApiError } from './core/api.mjs';
 import { pipeline } from 'node:stream/promises';
+import { safeObserver } from './logger.mjs';
 export async function startServer({ config, log, api, readiness }) {
+  log = safeObserver(log);
   let stopping = false;
   function reply(response, status, body) {
     response.writeHead(status, {
@@ -35,9 +37,10 @@ export async function startServer({ config, log, api, readiness }) {
     } catch (error) {
       if (response.headersSent || response.destroyed) { response.destroy(); return; }
       const conflict = ['session_busy_or_conflict', 'session_conflict', 'job_conflict', 'outbox_conflict'].includes(error.code);
-      const status = error instanceof ApiError ? error.status : conflict ? 409 : 503;
+      const invalid = ['invalid_store_input', 'invalid_store_limit', 'invalid_chat_argument', 'invalid_page_size', 'invalid_history_time', 'invalid_resource_type', 'invalid_message_content', 'invalid_file_name'].includes(error.code);
+      const status = error instanceof ApiError ? error.status : conflict ? 409 : invalid ? 400 : 503;
       if (status === 503) log('error', 'http_api', 'failed', { code: 'service_unavailable' });
-      reply(response, status, { error: error instanceof ApiError ? error.code : conflict ? 'conflict' : 'service_unavailable' });
+      reply(response, status, { error: error instanceof ApiError ? error.code : conflict ? 'conflict' : invalid ? 'invalid_payload' : 'service_unavailable' });
     }
   });
   const startedAt = Date.now();

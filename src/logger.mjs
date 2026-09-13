@@ -1,5 +1,10 @@
 // Only fixed lifecycle fields are accepted; never serialize config, requests,
 // arbitrary Error objects, headers, environment values, or message content.
+export function safeObserver(callback = () => {}) {
+  return (...args) => {
+    try { Promise.resolve(callback(...args)).catch(() => {}); } catch { /* observability never alters control flow */ }
+  };
+}
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
   return (level, operation, status, { code, durationMs, port } = {}) => {
     const event = {
@@ -17,6 +22,7 @@ export function createLogger(stream = process.stdout, { component = 'service', r
 }
 
 export function createErrorReporter({ url, token, warn, fetchImpl = fetch }) {
+  warn = safeObserver(warn);
   const pending = new Set();
   return {
     report(event) {

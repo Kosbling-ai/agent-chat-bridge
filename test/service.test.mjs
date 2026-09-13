@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import { validateConfig } from '../src/config.mjs';
 import { createApi } from '../src/core/api.mjs';
 import { createLogger, createErrorReporter } from '../src/logger.mjs';
-import { boundedFeishuHttp } from '../src/service.mjs';
+import { boundedFeishuHttp, startService } from '../src/service.mjs';
+import { createCodexAdapter } from '../src/agents/codex/adapter.mjs';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { createRuntime } from '../src/core/runtime.mjs';
 
@@ -90,4 +95,33 @@ test('SDK request wrapper enforces time, redirects and size without retries', as
   const client = boundedFeishuHttp({ request: async options => { calls++; assert.equal(options.timeout, 10000); assert.equal(options.maxRedirects, 0); return {}; } });
   await client.request({ timeout: 0, maxRedirects: 5 });
   assert.equal(calls, 1);
+});
+test('failed async warning sinks never become unhandled rejections', async () => {
+  const reporter = createErrorReporter({ url: 'http://synthetic.invalid', token: 'synthetic', warn: async () => { throw new Error('synthetic warning failure'); }, fetchImpl: async () => { throw new Error('synthetic HTTP failure'); } });
+  for (let i = 0; i < 6; i++) reporter.report({ code: 'fixture' });
+  await reporter.close();
+  await new Promise(resolve => setImmediate(resolve));
+});
+test('startup cancellation closes an actual spawned child while Feishu start is pending', { timeout: 5000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-start-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const fixture = join(directory, 'fixture.mjs');
+  await writeFile(fixture, "import readline from 'node:readline';readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')process.stdout.write(JSON.stringify({id:m.id,result:{}})+'\\n');});");
+  let child, storeClosed = false, socketStopped = false, enter;
+  const entered = new Promise(resolve => { enter = resolve; });
+  const controller = new AbortController();
+  const runtimeConfig = validateConfig({ ...config, codex: { bin: process.execPath, cwd: directory, envNames: [] } });
+  const started = startService({ config: runtimeConfig, configPath: join(directory, 'config.json'), env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, signal: controller.signal, log: async () => { throw new Error('synthetic log'); }, dependencies: {
+    pool: () => ({}), store: async () => ({ close: async () => { storeClosed = true; } }),
+    codex: (options, callbacks) => createCodexAdapter({ ...options, shutdownGraceMs: 100 }, { ...callbacks, spawnProcess: (_bin, _args, opts) => { child = spawn(process.execPath, [fixture], opts); return child; } }),
+    sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} }, chat: () => ({}),
+    feishu: () => ({ start: () => { enter(); return new Promise(() => {}); }, stop: () => { socketStopped = true; } }),
+  } });
+  t.after(() => { if (child?.exitCode === null && child?.signalCode === null) child.kill('SIGKILL'); });
+  const rejected = assert.rejects(started, { code: 'startup_cancelled' });
+  await entered;
+  assert(child.pid > 0);
+  controller.abort();
+  await rejected;
+  assert(storeClosed); assert(socketStopped); assert(child.exitCode !== null || child.signalCode !== null);
 });

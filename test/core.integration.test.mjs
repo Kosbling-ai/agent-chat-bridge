@@ -20,6 +20,7 @@ test('real Store core: immediate completion, independent hook, API authorization
   let store = await createMysqlStore({ pool });
   const config = { listen: { host: '127.0.0.1', port: 0 }, feishu: { connectionId: 'fixture', botOpenId: 'bot' }, auth: { clients: [{ id: 'tester', conversationIds: ['chat', 'unknown', 'unsupported'], admin: true }] }, routing: { version: '1', privateUserIds: ['human'], groups: [] }, hooks: [{ id: 'hook', url: 'http://synthetic.invalid', conversationIds: ['chat'] }] };
   let runtime, server, mode = 'normal', turns = 0, threadStarts = 0, hooks = 0;
+  let firstChunkGate, releaseChunk, failFirstChunk = false;
   const sent = [];
   const completed = new Map();
   const codex = {
@@ -29,15 +30,16 @@ test('real Store core: immediate completion, independent hook, API authorization
     async startTurn({ threadId }) {
       turns++;
       if (mode === 'unknown') throw Object.assign(new Error('synthetic'), { outcome: 'unknown' });
-      const turn = { id: `turn-${turns}`, status: 'completed', items: [{ type: 'agentMessage', text: 'Synthetic answer' }] };
+      const turn = { id: `turn-${turns}`, status: mode === 'live' ? 'inProgress' : 'completed', items: [{ type: 'agentMessage', text: mode === 'multipart' ? 'A'.repeat(12000) + 'B'.repeat(12000) : 'Synthetic answer' }] };
       completed.set(threadId, turn);
+      if (mode === 'live') return { turn: { id: turn.id, status: 'inProgress' } };
       // The Store commits this notification before RPC admission is returned.
       await runtime.notification({ method: 'turn/completed', params: { threadId, turn } });
       return { turn: { id: turn.id, status: 'inProgress' } };
     },
     async readThread({ threadId }) { return { thread: { turns: [completed.get(threadId)].filter(Boolean) } }; },
   };
-  const chat = { async sendMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async replyMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async getMessage({ messageId }) { return { items: [{ message_id: messageId, chat_id: messageId === 'foreign' ? 'forbidden' : 'chat' }] }; } };
+  const chat = { async sendMessage(input) { sent.push(input); if (input.content.text.startsWith('AAA')) { if (failFirstChunk) throw Object.assign(new Error('synthetic rejection'), { outcome: 'failed' }); await firstChunkGate; } return { message_id: `sent-${sent.length}` }; }, async replyMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async getMessage({ messageId }) { return { items: [{ message_id: messageId, chat_id: messageId === 'foreign' ? 'forbidden' : 'chat' }] }; } };
   const token = 'synthetic-bridge-token-for-tests-only';
   const event = { schemaVersion: 1, channel: 'feishu', connectionId: 'fixture', eventId: 'e1', eventKey: 'receive:e1', type: 'message.received', source: 'live', receivedAt: 1, occurredAt: 1, conversationId: 'chat', conversationType: 'p2p', messageId: 'm1', revision: '', actor: { type: 'user', openId: 'human' }, isApp: false, isSelf: false, message: { kind: 'text', parsedContent: { text: 'Synthetic question' }, content: '{"text":"Synthetic question"}', mentions: [] }, platform: { feishu: { eventType: 'receive' } } };
   try {
@@ -59,6 +61,9 @@ test('real Store core: immediate completion, independent hook, API authorization
     assert.equal((await fetch(`${url}/v1/messages/foreign`, { headers })).status, 403);
     assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'forbidden', idempotencyKey: 'x', text: 'synthetic' }) })).status, 403);
     assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'chat', idempotencyKey: 'x', text: 'synthetic', cwd: '/tmp' }) })).status, 400);
+    assert.equal((await fetch(`${url}/v1/messages/%ZZ`, { headers })).status, 400);
+    assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'chat', idempotencyKey: 'x'.repeat(255), text: 'synthetic' }) })).status, 400);
+    assert.equal((await fetch(`${url}/v1/deliveries`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'chat', idempotencyKey: 'reaction', kind: 'reaction', messageId: 'owned', emojiType: 'x'.repeat(513) }) })).status, 400);
     mode = 'unknown';
     const result = await (await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'unknown', idempotencyKey: 'unknown', text: 'synthetic' }) })).json();
     await eventually(() => store.getJob({ id: result.id }), row => row.status === 'unknown');
@@ -79,5 +84,34 @@ test('real Store core: immediate completion, independent hook, API authorization
     const unsupported = await runtime.ingest({ ...event, eventId: 'e2', eventKey: 'receive:e2', conversationId: 'unsupported', messageId: 'm2', message: { kind: 'image', parsedContent: { image_key: 'synthetic' }, mentions: [] } });
     await eventually(() => store.getJob({ id: unsupported.agentJobId }), row => row.status === 'succeeded');
     assert.equal(turns, before); assert.match(sent.at(-1).content.text, /仅支持文本/);
-  } finally { await server?.close(); await runtime?.stop(); await store.close(); }
+    mode = 'live';
+    const live = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'live', idempotencyKey: 'live', payload: { text: 'synthetic' } });
+    await eventually(async () => { const [[row]] = await pool.execute('SELECT native_turn_id FROM bridge_attempts WHERE job_id=?', [live.id]); return row; }, row => row?.native_turn_id);
+    const beforeStop = turns;
+    await runtime.stop();
+    assert.equal((await store.getJob({ id: live.id })).status, 'pending');
+    const binding = await store.getSession({ connectionId: 'fixture', conversationId: 'live', agentId: 'codex' });
+    completed.get(binding.nativeThreadId).status = 'completed';
+    runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => new Response(null, { status: 204 }) });
+    runtime.start();
+    await eventually(() => store.getJob({ id: live.id }), row => row.status === 'succeeded');
+    assert.equal(turns, beforeStop, 'graceful restart must recover known turn without replay');
+    mode = 'multipart';
+    firstChunkGate = new Promise(resolve => { releaseChunk = resolve; });
+    const count = sent.length;
+    const multipart = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'multipart', idempotencyKey: 'multipart', payload: { text: 'synthetic' } });
+    await eventually(async () => sent.length, value => value === count + 1);
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.equal(sent.length, count + 1, 'second chunk cannot start before first platform confirmation');
+    releaseChunk();
+    await eventually(() => store.getJob({ id: multipart.id }), row => row.status === 'succeeded');
+    assert(sent[count].content.text.startsWith('AAA')); assert(sent[count + 1].content.text.startsWith('BBB'));
+    failFirstChunk = true;
+    const failed = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'delivery-failed', idempotencyKey: 'delivery-failed', payload: { text: 'synthetic' } });
+    await eventually(() => store.getJob({ id: failed.id }), row => row.status === 'delivery_failed');
+    const sentAfterFailure = sent.length, turnsAfterFailure = turns;
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.equal(sent.length, sentAfterFailure, 'failed predecessor keeps later chunks blocked');
+    assert.equal(turns, turnsAfterFailure, 'delivery failure cannot rerun completed model work');
+  } finally { releaseChunk?.(); await server?.close(); await runtime?.stop(); await store.close(); }
 });

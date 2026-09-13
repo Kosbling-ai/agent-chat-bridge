@@ -12,7 +12,7 @@ import { createFeishuChatClient } from './channels/feishu/chat-client.mjs';
 import { createRuntime } from './core/runtime.mjs';
 import { createApi } from './core/api.mjs';
 import { startServer } from './server.mjs';
-import { createLogger, createErrorReporter } from './logger.mjs';
+import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
 
 function secret(env, key) {
   if (typeof env[key] !== 'string' || !env[key]) throw new ConfigError('required_environment_missing');
@@ -30,7 +30,9 @@ export function boundedFeishuHttp(base) {
   for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value));
   return http;
 }
-export async function startService({ config, configPath, env = process.env, log }) {
+export async function startService({ config, configPath, env = process.env, log, signal, dependencies = {} }) {
+  log = safeObserver(log);
+  if (signal?.aborted) throw new ConfigError('startup_cancelled');
   if (!config.storage) return startServer({ config, log });
   const root = dirname(resolve(configPath));
   const cwd = resolve(root, config.codex.cwd);
@@ -47,11 +49,23 @@ export async function startService({ config, configPath, env = process.env, log 
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const pool = createPoolFromEnvironment(config.storage, env);
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, sdk, ...dependencies };
+  const pool = factories.pool(config.storage, env);
   let store, codex, feishu, runtime, http;
   let writerHealthy = true;
   let closing;
+  let rejectCancelled;
+  const cancelled = new Promise((_, reject) => { rejectCancelled = reject; });
+  cancelled.catch(() => {});
+  const abort = () => {
+    rejectCancelled(new ConfigError('startup_cancelled'));
+    safeObserver(() => feishu?.stop())();
+    safeObserver(() => codex?.close())();
+  };
+  const checkCancelled = () => { if (signal?.aborted) throw new ConfigError('startup_cancelled'); };
+  signal?.addEventListener('abort', abort, { once: true });
   const close = () => closing ??= (async () => {
+    signal?.removeEventListener('abort', abort);
     const failures = [];
     for (const operation of [() => http?.close(), () => feishu?.stop(), () => runtime?.stop(), () => codex?.close(), () => store ? store.close() : pool.end(), () => reporter?.close()]) {
       try { await operation(); } catch { failures.push(true); }
@@ -59,20 +73,23 @@ export async function startService({ config, configPath, env = process.env, log 
     if (failures.length) throw new Error('service_shutdown_failed');
   })();
   try {
-    store = await createMysqlStore({ pool, onWriterLost: () => { writerHealthy = false; log('error', 'store_writer', 'failed', { code: 'writer_lost' }); } });
-    codex = createCodexAdapter({ bin, cwd, env: childEnv, threadDefaults: { approvalPolicy: 'never', sandbox: 'workspace-write', ...(config.codex.model ? { model: config.codex.model } : {}) } }, {
+    store = await factories.store({ pool, onWriterLost: () => { writerHealthy = false; log('error', 'store_writer', 'failed', { code: 'writer_lost' }); } });
+    checkCancelled();
+    codex = factories.codex({ bin, cwd, env: childEnv, threadDefaults: { approvalPolicy: 'never', sandbox: 'workspace-write', ...(config.codex.model ? { model: config.codex.model } : {}) } }, {
       onNotification: message => runtime.notification(message), onFault: event => runtime.onFault(event), log,
     });
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
-    const httpInstance = boundedFeishuHttp(sdk.defaultHttpInstance);
-    const client = new sdk.Client({ ...credentials, logger, httpInstance });
-    const chat = createFeishuChatClient({ client });
+    const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance);
+    const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
+    const chat = factories.chat({ client });
     runtime = createRuntime({ config, store, codex, chat, hookTokens, log });
-    feishu = createFeishuAdapter({ sdk, wsClient: new sdk.WSClient({ ...credentials, logger, httpInstance }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
+    feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
     const api = createApi({ config, store, chat, tokens });
-    await codex.start();
-    await feishu.start();
+    await Promise.race([codex.start(), cancelled]);
+    checkCancelled();
+    await Promise.race([feishu.start(), cancelled]);
+    checkCancelled();
     runtime.start();
     http = await startServer({ config, log, api, readiness: async () => {
       let storeReady = writerHealthy;
@@ -80,6 +97,8 @@ export async function startService({ config, configPath, env = process.env, log 
       const components = { store: storeReady, codex: codex.status().state === 'ready', feishu: feishu.status().connected, workers: runtime.status().running };
       return { ready: Object.values(components).every(Boolean), components };
     } });
+    checkCancelled();
+    signal?.removeEventListener('abort', abort);
     return { server: http.server, close };
   } catch (error) {
     await close().catch(() => {});
