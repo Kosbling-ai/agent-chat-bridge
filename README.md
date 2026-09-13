@@ -1,5 +1,7 @@
 # agent-chat-bridge
 
+Version: `0.1.0` — initial development release. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
+
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
 The runtime assembles MySQL, Codex app-server, one Feishu WebSocket owner, scoped hooks and authenticated task/chat APIs. It implements private image input, Agent-generated file delivery, first-receipt catchup, durable active-turn guidance, audited recovery, idle/rules/archived thread replacement and sealed resource retirement. Business edit/reconcile and document/table/contact tools remain outside the bridge. See the [capability matrix and boundaries](docs/runtime.md).
@@ -24,4 +26,4 @@ npm run check
 node scripts/test-storage.mjs test/core.integration.test.mjs
 ```
 
-Publishing remains disabled. No production migration, deployment, remote repository or public release has been performed. Licensing/publication review remains pending.
+npm publishing remains disabled (`private: true`). The intended public source repository is [Kosbling-ai/agent-chat-bridge](https://github.com/Kosbling-ai/agent-chat-bridge); creating and pushing it is separate from deployment or platform acceptance. No production replacement has been performed. Licensing is pending: public visibility does not itself grant an open-source license. See [source provenance](docs/provenance.md).

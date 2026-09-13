@@ -1,7 +1,9 @@
+import { checkVersion } from './check-version.mjs';
 import { readdir } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 
+await checkVersion();
 let count = 0;
 for (const directory of ['bin', 'src', 'scripts', 'test']) {
   for (const file of await readdir(directory, { recursive: true })) {

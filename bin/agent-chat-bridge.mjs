@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { ConfigError, loadConfig } from '../src/config.mjs';
 import { createLogger } from '../src/logger.mjs';
-import { startService, migrateService } from '../src/service.mjs';
+import { readFile } from 'node:fs/promises';
 
 const HELP = `agent-chat-bridge
 
 Usage:
   agent-chat-bridge --help
+  agent-chat-bridge --version
   agent-chat-bridge check-config --config <path>
   agent-chat-bridge start --config <path>
   agent-chat-bridge migrate --config <path>
@@ -23,6 +24,8 @@ const [command, flag, path, ...extra] = process.argv.slice(2);
 try {
   if (command === '--help' && flag === undefined) {
     process.stdout.write(HELP);
+  } else if (command === '--version' && flag === undefined) {
+    process.stdout.write(await readFile(new URL('../VERSION', import.meta.url), 'utf8'));
   } else {
     if (!['check-config', 'start', 'migrate'].includes(command) || flag !== '--config'
         || !path || path.startsWith('--') || extra.length) {
@@ -32,9 +35,11 @@ try {
     if (command === 'check-config') {
       log('info', 'check_config', 'succeeded');
     } else if (command === 'migrate') {
+      const { migrateService } = await import('../src/service.mjs');
       await migrateService({ config });
       log('info', 'migration', 'succeeded');
     } else {
+      const { startService } = await import('../src/service.mjs');
       const controller = new AbortController();
       let service;
       const shutdown = () => {

@@ -1,6 +1,6 @@
 {
   "name": "agent-chat-bridge",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Independent Feishu and Codex client with durable hooks and message delivery",
@@ -14,7 +14,8 @@
     "start": "node bin/agent-chat-bridge.mjs start",
     "test": "node --test test/*.test.mjs",
     "check": "node scripts/check.mjs",
-    "test:storage": "node scripts/test-storage.mjs"
+    "test:storage": "node scripts/test-storage.mjs",
+    "version:check": "node scripts/check-version.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.60.0",
@@ -22,5 +23,13 @@
   },
   "overrides": {
     "axios": "1.18.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kosbling-ai/agent-chat-bridge.git"
+  },
+  "homepage": "https://github.com/Kosbling-ai/agent-chat-bridge",
+  "bugs": {
+    "url": "https://github.com/Kosbling-ai/agent-chat-bridge/issues"
   }
 }
