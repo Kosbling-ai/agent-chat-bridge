@@ -62,7 +62,7 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
       const input = fields(await body(request, 512 * 1024), ['conversationId', 'idempotencyKey', 'text', 'executionNamespace', 'deliveryMode'], ['conversationId', 'idempotencyKey']);
       if (typeof input.text !== 'string' || !input.text.trim()) throw new ApiError('invalid_text');
       if (Buffer.byteLength(input.text) > 64 * 1024) throw new ApiError('text_too_large', 413);
-      if (input.executionNamespace !== undefined && (typeof input.executionNamespace !== 'string' || !/^[a-z0-9][a-z0-9._:-]{0,190}$/i.test(input.executionNamespace))) throw new ApiError('invalid_execution_namespace');
+      if (input.executionNamespace !== undefined && (typeof input.executionNamespace !== 'string' || !/^[a-z0-9][a-z0-9._:-]{0,127}$/i.test(input.executionNamespace))) throw new ApiError('invalid_execution_namespace');
       if (input.deliveryMode !== undefined && !['bridge','caller'].includes(input.deliveryMode)) throw new ApiError('invalid_delivery_mode');
       authorize(client, input.conversationId);
       const idempotencyKey = identifier(input.idempotencyKey, 255);
@@ -101,8 +101,10 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
     const recovery = /^\/v1\/recoveries\/([\w-]+)$/.exec(path);
     if (request.method === 'GET' && recovery) {
       if (!client.admin) throw new ApiError('forbidden', 403);
-      identifier(recovery[1], 36);
-      throw new ApiError('unsupported_execution_model',409);
+      const action = await store.getRecovery({ id: identifier(recovery[1], 36) });
+      if (!action || action.connectionId !== connectionId) throw new ApiError('not_found', 404);
+      authorize(client, action.conversationId);
+      return { status: 200, body: action };
     }
     if (request.method === 'POST' && path === '/v1/deliveries') {
       const input = fields(await body(request, 3 * 1024 * 1024), ['conversationId', 'idempotencyKey', 'kind', 'messageId', 'content', 'messageKind', 'emojiType', 'reactionId', 'mediaType', 'base64', 'fileName'], ['conversationId', 'idempotencyKey', 'kind']);

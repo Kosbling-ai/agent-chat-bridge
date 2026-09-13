@@ -145,9 +145,13 @@ export async function startService({ config, configPath, env = process.env, log,
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
     const chat = factories.chat({ client, maxMediaBytes: 28 * 1024 * 1024 });
     const media = await factories.media({ chat, workspace: cwd, inboxDir: resolve(cwd, '.agent-chat-bridge/inbox'), maxTotalBytes: config.feishu.mediaBudgetBytes, log });
-    const outbound = await factories.outbound({ chat, workspace: cwd, outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'), spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'), maxTotalBytes: config.feishu.outputBudgetBytes, log });
+    const outbound = await factories.outbound({ chat, workspace: cwd,
+      outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'),
+      bindingOutboxDir: resolve(cwd, 'data/feishu-outbox'),
+      spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'),
+      allowedGroupChatIds, maxTotalBytes: config.feishu.outputBudgetBytes, log });
     checkCancelled();
-    const replies=factories.replies({chat,outboxRoot:resolve(cwd,'data/feishu-outbox'),log});
+    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,log});
     const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
     const feedback=factories.feedback({jobs,sessions,chat,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
     forward=factories.forward({config:{steering:config.codex.steering},jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});

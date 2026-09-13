@@ -75,6 +75,8 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     ]);
     const events=await store.readEvents({id:first.id,after:'0',limit:10});
     assert.deepEqual(events.map(event=>event.title),['Progress']);
+    assert.equal(events[0].sequence, events[0].id);
+    assert.deepEqual(events[0].payload.progress, {kind:'tool',id:'safe'});
 
     const expiring = await store.upsert({ ...input, idempotencyKey: 'expiring', messageId: 'system:expiring' });
     const [expiringClaim] = await store.claim({ owner: 'worker-expiring', leaseMs: 100, limit: 1 });
@@ -173,10 +175,12 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     });
     await api(post('scheduled-a', 'namespace-a'));
     await api(post('scheduled-b', 'namespace-b'));
-    const [identities] = await pool.query("SELECT caller_id,sender_open_id FROM assistant_codex_forward_jobs WHERE caller_id IN ('live','api-caller') ORDER BY caller_id,sender_open_id");
+    const [identities] = await pool.query("SELECT caller_id,sender_open_id,source_message_id FROM assistant_codex_forward_jobs WHERE caller_id IN ('live','api-caller') ORDER BY caller_id,sender_open_id");
     const apiIdentities = identities.filter(row => row.caller_id === 'api-caller').map(row => row.sender_open_id).sort();
     assert.deepEqual(apiIdentities, [deriveExecutionScope('api-caller', 'namespace-a'), deriveExecutionScope('api-caller', 'namespace-b')].sort());
     assert.equal(identities.some(row => row.caller_id === 'live' && row.sender_open_id === 'human'), true);
+    assert(identities.filter(row => row.caller_id === 'api-caller').every(row => row.source_message_id === null));
+    assert.equal(identities.find(row => row.caller_id === 'live').source_message_id, 'message-1');
     await communication.close();
   } finally {
     if (!pool.pool?._closed) await pool.end();

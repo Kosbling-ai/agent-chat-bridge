@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS assistant_codex_forward_jobs (
   execution_namespace VARCHAR(191) NOT NULL DEFAULT '',
   delivery_mode VARCHAR(16) CHARACTER SET ascii NOT NULL DEFAULT 'bridge',
   message_id VARCHAR(191) NOT NULL,
+  source_message_id VARCHAR(191) NULL,
   chat_id VARCHAR(191) NOT NULL,
   chat_type VARCHAR(64) NOT NULL DEFAULT '',
   message_type VARCHAR(64) NOT NULL DEFAULT '',

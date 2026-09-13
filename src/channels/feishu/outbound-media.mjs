@@ -3,15 +3,19 @@ import { constants } from 'node:fs';
 import { link, lstat, mkdir, open, opendir, readFile, readdir, realpath, rename, rmdir, unlink } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { safeObserver } from '../../logger.mjs';
+import { outboxRelativeDirectory } from '../../agents/codex/prompt.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const fail = code => Object.assign(new Error(code), { code, outcome: 'failed' });
 const images = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 const fileTypes = { '.pdf': 'pdf', '.doc': 'doc', '.xls': 'xls', '.ppt': 'ppt', '.mp4': 'mp4', '.opus': 'opus' };
 const inside = (root, path) => { const rel = relative(root, path); return rel && !rel.startsWith('../') && rel !== '..' && !isAbsolute(rel); };
-const identity = scope => JSON.stringify([scope.connectionId, scope.conversationId, scope.runId]);
+const identity = scope => JSON.stringify(scope.bindingOpenId
+  ? [scope.connectionId, scope.conversationId, scope.runId, scope.bindingOpenId]
+  : [scope.connectionId, scope.conversationId, scope.runId]);
 function validScope(scope) {
   if (!scope || ['connectionId', 'conversationId', 'runId'].some(key => typeof scope[key] !== 'string' || !scope[key] || scope[key].length > 255)) throw fail('invalid_artifact_scope');
+  if (scope.bindingOpenId !== undefined && (typeof scope.bindingOpenId !== 'string' || !scope.bindingOpenId || scope.bindingOpenId.length > 255)) throw fail('invalid_artifact_scope');
 }
 function validName(name) {
   return typeof name === 'string' && name && name === basename(name) && name !== '.' && name !== '..'
@@ -23,17 +27,18 @@ const sourceVersion = (name, info, sha256) => digest(JSON.stringify([sourceStatK
 
 // This protects against unsafe paths and detects changed artifacts; it is not a
 // filesystem sandbox against another process with the same operating-system UID.
-export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat,
-  maxBytes = 28 * 1024 * 1024, maxTotalBytes = 512 * 1024 * 1024, log = () => {} }) {
-  if (![workspace, outboxDir, spoolDir].every(value => typeof value === 'string' && isAbsolute(value))
+export async function createOutboundMedia({ workspace, outboxDir, bindingOutboxDir = outboxDir, spoolDir, chat,
+  allowedGroupChatIds = new Set(), maxBytes = 28 * 1024 * 1024, maxTotalBytes = 512 * 1024 * 1024, log = () => {} }) {
+  if (![workspace, outboxDir, bindingOutboxDir, spoolDir].every(value => typeof value === 'string' && isAbsolute(value))
       || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 28 * 1024 * 1024
       || !Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < maxBytes || maxTotalBytes > 1024 * 1024 * 1024
-      || !chat?.uploadImage || !chat?.uploadFile || !chat?.sendMessage) throw fail('invalid_outbound_media_config');
+      || !(allowedGroupChatIds instanceof Set) || !chat?.uploadImage || !chat?.uploadFile || !chat?.sendMessage) throw fail('invalid_outbound_media_config');
   const base = await realpath(workspace);
   const sourceRoot = resolve(base, relative(resolve(workspace), resolve(outboxDir)));
+  const bindingRoot = resolve(base, relative(resolve(workspace), resolve(bindingOutboxDir)));
   const spoolRoot = resolve(base, relative(resolve(workspace), resolve(spoolDir)));
-  if (!inside(base, sourceRoot) || !inside(base, spoolRoot) || sourceRoot === spoolRoot
-    || inside(sourceRoot, spoolRoot) || inside(spoolRoot, sourceRoot)) throw fail('invalid_artifact_directories');
+  if (!inside(base, sourceRoot) || !inside(base, bindingRoot) || !inside(base, spoolRoot)
+    || [sourceRoot, bindingRoot].some(root => root === spoolRoot || inside(root, spoolRoot) || inside(spoolRoot, root))) throw fail('invalid_artifact_directories');
   log = safeObserver(log);
   async function directory(path, create = false) {
     if (!inside(base, path)) throw fail('unsafe_artifact_directory');
@@ -46,13 +51,15 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
     }
     if (await realpath(path) !== path) throw fail('unsafe_artifact_directory');
   }
-  await directory(sourceRoot, true); await directory(spoolRoot, true);
+  await directory(sourceRoot, true); await directory(bindingRoot, true); await directory(spoolRoot, true);
   async function syncDirectory(path) {
     const handle = await open(path, constants.O_RDONLY);
     try { await handle.sync(); } finally { await handle.close(); }
   }
   const runDir = scope => join(spoolRoot, digest(identity(scope)));
-  const chatDir = scope => join(sourceRoot, digest(JSON.stringify([scope.connectionId, scope.conversationId])));
+  const chatDir = scope => scope.bindingOpenId
+    ? resolve(base, outboxRelativeDirectory({ outboxRelativeRoot: relative(base, bindingRoot), chatId: scope.conversationId, bindingOpenId: scope.bindingOpenId }))
+    : join(sourceRoot, digest(JSON.stringify([scope.connectionId, scope.conversationId])));
   async function readBounded(path, limit) {
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
@@ -105,11 +112,12 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
         const { bytes } = await readBounded(path, 65536);
         const manifest = JSON.parse(bytes.toString('utf8'));
         const ids = JSON.parse(manifest.identity);
-        if (!Array.isArray(ids) || ids.length !== 3) throw fail('invalid_artifact_manifest');
-        const owner = {connectionId:ids[0],conversationId:ids[1],runId:ids[2]};
+        if (!Array.isArray(ids) || ![3, 4].includes(ids.length)) throw fail('invalid_artifact_manifest');
+        const owner = {connectionId:ids[0],conversationId:ids[1],runId:ids[2],...(ids[3] ? {bindingOpenId:ids[3]} : {})};
         validScope(owner); validateManifest(manifest, identity(owner));
         if (digest(identity(owner)) !== entry.name) throw fail('invalid_artifact_manifest');
-        if (owner.connectionId !== scope.connectionId || owner.conversationId !== scope.conversationId) continue;
+        if (owner.connectionId !== scope.connectionId || owner.conversationId !== scope.conversationId
+            || (owner.bindingOpenId || '') !== (scope.bindingOpenId || '')) continue;
         for (const artifact of manifest.artifacts) {
           claimedStats.add(sourceStatKey(artifact.fileName,artifact.source));
           claimed.add(sourceVersion(artifact.fileName,artifact.source,artifact.sha256));
@@ -139,7 +147,7 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
     prepare(scope) {
       return exclusive(async () => {
         validScope(scope);
-        if (scope.conversationType !== 'p2p') return { artifacts: [], failures: [], omitted: 0 };
+        if (scope.conversationType !== 'p2p' && (!scope.bindingOpenId || !allowedGroupChatIds.has(scope.conversationId))) return { artifacts: [], failures: [], omitted: 0 };
         if (!Number.isFinite(scope.sinceMs) || scope.sinceMs <= 0) throw fail('invalid_artifact_turn_time');
         const dir = runDir(scope);
         try {
@@ -217,6 +225,12 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
       // One call only: an upload has no platform UUID and unknown is held by core.
       return artifact.kind === 'image' ? chat.uploadImage({ bytes })
         : chat.uploadFile({ bytes, fileName: artifact.fileName, fileType: artifact.fileType });
+    },
+    async read({ scope, ref }) {
+      const artifact = await resolveRef(scope, ref);
+      const { bytes } = await readBounded(join(runDir(scope), artifact.artifactId), maxBytes);
+      if (bytes.length !== artifact.size || digest(bytes) !== artifact.sha256) throw fail('artifact_integrity_failed');
+      return { fileName: artifact.fileName, kind: artifact.kind, size: artifact.size, base64: bytes.toString('base64') };
     },
     async send({ scope, ref, uploadResult, uuid }) {
       let artifact;

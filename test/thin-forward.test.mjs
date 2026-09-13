@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { validateConfig } from '../src/config.mjs';
-import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
+import { createForwardRuntime, publicRun } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createApi } from '../src/core/api.mjs';
 
@@ -39,11 +39,26 @@ test('unknown native outcome becomes held and is not submitted again',async()=>{
 });
 
 test('run API freezes namespace/delivery mode and rejects ledger management after scope checks',async()=>{
-  const token='synthetic-token-at-least-24-characters';const submitted=[];const current={id:'run',conversationId:'chat',status:'completed'};const forwardRuntime={submit:async input=>{submitted.push(input);return{id:'run',duplicate:false};},getRun:async()=>current,readRunEvents:async()=>[],getResource:async()=>null};const api=createApi({config:validateConfig(base),store:{},chat:{},tokens:{caller:token},forwardRuntime});
+  const token='synthetic-token-at-least-24-characters';const submitted=[];const current={id:'run',conversationId:'chat',status:'completed'};const forwardRuntime={submit:async input=>{submitted.push(input);return{id:'run',duplicate:false};},getRun:async()=>current,readRunEvents:async()=>({items:[{sequence:'9007199254740993',payload:{type:'progress'}}],nextCursor:'9007199254740993'}),getResource:async()=>null};const api=createApi({config:validateConfig(base),store:{getRecovery:async()=>({id:'recovery',connectionId:'test',conversationId:'chat',status:'applied'})},chat:{},tokens:{caller:token},forwardRuntime});
   const request=(method,url,value)=>Object.assign(Readable.from(value?[Buffer.from(JSON.stringify(value))]:[]),{method,url,headers:{authorization:`Bearer ${token}`}});
   assert.equal((await api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'daily:1',text:'prompt',executionNamespace:'daily',deliveryMode:'caller'}))).status,202);assert.equal(submitted[0].deliveryMode,'caller');
+  assert.equal(submitted[0].message.messageId,undefined);
+  await assert.rejects(api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'long',text:'prompt',executionNamespace:'a'.repeat(129)})),{status:400,code:'invalid_execution_namespace'});
+  const events=await api(request('GET','/v1/runs/run/events?after=9007199254740992'));
+  assert.equal(events.body.events[0].sequence,'9007199254740993');assert.equal(events.body.nextCursor,'9007199254740993');
+  assert.equal((await api(request('GET','/v1/recoveries/recovery'))).body.status,'applied');
   await assert.rejects(api(request('GET','/v1/runs/run/attempt')),{status:409,code:'unsupported_execution_model'});
   await assert.rejects(api(request('POST','/v1/sessions/reset',{conversationId:'chat',generation:1})),{status:409,code:'unsupported_execution_model'});
+});
+
+test('public run keeps result contract and separates execution from delivery status', () => {
+  const pending = publicRun({ id:'run',chatId:'chat',status:'pending',deliveryMode:'bridge',executionNamespace:'daily',result:{},createdAt:1,updatedAt:1 });
+  assert.equal(pending.executionStatus,'pending');
+  assert.equal(pending.result.delivery.status,'waiting');
+  const failed = publicRun({ id:'run',chatId:'chat',status:'reply_pending',deliveryMode:'bridge',executionNamespace:'daily',last_error:'CODEX_TURN_FAILED',result:{failed:true,turnStatus:'failed',answer:'failed'},createdAt:1,updatedAt:2 });
+  assert.equal(failed.executionStatus,'failed');
+  assert.equal(failed.result.answer,'failed');
+  assert.equal(failed.errorCode,'CODEX_TURN_FAILED');
 });
 
 test('persisted start intent without a turn is held without a new executor call', async () => {

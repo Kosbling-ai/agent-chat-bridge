@@ -13,20 +13,30 @@ const stableMessageId = value => `api:${createHash('sha256').update(value).diges
 
 export function publicRun(job) {
   const execution = job.result?.execution || {};
+  const executionFailed = job.result?.failed === true || ['failed', 'interrupted'].includes(job.result?.turnStatus || execution.terminal);
   const delivery = job.deliveryMode === 'caller'
     ? { mode: 'caller', status: terminal.has(job.status) ? 'not_requested' : 'pending' }
     : { mode: 'bridge', status: job.replySentAt ? 'sent' : job.status === 'reply_pending' ? 'pending' : job.status === 'failed' ? 'failed' : 'waiting' };
   return {
     id: job.id, conversationId: job.chatId, status: job.status,
-    executionStatus: job.status === 'held' ? 'held' : terminal.has(job.status)
+    executionStatus: job.status === 'pending' ? 'pending' : job.status === 'held' ? 'held' : terminal.has(job.status)
       ? (job.status === 'failed' ? 'failed' : 'completed')
-      : job.status === 'reply_pending' ? 'completed' : 'running',
+      : job.status === 'reply_pending' ? (executionFailed ? 'failed' : 'completed') : 'running',
     deliveryStatus: delivery.status, deliveryMode: delivery.mode,
     executionNamespace: job.executionNamespace,
     answer: job.result?.answer ?? null, rawAnswer: job.result?.rawAnswer ?? null,
     attachments: publicAttachments(job.result?.attachments),
     native: { threadId: execution.threadId || job.result?.threadId || null, turnId: execution.turnId || job.result?.turnId || null, status: execution.terminal || execution.status || null },
     held: job.status === 'held' ? { reason: job.last_error || execution.heldReason || 'native_outcome_unknown' } : null,
+    result: {
+      answer: job.result?.answer ?? null, rawAnswer: job.result?.rawAnswer ?? null,
+      attachments: publicAttachments(job.result?.attachments),
+      deferred: job.result?.deferred === true, failed: job.result?.failed === true,
+      turnStatus: job.result?.turnStatus || execution.terminal || null,
+      native: { threadId: execution.threadId || job.result?.threadId || null, turnId: execution.turnId || job.result?.turnId || null, status: execution.terminal || execution.status || null },
+      held: job.status === 'held' ? { reason: job.last_error || execution.heldReason || 'native_outcome_unknown' } : null,
+      delivery,
+    },
     errorCode: job.last_error || null, createdAt: job.createdAt, updatedAt: job.updatedAt,
   };
 }
@@ -58,7 +68,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     const bindingOpenId = identity(input);
     const messageId = input.message?.messageId || stableMessageId(`${input.callerId}\0${input.idempotencyKey}`);
     return jobs.upsert({
-      callerId: input.callerId, idempotencyKey: input.idempotencyKey, conversationId, messageId, bindingOpenId,
+      callerId: input.callerId, idempotencyKey: input.idempotencyKey, conversationId, messageId,
+      sourceMessageId: input.message?.messageId || null, bindingOpenId,
       chatType: input.message?.conversationType || input.chatType || 'group', messageType: input.message?.type || 'text',
       senderOpenId: input.actor?.openId || input.senderOpenId || bindingOpenId, senderName: input.actor?.name || input.senderName || '',
       executionNamespace: input.executionNamespace || '', deliveryMode: input.deliveryMode || input.delivery?.mode || 'bridge',
@@ -148,7 +159,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         senderOpenId: job.senderOpenId, senderName: job.senderName, prompt,
         groupChatContext: job.groupChatContext, busyPolicy: job.executionNamespace || config.steering === false ? 'reject' : 'steer',
       };
-      const result = await executor.execute(input, {
+      let result = await executor.execute(input, {
         signal: lease.signal,
         ...(known ? { resume: { threadId: execution.threadId, turnId: execution.turnId, startedAt: execution.startedAt } } : {}),
         onStartIntent: async value => {
@@ -165,13 +176,16 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       });
       lease.assertOwned();
       execution = { ...execution, threadId: result.threadId || execution.threadId, turnId: result.turnId || execution.turnId, terminal: result.deferred ? 'deferred' : 'completed', unconfirmed: false, finishedAt: now() };
+      result = await replies?.prepare?.(job, { ...result, execution }) || { ...result, execution };
+      lease.assertOwned();
       if (inbound && !result.deferred) await inbound.markForwarded({ entries: job.contextEntries, threadId: result.threadId, turnId: result.turnId });
       if (result.deferred) {
-        await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: owner, status: 'deferred', result: { ...result, execution } });
+        if (job.deliveryMode === 'bridge') await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result });
+        else await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: owner, status: 'deferred', result });
         return;
       }
       await feedback?.prepare?.(job, result, state);
-      await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result: { ...result, execution } });
+      await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result });
     } catch (error) {
       lease.assertOwned();
       if (['forward_lease_lost', 'forward_runtime_stopping'].includes(error?.code)) throw error;
@@ -190,7 +204,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         return;
       }
       execution = { ...execution, terminal: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', finishedAt: now() };
-      const failed = { failed: true, turnStatus: execution.terminal, answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : '执行未完成，请稍后重试。', rawAnswer: '', attachments: [], execution };
+      let failed = { failed: true, turnStatus: execution.terminal, answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : '执行未完成，请稍后重试。', rawAnswer: '', attachments: [], execution };
+      failed = await replies?.prepare?.(job, failed) || failed;
       await feedback?.prepare?.(job, failed, state);
       await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result: failed, errorCode: error.code || 'forward_execution_failed' });
       log('error', 'forward_execution', 'failed', { code: error.code || 'forward_execution_failed' });
@@ -205,10 +220,11 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         if (job.deliveryMode === 'bridge') {
           const cardDelivered = await feedback?.finish(job, result, null, null);
           lease.assertOwned();
-          if (!cardDelivered) await replies.deliver(job, result, { signal: lease.signal, assertLease: lease.assertOwned });
+          await replies.deliver(job, result, { skipText: cardDelivered || result.deferred, signal: lease.signal, assertLease: lease.assertOwned });
         }
         lease.assertOwned();
-        await jobs.markFinished({ id: job.id, leaseOwner: owner, status: result.failed ? 'failed' : 'completed', result, replySent: job.deliveryMode === 'bridge' });
+        const status = result.deferred ? 'deferred' : result.failed ? 'failed' : 'completed';
+        await jobs.markFinished({ id: job.id, leaseOwner: owner, status, result, replySent: job.deliveryMode === 'bridge', errorCode: job.last_error || result.errorCode });
         if (inbound && job.deliveryMode === 'bridge') await inbound.recordReply({ messageId: `bridge-reply:${job.id}`, chatId: job.chatId, chatType: job.chatType, text: result.answer || '', createdAt: now() });
       });
     } catch (error) {
@@ -255,7 +271,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   return Object.freeze({
     submit,
     getRun: async ({ id }) => { const job = await jobs.getRun({ id }); return job ? publicRun(job) : null; },
-    readRunEvents: async input => { const items = await jobs.readEvents(input); return { items, nextCursor: items.at(-1)?.id ?? String(input.after ?? '0') }; },
+    readRunEvents: async input => { const items = await jobs.readEvents(input); return { items, nextCursor: items.at(-1)?.sequence ?? String(input.after ?? '0') }; },
     getResource: async ({ id, index }) => { const job = await jobs.getRun({ id }); return job ? replies.readResource(job, index) : null; },
     start() {
       if (running) throw new Error('forward_runtime_already_started');

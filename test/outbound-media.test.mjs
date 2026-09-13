@@ -36,6 +36,28 @@ test('private flat scan keeps newest nine in time order and excludes old files a
   assert.equal(f.calls.length, 0);
 });
 
+test('trusted binding directory supports an allowed group and remains scoped by binding', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'bridge-binding-outbound-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const chat = { async uploadFile() {}, async uploadImage() {}, async sendMessage() {} };
+  const config = {
+    workspace: root,
+    outboxDir: join(root, 'outbox'),
+    bindingOutboxDir: join(root, 'data/feishu-outbox'),
+    spoolDir: join(root, 'spool'),
+    allowedGroupChatIds: new Set(['group-chat']),
+    chat,
+  };
+  const media = await createOutboundMedia(config);
+  const bindingScope = { connectionId: 'fixture', conversationId: 'group-chat', runId: 'binding-run', conversationType: 'group', bindingOpenId: 'group:binding', sinceMs };
+  const directory = await media.directory(bindingScope);
+  await writeFile(join(directory, 'report.pdf'), 'group report');
+  await utimes(join(directory, 'report.pdf'), sinceMs / 1000, sinceMs / 1000);
+  assert.deepEqual((await media.prepare(bindingScope)).artifacts.map(item => item.fileName), ['report.pdf']);
+  assert.equal((await media.prepare({ ...bindingScope, runId: 'denied', conversationId: 'other-chat' })).artifacts.length, 0);
+  assert.equal((await media.prepare({ ...bindingScope, runId: 'other-binding', bindingOpenId: 'system:other' })).artifacts.length, 0);
+});
+
 test('manifest freezes bytes before effects and restart does not rescan a new file or changed source', async t => {
   const f = await fixture(t); const path = await f.put('report.pdf', 'original');
   const prepared = await f.media.prepare(scope);

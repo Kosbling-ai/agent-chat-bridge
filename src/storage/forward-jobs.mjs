@@ -24,6 +24,7 @@ function row(value) {
     executionNamespace: value.execution_namespace || null,
     deliveryMode: value.delivery_mode,
     messageId: value.message_id,
+    sourceMessageId: value.source_message_id,
     chatId: value.chat_id,
     chatType: value.chat_type,
     messageType: value.message_type,
@@ -71,8 +72,8 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const createdAt = now();
         const initialResult = input.bindingOpenId ? { execution: { bindingOpenId: input.bindingOpenId } } : {};
         await connection.execute(`INSERT IGNORE INTO assistant_codex_forward_jobs
-          (public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,context_entries_json,status,next_attempt_at,result_json,last_error,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,safeJson(initialResult),'',createdAt,createdAt]);
+          (public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,source_message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,context_entries_json,status,next_attempt_at,result_json,last_error,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),input.sourceMessageId || null,required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,safeJson(initialResult),'',createdAt,createdAt]);
         const [[found]] = await connection.execute('SELECT id AS internal_id, assistant_codex_forward_jobs.* FROM assistant_codex_forward_jobs WHERE request_key_hash=? LIMIT 1', [keyHash]);
         if (!found || found.request_hash !== requestHash) throw new StoreError('job_conflict');
         return { ...row(found), duplicate: found.public_run_id !== publicRunId };
@@ -175,9 +176,9 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET status=?,
             result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
-              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
-            last_error=?,finished_at=?,reply_sent_at=?,lease_owner='',lease_expires_at=NULL,updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='reply_pending'`, [input.status, safeJson(input.result || {}), input.errorCode || '', at, input.replySent === false ? null : at, at, id, owner, at]);
+              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop','$.delivery')),
+            last_error=CASE WHEN ?='' THEN last_error ELSE ? END,finished_at=?,reply_sent_at=?,lease_owner='',lease_expires_at=NULL,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='reply_pending'`, [input.status, safeJson(input.result || {}), input.errorCode || '', input.errorCode || '', at, input.replySent === false ? null : at, at, id, owner, at]);
         await assertLease(connection, result);
         return { status: input.status };
       });
@@ -191,8 +192,8 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
           SET status=?,
             result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
               JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
-            last_error=?,finished_at=?,reply_sent_at=NULL,lease_owner='',lease_expires_at=NULL,updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='running'`, [input.status, safeJson(input.result || {}), input.errorCode || '', at, at, id, owner, at]);
+            last_error=CASE WHEN ?='' THEN last_error ELSE ? END,finished_at=?,reply_sent_at=NULL,lease_owner='',lease_expires_at=NULL,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='running'`, [input.status, safeJson(input.result || {}), input.errorCode || '', input.errorCode || '', at, at, id, owner, at]);
         await assertLease(connection, result);
         return { status: input.status };
       });
@@ -221,16 +222,20 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const after = String(input.after ?? '0');
         if (!/^\d+$/.test(after)) throw new StoreError('invalid_store_input');
         const take = Math.max(1, Math.min(100, Number(input.limit || 50)));
-        const [rows] = await connection.execute(`SELECT id,event_type,role,title,text,detail_json,created_at
+        const [rows] = await connection.execute(`SELECT id,event_key,event_type,role,title,text,detail_json,created_at
           FROM assistant_codex_events
           WHERE feishu_open_id=? AND chat_id=? AND codex_session_id=? AND message_id=? AND id>?
             AND event_type IN ('public_progress','agent_message','error','session_rollover')
           ORDER BY id LIMIT ${take}`, [execution.bindingOpenId, found.chat_id, execution.threadId, found.message_id, after]);
-        return rows.map(item => ({
-          id: String(item.id), type: item.event_type, role: item.role, title: item.title, text: item.text,
-          ...(item.event_type === 'public_progress' ? { progress: parse(item.detail_json) } : {}),
-          createdAt: Number(item.created_at),
-        }));
+        return rows.map(item => {
+          const progress = item.event_type === 'public_progress' ? parse(item.detail_json) : undefined;
+          const payload = { role: item.role, title: item.title, text: item.text, ...(progress ? { progress } : {}) };
+          return {
+            id: String(item.id), sequence: String(item.id), runId: input.id, eventKey: item.event_key,
+            type: item.event_type, role: item.role, title: item.title, text: item.text,
+            ...(progress ? { progress } : {}), payload, createdAt: Number(item.created_at),
+          };
+        });
       });
     },
   });
