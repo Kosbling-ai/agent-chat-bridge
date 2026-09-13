@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { safeObserver } from '../logger.mjs';
+import { extractFinalAnswer, buildConversationPrompt } from './format.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -25,7 +26,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     const triggered = allowed && event.type === 'message.received' && (event.conversationType === 'p2p' || group?.trigger === 'all' || mentioned);
     const text = event.message?.kind === 'text' ? event.message.parsedContent?.text : undefined;
     // Unsupported attachment-only input is retained in inbox/hooks, never misread as text.
-    const agentJob = triggered ? { payload: { text: typeof text === 'string' ? text : '', unsupported: !(typeof text === 'string' && text.trim()), messageId: event.messageId, source: 'chat' } } : undefined;
+    const agentJob = triggered ? { payload: { text: typeof text === 'string' ? text : '', unsupported: !(typeof text === 'string' && text.trim()), messageId: event.messageId, source: 'chat', event } } : undefined;
     const hooks = config.hooks.filter(hook => hook.conversationIds.includes(event.conversationId) && !event.isSelf && !event.isApp).map(hook => ({ hookId: hook.id, payload: event }));
     const result = await store.acceptInbound({ ...scope(event.conversationId), eventKey: event.eventKey, eventType: event.type, messageId: event.messageId, ...(event.type === 'message.recalled' ? { recalledMessageId: event.messageId } : {}), revision: event.revision, occurredAt: event.occurredAt, payload: event, semanticPayload: feishuEventIdentity(event), policyVersion: config.routing.version, passiveContext: Boolean(allowed && !triggered && group?.passiveContext && event.type === 'message.received'), agentJob, hooks });
     return result;
@@ -39,6 +40,8 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
   }
   async function awaitTurn(job, attempt, turnId) {
     let cursor = 0, renewedAt = Date.now();
+    let lastAgentMessage = '';
+    const itemText = new Map();
     while (!stopping) {
       const rows = await store.readNativeEvents({ connectionId, nativeThreadId: attempt.nativeThreadId, afterSequence: cursor, limit: 100 });
       for (const row of rows) {
@@ -46,12 +49,22 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
         const event = parse(row.payload);
         const ids = nativeIds(event);
         if (ids.nativeTurnId !== turnId) continue;
+        if (['agentMessage/delta', 'item/agentMessage/delta'].includes(event.method)) {
+          const itemId = event.params.itemId ?? 'agent-delta';
+          const next = ((itemText.get(itemId) ?? '') + (event.params.delta ?? '')).slice(-12000);
+          itemText.set(itemId, next);
+          if (itemText.size > 128) itemText.delete(itemText.keys().next().value);
+          lastAgentMessage = next;
+        }
+        if (event.method === 'item/completed' && event.params.item?.type === 'agentMessage') lastAgentMessage = event.params.item.text ?? lastAgentMessage;
         await store.appendRunEvent({ runId: job.id, eventKey: `native:${row.sequence}`, type: event.method, payload: event.params });
         if (event.method === 'turn/completed') {
           // Some protocol versions omit item bodies from terminal notifications.
           if (Array.isArray(event.params.turn?.items) && event.params.turn.items.length) return event.params.turn;
           const result = await codex.readThread({ threadId: attempt.nativeThreadId, includeTurns: true });
-          return result.thread?.turns?.find(turn => turn.id === turnId) ?? null;
+          const recovered = result.thread?.turns?.find(turn => turn.id === turnId);
+          if (recovered && !extractFinalAnswer(recovered) && lastAgentMessage) return { ...recovered, items: [{ type: 'agentMessage', text: lastAgentMessage }] };
+          return recovered ?? null;
         }
       }
       if (Date.now() - renewedAt > 15000) {
@@ -68,7 +81,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
       await store.retryJob({ id: job.id, leaseToken: job.leaseToken, terminal: true, errorCode: 'agent_turn_failed' });
       return;
     }
-    const text = (turn.items ?? []).filter(item => item.type === 'agentMessage').map(item => item.text ?? '').filter(Boolean).join('\n');
+    const text = extractFinalAnswer(turn);
     const payload = parse(job.payload);
     // Independent text effects are small enough for the platform JSON limit.
     const pieces = [];
@@ -98,15 +111,16 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
         if (!turn) { await hold(job, 'agent_turn_unresolved'); return; }
       } else {
         rpcPhase = 'thread_admission';
+        const newThread = !attempt.nativeThreadId;
         const thread = attempt.nativeThreadId
           ? await codex.resumeThread({ threadId: attempt.nativeThreadId }) : await codex.startThread();
         if (!thread.thread?.id) throw Object.assign(new Error('invalid_thread_result'), { outcome: 'unknown' });
         attempt.nativeThreadId = thread.thread.id;
         await store.bindAgentAttempt({ id: job.id, leaseToken: job.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: attempt.nativeThreadId });
         const context = await store.readPassiveContext({ ...scope(job.conversationId), limit: 100 });
-        const lines = context.map(item => parse(item.payload).message?.parsedContent?.text).filter(value => typeof value === 'string');
+        const contextEntries = context.map(item => { const event = parse(item.payload); return { event, text: event.message?.parsedContent?.text }; }).filter(item => typeof item.text === 'string');
         const payload = parse(job.payload);
-        const inputText = [...lines, payload.text].join('\n');
+        const inputText = buildConversationPrompt({ event: payload.event, text: payload.text, context: contextEntries, newThread, group: config.routing.groups.find(group => group.conversationId === job.conversationId) });
         rpcPhase = 'turn_admission';
         const result = await codex.startTurn({ threadId: attempt.nativeThreadId, input: [{ type: 'text', text: inputText }], clientUserMessageId: job.id });
         if (!result.turn?.id) throw Object.assign(new Error('invalid_turn_result'), { outcome: 'unknown' });

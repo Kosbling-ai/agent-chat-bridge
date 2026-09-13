@@ -24,15 +24,15 @@ Private messages require actor.openId in privateUserIds. Group routing requires 
 
 Inbox and independent agent/hook jobs commit before the Feishu handler resolves. Agent work persists an attempt before native RPC; thread/turn binding uses lease/generation fencing. Native notifications are buffered durably before admission bookkeeping, then associated by thread/turn. Random receive keys preserve repeated deltas as distinct receipts; they are not semantic deduplication keys. Terminal effects use stable per-run outbox keys and fenced atomic completion. A known admitted turn can recover by thread/read; graceful shutdown keeps that attempt pending for recovery rather than classifying its admission as unknown. A missing native admission ID becomes status=unknown, locks the session and is never replayed automatically. GET run exposes that state. There is currently no operator recovery mutation for an unknown session; production migration must supply a reviewed recovery workflow before relying on it.
 
-Same-conversation work is **durably deferred** and later resumes the shared native thread. This stage does not steer an active turn. Reset requires admin plus conversation authorization and exact generation, and rejects active/unknown runs. Passive context reads are bounded to 100 rows per turn. Active task cancellation on message recall and history catch-up have not been wired; recalled pending Agent jobs are not retroactively cancelled.
+Same-conversation work is **durably deferred** and later resumes the shared native thread. This stage does not steer an active turn. Reset requires admin plus conversation authorization and exact generation, and rejects active/unknown runs. Passive context reads are bounded to 100 rows per turn. Recalls do not retroactively cancel Agent jobs, matching the old runtime. History catch-up is being restored only for missing first receipts, not as a public edit stream.
 
 RPC failures are classified by phase: an explicit refusal of this run's thread/turn admission may fail the run and release its session. A rejected native read, including the final item read after a terminal notification, cannot prove that an admitted turn failed. The known attempt remains pending for reconciliation with its session binding intact; successful later reads finish delivery without a new turn/start.
 
-Hook subscriptions are static `{id,url,tokenEnv,conversationIds}`. Each delivery is `{deliveryId,event}`, with `Idempotency-Key: deliveryId`. The consumer must durably accept/deduplicate before returning **204**. This acknowledges durable receipt, not completion of business processing. Redirects are forbidden, requests time out after 3 seconds, bodies are cancelled immediately, and delivery retries stop after 8 attempts. Hook failure never recreates Agent output. Business document/Base APIs remain outside this service.
+Hook subscriptions are static `{id,url,tokenEnv,conversationIds}`. Each delivery is `{deliveryId,event}`, with `Idempotency-Key: deliveryId`. The consumer must durably accept/deduplicate before returning **204**. This acknowledges durable receipt, not completion of business processing. Redirects are forbidden, requests time out after 3 seconds, bodies are cancelled immediately, and delivery retries stop after 8 attempts. Hook failure never recreates Agent output. Business message/history/member/resource queries and document/Base APIs remain outside this service. Existing business SDK/REST readers stay in the business process; no forced lark-cli rewrite.
 
 ## Authenticated HTTP APIs
 
-All `/v1/` operations require `Authorization: Bearer <token>`. Run/delivery reads check stored connection and conversation ownership. Message/resource reads verify platform message membership before returning content. No caller-provided actor or connection/workspace overrides are accepted.
+All `/v1/` operations require `Authorization: Bearer <token>`. Run/delivery reads check stored connection and conversation ownership. Reply/reaction writes verify platform message membership internally before registration. No caller-provided actor or connection/workspace overrides are accepted.
 
 | Endpoint | Contract |
 | --- | --- |
@@ -42,11 +42,6 @@ All `/v1/` operations require `Authorization: Bearer <token>`. Run/delivery read
 | POST /v1/deliveries | common `{conversationId,idempotencyKey,kind,...}` → 202; see below |
 | GET /v1/deliveries/:id | durable delivery status/result/errorCode |
 | POST /v1/sessions/reset | `{conversationId,generation}`; admin required; busy/conflict=409 |
-| GET /v1/conversations/:id/messages | bounded platform page, `limit` and `pageToken` |
-| GET /v1/conversations/:id/members | same pagination, no global contacts |
-| GET /v1/messages/:id | verify message chat membership before returning |
-| GET /v1/messages/:id/reactions | bounded platform reaction page |
-| GET /v1/messages/:id/resources | `fileKey`, `type=image\|file`; authorized streaming attachment |
 
 Delivery kinds: create/reply accept `messageKind=text|post|interactive|image|file` and platform content object; text also accepts a string. Reply requires messageId belonging to the same authorized conversation. Reaction accepts messageId plus emojiType to add or reactionId to remove. Upload accepts mediaType=image|file and base64; file requires fileName. Upload is capped at 2 MiB and persists bytes in the independent Store; use a subsequent authorized image/file delivery with the returned key. These are separate effects, not one fake atomic send. Content is capped at 20 KB; unsupported operations return 422. Inline source paths are never accepted.
 
@@ -59,14 +54,15 @@ Create/reply retries preserve platform UUID within the Store's conservative 55-m
 | Inbound text → Codex → text reply | implemented; real Store + synthetic providers tested |
 | Inbound post/image/file → Agent | explicit durable unsupported result and text notice; media ingestion still required before full migration |
 | Outbound text/post/interactive/image/file | durable create/reply API wired to adapter; platform acceptance not live tested |
-| Reaction add/remove/list | API + adapter wired; unknown writes held |
+| Reaction add/remove | Write API + adapter wired; unknown writes held |
 | Upload image/file | bounded durable API wired; unknown upload held |
-| Download resources/history/member reads | authorized adapter API wired |
-| Edit events, card actions, revoke pending execution, reconnect catch-up | not implemented in this stage |
+| Internal resource/history reads | Agent media and catch-up only; business reads remain outside the public bridge API |
+| Business edit/reconcile and recall cancellation | Business edit/reconcile remains outside bridge; old recall did not cancel execution |
+| Reconnect catch-up | pending internal first-receipt gap recovery |
 | Active steer | deferred-only now; migration must assess behavior difference |
 | Automatic unknown-admission recovery without native ID | explicitly unavailable; operator workflow required |
 
-This matrix is a staging boundary, not a declaration that existing required media/chat behavior may be removed. The missing existing capabilities remain follow-up work before production replacement.
+This matrix is a staging boundary, not a declaration that existing required media/chat behavior may be removed. The missing existing capabilities remain follow-up work before production replacement. File input was unsupported in the old bridge; cancelling Codex on recall was not old behavior and is not an implied migration requirement.
 
 ## Observability and tests
 

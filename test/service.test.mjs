@@ -33,6 +33,14 @@ test('API tokens must be distinct and sufficiently long', () => {
   const validated = validateConfig(config);
   assert.throws(() => createApi({ config: validated, store: {}, chat: {}, tokens: { tester: 'short' } }), { code: 'invalid_auth_environment' });
 });
+test('public chat read proxies are absent while send-scope checks remain internal', async () => {
+  const token = 'synthetic-long-token-for-local-test';
+  const chat = new Proxy({}, { get() { throw new Error('public read unexpectedly touched platform'); } });
+  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: {}, chat });
+  for (const url of ['/v1/conversations/chat/messages', '/v1/conversations/chat/members', '/v1/messages/m', '/v1/messages/m/reactions', '/v1/messages/m/resources']) {
+    await assert.rejects(api({ method: 'GET', url, headers: { authorization: `Bearer ${token}` } }), { status: 404 });
+  }
+});
 test('group defaults allow all human members; explicit member filter does not limit hooks', async () => {
   const observed = [];
   const groupConfig = validateConfig({ ...config, routing: { ...config.routing, groups: [{ conversationId: 'chat', trigger: 'all', passiveContext: true }] }, hooks: [{ id: 'h', url: 'http://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: ['chat'] }] });

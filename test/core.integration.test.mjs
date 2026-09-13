@@ -35,6 +35,10 @@ test('real Store core: immediate completion, independent hook, API authorization
       const turn = { id: `turn-${turns}`, status: mode === 'live' ? 'inProgress' : 'completed', items: [{ type: 'agentMessage', text: mode === 'multipart' ? 'A'.repeat(12000) + 'B'.repeat(12000) : 'Synthetic answer' }] };
       completed.set(threadId, turn);
       if (mode === 'live') return { turn: { id: turn.id, status: 'inProgress' } };
+      if (mode === 'stream-fallback') {
+        turn.items = [];
+        await runtime.notification({ method: 'item/agentMessage/delta', params: { threadId, turnId: turn.id, itemId: 'stream', delta: 'Recovered streamed answer' } });
+      }
       // The Store commits this notification before RPC admission is returned.
       if (mode === 'thin-terminal') rejectReads.add(threadId);
       await runtime.notification({ method: 'turn/completed', params: { threadId, turn: mode === 'thin-terminal' ? { id: turn.id, status: 'completed', items: [] } : turn } });
@@ -65,10 +69,10 @@ test('real Store core: immediate completion, independent hook, API authorization
     assert.equal((await fetch(`${url}/v1/runs/${accepted.agentJobId}`)).status, 401);
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
     assert.equal((await fetch(`${url}/v1/runs/${accepted.agentJobId}`, { headers })).status, 200);
-    assert.equal((await fetch(`${url}/v1/messages/foreign`, { headers })).status, 403);
+    assert.equal((await fetch(`${url}/v1/messages/foreign`, { headers })).status, 404);
     assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'forbidden', idempotencyKey: 'x', text: 'synthetic' }) })).status, 403);
     assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'chat', idempotencyKey: 'x', text: 'synthetic', cwd: '/tmp' }) })).status, 400);
-    assert.equal((await fetch(`${url}/v1/messages/%ZZ`, { headers })).status, 400);
+    assert.equal((await fetch(`${url}/v1/messages/%ZZ`, { headers })).status, 404);
     assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'chat', idempotencyKey: 'x'.repeat(255), text: 'synthetic' }) })).status, 400);
     assert.equal((await fetch(`${url}/v1/deliveries`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'chat', idempotencyKey: 'reaction', kind: 'reaction', messageId: 'owned', emojiType: 'x'.repeat(513) }) })).status, 400);
     mode = 'unknown';
@@ -140,5 +144,9 @@ test('real Store core: immediate completion, independent hook, API authorization
     const denied = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'denied', idempotencyKey: 'denied', payload: { text: 'synthetic' } });
     await eventually(() => store.getJob({ id: denied.id }), row => row.status === 'failed');
     assert.equal((await store.getSession({ connectionId: 'fixture', conversationId: 'denied', agentId: 'codex' })).activeRunId, null);
+    mode = 'stream-fallback';
+    const streamed = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'streamed', idempotencyKey: 'streamed', payload: { text: 'synthetic' } });
+    await eventually(() => store.getJob({ id: streamed.id }), row => row.status === 'succeeded');
+    assert.equal(sent.at(-1).content.text, 'Recovered streamed answer');
   } finally { releaseChunk?.(); await server?.close(); await runtime?.stop(); await store.close(); }
 });

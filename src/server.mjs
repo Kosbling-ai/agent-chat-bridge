@@ -1,6 +1,5 @@
 import http from 'node:http';
 import { ApiError } from './core/api.mjs';
-import { pipeline } from 'node:stream/promises';
 import { safeObserver } from './logger.mjs';
 export async function startServer({ config, log, api, readiness }) {
   log = safeObserver(log);
@@ -17,10 +16,7 @@ export async function startServer({ config, log, api, readiness }) {
     try {
     if (request.url.startsWith('/v1/') && api && !stopping) {
       const result = await api(request);
-      if (result.stream) {
-        response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
-        await pipeline(result.stream, response);
-      } else reply(response, result.status, result.body);
+      reply(response, result.status, result.body);
     } else if (request.method !== 'GET') {
       reply(response, 405, { error: 'method_not_allowed' });
     } else if (request.url === '/health/live') {

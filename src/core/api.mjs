@@ -13,9 +13,6 @@ function identifier(value, max = 512) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw new ApiError('invalid_identifier');
   return value;
 }
-function decodePath(value) {
-  try { return identifier(decodeURIComponent(value)); } catch { throw new ApiError('invalid_path'); }
-}
 export function createApi({ config, store, chat, tokens }) {
   const connectionId = config.feishu.connectionId;
   const clients = config.auth.clients.map(client => {
@@ -126,31 +123,6 @@ export function createApi({ config, store, chat, tokens }) {
       if (!client.admin) throw new ApiError('forbidden', 403);
       if (!Number.isInteger(input.generation) || input.generation < 1) throw new ApiError('invalid_generation');
       return { status: 200, body: await store.resetSession({ connectionId, conversationId: input.conversationId, agentId: 'codex', expectedGeneration: input.generation }) };
-    }
-    const list = /^\/v1\/conversations\/([^/]+)\/(messages|members)$/.exec(path);
-    if (request.method === 'GET' && list) {
-      const conversationId = decodePath(list[1]); authorize(client, conversationId);
-      const { limit } = pagination(url);
-      const pageToken = url.searchParams.get('pageToken') ?? undefined;
-      if (pageToken) identifier(pageToken);
-      return { status: 200, body: await chat[list[2] === 'messages' ? 'listMessages' : 'listMembers']({ conversationId, pageSize: limit, pageToken }) };
-    }
-    const message = /^\/v1\/messages\/([^/]+)$/.exec(path);
-    if (request.method === 'GET' && message) return { status: 200, body: (await ownedMessage(client, decodePath(message[1]))).result };
-    const resource = /^\/v1\/messages\/([^/]+)\/(resources|reactions)$/.exec(path);
-    if (request.method === 'GET' && resource) {
-      const messageId = decodePath(resource[1]);
-      await ownedMessage(client, messageId);
-      if (resource[2] === 'reactions') {
-        const pageToken = url.searchParams.get('pageToken') ?? undefined;
-        if (pageToken) identifier(pageToken);
-        return { status: 200, body: await chat.listReactions({ messageId, pageSize: pagination(url).limit, pageToken }) };
-      }
-      const fileKey = url.searchParams.get('fileKey');
-      const type = url.searchParams.get('type');
-      if (!fileKey || fileKey.length > 512 || !['image', 'file'].includes(type)) throw new ApiError('invalid_resource');
-      const result = await chat.downloadResource({ messageId, fileKey, type });
-      return { status: 200, stream: result.stream };
     }
     throw new ApiError('not_found', 404);
   };
