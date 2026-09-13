@@ -63,7 +63,7 @@ function isGroupMessage(message) {
   return message.chat_type && message.chat_type !== 'p2p';
 }
 
-export { extractFinalAnswer, buildCodexForwardPrompt };
+export { extractFinalAnswer, codexMessageText, buildCodexForwardPrompt };
 
 export function buildConversationPrompt({ event, text, context = [], newThread = false, group = {}, outboxDir }) {
   if (!event) return text; // Trusted background run prompt is already complete.

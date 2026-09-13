@@ -39,7 +39,10 @@ test('real Store core: immediate completion, independent hook, API authorization
       if (mode === 'live') return { turn: { id: turn.id, status: 'inProgress' } };
       if (mode === 'stream-fallback') {
         turn.items = [{ type: 'commandExecution', id: 'tool-only', status: 'completed' }];
-        await runtime.notification({ method: 'item/agentMessage/delta', params: { threadId, turnId: turn.id, itemId: 'stream', delta: 'Recovered streamed answer' } });
+        await runtime.notification({ method: 'item/agentMessage/delta', params: { threadId, turnId: turn.id, itemId: 'stream', delta: 'Partial streamed draft' } });
+        await runtime.notification({ method: 'item/completed', params: { threadId, turnId: turn.id, item: { type: 'message', role: 'assistant', phase: 'final_answer', content: [{ output_text: 'Recovered streamed answer' }] } } });
+        await runtime.notification({ method: 'item/completed', params: { threadId, turnId: turn.id, item: { type: 'agentMessage', phase: 'commentary', text: 'must not replace final' } } });
+        await runtime.notification({ method: 'item/completed', params: { threadId, turnId: turn.id, item: { type: 'message', role: 'user', content: ['USER_SECRET'] } } });
       }
       // The Store commits this notification before RPC admission is returned.
       if (mode === 'thin-terminal') rejectReads.add(threadId);
@@ -101,7 +104,9 @@ test('real Store core: immediate completion, independent hook, API authorization
     const [claim] = await store.claimJobs({ kind: 'agent', owner: 'crashed-worker', limit: 1, leaseMs: 100 });
     const attempt = await store.beginAgentAttempt({ id: claim.id, leaseToken: claim.leaseToken, agentId: 'codex' });
     completed.set('recovery-thread', { id: 'recovery-turn', status: 'completed', items: [{ type: 'commandExecution', id: 'tool-only', status: 'completed' }] });
-    await store.bufferNativeEvent({ connectionId: 'fixture', eventKey: 'recovery-delta', nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn', payload: { method: 'item/agentMessage/delta', params: { threadId: 'recovery-thread', turnId: 'recovery-turn', itemId: 'recovery-message', delta: 'Recovered answer' } } });
+    await store.bufferNativeEvent({ connectionId: 'fixture', eventKey: 'recovery-delta', nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn', payload: { method: 'item/agentMessage/delta', params: { threadId: 'recovery-thread', turnId: 'recovery-turn', itemId: 'recovery-message', delta: 'Partial recovery draft' } } });
+    await store.bufferNativeEvent({ connectionId: 'fixture', eventKey: 'recovery-message-final', nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn', payload: { method: 'item/completed', params: { threadId: 'recovery-thread', turnId: 'recovery-turn', item: { type: 'message', role: 'assistant', phase: 'final_answer', content: [{ output_text: 'Recovered answer' }] } } } });
+    await store.bufferNativeEvent({ connectionId: 'fixture', eventKey: 'recovery-message-user', nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn', payload: { method: 'item/completed', params: { threadId: 'recovery-thread', turnId: 'recovery-turn', item: { type: 'message', role: 'user', content: ['USER_SECRET'] } } } });
     await store.bindAgentAttempt({ id: claim.id, leaseToken: claim.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn' });
     await new Promise(resolve => setTimeout(resolve, 150));
     runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => new Response(null, { status: 204 }) });

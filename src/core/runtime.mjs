@@ -3,6 +3,7 @@ import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { safeObserver } from '../logger.mjs';
 import { extractFinalAnswer, buildConversationPrompt } from './format.mjs';
 import { extractMessageText } from '../channels/feishu/media.mjs';
+import { createAnswerProjection } from './answer-projection.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -77,26 +78,19 @@ export function createRuntime({ config, store, codex, chat, media, hookTokens = 
     return null;
   }
   async function durableFinalAnswer(job, attempt, turn) {
-    const final = extractFinalAnswer(turn);
+    const final = extractFinalAnswer({ items: (turn.items ?? []).filter(item => item?.phase === 'final_answer') });
     if (final) return final;
-    let cursor = 0, lastAgentMessage = '', renewedAt = Date.now();
-    const itemText = new Map();
+    let cursor = 0, renewedAt = Date.now();
+    const projection = createAnswerProjection();
     for (let page = 0; page < 1000; page++) {
       const rows = await store.readNativeEvents({ connectionId, nativeThreadId: attempt.nativeThreadId, nativeTurnId: turn.id, afterSequence: cursor, limit: 100 });
       for (const row of rows) {
         cursor = row.sequence;
         const event = parse(row.payload);
         if (nativeIds(event).nativeTurnId !== turn.id) continue;
-        if (['agentMessage/delta', 'item/agentMessage/delta'].includes(event.method)) {
-          const itemId = event.params.itemId ?? 'agent-delta';
-          const next = ((itemText.get(itemId) ?? '') + (event.params.delta ?? '')).slice(-12000);
-          itemText.set(itemId, next);
-          if (itemText.size > 128) itemText.delete(itemText.keys().next().value);
-          lastAgentMessage = next;
-        }
-        if (event.method === 'item/completed' && event.params.item?.type === 'agentMessage') lastAgentMessage = event.params.item.text ?? lastAgentMessage;
+        projection.observe(event);
       }
-      if (rows.length < 100) return lastAgentMessage;
+      if (rows.length < 100) return projection.answer(turn);
       if (Date.now() - renewedAt > 15000) { await store.renewJob({ id: job.id, leaseToken: job.leaseToken, leaseMs }); renewedAt = Date.now(); }
     }
     // Do not silently return a prefix when bounded recovery cannot reach the tail.
