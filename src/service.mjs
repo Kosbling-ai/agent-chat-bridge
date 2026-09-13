@@ -119,7 +119,11 @@ export async function startService({ config, configPath, env = process.env, log,
       ...config.routing.groups.filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId),
       ...config.auth.clients.flatMap(client => client.conversationIds),
     ]);
-    const executorLog = (level, event = {}) => log(level, event.operation || 'codex_executor', event.status || 'unknown', { code: event.code });
+    const executorLog = (level, event = {}) => log(level, event.operation || 'codex_executor', event.status || 'unknown', {
+      code: event.error_code || event.code,
+      rpcMethod: event.rpc_method,
+      stage: event.stage,
+    });
     const executorConfig = {
       bin,
       cwd,
@@ -154,7 +158,11 @@ export async function startService({ config, configPath, env = process.env, log,
     const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,log});
     const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
     const feedback=factories.feedback({jobs,sessions,chat,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
-    forward=factories.forward({config:{steering:config.codex.steering},jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
+    forward=factories.forward({config:{
+      steering:config.codex.steering,
+      retryDelayMs:config.codex.jobRetryMs,
+      maxAttempts:config.codex.jobMaxAttempts,
+    },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
     communication=factories.communication({config,store,inbound,chat,outbound,hookTokens,log});
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest, onCardAction: feedback.handleCardAction, log });
     const api = createApi({ config, store, forwardRuntime:forward, chat, tokens });

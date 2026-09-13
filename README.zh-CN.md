@@ -4,7 +4,7 @@
 
 英文文档和实际代码是主契约；API、配置字段、命令和结构化日志保持英文。
 
-版本：`0.2.1`，当前为未发布开发版；0.1.1 是此前实现版本。0.2.1 修正 Codex app-server 新建与恢复线程使用的审批 reviewer 枚举。参见英文[更新记录](CHANGELOG.md)和[版本与迁移策略](MIGRATIONS.md)。
+版本：`0.2.2`，当前为未发布开发版；0.1.1 是此前实现版本。0.2.2 在 reviewer 协议修复基础上，阻止人工会话被其他客户端占用时的无界重试；飞书只收到一次明确失败结果。参见英文[更新记录](CHANGELOG.md)和[版本与迁移策略](MIGRATIONS.md)。
 
 这是独立的飞书 + Codex bridge。一个进程持有一套飞书 bot/WebSocket 和一个 Codex app-server/executor；MySQL 使用 bridge 自己的 schema。communication worker 负责 hook 和已登记消息 outbox，唯一的 forward worker 负责 Codex 执行、恢复、卡片、Typing、停止和答案/附件投递。
 

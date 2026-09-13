@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { validateConfig } from '../src/config.mjs';
 import { startService } from '../src/service.mjs';
 import { createCodexExecutor } from '../src/agents/codex/executor.mjs';
+import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
+import { createLogger } from '../src/logger.mjs';
 
 function sessionStore() {
   const bindings = new Map();
@@ -35,6 +37,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  const message=JSON.parse(line);
  if(message.method==='initialize') { writeFileSync(process.env.OBSERVED_FILE,JSON.stringify(process.env)); send({id:message.id,result:{}}); }
  else if(message.method==='thread/start') send({id:message.id,result:{thread:{id:'thread-1'}}});
+ else if(message.method==='thread/resume'&&message.params.threadId==='log-reject') send({id:message.id,error:{code:-32000,message:'active writer SYNTHETIC_SECRET'}});
  else if(message.method==='turn/start') { writeFileSync(process.env.OBSERVED_FILE+'.turn','started'); send({id:message.id,result:{turn:{id:'turn-1'}}}); }
  else if(message.method==='thread/read') send({id:message.id,result:{thread:{id:'thread-1',turns:[{id:'turn-1',status:'inProgress',items:[]}]}}});
  else if(message.method==='turn/steer') { writeFileSync(process.env.OBSERVED_FILE+'.steer','steered'); send({id:message.id,result:{}}); }
@@ -59,6 +62,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     PATH: process.env.PATH, HOME: directory, OBSERVED_FILE: observed, UNSELECTED_SECRET: 'must-not-enter-child',
   };
   let executorConfig;
+  let executorInstance;
+  let forwardConfig;
+  let sessions;
+  const logEvents = [];
   const forwardJobs = [
     { id: 'run-1', callerId: 'live', chatId: 'chat', chatType: 'group', messageId: 'message-1', senderOpenId: 'human', senderName: 'Human', deliveryMode: 'caller', executionNamespace: null, prompt: 'first', attempts: 1, result: {}, createdAt: 1, leaseOwner: '' },
     { id: 'run-2', callerId: 'live', chatId: 'chat', chatType: 'group', messageId: 'message-2', senderOpenId: 'human', senderName: 'Human', deliveryMode: 'caller', executionNamespace: null, prompt: 'second', attempts: 1, result: {}, createdAt: 2, leaseOwner: '' },
@@ -76,16 +83,19 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     async getRun() { return null; }, async readEvents() { return []; },
   };
   const inertWorker = { start() {}, beginStop() {}, async stop() {}, status: () => ({ running: true }) };
-  const service = await startService({ config: validateConfig(raw), configPath: join(directory, 'bridge.json'), env, dependencies: {
+  const service = await startService({ config: validateConfig(raw), configPath: join(directory, 'bridge.json'), env,
+    log: createLogger({ write(value) { logEvents.push(JSON.parse(value)); } }), dependencies: {
     pool: () => ({ async query() {}, async end() {} }),
     store: async () => ({ async assertCurrent() {}, async close() {} }),
-    sessions: () => sessionStore(),
+    sessions: () => (sessions = sessionStore()),
     jobs: () => jobStore, inbound: () => ({}), feedback: () => ({}), replies: () => ({}),
     communication: () => inertWorker,
     executor: input => {
       executorConfig = input.config;
-      return createCodexExecutor(input);
+      executorInstance = createCodexExecutor(input);
+      return executorInstance;
     },
+    forward: input => { forwardConfig = input.config; return createForwardRuntime(input); },
     media: async () => ({}), outbound: async () => ({}), chat: () => ({}),
     sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} },
     feishu: () => ({ async start() {}, async stop() {}, status: () => ({ connected: true }) }),
@@ -100,6 +110,13 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(childEnv.CODEX_HOME, join(directory, '.codex'));
   assert.deepEqual(executorConfig.rulesPaths, ['AGENTS.md']);
   assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['api-chat', 'chat']);
+  assert.equal(forwardConfig.retryDelayMs, 60_000);
+  assert.equal(forwardConfig.maxAttempts, 3);
+  await sessions.saveCodexBinding({feishuOpenId:'system:log',chatId:'log-chat',chatType:'group',codexSessionId:'log-reject',threadName:'log',created:false});
+  await assert.rejects(executorInstance.execute({bindingOpenId:'system:log',chatId:'log-chat',chatType:'group',messageId:'log-message',prompt:'work',busyPolicy:'reject'}), {code:'CODEX_THREAD_BUSY'});
+  const rpcLog = logEvents.find(event => event.operation === 'rpc_request');
+  assert.deepEqual({code:rpcLog.code,rpcMethod:rpcLog.rpc_method}, {code:'CODEX_THREAD_BUSY',rpcMethod:'thread/resume'});
+  assert.equal(JSON.stringify(logEvents).includes('SYNTHETIC_SECRET'), false);
   assert.equal(forwardJobs[1].status, 'deferred');
   await service.close();
   assert.equal(forwardJobs[0].status, 'running');

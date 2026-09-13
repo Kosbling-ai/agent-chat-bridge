@@ -1,10 +1,14 @@
 # Versions and migrations
 
-Application version: `0.2.1`
+Application version: `0.2.2`
 
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.2 busy retry policy
+
+Version 0.2.2 adds no database migration. Optional `codex.jobRetryMs` defaults to 60000 and accepts 10000–1800000; `codex.jobMaxAttempts` defaults to 3 and accepts 1–10. Existing configurations may omit both fields.
 
 ## 0.2.1 protocol fix
 

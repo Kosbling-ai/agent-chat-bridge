@@ -70,6 +70,16 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     }
   }
 
+  async function ensureTypingStopped(job, state) {
+    const settled = () => state.result.typing?.desired === false && state.result.typing?.outcome === 'confirmed';
+    if (settled()) return state.result.typing;
+    const pending = { ...(state.result.typing || {}), desired: false, operation: 'remove', intentAt: now(), outcome: 'pending' };
+    await persist(job, state, 'typing', pending);
+    await state.typing;
+    if (settled()) return state.result.typing;
+    return typingDesired(job, state, false);
+  }
+
   function cardFor(job, state, saved) {
     return new ExecutionCard({
       client: cardClient, chatId: job.chatId, jobId: job.id, messageId: job.messageId,
@@ -128,6 +138,37 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     return state;
   }
 
+  function restoreWaiting(job, control = {}) {
+    if (job.deliveryMode === 'caller') return null;
+    const state = stateFor(job, control);
+    state.card = cardFor(job, state, state.result.executionCard);
+    return state;
+  }
+
+  function activate(job, state, execution) {
+    if (!state || state.result.executionCard?.status !== 'retrying') return;
+    state.typing = typingDesired(job, state, true).catch(error => {
+      log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
+      return null;
+    });
+    state.card?.push({ kind: 'started', turnId: execution?.turnId });
+    state.card?.enqueue?.();
+  }
+
+  async function wait(job, state) {
+    if (job.deliveryMode === 'caller' || !state) return;
+    const savedCard = state.result.executionCard;
+    const waitingConfirmed = savedCard?.status === 'retrying'
+      && savedCard.deliveryState?.status === 'confirmed'
+      && Number(savedCard.ackedRevision || 0) >= Number(savedCard.desiredRevision || 0);
+    if (!waitingConfirmed && state.card) {
+      state.result.executionCard = await state.card.pause();
+    }
+    await ensureTypingStopped(job, state).catch(error => {
+      log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
+    });
+  }
+
   async function prepare(job, result, state) {
     if (job.deliveryMode === 'caller' || !state) return;
     if (state.observer) result.executionCard = await state.observer.stop();
@@ -136,10 +177,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
       await state.card.chain;
       result.executionCard = state.card.snapshot();
     }
-    const pending = { ...(state.result.typing || {}), desired: false, operation: 'remove', intentAt: now(), outcome: 'pending' };
-    await persist(job, state, 'typing', pending);
-    await state.typing;
-    await typingDesired(job, state, false).catch(error => {
+    await ensureTypingStopped(job, state).catch(error => {
       log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
     });
   }
@@ -215,5 +253,5 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     await typingDesired(job, state, false);
   }
 
-  return Object.freeze({ start, observe, restore, prepare, finish, handleCardAction, abandon, cleanup });
+  return Object.freeze({ start, observe, restore, restoreWaiting, activate, wait, prepare, finish, handleCardAction, abandon, cleanup });
 }

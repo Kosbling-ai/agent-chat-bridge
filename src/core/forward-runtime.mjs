@@ -10,6 +10,15 @@ const held = error => error?.outcome === 'unknown' || [
   'CODEX_TURN_UNKNOWN', 'CODEX_OBSERVATION_LOST',
 ].includes(error?.code);
 const stableMessageId = value => `api:${createHash('sha256').update(value).digest('hex')}`;
+const preAdmissionBusy = error => error?.code === 'CODEX_THREAD_BUSY'
+  && error?.outcome === 'rejected' && error?.phase === 'pre_admission';
+
+function trustedSystemWait(job, execution) {
+  if (!job.executionNamespace || !job.callerId || !execution?.bindingOpenId) return false;
+  try {
+    return deriveExecutionScope(job.callerId, job.executionNamespace) === execution.bindingOpenId;
+  } catch { return false; }
+}
 
 export function publicRun(job) {
   const execution = job.result?.execution || {};
@@ -51,7 +60,10 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   const owner = config.owner || randomUUID();
   const leaseMs = Number(config.leaseMs || 60000);
   const pollMs = Number(config.pollMs || 100);
-  const maxAttempts = Number(config.maxAttempts || 3);
+  const maxAttempts = Number(config.maxAttempts ?? 3);
+  const retryDelayMs = Number(config.retryDelayMs ?? 60_000);
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) throw new Error('invalid_forward_max_attempts');
+  if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 10_000 || retryDelayMs > 1_800_000) throw new Error('invalid_forward_retry_delay');
   const maxActive = Math.max(1, Math.min(8, Number(config.maxActive || 5)));
   const claimOwner = () => `${owner.slice(0, 150)}:${randomUUID()}`;
   const active = new Set();
@@ -157,8 +169,9 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       }
 
       const known = execution.threadId && execution.turnId && execution.startedAt;
+      const waiting = execution.waiting?.kind === 'pre_admission';
       state = job.deliveryMode === 'bridge'
-        ? await (known ? feedback?.restore?.(job, lease) : feedback?.start(job, lease))
+        ? await (known ? feedback?.restore?.(job, lease) : waiting ? feedback?.restoreWaiting?.(job, lease) : feedback?.start(job, lease))
         : null;
       if (known) feedback?.observe?.(job, state, execution);
       lease.assertOwned();
@@ -180,13 +193,14 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         },
         onBound: async value => {
           lease.assertOwned();
-          execution = { ...execution, threadId: value.threadId, turnId: value.turnId, startedAt: value.startedAt, status: 'bound', unconfirmed: false };
+          execution = { ...execution, threadId: value.threadId, turnId: value.turnId, startedAt: value.startedAt, status: 'bound', unconfirmed: false, waiting: null };
           await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
+          if (state) feedback?.activate?.(job, state, execution);
           feedback?.observe?.(job, state, execution);
         },
       });
       lease.assertOwned();
-      execution = { ...execution, threadId: result.threadId || execution.threadId, turnId: result.turnId || execution.turnId, terminal: result.deferred ? 'deferred' : 'completed', unconfirmed: false, finishedAt: now() };
+      execution = { ...execution, threadId: result.threadId || execution.threadId, turnId: result.turnId || execution.turnId, terminal: result.deferred ? 'deferred' : 'completed', unconfirmed: false, waiting: null, finishedAt: now() };
       result = { ...result, execution };
       if (inbound && !result.deferred) await inbound.markForwarded({ entries: job.contextEntries, threadId: result.threadId, turnId: result.turnId });
       if (result.deferred) {
@@ -207,24 +221,44 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       }
       lease.assertOwned();
       if (held(error)) {
-        execution = { ...execution, threadId: error.threadId || execution.threadId, turnId: error.turnId || execution.turnId, startedAt: error.startedAt || execution.startedAt, status: 'unknown', unconfirmed: true, heldReason: error.code || 'native_outcome_unknown' };
+        execution = { ...execution, threadId: error.threadId || execution.threadId, turnId: error.turnId || execution.turnId, startedAt: error.startedAt || execution.startedAt, status: 'unknown', unconfirmed: true, waiting: null, heldReason: error.code || 'native_outcome_unknown', ...(error.intent ? { intent: error.intent } : {}) };
         await feedback?.prepare?.(job, {}, state).catch(() => {});
         await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
         await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, held: true, errorCode: error.code || 'native_outcome_unknown' });
-        log('warning', 'forward_execution', 'held', { code: error.code || 'native_outcome_unknown', stage: error.rpcMethod || 'execute' });
+        log('warning', 'forward_execution', 'held', { code: error.code || 'native_outcome_unknown', stage: error.phase || error.rpcMethod || 'execute', rpcMethod: error.rpcMethod, runId: job.id, attempt: job.attempts, maxAttempts });
         return;
       }
-      if (retryable(error) && (error.code === 'CODEX_THREAD_BUSY' || job.attempts < maxAttempts)) {
-        await feedback?.prepare?.(job, {}, state).catch(() => {});
-        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, preserveAttempt: error.code === 'CODEX_THREAD_BUSY', errorCode: error.code || 'forward_execution_failed', nextAttemptAt: now() + 1000 });
-        log('warning', 'forward_execution', 'retrying', { code: error.code || 'forward_execution_failed', stage: error.rpcMethod || 'execute' });
+      if (preAdmissionBusy(error) && trustedSystemWait(job, execution)) {
+        const nextRetryAt = now() + retryDelayMs;
+        execution = { ...execution, waiting: { kind: 'pre_admission', reason: 'CODEX_THREAD_BUSY', sinceAt: execution.waiting?.sinceAt || now(), probeCount: Number(execution.waiting?.probeCount || 0) + 1, nextRetryAt } };
+        await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
+        if (state) await feedback?.wait?.(job, state).catch(feedbackError => log('warning', 'forward_feedback', 'pending', { code: feedbackError?.code || 'feedback_wait_pending', runId: job.id }));
+        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, preserveAttempt: true, errorCode: 'CODEX_THREAD_BUSY', nextAttemptAt: nextRetryAt });
+        log('warning', 'forward_execution', 'waiting', { code: 'CODEX_THREAD_BUSY', stage: error.phase, rpcMethod: error.rpcMethod, runId: job.id, attempt: job.attempts, maxAttempts, nextRetryAt });
+        return;
+      }
+      if (preAdmissionBusy(error)) {
+        execution = { ...execution, status: 'rejected', terminal: 'failed', unconfirmed: false, waiting: null, notStarted: true, finishedAt: now() };
+        const failed = { failed: true, turnStatus: 'failed', answer: '会话被其他客户端占用，请释放后重试或新建会话。', rawAnswer: '', attachments: [], execution };
+        await feedback?.prepare?.(job, failed, state);
+        await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: 'CODEX_THREAD_BUSY' });
+        log('warning', 'forward_execution', 'rejected', { code: 'CODEX_THREAD_BUSY', stage: error.phase, rpcMethod: error.rpcMethod, runId: job.id, attempt: job.attempts, maxAttempts });
+        return;
+      }
+      if (retryable(error) && job.attempts < maxAttempts) {
+        const nextRetryAt = now() + retryDelayMs;
+        execution = { ...execution, waiting: { kind: 'pre_admission', reason: error.code || 'forward_execution_failed', sinceAt: execution.waiting?.sinceAt || now(), probeCount: Number(execution.waiting?.probeCount || 0) + 1, nextRetryAt } };
+        await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
+        if (state) await feedback?.wait?.(job, state).catch(feedbackError => log('warning', 'forward_feedback', 'pending', { code: feedbackError?.code || 'feedback_wait_pending', runId: job.id }));
+        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, errorCode: error.code || 'forward_execution_failed', nextAttemptAt: nextRetryAt });
+        log('warning', 'forward_execution', 'retrying', { code: error.code || 'forward_execution_failed', stage: error.phase || error.rpcMethod || 'execute', rpcMethod: error.rpcMethod, runId: job.id, attempt: job.attempts, maxAttempts, nextRetryAt });
         return;
       }
       execution = { ...execution, terminal: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', finishedAt: now() };
       const failed = { failed: true, turnStatus: execution.terminal, answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : '执行未完成，请稍后重试。', rawAnswer: '', attachments: [], execution };
       await feedback?.prepare?.(job, failed, state);
       await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: error.code || 'forward_execution_failed' });
-      log('error', 'forward_execution', 'failed', { code: error.code || 'forward_execution_failed', stage: error.rpcMethod || 'execute' });
+      log('error', 'forward_execution', 'failed', { code: error.code || 'forward_execution_failed', stage: error.phase || error.rpcMethod || 'execute', rpcMethod: error.rpcMethod, runId: job.id, attempt: job.attempts, maxAttempts });
     }
   }
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2] — Unreleased
+
+- End a manual Feishu request on its first confirmed pre-admission `CODEX_THREAD_BUSY` result and deliver one explicit occupied-session notice without replacing the binding or replaying the request.
+- Retain 60-second waiting only for a validated persisted caller/namespace system binding. Other retryable admission failures remain bounded to three claims by default; configuration enforces the original 10-second retry-delay floor.
+- Keep known-turn observation, unconfirmed start and unresolved steer confirmation in `held` with their native/intent identity. Reuse the waiting card and keep Typing off between system probes.
+- Preserve sanitized RPC method, stable code, phase and bounded retry facts through the service logger and optional reporter.
+
+No database migration is added. Validation is offline with synthetic app-server, Feishu and clock fixtures; no real message or model acceptance was run.
+
 ## [0.2.1] — Unreleased
 
 - Use the Codex app-server protocol value `auto_review` for `approvalsReviewer` on thread start, thread resume and turn start. The previous `auto` value is not part of the current protocol enum and caused an existing binding to fail before native turn admission.

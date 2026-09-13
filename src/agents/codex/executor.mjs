@@ -14,10 +14,24 @@ const limitText = (value, max) => String(value || '').slice(0, max || undefined)
 const stableKey = (value) => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const bindingKey = ({ feishuOpenId, chatId }) => `${feishuOpenId || 'unknown'}:${chatId || 'unknown'}`;
 
-function coded(message, code, { retryable = false, outcome } = {}) {
+function coded(message, code, { retryable = false, outcome, phase, busyOrigin } = {}) {
   const error = new Error(message); error.code = code; error.retryable = retryable;
   if (outcome) error.outcome = outcome;
+  if (phase) error.phase = phase;
+  if (busyOrigin) error.busyOrigin = busyOrigin;
   return error;
+}
+
+function uncertainObservation(error, { threadId, turnId, startedAt, phase, intent } = {}) {
+  const value = coded('Codex native state could not be confirmed', error?.code || 'CODEX_OBSERVATION_LOST', {
+    retryable: true, outcome: 'unknown', phase,
+  });
+  Object.assign(value, {
+    rpcMethod: error?.rpcMethod,
+    threadId, turnId, startedAt,
+    ...(intent ? { intent } : {}),
+  });
+  return value;
 }
 
 function parseDetail(row) {
@@ -169,8 +183,17 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   async function ensureThreadReady(binding) {
     if (loadedThreads.has(binding.codexSessionId)) return;
-    const response = await client.request('thread/resume', threadDefaults({ threadId: binding.codexSessionId,
-      ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }));
+    let response;
+    try {
+      response = await client.request('thread/resume', threadDefaults({ threadId: binding.codexSessionId,
+        ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }));
+    } catch (error) {
+      if (error?.code === 'CODEX_THREAD_BUSY' && error.outcome === 'rejected') {
+        error.phase = 'pre_admission';
+        error.busyOrigin = 'native';
+      }
+      throw error;
+    }
     const activeIds = inProgressTurnIds(response?.thread);
     if (activeIds.length) throw coded(`Codex thread contains an unbound active turn: ${activeIds.join(',')}`, 'CODEX_THREAD_HELD', { retryable: true, outcome: 'unknown' });
     loadedThreads.add(binding.codexSessionId);
@@ -253,14 +276,23 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     if (receipt('user-steer-rejected')) return null;
     const accepted = () => ({ deferred: true, accepted: true, threadId: binding.codexSessionId, turnId: detail.turnId, rootMessageId: detail.rootMessageId });
     if (receipt('user-steer-confirmed')) return accepted();
-    const response = await client.request('thread/read', { threadId: binding.codexSessionId, includeTurns: true });
-    const turn = (response?.thread?.turns || []).find((entry) => entry.id === detail.turnId);
-    const baseline = new Set(detail.baselineIds || []);
-    const matches = (turn?.items || []).filter((item) => item.type === 'userMessage' && !baseline.has(item.id)
-      && (item.content || []).filter((part) => part.type === 'text').map((part) => part.text || '').join('') === prompt);
-    if (matches.length !== 1) throw coded('steer delivery unconfirmed', 'CODEX_STEER_UNCONFIRMED', { outcome: 'unknown' });
-    await persistUser(binding, { messageId }, 'user-steer-confirmed', prompt, { attemptId: detail.attemptId });
-    return accepted();
+    try {
+      const response = await client.request('thread/read', { threadId: binding.codexSessionId, includeTurns: true });
+      const turn = (response?.thread?.turns || []).find((entry) => entry.id === detail.turnId);
+      const baseline = new Set(detail.baselineIds || []);
+      const matches = (turn?.items || []).filter((item) => item.type === 'userMessage' && !baseline.has(item.id)
+        && (item.content || []).filter((part) => part.type === 'text').map((part) => part.text || '').join('') === prompt);
+      if (matches.length !== 1) throw coded('steer delivery unconfirmed', 'CODEX_STEER_UNCONFIRMED', { outcome: 'unknown' });
+      await persistUser(binding, { messageId }, 'user-steer-confirmed', prompt, { attemptId: detail.attemptId });
+      return accepted();
+    } catch (error) {
+      throw uncertainObservation(error, {
+        threadId: binding.codexSessionId,
+        turnId: detail.turnId,
+        phase: 'steer_confirmation',
+        intent: { kind: 'steer', attemptId: detail.attemptId, messageId },
+      });
+    }
   }
 
   async function steer(active, input) {
@@ -409,7 +441,13 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         const active = activeByBinding.get(bindingKey(actor));
         if (active) {
           if (active.threadId !== options.resume.threadId || active.turnId !== options.resume.turnId || active.messageId !== normalized.messageId) {
-            throw coded('another turn currently holds this binding', 'CODEX_THREAD_HELD', { retryable: true });
+            throw uncertainObservation(coded('another turn currently holds this binding', 'CODEX_THREAD_HELD', { retryable: true }), {
+              threadId: options.resume.threadId,
+              turnId: options.resume.turnId,
+              startedAt: Number(options.resume.startedAt),
+              phase: 'known_resume',
+              intent: { kind: 'observe', messageId: normalized.messageId },
+            });
           }
           return { state: active, resume: true };
         }
@@ -425,7 +463,9 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         if (normalized.messageId && normalized.messageId === active.messageId) {
           return { completion: waitForTurn(active, normalized.messageId, { takeover: true, signal: options.signal }) };
         }
-        if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', { retryable: true });
+        if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', {
+          retryable: true, outcome: 'rejected', phase: 'pre_admission', busyOrigin: 'local',
+        });
         if (active.settled) return { afterFinal: active.finalized, restart: { input: normalized } };
         const result = await steer(active, normalized);
         return result?.restart ? { restart: result } : { completion: Promise.resolve(result) };
@@ -463,7 +503,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           loadedThreads.delete(binding.codexSessionId);
           throw coded('Codex thread was archived before turn start', 'CODEX_THREAD_ARCHIVED', { retryable: true, outcome: 'rejected' });
         }
-        error.code ||= 'CODEX_TURN_START_UNCONFIRMED'; error.outcome ||= 'unknown'; throw error;
+        error.code ||= 'CODEX_TURN_START_UNCONFIRMED'; error.outcome ||= 'unknown'; error.phase ||= 'turn_start'; throw error;
       } finally {
         pendingStartThreads.delete(binding.codexSessionId);
       }
@@ -509,7 +549,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       const otherActiveIds = inProgressTurnIds(response?.thread).filter((turnId) => turnId !== resume.turnId);
       if (snapshot.status !== 'unknown' && otherActiveIds.length === 0) loadedThreads.add(resume.threadId);
     }
-    catch (error) { pendingKnownTurns.delete(resume.turnId); throw error; }
+    catch (error) {
+      pendingKnownTurns.delete(resume.turnId);
+      throw uncertainObservation(error, {
+        threadId: resume.threadId,
+        turnId: resume.turnId,
+        startedAt: Number(resume.startedAt),
+        phase: 'known_resume',
+        intent: { kind: 'observe', messageId: input.messageId },
+      });
+    }
     if (snapshot.status === 'unknown') { pendingKnownTurns.delete(resume.turnId); throw coded('persisted turn could not be confirmed', 'CODEX_TURN_UNKNOWN', { retryable: true, outcome: 'unknown' }); }
     const state = createTurnState(binding, input, resume.turnId, Number(resume.startedAt));
     await registerState(state);

@@ -44,7 +44,7 @@ function memoryStore(initial = []) {
   };
 }
 
-function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set() } = {}) {
+function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set() } = {}) {
   let threadNumber = 0; let turnNumber = 0;
   const children = []; const calls = []; const envs = []; const args = [];
   const spawnImpl = (_bin, childArgs, options) => {
@@ -55,6 +55,10 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, comple
       if (hangMethods.has(message.method)) return;
       const respond = (result, delayMs = 0) => setTimeout(() => instance.send({ id: message.id, result }), delayMs);
       if (message.method === 'initialize') respond({});
+      else if (rejectMethods.has(message.method)) {
+        const error = rejectMethods.get(message.method);
+        setImmediate(() => instance.send({ id: message.id, error: typeof error === 'function' ? error(message) : error }));
+      }
       else if (['thread/start', 'thread/resume', 'turn/start'].includes(message.method)
         && Object.hasOwn(message.params, 'approvalsReviewer')
         && !['user', 'auto_review', 'guardian_subagent'].includes(message.params.approvalsReviewer)) {
@@ -263,6 +267,60 @@ test('unknown resumed activity is held and known resume is inspect-only', async 
     const result = await known.execute({ bindingOpenId: 'system:x', chatId: 'chat', chatType: 'group', messageId: 'job', prompt: 'work', busyPolicy: 'reject' }, { resume: { threadId: 'thread-existing', turnId: 'known-turn', startedAt: 1 }, onStartIntent: () => { intents++; } });
     assert.equal(result.answer, 'known'); assert.equal(intents, 0);
     assert.equal(knownRuntime.calls.filter((call) => call.method === 'turn/start').length, 0); await known.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('executor classifies admission busy separately from uncertain bound and steer observations', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  const activeWriter = { code: -32000, message: 'thread has an active writer' };
+  const binding = { feishuOpenId: 'ou', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', threadName: 'human', created: false };
+  const input = { bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'message', prompt: 'work', busyPolicy: 'steer' };
+  try {
+    const admissionRuntime = fakeRuntime({ rejectMethods: new Map([['thread/resume', activeWriter]]) });
+    const admission = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore([binding]), spawnImpl: admissionRuntime.spawnImpl });
+    await assert.rejects(admission.execute(input), error => {
+      assert.equal(error.code, 'CODEX_THREAD_BUSY');
+      assert.equal(error.outcome, 'rejected');
+      assert.equal(error.phase, 'pre_admission');
+      assert.equal(error.rpcMethod, 'thread/resume');
+      return true;
+    });
+    assert.equal(admissionRuntime.calls.filter(call => call.method === 'turn/start').length, 0);
+    await admission.close();
+
+    const resumeRuntime = fakeRuntime({ rejectMethods: new Map([['thread/resume', activeWriter]]) });
+    const resume = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore([binding]), spawnImpl: resumeRuntime.spawnImpl });
+    await assert.rejects(resume.execute(input, { resume: { threadId: 'thread-existing', turnId: 'turn-known', startedAt: 10 } }), error => {
+      assert.equal(error.code, 'CODEX_THREAD_BUSY');
+      assert.equal(error.outcome, 'unknown');
+      assert.equal(error.phase, 'known_resume');
+      assert.equal(error.threadId, 'thread-existing');
+      assert.equal(error.turnId, 'turn-known');
+      assert.equal(error.startedAt, 10);
+      assert.deepEqual(error.intent, { kind: 'observe', messageId: 'message' });
+      return true;
+    });
+    assert.equal(resumeRuntime.calls.filter(call => call.method === 'turn/start').length, 0);
+    await resume.close();
+
+    const steerStore = memoryStore([binding]);
+    await steerStore.saveCodexRealtimeEvent(binding, {
+      messageId: 'message', eventKey: 'user-steer-attempt:message', eventType: 'user_message',
+      detail: { attemptId: 'attempt-1', turnId: 'root-turn', rootMessageId: 'root-message', baselineIds: [] },
+    });
+    const steerRuntime = fakeRuntime({ rejectMethods: new Map([['thread/read', activeWriter]]) });
+    const steer = createCodexExecutor({ config: config(cwd), sessionStore: steerStore, spawnImpl: steerRuntime.spawnImpl });
+    await assert.rejects(steer.execute(input), error => {
+      assert.equal(error.code, 'CODEX_THREAD_BUSY');
+      assert.equal(error.outcome, 'unknown');
+      assert.equal(error.phase, 'steer_confirmation');
+      assert.equal(error.threadId, 'thread-existing');
+      assert.equal(error.turnId, 'root-turn');
+      assert.deepEqual(error.intent, { kind: 'steer', attemptId: 'attempt-1', messageId: 'message' });
+      return true;
+    });
+    assert.equal(steerRuntime.calls.filter(call => ['turn/start', 'turn/steer'].includes(call.method)).length, 0);
+    await steer.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 

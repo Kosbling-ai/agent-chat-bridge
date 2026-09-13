@@ -6,13 +6,21 @@ export function safeObserver(callback = () => {}) {
   };
 }
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
-  return (level, operation, status, { code, durationMs, port } = {}) => {
+  return (level, operation, status, { code, durationMs, port, rpcMethod, stage, runId, attempt, maxAttempts, nextRetryAt } = {}) => {
+    const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
+    const boundedInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
     const event = {
       timestamp: new Date().toISOString(), level, module: 'bridge',
       component, operation, status,
-      ...(code !== undefined ? { code } : {}),
+      ...(identifier(code, 64) !== undefined ? { code } : {}),
       ...(durationMs !== undefined ? { durationMs } : {}),
       ...(port !== undefined ? { port } : {}),
+      ...(identifier(rpcMethod, 64) !== undefined ? { rpc_method: rpcMethod } : {}),
+      ...(identifier(stage, 64) !== undefined ? { stage } : {}),
+      ...(identifier(runId, 64) !== undefined ? { run_id: runId } : {}),
+      ...(boundedInteger(attempt, 0, 10_000) !== undefined ? { attempt } : {}),
+      ...(boundedInteger(maxAttempts, 1, 10) !== undefined ? { max_attempts: maxAttempts } : {}),
+      ...(boundedInteger(nextRetryAt, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { next_retry_at: nextRetryAt } : {}),
     };
     stream.write(`${JSON.stringify(event)}\n`);
     if (level === 'error' && reportError) {
