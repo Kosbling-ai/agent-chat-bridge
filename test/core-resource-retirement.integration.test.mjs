@@ -1,0 +1,52 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, readFile, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import { createPoolFromEnvironment } from '../src/storage/connection.mjs';
+import { migrate } from '../src/storage/migrations.mjs';
+import { createMysqlStore } from '../src/storage/store.mjs';
+import { createFeishuMedia } from '../src/channels/feishu/media.mjs';
+import { createOutboundMedia } from '../src/channels/feishu/outbound-media.mjs';
+import { createResourceRetirement } from '../src/core/resource-retirement.mjs';
+import { createConversationGuard } from '../src/core/conversation-guard.mjs';
+const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `BRIDGE_TEST_${key.toUpperCase()}`]));
+test('resource worker frees empty output independently and resumes sealed input retirement after failure', { skip: !process.env.BRIDGE_TEST_PASSWORD, timeout: 15000 }, async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'bridge-resource-retirement-'));
+  const pool = createPoolFromEnvironment(refs); let store;
+  const scope = { connectionId: 'resource-fixture', conversationId: 'chat', agentId: 'codex' };
+  const chat = { downloadResource: async () => ({ contentType: 'image/png', stream: Readable.from(['synthetic-image']) }) };
+  try {
+    await migrate(pool); store = await createMysqlStore({ pool });
+    const job = await store.enqueueJob({ ...scope, kind: 'agent', idempotencyKey: 'completed', payload: { text: 'completed' } });
+    const [claim] = await store.claimJobs({ kind: 'agent', owner: 'fixture', leaseMs: 60000, limit: 1 });
+    const media = await createFeishuMedia({ workspace, inboxDir: join(workspace, 'inbox'), chat });
+    const prepared = await media.prepare({ ...scope, conversationType: 'p2p', messageId: 'message', message: { kind: 'image', parsedContent: { image_key: 'image' }, content: '{"image_key":"image"}' } }, { runId: job.id });
+    assert.equal(prepared.status, 'ready');
+    const attempt = await store.beginAgentAttempt({ ...claim, agentId: 'codex' });
+    await store.bindAgentAttempt({ ...claim, expectedGeneration: attempt.generation, nativeThreadId: 'retired-thread', nativeTurnId: 'completed-turn' });
+    const spoolDir = join(workspace, 'spool');
+    const outbound = await createOutboundMedia({ workspace, outboxDir: join(workspace, 'outbox'), spoolDir, chat });
+    await outbound.prepare({ connectionId: scope.connectionId, conversationId: scope.conversationId, runId: job.id, conversationType: 'p2p', sinceMs: Date.now() });
+    await store.finishJobWithOutbox({ ...claim, result: {}, outbox: [] });
+    const guard = createConversationGuard();
+    let retire = createResourceRetirement({ store, media, outbound, guard, connectionId: scope.connectionId });
+    await retire();
+    assert.equal(await readFile(prepared.localPaths[0], 'utf8'), 'synthetic-image', 'current native thread keeps input');
+    assert.equal((await readdir(spoolDir)).length, 0, 'empty output manifest does not wait for thread retirement');
+    await store.resetSession({ ...scope, expectedGeneration: attempt.generation });
+    const release = media.release; let failures = 0;
+    media.release = async () => { failures++; throw new Error('synthetic process failure after seal'); };
+    await retire(); assert.equal(failures, 1);
+    const candidates = await store.listRetirableResources({ connectionId: scope.connectionId, limit: 10 });
+    assert.equal(candidates.items.find(row => row.runId === job.id).inputState, 'sealed');
+    await assert.rejects(store.setSession({ ...scope, expectedGeneration: Number(attempt.generation) + 1, nativeThreadId: 'retired-thread' }), { code: 'resource_retired' });
+    media.release = release;
+    retire = createResourceRetirement({ store, media, outbound, guard, connectionId: scope.connectionId });
+    await retire();
+    await assert.rejects(readFile(prepared.localPaths[0]), { code: 'ENOENT' });
+    assert(!(await store.listRetirableResources({ connectionId: scope.connectionId, limit: 10 })).items.some(row => row.runId === job.id));
+    await retire(); // Replay is a no-op once both receipts are complete.
+  } finally { if (store) await store.close(); else await pool.end(); await rm(workspace, { recursive: true, force: true }); }
+});

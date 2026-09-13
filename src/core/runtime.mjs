@@ -9,6 +9,7 @@ import { createSessionRotation } from './session-rotation.mjs';
 import { createSteeringHandler } from './steering.mjs';
 import { createConversationGuard } from './conversation-guard.mjs';
 import { admitThread } from './thread-admission.mjs';
+import { createResourceRetirement } from './resource-retirement.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -22,6 +23,7 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
   let stopping = false, started = false, healthy = true;
   let worker;
   let cleanupAt = 0, cleanupRunning = false, cleanupCursor;
+  let retirementAt = 0, retirementRunning = false;
   const active = new Set();
   const conversationGuard = createConversationGuard();
   const guardKey = row => JSON.stringify([row.connectionId ?? connectionId, row.conversationId]);
@@ -29,6 +31,7 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
   const scope = conversationId => ({ connectionId, conversationId });
   const recover = workspace ? createRecoveryHandler({ store, codex, workspace, connectionId, log }) : null;
   const rotate = workspace ? createSessionRotation({ store, codex, workspace, connectionId, config: config.codex ?? {}, log }) : null;
+  const retireResources = media || outbound ? createResourceRetirement({ store, media, outbound, guard: conversationGuard, connectionId, log, stopped: () => stopping }) : null;
   const steer = createSteeringHandler({ store, codex, log, enabled: config.codex?.steering !== false });
   function fault(code) { healthy = false; log('error', 'core', 'failed', { code }); }
   async function ingest(event, context = {}) {
@@ -304,6 +307,10 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
     while (!stopping && healthy) {
       try {
         if (active.size < 8) {
+          if (retireResources && !retirementRunning && Date.now() >= retirementAt) {
+            retirementAt = Date.now() + 30000; retirementRunning = true;
+            launch(retireResources().finally(() => { retirementRunning = false; }));
+          }
           if (outbound && !cleanupRunning && Date.now() >= cleanupAt) { cleanupAt = Date.now() + 1000; launch(cleanupArtifacts()); }
           if (recover && codex.status().state === 'ready') for (const action of await store.claimRecoveries({ owner, leaseMs, limit: 1 })) launch(conversationGuard.native(guardKey(action), () => stopping ? undefined : recover(action)));
           if (codex.status().state === 'ready') for (const job of await store.claimJobs({ kind: 'agent', owner, leaseMs, limit: 1 })) launch(conversationGuard.native(guardKey(job), () => stopping ? undefined : execute(job)));
