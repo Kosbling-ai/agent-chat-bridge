@@ -122,7 +122,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET lease_expires_at=?,updated_at=? WHERE public_run_id=? AND lease_owner=?
-            AND lease_expires_at>? AND status IN ('running','reply_pending')`, [at + Number(input.leaseMs || 60000), at, id, owner, at]);
+            AND lease_expires_at>? AND status IN ('running','reply_pending','held','completed','failed','deferred')`, [at + Number(input.leaseMs || 60000), at, id, owner, at]);
         await assertLease(connection, result);
         return { renewed: true };
       });
@@ -142,13 +142,25 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
     patchFeedback(input) {
       const [id, owner] = leaseArgs(input);
       const key = required(input.key, 32);
-      if (!['executionCard', 'typing', 'stop'].includes(key)) throw new StoreError('invalid_store_input');
+      if (!['executionCard', 'typing', 'stop', 'delivery'].includes(key)) throw new StoreError('invalid_store_input');
       return write(async connection => {
         const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
             '$.${key}',CAST(? AS JSON)),updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('running','reply_pending')`, [safeJson(input.value), at, id, owner, at]);
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('running','reply_pending','held','completed','failed','deferred')`, [safeJson(input.value), at, id, owner, at]);
+        await assertLease(connection, result);
+        return { updated: true };
+      });
+    },
+    patchReplyResult(input) {
+      const [id, owner] = leaseArgs(input);
+      return write(async connection => {
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+            JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='reply_pending'`, [safeJson(input.result || {}), at, id, owner, at]);
         await assertLease(connection, result);
         return { updated: true };
       });
@@ -210,6 +222,91 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
           WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('running','reply_pending')`, [status, input.errorCode || '', isTerminal ? null : (input.nextAttemptAt ?? at + 1000), isTerminal ? at : null, input.preserveAttempt ? 1 : 0, at, id, owner, at]);
         await assertLease(connection, result);
         return { status };
+      });
+    },
+    beginStop(input) {
+      const id = required(input.id, 36);
+      const threadId = required(input.threadId, 255);
+      const turnId = required(input.turnId, 255);
+      const messageId = required(input.messageId, 191);
+      return write(async connection => {
+        const [[found]] = await connection.execute(`SELECT status,message_id,result_json FROM assistant_codex_forward_jobs
+          WHERE public_run_id=? FOR UPDATE`, [id]);
+        if (!found) return { outcome: 'not_found' };
+        const result = parse(found.result_json);
+        const execution = result.execution || {};
+        if (execution.threadId !== threadId || execution.turnId !== turnId || found.message_id !== messageId) return { outcome: 'stale' };
+        if (found.status !== 'running') return { outcome: 'already_finished' };
+        const previous = result.stop;
+        if (previous?.threadId === threadId && previous?.turnId === turnId && previous?.messageId === messageId) {
+          return { outcome: 'replay', stop: previous };
+        }
+        const stop = { threadId, turnId, messageId, actor: required(input.actor, 191), intentAt: now(), outcome: 'pending' };
+        await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+            '$.stop',CAST(? AS JSON)),updated_at=? WHERE public_run_id=? AND status='running'`, [safeJson(stop), now(), id]);
+        return { outcome: 'new', stop };
+      });
+    },
+    finishStop(input) {
+      const id = required(input.id, 36);
+      const stop = input.stop;
+      if (!stop || !['requested', 'already_finished', 'unconfirmed'].includes(stop.outcome)) throw new StoreError('invalid_store_input');
+      return write(async connection => {
+        const at = now();
+        const definitive = stop.outcome !== 'unconfirmed';
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+            '$.stop',CAST(? AS JSON)),updated_at=?
+          WHERE public_run_id=? AND status='running'
+            AND JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.stop.threadId'))=?
+            AND JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.stop.turnId'))=?
+            AND JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.stop.messageId'))=?
+            AND JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.stop.outcome')) ${definitive ? "IN ('pending','unconfirmed')" : "='pending'"}`,
+        [safeJson(stop), at, id, stop.threadId, stop.turnId, stop.messageId]);
+        if (result.affectedRows) return { stop };
+        const [[found]] = await connection.execute(`SELECT result_json FROM assistant_codex_forward_jobs
+          WHERE public_run_id=? LIMIT 1`, [id]);
+        const saved = parse(found?.result_json).stop;
+        if (saved?.threadId === stop.threadId && saved?.turnId === stop.turnId && saved?.messageId === stop.messageId) {
+          return { stop: saved, replay: true };
+        }
+        throw new StoreError('stop_conflict');
+      });
+    },
+    claimFeedbackPending(input) {
+      const owner = required(input.owner, 191);
+      const leaseMs = Number(input.leaseMs || 60000);
+      const take = Math.max(1, Math.min(5, Number(input.limit || 1)));
+      return write(async connection => {
+        const at = now();
+        const [candidates] = await connection.execute(`SELECT id FROM assistant_codex_forward_jobs
+          WHERE status IN ('held','completed','failed','deferred')
+            AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+            AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+            AND JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.typing.desired'))='false'
+            AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.typing.outcome')),'') NOT IN ('confirmed','not_applicable')
+          ORDER BY updated_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [at, at]);
+        if (!candidates.length) return [];
+        const ids = candidates.map(item => String(item.id));
+        const slots = ids.map(() => '?').join(',');
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET lease_owner=?,lease_expires_at=?,updated_at=?
+          WHERE id IN (${slots})`, [owner, at + leaseMs, at, ...ids]);
+        const [rows] = await connection.execute(`SELECT id AS internal_id,assistant_codex_forward_jobs.*
+          FROM assistant_codex_forward_jobs WHERE id IN (${slots}) ORDER BY updated_at,id`, ids);
+        return rows.map(row);
+      });
+    },
+    releaseFeedback(input) {
+      const [id, owner] = leaseArgs(input);
+      return write(async connection => {
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET lease_owner='',lease_expires_at=NULL,next_attempt_at=?,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('held','completed','failed','deferred')`,
+        [input.nextAttemptAt ?? null, at, id, owner, at]);
+        await assertLease(connection, result);
+        return { released: true };
       });
     },
     readEvents(input) {

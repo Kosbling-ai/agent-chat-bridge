@@ -39,16 +39,19 @@ test('unknown native outcome becomes held and is not submitted again',async()=>{
 });
 
 test('run API freezes namespace/delivery mode and rejects ledger management after scope checks',async()=>{
-  const token='synthetic-token-at-least-24-characters';const submitted=[];const current={id:'run',conversationId:'chat',status:'completed'};const forwardRuntime={submit:async input=>{submitted.push(input);return{id:'run',duplicate:false};},getRun:async()=>current,readRunEvents:async()=>({items:[{sequence:'9007199254740993',payload:{type:'progress'}}],nextCursor:'9007199254740993'}),getResource:async()=>null};const api=createApi({config:validateConfig(base),store:{getRecovery:async()=>({id:'recovery',connectionId:'test',conversationId:'chat',status:'applied'})},chat:{},tokens:{caller:token},forwardRuntime});
+  const token='synthetic-token-at-least-24-characters';const submitted=[];const current={id:'run',conversationId:'chat',status:'completed'};const forwardRuntime={submit:async input=>{submitted.push(input);return{id:'run',duplicate:false};},getRun:async()=>current,readRunEvents:async()=>({items:[{sequence:'9007199254740993',payload:{type:'progress'}}],nextCursor:'9007199254740993'}),getResource:async({index})=>index===0?{fileName:'answer.txt',kind:'file',size:6,base64:'YW5zd2Vy'}:null};const api=createApi({config:validateConfig(base),store:{getRecovery:async()=>({id:'recovery',connectionId:'test',conversationId:'chat',status:'applied'})},chat:{},tokens:{caller:token},forwardRuntime});
   const request=(method,url,value)=>Object.assign(Readable.from(value?[Buffer.from(JSON.stringify(value))]:[]),{method,url,headers:{authorization:`Bearer ${token}`}});
   assert.equal((await api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'daily:1',text:'prompt',executionNamespace:'daily',deliveryMode:'caller'}))).status,202);assert.equal(submitted[0].deliveryMode,'caller');
   assert.equal(submitted[0].message.messageId,undefined);
   await assert.rejects(api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'long',text:'prompt',executionNamespace:'a'.repeat(129)})),{status:400,code:'invalid_execution_namespace'});
+  assert.equal((await api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'slash',text:'prompt',executionNamespace:'team/daily'}))).status,202);
   const events=await api(request('GET','/v1/runs/run/events?after=9007199254740992'));
   assert.equal(events.body.events[0].sequence,'9007199254740993');assert.equal(events.body.nextCursor,'9007199254740993');
+  assert.equal((await api(request('GET','/v1/runs/run/resources/0'))).body.fileName,'answer.txt');
   assert.equal((await api(request('GET','/v1/recoveries/recovery'))).body.status,'applied');
   await assert.rejects(api(request('GET','/v1/runs/run/attempt')),{status:409,code:'unsupported_execution_model'});
-  await assert.rejects(api(request('POST','/v1/sessions/reset',{conversationId:'chat',generation:1})),{status:409,code:'unsupported_execution_model'});
+  await assert.rejects(api(request('POST','/v1/recoveries',{runId:'run'})),{status:409,code:'unsupported_execution_model'});
+  await assert.rejects(api(request('POST','/v1/sessions/reset',{conversationId:'chat'})),{status:409,code:'unsupported_execution_model'});
 });
 
 test('public run keeps result contract and separates execution from delivery status', () => {
@@ -59,6 +62,48 @@ test('public run keeps result contract and separates execution from delivery sta
   assert.equal(failed.executionStatus,'failed');
   assert.equal(failed.result.answer,'failed');
   assert.equal(failed.errorCode,'CODEX_TURN_FAILED');
+  const withResource = publicRun({
+    id: 'resource-run', chatId: 'chat', status: 'completed', deliveryMode: 'caller',
+    result: { attachments: [{ ref: { artifactId: 'internal-secret' }, fileName: 'answer.txt', size: 6, kind: 'file' }] },
+    createdAt: 1, updatedAt: 2,
+  });
+  assert.deepEqual(withResource.attachments, [{ id: '0', fileName: 'answer.txt', size: 6, kind: 'file' }]);
+});
+
+test('unknown reply stays pending and a failed reply never records a successful inbound answer', async () => {
+  async function runDelivery(status) {
+    const calls = [];
+    let claimed = false;
+    const job = {
+      id: `delivery-${status}`, leaseOwner: 'delivery-worker', status: 'reply_pending',
+      callerId: 'live', chatId: 'chat', chatType: 'group', messageId: 'message',
+      sourceMessageId: 'message', deliveryMode: 'bridge', result: { answer: 'answer' }, createdAt: 1,
+    };
+    const jobs = {
+      async claimReplyPending() { if (claimed) return []; claimed = true; return [job]; },
+      async claim() { return []; },
+      async renew() {},
+      async markRetry(value) { calls.push(['retry', value]); },
+      async markFinished(value) { calls.push(['finished', value]); },
+    };
+    const runtime = createForwardRuntime({
+      config: { owner: 'delivery-worker', pollMs: 1, leaseMs: 10_000 }, jobs, sessions: {}, executor: {},
+      feedback: { async finish() { return false; } },
+      replies: { async prepare(_job, result) { return result; }, async deliver() { return { status }; } },
+      inbound: { async recordReply() { calls.push(['recorded']); } },
+    });
+    runtime.start(); await flush(); await runtime.stop();
+    return calls;
+  }
+
+  const unknown = await runDelivery('unknown');
+  assert.equal(unknown.some(([name]) => name === 'finished'), false);
+  assert.equal(unknown.find(([name]) => name === 'retry')[1].replyPending, true);
+  const failed = await runDelivery('failed');
+  assert.equal(failed.some(([name]) => name === 'recorded'), false);
+  const finished = failed.find(([name]) => name === 'finished')[1];
+  assert.equal(finished.replySent, false);
+  assert.equal(finished.errorCode, 'reply_delivery_failed');
 });
 
 test('persisted start intent without a turn is held without a new executor call', async () => {

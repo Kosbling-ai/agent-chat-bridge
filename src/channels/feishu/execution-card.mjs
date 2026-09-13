@@ -34,6 +34,10 @@ export class ExecutionCard {
     this.client = client; this.chatId = chatId; this.uuid = uuid; this.persist = persist; this.audit = audit; this.logger = logger; this.jobId = String(jobId).slice(0, 64); this.messageId = String(messageId).slice(0, 80);
     this.intervalMs = Math.max(1000, Number(intervalMs) || 1000); this.displayName = displayName;
     this.state = { status: 'running', entries: [], jobId: this.jobId, ...saved };
+    if (!this.state.messageId && this.state.deliveryState?.operation === 'create' && this.state.deliveryState.status === 'intent') {
+      this.state.delivery = 'unknown';
+      this.state.deliveryState = { ...this.state.deliveryState, status: 'unknown' };
+    }
     this.chain = Promise.resolve(); this.timer = null; this.closed = false; this.dirty = false;
     this.startedAt = Date.now(); this.failures = 0; this.inFlight = false;
   }
@@ -46,7 +50,7 @@ export class ExecutionCard {
   }
   snapshot() { return structuredClone(this.state); }
   push(event) {
-    if (this.closed || this.state.delivery === 'fallback' || !event) return;
+    if (this.closed || ['fallback', 'unknown'].includes(this.state.delivery) || !event) return;
     if (event.kind === 'started') { this.state.status = 'running'; if (event.turnId) this.state.turnId = event.turnId; }
     if (event.kind === 'commentary' || event.kind === 'tool') {
       const entries = this.state.entries;
@@ -67,17 +71,24 @@ export class ExecutionCard {
     }
   }
   enqueue() {
-    if (this.inFlight || this.closed || this.state.delivery === 'fallback') return this.chain;
+    if (this.inFlight || this.closed || ['fallback', 'unknown'].includes(this.state.delivery)) return this.chain;
     this.dirty = false;
     this.inFlight = true;
     this.chain = this.update().catch(async (error) => {
       this.failures++;
+      if (error?.code === 'card_create_unknown') {
+        await this.log('unknown', 'warn', { failure_count: this.failures, error_code: errorCode(error) }).catch(() => {});
+        return;
+      }
       await this.log('fallback', 'warn', { failure_count: this.failures, error_code: errorCode(error) }).catch(() => {});
       if (this.failures >= 3 || !this.state.messageId) this.state.delivery = 'fallback';
     }).finally(() => { this.inFlight = false; });
     return this.chain;
   }
   async update(answer = '') {
+    if (!this.state.messageId && this.state.delivery === 'unknown') {
+      throw Object.assign(new Error('card create outcome is unknown'), { code: 'card_create_unknown', outcome: 'unknown' });
+    }
     const snapshot = this.snapshot();
     const card = renderExecutionCard(snapshot, answer, this.displayName);
     const operation = this.state.messageId ? 'patch' : 'create';
@@ -90,8 +101,17 @@ export class ExecutionCard {
     this.state.deliveryState = intent.deliveryState;
     if (!this.state.messageId) {
       // Deterministic UUID handles an ambiguous create response or a crash before persistence.
-      const response = await this.client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: this.chatId, msg_type: 'interactive', content: JSON.stringify(card), uuid: this.uuid } });
-      checkResponse(response);
+      let response;
+      try {
+        response = await this.client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: this.chatId, msg_type: 'interactive', content: JSON.stringify(card), uuid: this.uuid } });
+        checkResponse(response);
+      } catch (error) {
+        if (error?.outcome === 'failed') throw error;
+        this.state.delivery = 'unknown';
+        this.state.deliveryState = { operation, status: 'unknown', at: Date.now(), errorCode: errorCode(error) };
+        await this.persist(this.snapshot());
+        throw Object.assign(new Error('card create outcome is unknown'), { code: 'card_create_unknown', outcome: 'unknown' });
+      }
       this.state.messageId = response?.data?.message_id;
       if (!this.state.messageId) throw new Error('card message id missing');
       this.state.ackedRevision = desiredRevision;
@@ -123,6 +143,7 @@ export class ExecutionCard {
         await this.log('succeeded');
         return true;
       } catch (error) {
+        if (error?.code === 'card_create_unknown') throw error;
         this.state.delivery = 'fallback';
         await this.log('fallback', 'warn', { error_code: errorCode(error) }).catch(() => {});
       }
@@ -132,18 +153,21 @@ export class ExecutionCard {
     if (this.state.messageId) await this.update('').catch((error) => this.log('fallback', 'warn', { operation: 'close_fallback_card', error_code: errorCode(error) }));
     return false;
   }
+  setObserverCursor(cursor) {
+    this.state.observerCursor = { at: Number(cursor.at || 0), id: String(cursor.id || '0') };
+    this.dirty = true;
+  }
 }
 function errorCode(error) { return String(error?.code || error?.name || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64); }
 function checkResponse(response) {
   if (response?.code != null && response.code !== 0) {
-    const error = new Error('Feishu card request rejected'); error.code = String(response.code); throw error;
+    const error = new Error('Feishu card request rejected'); error.code = String(response.code); error.outcome = 'failed'; throw error;
   }
 }
 
 // A bounded, read-only sidecar. It cannot cancel/steer or retry a Codex turn.
-export function observeExecutionCard({ card, load, since, intervalMs = 1000 }) {
-  let cursor = { at: since, id: 0 };
-  let highWater = since;
+export function observeExecutionCard({ card, load, since, cursor: savedCursor, intervalMs = 1000 }) {
+  let cursor = { at: Number(savedCursor?.at || since || 0), id: String(savedCursor?.id || '0') };
   const seen = new Set();
   let stopped = false;
   let pending = null;
@@ -153,8 +177,8 @@ export function observeExecutionCard({ card, load, since, intervalMs = 1000 }) {
     pending = (async () => {
       const rows = await load(cursor);
       for (const row of rows) {
-        cursor = { at: Number(row.created_at), id: Number(row.id) };
-        highWater = Math.max(highWater, cursor.at);
+        cursor = { at: Number(row.created_at), id: String(row.id) };
+        card.setObserverCursor(cursor);
         if (!row.progress_json || seen.has(String(row.id))) continue;
         seen.add(String(row.id));
         if (seen.size > 500) seen.delete(seen.values().next().value);
@@ -162,9 +186,6 @@ export function observeExecutionCard({ card, load, since, intervalMs = 1000 }) {
         try { event = typeof row.progress_json === 'string' ? JSON.parse(row.progress_json) : row.progress_json; } catch { continue; }
         if (['started', 'commentary', 'tool'].includes(event?.kind)) card.push(event);
       }
-      // Replay a bounded overlap for asynchronously committed events. Full pages
-      // continue keyset paging first, so a busy chat cannot starve later rows.
-      if (rows.length < 100) cursor = { at: Math.max(since, highWater - 10000), id: 0 };
     })().catch(async () => { failed = true; await card.log('fallback', 'warn', { operation: 'read_progress' }).catch(() => {}); }).finally(() => { pending = null; });
     return pending;
   };
@@ -174,6 +195,7 @@ export function observeExecutionCard({ card, load, since, intervalMs = 1000 }) {
     clearInterval(timer);
     if (!stopped) { await pending; await poll(); stopped = true; }
     card.stop(); await card.chain;
+    await card.persist(card.snapshot());
     return card.snapshot();
   } };
 }

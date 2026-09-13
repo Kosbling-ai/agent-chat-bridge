@@ -89,8 +89,25 @@ test('observer advances cursor through unrelated rows without exposing them', as
     return reads === 1 ? [{ id: 1, created_at: 101, progress_json: null }, { id: 2, created_at: 101, progress_json: JSON.stringify(tool('t')) }] : [];
   } });
   await tick(); const snapshot = await observer.stop();
-  assert.deepEqual(cursors[1], { at: 100, id: 0 });
+  assert.deepEqual(cursors[1], { at: 101, id: '2' });
   assert.equal(snapshot.entries[0].id, 't');
+  const resumed=[];
+  const next=observeExecutionCard({card:fixture(snapshot).card,since:100,cursor:snapshot.observerCursor,load:async cursor=>{resumed.push(cursor);return[];}});
+  await next.stop();
+  assert.deepEqual(resumed[0],{at:101,id:'2'});
+});
+
+test('unknown create persists a hold and restart never creates or falls back', async () => {
+  let creates = 0;
+  const first = fixture(null, { create: async () => { creates += 1; throw new Error('timeout'); } });
+  first.card.push({ kind: 'started' });
+  await first.card.chain;
+  assert.equal(first.card.snapshot().delivery, 'unknown');
+  const saved = first.persisted.at(-1);
+  const restarted = fixture(saved, { create: async () => { creates += 1; } });
+  await assert.rejects(restarted.card.finish('answer'), { code: 'card_create_unknown' });
+  assert.equal(creates, 1);
+  assert.equal(restarted.card.snapshot().delivery, 'unknown');
 });
 
 test('observer read failure cannot reject final delivery', async () => {

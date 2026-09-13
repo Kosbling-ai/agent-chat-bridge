@@ -11,7 +11,7 @@ export function publicAttachments(attachments = []) {
     const path = typeof value === 'string' ? value : value?.filePath;
     const fileName = value?.fileName || basename(path || `attachment-${index}`);
     return {
-      id: value?.ref?.artifactId || String(index), fileName,
+      id: String(index), fileName,
       size: Number(value?.size || 0) || null,
       kind: value?.kind || (imageTypes.has(extname(fileName).toLowerCase()) ? 'image' : 'file'),
     };
@@ -41,13 +41,16 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = 
       artifactId: artifact.ref.artifactId,
       ...(previous.get(artifact.ref.artifactId) || { status: 'pending' }),
     }));
-    return {
+    const value = {
       ...result,
       attachments: prepared.artifacts,
       attachmentFailures: prepared.failures,
       attachmentsOmitted: prepared.omitted,
       delivery: { ...(result.delivery || {}), artifactsPrepared: true, attachments },
     };
+    await jobs.patchReplyResult({ id: job.id, leaseOwner: job.leaseOwner, result: value });
+    job.result = value;
+    return value;
   }
 
   async function sendText(job, result, control) {
@@ -56,7 +59,13 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = 
     delivery.text ||= { items: cards.map((_, index) => ({ index, status: 'pending' })) };
     for (const [index, content] of cards.entries()) {
       const item = delivery.text.items[index] ||= { index, status: 'pending' };
-      if (['sent', 'failed', 'unknown'].includes(item.status)) continue;
+      if (item.status === 'intent') {
+        item.status = 'unknown';
+        item.errorCode ||= 'reply_delivery_unknown';
+        await persist(job, delivery);
+      }
+      if (['sent', 'failed'].includes(item.status)) continue;
+      if (item.status === 'unknown') return { sent: 0, status: 'unknown' };
       item.status = 'intent';
       await persist(job, delivery);
       control.assertLease();
@@ -72,9 +81,10 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = 
         item.errorCode = error?.code || 'reply_delivery_unknown';
       }
       await persist(job, delivery);
-      if (item.status === 'unknown') throw effectUnknown(item.errorCode);
+      if (item.status === 'unknown') return { sent: 0, status: 'unknown' };
     }
-    return delivery.text.items.filter(item => item.status === 'sent').length;
+    const failed = delivery.text.items.some(item => item.status === 'failed');
+    return { sent: delivery.text.items.filter(item => item.status === 'sent').length, status: failed ? 'failed' : 'sent' };
   }
 
   async function sendAttachments(job, result, control) {
@@ -89,6 +99,11 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = 
       if (!item) {
         item = { artifactId, status: 'pending' };
         delivery.attachments.push(item);
+      }
+      if (['upload_intent', 'send_intent'].includes(item.status)) {
+        item.status = 'unknown';
+        item.errorCode ||= item.uploadResult ? 'attachment_send_unknown' : 'attachment_upload_unknown';
+        await persist(job, delivery);
       }
       if (['cleaned', 'failed', 'unknown'].includes(item.status)) { facts.push({ ...item, index }); continue; }
       if (!item.uploadResult) {
@@ -144,10 +159,14 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = 
     async deliver(job, result, { skipText = false, signal, assertLease = () => {} } = {}) {
       if (signal?.aborted) throw Object.assign(new Error('forward_lease_lost'), { code: 'forward_lease_lost' });
       const control = { signal, assertLease };
-      const messages = skipText ? 0 : await sendText(job, result, control);
+      const text = skipText ? { sent: 0, status: 'sent' } : await sendText(job, result, control);
       const attachments = await sendAttachments(job, result, control);
-      log('info', 'forward_reply', 'succeeded', { attachments: attachments.filter(item => item.status === 'cleaned').length });
-      return { messages, attachments };
+      const statuses = [text.status, ...attachments.map(item => item.status)];
+      const status = statuses.some(value => value === 'unknown') ? 'unknown'
+        : statuses.some(value => value === 'failed') ? 'failed' : 'sent';
+      log(status === 'sent' ? 'info' : 'warning', 'forward_reply', status === 'sent' ? 'succeeded' : status,
+        { attachments: attachments.filter(item => item.status === 'cleaned').length });
+      return { messages: text.sent, attachments, status };
     },
     async readResource(job, index) {
       const artifact = (job.result?.attachments || [])[index];

@@ -7,6 +7,8 @@ import { createMysqlStore } from '../src/storage/store.mjs';
 import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
 import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
 import { createApi } from '../src/core/api.mjs';
+import { createFeishuReplies } from '../src/channels/feishu/replies.mjs';
+import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 import { validateConfig } from '../src/config.mjs';
 import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
 import { Readable } from 'node:stream';
@@ -48,7 +50,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     });
     await store.patchFeedback({
       id: first.id, leaseOwner: 'worker-a', key: 'typing',
-      value: { desired: false, reactionId: 'reaction' },
+      value: { desired: false, reactionId: 'reaction', outcome: 'confirmed' },
     });
     await store.markReplyPending({
       id: first.id, leaseOwner: 'worker-a',
@@ -126,6 +128,92 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal(ignoredRun.status, 'completed');
     assert.equal(ignoredRun.result.inputStatus, 'ignored');
     assert.deepEqual(executed, ['runtime-deferred']);
+
+    const deliveryRun = await store.upsert({
+      ...input,
+      idempotencyKey: 'delivery-sidecar',
+      messageId: 'delivery-source',
+      sourceMessageId: 'delivery-source',
+      deliveryMode: 'bridge',
+    });
+    const deliveryClaim = (await store.claim({ owner: 'delivery-executor', leaseMs: 100, limit: 5 }))
+      .find(job => job.id === deliveryRun.id);
+    assert(deliveryClaim);
+    const deliveryResult = {
+      answer: 'delivered answer', rawAnswer: 'raw delivered answer',
+      execution: { bindingOpenId: 'group:binding', threadId: 'delivery-thread', turnId: 'delivery-turn', startedAt: now },
+    };
+    await store.markReplyPending({
+      id: deliveryRun.id, leaseOwner: 'delivery-executor', result: deliveryResult,
+    });
+    const replyClaim = (await store.claimReplyPending({ owner: 'delivery-worker', leaseMs: 100, limit: 5 }))
+      .find(job => job.id === deliveryRun.id);
+    assert(replyClaim);
+    const deliveryCalls = [];
+    const replies = createFeishuReplies({
+      connectionId: 'fixture', jobs: store,
+      chat: {
+        async replyMessage() { deliveryCalls.push('reply'); return { message_id: 'reply-message' }; },
+      },
+      outbound: {
+        async prepare() {
+          return { artifacts: [{ ref: { artifactId: 'artifact-one' }, fileName: 'result.txt', size: 6, kind: 'file' }], failures: [], omitted: 0 };
+        },
+        async upload() { deliveryCalls.push('upload'); return { file_key: 'file-key' }; },
+        async send() { deliveryCalls.push('attachment'); return { message_id: 'attachment-message' }; },
+        async cleanup() { deliveryCalls.push('cleanup'); },
+      },
+    });
+    const preparedDelivery = await replies.prepare(replyClaim, replyClaim.result);
+    const delivered = await replies.deliver(replyClaim, preparedDelivery, { assertLease() {} });
+    assert.equal(delivered.status, 'sent');
+    assert.deepEqual(deliveryCalls, ['reply', 'upload', 'attachment', 'cleanup']);
+    const persistedDelivery = await store.getRun({ id: deliveryRun.id });
+    assert.equal(persistedDelivery.result.delivery.text.items[0].status, 'sent');
+    assert.equal(persistedDelivery.result.delivery.attachments[0].status, 'cleaned');
+
+    await store.patchFeedback({
+      id: deliveryRun.id, leaseOwner: 'delivery-worker', key: 'typing',
+      value: { desired: false, operation: 'remove', outcome: 'unknown' },
+    });
+    await store.markFinished({
+      id: deliveryRun.id, leaseOwner: 'delivery-worker', status: 'completed',
+      result: preparedDelivery, replySent: true,
+    });
+    const [cleanupClaim] = await store.claimFeedbackPending({ owner: 'feedback-worker', leaseMs: 100, limit: 1 });
+    assert.equal(cleanupClaim.id, deliveryRun.id);
+    const removedReactions = [];
+    const feedback = createExecutionFeedback({
+      jobs: store, sessions: {}, executor: {},
+      chat: {
+        async listReactions() {
+          return { items: [{ reaction_id: 'typing-reaction', operator: { operator_type: 'app' }, reaction_type: { emoji_type: 'Typing' } }] };
+        },
+        async removeReaction(value) { removedReactions.push(value.reactionId); },
+      },
+    });
+    await feedback.cleanup(cleanupClaim, { assertLease() {} });
+    await store.releaseFeedback({ id: deliveryRun.id, leaseOwner: 'feedback-worker' });
+    assert.deepEqual(removedReactions, ['typing-reaction']);
+    assert.equal((await store.getRun({ id: deliveryRun.id })).result.typing.outcome, 'confirmed');
+    assert.deepEqual(await store.claimFeedbackPending({ owner: 'feedback-worker-2', leaseMs: 100, limit: 1 }), []);
+
+    const stopRun = await store.upsert({ ...input, idempotencyKey: 'stop-once', messageId: 'stop-source' });
+    const stopClaim = (await store.claim({ owner: 'stop-worker', leaseMs: 100, limit: 5 }))
+      .find(job => job.id === stopRun.id);
+    assert(stopClaim);
+    await store.patchExecution({
+      id: stopRun.id, leaseOwner: 'stop-worker',
+      execution: { bindingOpenId: 'group:binding', threadId: 'stop-thread', turnId: 'stop-turn', startedAt: now },
+    });
+    const stopInput = { id: stopRun.id, threadId: 'stop-thread', turnId: 'stop-turn', messageId: 'stop-source', actor: 'human' };
+    const stopBegins = await Promise.all([store.beginStop(stopInput), store.beginStop(stopInput)]);
+    assert.deepEqual(stopBegins.map(value => value.outcome).sort(), ['new', 'replay']);
+    const pendingStop = stopBegins[0].stop;
+    await store.finishStop({ id: stopRun.id, stop: { ...pendingStop, outcome: 'requested', confirmedAt: now } });
+    const staleUnknown = await store.finishStop({ id: stopRun.id, stop: { ...pendingStop, outcome: 'unconfirmed', confirmedAt: now } });
+    assert.equal(staleUnknown.replay, true);
+    assert.equal(staleUnknown.stop.outcome, 'requested');
 
     const communication = await createMysqlStore({ pool, now: () => now });
     const receipt = {

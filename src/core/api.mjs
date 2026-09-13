@@ -62,7 +62,7 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
       const input = fields(await body(request, 512 * 1024), ['conversationId', 'idempotencyKey', 'text', 'executionNamespace', 'deliveryMode'], ['conversationId', 'idempotencyKey']);
       if (typeof input.text !== 'string' || !input.text.trim()) throw new ApiError('invalid_text');
       if (Buffer.byteLength(input.text) > 64 * 1024) throw new ApiError('text_too_large', 413);
-      if (input.executionNamespace !== undefined && (typeof input.executionNamespace !== 'string' || !/^[a-z0-9][a-z0-9._:-]{0,127}$/i.test(input.executionNamespace))) throw new ApiError('invalid_execution_namespace');
+      if (input.executionNamespace !== undefined && (typeof input.executionNamespace !== 'string' || !/^[a-z0-9][a-z0-9._:/-]{0,127}$/i.test(input.executionNamespace))) throw new ApiError('invalid_execution_namespace');
       if (input.deliveryMode !== undefined && !['bridge','caller'].includes(input.deliveryMode)) throw new ApiError('invalid_delivery_mode');
       authorize(client, input.conversationId);
       const idempotencyKey = identifier(input.idempotencyKey, 255);
@@ -80,22 +80,18 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
         if (!client.admin) throw new ApiError('forbidden', 403);
         throw new ApiError('unsupported_execution_model',409);
       }
-      const page=pagination(url);
       if (!run[2]) return { status: 200, body: row };
+      const page=pagination(url);
       const events = await forwardRuntime.readRunEvents({ id: row.id, after: page.afterSequence, limit: page.limit });
       return { status: 200, body: { events: events.items, nextCursor: events.nextCursor } };
     }
     if (request.method === 'POST' && path === '/v1/recoveries') {
       if (!client.admin) throw new ApiError('forbidden', 403);
-      const input = fields(await body(request), ['runId', 'idempotencyKey', 'generation', 'action', 'evidence', 'nativeThreadId', 'nativeTurnId'], ['runId', 'idempotencyKey', 'action']);
+      const input = fields(await body(request), ['runId', 'idempotencyKey', 'generation', 'action', 'evidence', 'nativeThreadId', 'nativeTurnId'], ['runId']);
       identifier(input.runId, 36);
       const job = await forwardRuntime.getRun({ id: input.runId });
       if (!job) throw new ApiError('not_found', 404);
       authorize(client, job.conversationId);
-      if (!Number.isSafeInteger(input.generation) || input.generation < 1) throw new ApiError('invalid_generation');
-      if (!['adopt_turn', 'abandon_verified', 'abandon_guidance_verified'].includes(input.action) || typeof input.evidence !== 'string' || !input.evidence.trim() || input.evidence.length > 4096) throw new ApiError('invalid_recovery');
-      if (input.action === 'adopt_turn') { identifier(input.nativeThreadId, 255); identifier(input.nativeTurnId, 255); }
-      else if (input.nativeThreadId !== undefined || input.nativeTurnId !== undefined) throw new ApiError('invalid_recovery');
       throw new ApiError('unsupported_execution_model',409);
     }
     const recovery = /^\/v1\/recoveries\/([\w-]+)$/.exec(path);
@@ -153,7 +149,6 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
       const input = fields(await body(request), ['conversationId', 'generation'], ['conversationId']);
       authorize(client, input.conversationId);
       if (!client.admin) throw new ApiError('forbidden', 403);
-      if (!Number.isInteger(input.generation) || input.generation < 1) throw new ApiError('invalid_generation');
       throw new ApiError('unsupported_execution_model',409);
     }
     throw new ApiError('not_found', 404);
