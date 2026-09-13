@@ -161,19 +161,16 @@ test('write uncertainty survives timeout/network/platform error and never leaks 
   }
 });
 
-test('history, members, resource and reaction requests stay scoped and paginated', async () => {
+test('internal history reads and reaction writes stay scoped and bounded', async () => {
   const { chat, calls } = fakeChat();
   await chat.getMessage({ messageId: 'm' });
   await chat.listMessages({ conversationId: 'chat', pageSize: 20, pageToken: 'next' });
-  await chat.listMembers({ conversationId: 'chat' });
-  await chat.listReactions({ messageId: 'm' });
   await chat.addReaction({ messageId: 'm', emojiType: 'OK' });
   await chat.removeReaction({ messageId: 'm', reactionId: 'owned' });
   assert.equal(calls[1].request.params.page_size, 20);
-  assert.equal(calls[2].resource, 'chatMembers');
-  assert.equal(calls[5].request.path.reaction_id, 'owned');
+  assert.equal(calls[3].request.path.reaction_id, 'owned');
   assert.throws(() => chat.listMessages({ conversationId: 'chat', pageSize: 101 }));
-  assert.throws(() => chat.listMembers({ conversationId: 'chat', pageToken: 'x'.repeat(513) }));
+  assert.throws(() => chat.listMessages({ conversationId: 'chat', pageToken: 'x'.repeat(513) }));
 });
 
 test('uploads accept bounded bytes only, never arbitrary filesystem paths', async () => {
@@ -225,9 +222,7 @@ test('installed SDK and axios build chat HTTP requests without any network trans
   await chat.replyMessage({ ...send, messageId: 'm' });
   await chat.getMessage({ messageId: 'm' });
   await chat.listMessages({ conversationId: 'chat' });
-  await chat.listMembers({ conversationId: 'chat' });
   await chat.addReaction({ messageId: 'm', emojiType: 'OK' });
-  await chat.listReactions({ messageId: 'm' });
   await chat.removeReaction({ messageId: 'm', reactionId: 'r' });
   await chat.uploadImage({ bytes: Buffer.from('image') });
   await chat.uploadFile({ bytes: Buffer.from('file'), fileName: 'test.pdf', fileType: 'pdf' });
@@ -235,10 +230,9 @@ test('installed SDK and axios build chat HTTP requests without any network trans
   let content = '';
   for await (const chunk of resource.stream) content += chunk.toString();
   assert.equal(content, 'ok');
-  assert.equal(requests.filter((request) => request.url.includes('/im/')).length, 11);
+  assert.equal(requests.filter((request) => request.url.includes('/im/')).length, 9);
   const create = requests.find((request) => request.url.endsWith('/im/v1/messages'));
   assert.equal(JSON.parse(create.data).uuid, 'stable-effect');
-  assert.ok(requests.some((request) => request.url.endsWith('/chats/chat/members')));
   assert.ok(requests.some((request) => request.url.endsWith('/messages/m/resources/f')));
   const fileUpload = requests.find(request => request.url.endsWith('/im/v1/files'));
   assert.match(fileUpload.data.getBuffer().toString(), /name="file_type"\r\n\r\npdf/);

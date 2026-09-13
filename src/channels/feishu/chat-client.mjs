@@ -77,12 +77,6 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
         sort_type: 'ByCreateTimeAsc', ...page({ pageSize, pageToken }),
         ...(startTime !== undefined ? { start_time: String(startTime) } : {}), ...(endTime !== undefined ? { end_time: String(endTime) } : {}) } });
     },
-    listMembers({ conversationId, pageSize, pageToken }) {
-      return call('chatMembers', 'get', { path: { chat_id: required(conversationId) }, params: { member_id_type: 'open_id', ...page({ pageSize, pageToken }) } });
-    },
-    listReactions({ messageId, pageSize, pageToken }) {
-      return call('messageReaction', 'list', { path: { message_id: required(messageId) }, params: { user_id_type: 'open_id', ...page({ pageSize, pageToken }) } });
-    },
     addReaction({ messageId, emojiType }) {
       return call('messageReaction', 'create', { path: { message_id: required(messageId) }, data: { reaction_type: { emoji_type: required(emojiType) } } }, true);
     },
