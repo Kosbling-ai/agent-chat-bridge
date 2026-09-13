@@ -157,7 +157,11 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
 
   async function wait(job, state) {
     if (job.deliveryMode === 'caller' || !state) return;
-    if (state.result.executionCard?.status !== 'retrying' && state.card) {
+    const savedCard = state.result.executionCard;
+    const waitingConfirmed = savedCard?.status === 'retrying'
+      && savedCard.deliveryState?.status === 'confirmed'
+      && Number(savedCard.ackedRevision || 0) >= Number(savedCard.desiredRevision || 0);
+    if (!waitingConfirmed && state.card) {
       state.result.executionCard = await state.card.pause();
     }
     await ensureTypingStopped(job, state).catch(error => {

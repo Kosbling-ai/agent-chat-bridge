@@ -97,6 +97,51 @@ test('busy waiting reuses one card and does not repeat Typing until admission su
   assert.deepEqual(effects.filter(value => value.startsWith('typing:remove')), ['typing:remove:reaction-1']);
 });
 
+test('busy waiting retries an unconfirmed card patch once and then stays quiet', async () => {
+  const job = jobFixture();
+  job.sourceMessageId = null;
+  job.result.executionCard = {
+    messageId: 'card-message',
+    status: 'running',
+    entries: [],
+    desiredRevision: 1,
+    ackedRevision: 1,
+    deliveryState: { operation: 'patch', status: 'confirmed', at: 1 },
+  };
+  let patches = 0;
+  const feedback = createExecutionFeedback({
+    jobs: {
+      async patchFeedback({ key, value }) {
+        job.result = { ...job.result, [key]: structuredClone(value) };
+      },
+    },
+    sessions: {}, chat: {}, executor: {},
+    cardClient: { im: { v1: { message: {
+      async patch() {
+        patches += 1;
+        if (patches === 1) throw new Error('ambiguous transport failure');
+        return { code: 0 };
+      },
+    } } } },
+  });
+
+  await feedback.wait(job, feedback.restoreWaiting(job));
+  assert.equal(patches, 1);
+  assert.equal(job.result.executionCard.status, 'retrying');
+  assert.equal(job.result.executionCard.deliveryState.status, 'unknown');
+  assert.equal(job.result.executionCard.desiredRevision, 2);
+  assert.equal(job.result.executionCard.ackedRevision, 1);
+
+  await feedback.wait(job, feedback.restoreWaiting(job));
+  assert.equal(patches, 2);
+  assert.equal(job.result.executionCard.deliveryState.status, 'confirmed');
+  assert.equal(job.result.executionCard.desiredRevision, 3);
+  assert.equal(job.result.executionCard.ackedRevision, 3);
+
+  await feedback.wait(job, feedback.restoreWaiting(job));
+  assert.equal(patches, 2);
+});
+
 test('lease loss while card intent persistence is blocked prevents the platform call', async () => {
   const job = jobFixture();
   job.sourceMessageId = null;
