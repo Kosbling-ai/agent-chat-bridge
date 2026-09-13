@@ -56,6 +56,13 @@ function reference(value) {
   if (typeof value !== 'string' || !/^[A-Z_][A-Z0-9_]{0,127}$/.test(value)) throw new ConfigError('invalid_environment_reference');
   return value;
 }
+// Codex receives only explicitly selected names. Lowercase proxy variables are
+// conventional environment names; secret-reference fields retain uppercase-only
+// validation and this does not enable ambient environment inheritance.
+function codexEnvironmentName(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(value)) throw new ConfigError('invalid_environment_reference');
+  return value;
+}
 function strings(value) {
   if (!Array.isArray(value) || value.length > 1000) throw new ConfigError('invalid_scope');
   return [...new Set(value.map(v => string(v)))];
@@ -74,8 +81,12 @@ function validateRuntime(raw) {
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
   object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
-  object(raw.codex, ['bin', 'cwd', 'envNames', 'model', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'steering'], 'invalid_codex_fields');
-  const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(reference) };
+  object(raw.codex, ['bin', 'cwd', 'envNames', 'model', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'steering', 'proxyEnv'], 'invalid_codex_fields');
+  const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
+  if (raw.codex.proxyEnv !== undefined) {
+    object(raw.codex.proxyEnv, ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'], 'invalid_codex_proxy_fields');
+    codex.proxyEnv = Object.fromEntries(Object.entries(raw.codex.proxyEnv).map(([name, source]) => [name, reference(source)]));
+  }
   if (raw.codex.model !== undefined) codex.model = string(raw.codex.model);
   codex.steering = raw.codex.steering ?? true;
   if (typeof codex.steering !== 'boolean') throw new ConfigError('invalid_steering_flag');

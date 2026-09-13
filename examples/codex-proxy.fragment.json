@@ -1,0 +1,14 @@
+{
+  "codex": {
+    "proxyEnv": {
+      "HTTP_PROXY": "BRIDGE_CODEX_PROXY",
+      "HTTPS_PROXY": "BRIDGE_CODEX_PROXY",
+      "http_proxy": "BRIDGE_CODEX_PROXY",
+      "https_proxy": "BRIDGE_CODEX_PROXY",
+      "ALL_PROXY": "BRIDGE_CODEX_ALL_PROXY",
+      "all_proxy": "BRIDGE_CODEX_ALL_PROXY",
+      "NO_PROXY": "BRIDGE_CODEX_NO_PROXY",
+      "no_proxy": "BRIDGE_CODEX_NO_PROXY"
+    }
+  }
+}
