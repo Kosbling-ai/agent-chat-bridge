@@ -67,6 +67,7 @@ export async function startService({ config, configPath, env = process.env, log,
   // Custom source names avoid changing the SDK's ambient proxy environment.
   // Explicit proxy mappings override same-name envNames only in the child.
   for (const [name, source] of Object.entries(proxyEnv)) childEnv[name] = secret(env, source);
+  const sharedHome = childEnv.CODEX_HOME || childEnv.HOME || resolve(cwd, '.agent-chat-bridge/codex-home');
   const tokens = Object.fromEntries(config.auth.clients.map(client => [client.id, secret(env, client.tokenEnv)]));
   const hookTokens = Object.fromEntries(config.hooks.map(hook => [hook.id, secret(env, hook.tokenEnv)]));
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
@@ -90,7 +91,17 @@ export async function startService({ config, configPath, env = process.env, log,
   const close = () => closing ??= (async () => {
     signal?.removeEventListener('abort', abort);
     const failures = [];
-    for (const operation of [() => http?.close(), () => feishu?.stop(), () => catchup?.stop(), () => communication?.stop(), () => forward?.stop(), () => executor?.close(), () => store ? store.close() : pool.end(), () => reporter?.close()]) {
+    for (const operation of [() => http?.close(), () => feishu?.stop()]) {
+      try { await operation(); } catch { failures.push(true); }
+    }
+    forward?.beginStop?.();
+    const executorClosing = Promise.resolve().then(() => executor?.close());
+    for (const operation of [() => catchup?.stop(), () => communication?.stop()]) {
+      try { await operation(); } catch { failures.push(true); }
+    }
+    try { await forward?.stop(); } catch { failures.push(true); }
+    try { await executorClosing; } catch { failures.push(true); }
+    for (const operation of [() => store ? store.close() : pool.end(), () => reporter?.close()]) {
       try { await operation(); } catch { failures.push(true); }
     }
     if (failures.length) throw new Error('service_shutdown_failed');
@@ -104,7 +115,29 @@ export async function startService({ config, configPath, env = process.env, log,
     const sessions=pool?.query?factories.sessions({pool,schema}):{};
     const jobs=factories.jobs({pool});
     const inbound=factories.inbound({pool});
-    executor=factories.executor({config:{...config.codex,bin,cwd,approvalPolicy:'never',sandbox:'workspace-write',serviceName:'Agent Chat Bridge'},sessionStore:sessions,childEnv,log});
+    const allowedGroupChatIds = new Set([
+      ...config.routing.groups.filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId),
+      ...config.auth.clients.flatMap(client => client.conversationIds),
+    ]);
+    const executorLog = (level, event = {}) => log(level, event.operation || 'codex_executor', event.status || 'unknown', { code: event.code });
+    const executorConfig = {
+      bin,
+      cwd,
+      sharedHome,
+      serviceName: config.feishu.displayName || 'Agent Chat Bridge',
+      approvalPolicy: 'never',
+      sandbox: 'workspace-write',
+      model: config.codex.model,
+      rolloverIdleMs: config.codex.rolloverIdleMs,
+      rolloverOnRulesUpdate: config.codex.rolloverOnRulesUpdate,
+      rulesPaths: config.codex.rulesFiles,
+      allowedGroupChatIds,
+    };
+    executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,onRestartRequired:async reason=>{
+      log('warning','codex_executor','restart_required',{code:reason});
+      forward?.beginStop?.();
+      await feishu?.stop?.();
+    }});
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
     const proxyAgent = config.feishu.httpProxyEnv ? factories.feishuProxyAgent(secret(env, config.feishu.httpProxyEnv)) : undefined;
@@ -117,7 +150,7 @@ export async function startService({ config, configPath, env = process.env, log,
     const replies=factories.replies({chat,outboxRoot:resolve(cwd,'data/feishu-outbox'),log});
     const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
     const feedback=factories.feedback({jobs,sessions,chat,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
-    forward=factories.forward({config:{},jobs,sessions,inbound,executor,feedback,replies,authorize:async()=>true,log});
+    forward=factories.forward({config:{steering:config.codex.steering},jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
     communication=factories.communication({config,store,inbound,chat,outbound,hookTokens,log});
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest, onCardAction: feedback.handleCardAction, log });
     const api = createApi({ config, store, forwardRuntime:forward, chat, tokens });
@@ -131,7 +164,7 @@ export async function startService({ config, configPath, env = process.env, log,
       let storeReady = writerHealthy;
       try { await store.assertCurrent(); } catch { storeReady = false; }
       const executorStatus=executor.status();
-      const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
+      const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending&&!executorStatus.fault, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
       return { ready: Object.values(components).every(Boolean), components };
     } });
     checkCancelled();

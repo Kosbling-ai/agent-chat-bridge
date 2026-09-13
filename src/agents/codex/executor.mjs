@@ -619,7 +619,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   return Object.freeze({
     execute, inspect, interrupt,
-    status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), activeTurns: activeByTurn.size, heldNotifications: [...earlyNotifications.values()].reduce((n, list) => n + list.length, 0), restartPending: restartPending || null }),
+    status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), fault: client.fault || null, activeTurns: activeByTurn.size, heldNotifications: [...earlyNotifications.values()].reduce((n, list) => n + list.length, 0), restartPending: restartPending || null }),
     async close() {
       closing = true;
       clearInterval(memoryTimer);

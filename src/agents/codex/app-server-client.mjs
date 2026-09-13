@@ -32,6 +32,7 @@ export class CodexAppServerClient {
     this.pending = new Map();
     this.stdoutBuffer = '';
     this.notificationChain = Promise.resolve();
+    this.fault = null;
     this.disconnectedChildren = new WeakSet();
     this.lifecycle = new IdleLifecycle({
       idleMs: config.idleCloseMs ?? 60_000,
@@ -76,6 +77,7 @@ export class CodexAppServerClient {
     }, { skipStart: true });
     if (this.child !== child) throw new Error('codex app-server child changed during initialize');
     this.ready = true;
+    this.fault = null;
     emitLog(this.log, 'info', 'app_server_start', 'succeeded');
   }
 
@@ -161,6 +163,7 @@ export class CodexAppServerClient {
   fail(error, child) {
     if (this.child !== child) return;
     this.ready = false;
+    this.fault = 'rpc_failure';
     this.rejectAll(error);
     this.notifyDisconnect(error, child);
     this.close('rpc_failure').catch(() => emitLog(this.log, 'error', 'app_server_close', 'failed'));
@@ -174,6 +177,7 @@ export class CodexAppServerClient {
 
   handleExit(error, child) {
     if (this.child !== child) return;
+    if (!this.closing) this.fault = 'unexpected_exit';
     this.ready = false; this.child = null; this.rejectAll(error); this.notifyDisconnect(error, child);
   }
 
@@ -185,6 +189,6 @@ export class CodexAppServerClient {
   }
 
   status() {
-    return { ready: this.ready, starting: Boolean(this.starting), closing: Boolean(this.closing), active: this.lifecycle.active, pending: this.pending.size };
+    return { ready: this.ready, starting: Boolean(this.starting), closing: Boolean(this.closing), active: this.lifecycle.active, pending: this.pending.size, fault: this.fault };
   }
 }

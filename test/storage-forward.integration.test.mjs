@@ -4,6 +4,12 @@ import { createPoolFromEnvironment } from '../src/storage/connection.mjs';
 import { migrate } from '../src/storage/migrations.mjs';
 import { createForwardJobStore } from '../src/storage/forward-jobs.mjs';
 import { createMysqlStore } from '../src/storage/store.mjs';
+import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
+import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
+import { createApi } from '../src/core/api.mjs';
+import { validateConfig } from '../src/config.mjs';
+import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
+import { Readable } from 'node:stream';
 
 const enabled = Boolean(process.env.BRIDGE_TEST_PASSWORD);
 const refs = Object.fromEntries(
@@ -70,13 +76,26 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const events=await store.readEvents({id:first.id,after:'0',limit:10});
     assert.deepEqual(events.map(event=>event.title),['Progress']);
 
+    const expiring = await store.upsert({ ...input, idempotencyKey: 'expiring', messageId: 'system:expiring' });
+    const [expiringClaim] = await store.claim({ owner: 'worker-expiring', leaseMs: 100, limit: 1 });
+    assert.equal(expiringClaim.id, expiring.id);
+    now += 101;
+    await assert.rejects(store.patchExecution({ id: expiring.id, leaseOwner: 'worker-expiring', execution: { status: 'too-late' } }), { code: 'forward_lease_lost' });
+
+    const busy = await store.upsert({ ...input, idempotencyKey: 'busy', messageId: 'system:busy' });
+    const busyClaim = (await store.claim({ owner: 'worker-busy', leaseMs: 100, limit: 5 })).find(job => job.id === busy.id);
+    assert.equal(busyClaim.id, busy.id);
+    await store.markRetry({ id: busy.id, leaseOwner: 'worker-busy', preserveAttempt: true, errorCode: 'CODEX_THREAD_BUSY', nextAttemptAt: now + 1000 });
+    assert.equal((await store.getRun({ id: busy.id })).attempts, 0);
+
     const communication = await createMysqlStore({ pool, now: () => now });
     const receipt = {
       connectionId: 'fixture', conversationId: 'chat', source: 'live', conversationType: 'group',
       eventKey: 'event-1', eventType: 'message.received', messageId: 'message-1',
       payload: { source: 'live', conversationType: 'group' }, policyVersion: '1',
-      inboundMessage: { messageType: 'text', senderOpenId: 'human', senderName: 'Human', text: 'hello' },
-      forwardJob: { prompt: 'Human：hello', senderOpenId: 'human', senderName: 'Human' },
+      occurredAt: 2000,
+      inboundMessage: { messageType: 'text', senderOpenId: 'human', senderName: 'Human', text: 'hello', createdAt: 2000, groupContextCandidate: true },
+      forwardJob: { prompt: 'Human：hello', senderOpenId: 'human', senderName: 'Human', inputEvent: { messageId: 'message-1', message: { kind: 'text' } } },
       hooks: [{ hookId: 'hook', payload: { messageId: 'message-1' } }],
     };
     const accepted = await communication.acceptInbound(receipt);
@@ -88,6 +107,39 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
       (SELECT COUNT(*) FROM bridge_jobs WHERE event_id=? AND kind='hook') AS hook_count`, [accepted.eventId]);
     assert.equal(Number(counts.forward_count), 1);
     assert.equal(Number(counts.hook_count), 1);
+    const [[forwardInput]] = await pool.query('SELECT result_json FROM assistant_codex_forward_jobs WHERE message_id=?', ['message-1']);
+    assert.equal(JSON.parse(forwardInput.result_json).inputEvent.messageId, 'message-1');
+
+    await communication.acceptInbound({
+      connectionId: 'fixture', conversationId: 'chat', source: 'live', conversationType: 'group',
+      eventKey: 'recall-1', eventType: 'message.recalled', messageId: 'message-1', recalledMessageId: 'message-1',
+      payload: { source: 'live', conversationType: 'group' }, policyVersion: '1',
+    });
+    const inbound = createInboundMessageStore({ pool, now: () => now });
+    const context = await inbound.loadRecentGroupContext({ connectionId: 'fixture', chatId: 'chat', beforeMs: 2100 });
+    assert.deepEqual(context, []);
+
+    const apiConfig = validateConfig({
+      schemaVersion: 1,
+      storage: { hostEnv: 'DB_HOST', portEnv: 'DB_PORT', userEnv: 'DB_USER', passwordEnv: 'DB_PASSWORD', databaseEnv: 'DB_DATABASE' },
+      codex: { bin: './codex', cwd: './workspace', envNames: [] },
+      feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot' },
+      routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true }] },
+      auth: { clients: [{ id: 'api-caller', tokenEnv: 'API_TOKEN', conversationIds: ['chat'], admin: false }] },
+      hooks: [],
+    });
+    const runtime = createForwardRuntime({ jobs: store, sessions: {}, executor: {}, replies: {}, authorize: async () => true });
+    const token = 'synthetic-token-at-least-24-characters';
+    const api = createApi({ config: apiConfig, store: communication, forwardRuntime: runtime, chat: {}, tokens: { 'api-caller': token } });
+    const post = (idempotencyKey, executionNamespace) => Object.assign(Readable.from([Buffer.from(JSON.stringify({ conversationId: 'chat', idempotencyKey, executionNamespace, deliveryMode: 'caller', text: 'scheduled' }))]), {
+      method: 'POST', url: '/v1/runs', headers: { authorization: `Bearer ${token}` },
+    });
+    await api(post('scheduled-a', 'namespace-a'));
+    await api(post('scheduled-b', 'namespace-b'));
+    const [identities] = await pool.query("SELECT caller_id,sender_open_id FROM assistant_codex_forward_jobs WHERE caller_id IN ('live','api-caller') ORDER BY caller_id,sender_open_id");
+    const apiIdentities = identities.filter(row => row.caller_id === 'api-caller').map(row => row.sender_open_id).sort();
+    assert.deepEqual(apiIdentities, [deriveExecutionScope('api-caller', 'namespace-a'), deriveExecutionScope('api-caller', 'namespace-b')].sort());
+    assert.equal(identities.some(row => row.caller_id === 'live' && row.sender_open_id === 'human'), true);
     await communication.close();
   } finally {
     if (!pool.pool?._closed) await pool.end();

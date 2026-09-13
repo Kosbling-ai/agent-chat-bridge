@@ -45,3 +45,126 @@ test('run API freezes namespace/delivery mode and rejects ledger management afte
   await assert.rejects(api(request('GET','/v1/runs/run/attempt')),{status:409,code:'unsupported_execution_model'});
   await assert.rejects(api(request('POST','/v1/sessions/reset',{conversationId:'chat',generation:1})),{status:409,code:'unsupported_execution_model'});
 });
+
+test('persisted start intent without a turn is held without a new executor call', async () => {
+  const jobs = memoryJobs({ status: 'pending', result: { execution: { threadId: 'thread', startedAt: 2, status: 'start_intent', unconfirmed: true } } });
+  let executions = 0;
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+    executor: { async execute() { executions += 1; } },
+    replies: { readResource: async () => null }, authorize: async () => true,
+  });
+  runtime.start(); await flush(); await runtime.stop();
+  assert.equal(executions, 0);
+  assert.equal(jobs.job.status, 'held');
+  assert.equal(jobs.calls.at(-1)[1].errorCode, 'native_start_unconfirmed');
+});
+
+test('known recovery restores and observes feedback before inspect-only execution', async () => {
+  const jobs = memoryJobs({ status: 'pending', deliveryMode: 'bridge', result: { execution: { bindingOpenId: 'group:binding', threadId: 'thread', turnId: 'turn', startedAt: 2 } } });
+  const calls = [];
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+    executor: { async execute(_input, options) { calls.push(['execute', options.resume]); return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
+    feedback: {
+      async restore() { calls.push(['restore']); return { card: {} }; },
+      observe(_job, _state, execution) { calls.push(['observe', execution.turnId]); },
+      async prepare() {}, async finish() { return true; },
+    },
+    replies: { readResource: async () => null }, authorize: async () => true,
+  });
+  runtime.start(); await flush(); await runtime.stop();
+  assert.deepEqual(calls.slice(0, 3), [['restore'], ['observe', 'turn'], ['execute', { threadId: 'thread', turnId: 'turn', startedAt: 2 }]]);
+});
+
+test('media preparation feeds a durable image addendum to executor input', async () => {
+  const jobs = memoryJobs({ status: 'pending', prompt: 'User：', result: { inputEvent: { messageId: 'message', message: { kind: 'image' } } } });
+  let prompt;
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+    media: { async prepare() { return { status: 'ready', text: '', addendum: '（图片路径：safe/image.png）' }; } },
+    executor: { async execute(input) { prompt = input.prompt; return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
+    replies: { readResource: async () => null }, authorize: async () => true,
+  });
+  runtime.start(); await flush(); await runtime.stop();
+  assert.match(prompt, /safe\/image\.png/);
+  assert.equal(jobs.calls.filter(([name]) => name === 'execution')[0][1].inputStatus, 'ready');
+});
+
+test('system busy returns to pending without consuming a failure attempt', async () => {
+  const jobs = memoryJobs({ status: 'pending', attempts: 99, executionNamespace: 'daily' });
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, maxAttempts: 1 }, jobs, sessions: {},
+    executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true }); } },
+    replies: { readResource: async () => null }, authorize: async () => true,
+  });
+  runtime.start(); await flush(); await runtime.stop();
+  const retry = jobs.calls.find(([name]) => name === 'retry')[1];
+  assert.equal(retry.preserveAttempt, true);
+  assert.equal(jobs.job.status, 'pending');
+});
+
+test('claim failure marks the only worker unhealthy', async () => {
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1 },
+    jobs: { async claimReplyPending() { throw new Error('database unavailable'); } },
+    sessions: {}, executor: {}, replies: {},
+  });
+  runtime.start(); await flush();
+  assert.equal(runtime.status().healthy, false);
+  await runtime.stop();
+});
+
+test('one forward worker admits another human job while the first turn is active', async () => {
+  const baseJob = { internalId: '1', callerId: 'live', chatId: 'chat', chatType: 'group', senderOpenId: 'human', senderName: 'Human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work', attempts: 1, result: {}, createdAt: 1, leaseOwner: 'owner' };
+  const queued = [{ ...baseJob, id: 'run-1', messageId: 'message-1' }, { ...baseJob, id: 'run-2', internalId: '2', messageId: 'message-2' }];
+  let claimed = false;
+  let releaseFirst;
+  let secondEntered;
+  const second = new Promise(resolve => { secondEntered = resolve; });
+  const jobs = {
+    async claimReplyPending() { return []; },
+    async claim() { if (claimed) return []; claimed = true; return queued; },
+    async renew() { return { renewed: true }; },
+    async patchExecution() {},
+    async markReplyPending() {},
+    async markFinished() {},
+    async markRetry() {},
+    async getRun() { return null; },
+    async readEvents() { return []; },
+  };
+  const executor = { async execute(input) {
+    if (input.messageId === 'message-2') { secondEntered(); return { threadId: 'thread', turnId: 'turn-2', answer: 'steered', rawAnswer: 'steered', attachments: [], deferred: true }; }
+    return new Promise(resolve => { releaseFirst = () => resolve({ threadId: 'thread', turnId: 'turn-1', answer: 'done', rawAnswer: 'done', attachments: [] }); });
+  } };
+  const runtime = createForwardRuntime({ config: { owner: 'owner', pollMs: 1, maxActive: 5 }, jobs, sessions: {}, executor, replies: {}, authorize: async () => true });
+  runtime.start();
+  await second;
+  assert.equal(typeof releaseFirst, 'function');
+  releaseFirst();
+  await flush();
+  await runtime.stop();
+});
+
+test('lease loss after binding aborts observation without a terminal write', async () => {
+  const jobs = memoryJobs({ status: 'pending' });
+  let renewals = 0;
+  jobs.renew = async () => {
+    renewals += 1;
+    if (renewals > 1) throw Object.assign(new Error('lost'), { code: 'forward_lease_lost' });
+    return { renewed: true };
+  };
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, leaseMs: 100, heartbeatMs: 5 }, jobs, sessions: {},
+    executor: { async execute(_input, options) {
+      await options.onStartIntent({ binding: { feishuOpenId: 'group:binding' }, threadId: 'thread', messageId: 'message', startedAt: 2 });
+      await options.onBound({ threadId: 'thread', turnId: 'turn', startedAt: 2 });
+      return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(new Error('stopped'), { code: 'CODEX_WAIT_ABORTED', outcome: 'unknown' })), { once: true }));
+    } },
+    replies: { readResource: async () => null }, authorize: async () => true,
+  });
+  runtime.start(); await flush(); await runtime.stop();
+  assert.ok(renewals > 1);
+  assert.deepEqual(jobs.calls.map(([name]) => name), ['execution', 'execution']);
+  assert.equal(jobs.job.status, 'running');
+});

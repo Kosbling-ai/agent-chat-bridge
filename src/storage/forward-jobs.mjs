@@ -69,9 +69,10 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       return write(async connection => {
         const publicRunId = randomUUID();
         const createdAt = now();
+        const initialResult = input.bindingOpenId ? { execution: { bindingOpenId: input.bindingOpenId } } : {};
         await connection.execute(`INSERT IGNORE INTO assistant_codex_forward_jobs
           (public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,context_entries_json,status,next_attempt_at,result_json,last_error,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,'{}','',createdAt,createdAt]);
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,safeJson(initialResult),'',createdAt,createdAt]);
         const [[found]] = await connection.execute('SELECT id AS internal_id, assistant_codex_forward_jobs.* FROM assistant_codex_forward_jobs WHERE request_key_hash=? LIMIT 1', [keyHash]);
         if (!found || found.request_hash !== requestHash) throw new StoreError('job_conflict');
         return { ...row(found), duplicate: found.public_run_id !== publicRunId };
@@ -120,7 +121,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET lease_expires_at=?,updated_at=? WHERE public_run_id=? AND lease_owner=?
-            AND status IN ('running','reply_pending')`, [at + Number(input.leaseMs || 60000), at, id, owner]);
+            AND lease_expires_at>? AND status IN ('running','reply_pending')`, [at + Number(input.leaseMs || 60000), at, id, owner, at]);
         await assertLease(connection, result);
         return { renewed: true };
       });
@@ -128,10 +129,11 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
     patchExecution(input) {
       const [id, owner] = leaseArgs(input);
       return write(async connection => {
+        const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
             '$.execution',CAST(? AS JSON)),updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND status='running'`, [safeJson(input.execution), now(), id, owner]);
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='running'`, [safeJson(input.execution), at, id, owner, at]);
         await assertLease(connection, result);
         return { updated: true };
       });
@@ -141,10 +143,11 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       const key = required(input.key, 32);
       if (!['executionCard', 'typing', 'stop'].includes(key)) throw new StoreError('invalid_store_input');
       return write(async connection => {
+        const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
             '$.${key}',CAST(? AS JSON)),updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND status IN ('running','reply_pending')`, [safeJson(input.value), now(), id, owner]);
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('running','reply_pending')`, [safeJson(input.value), at, id, owner, at]);
         await assertLease(connection, result);
         return { updated: true };
       });
@@ -159,7 +162,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
             result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
               JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
             last_error=?,lease_expires_at=?,updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND status='running'`, [safeJson(value), input.errorCode || '', at, at, id, owner]);
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='running'`, [safeJson(value), input.errorCode || '', at, at, id, owner, at]);
         await assertLease(connection, result);
         return { status: 'reply_pending' };
       });
@@ -174,7 +177,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
             result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
               JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
             last_error=?,finished_at=?,reply_sent_at=?,lease_owner='',lease_expires_at=NULL,updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND status='reply_pending'`, [input.status, safeJson(input.result || {}), input.errorCode || '', at, input.replySent === false ? null : at, at, id, owner]);
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='reply_pending'`, [input.status, safeJson(input.result || {}), input.errorCode || '', at, input.replySent === false ? null : at, at, id, owner, at]);
         await assertLease(connection, result);
         return { status: input.status };
       });
@@ -186,8 +189,9 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const status = isTerminal ? 'failed' : input.held ? 'held' : input.replyPending ? 'reply_pending' : 'pending';
         const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
-          SET status=?,last_error=?,next_attempt_at=?,finished_at=?,lease_owner='',lease_expires_at=NULL,updated_at=?
-          WHERE public_run_id=? AND lease_owner=? AND status IN ('running','reply_pending')`, [status, input.errorCode || '', isTerminal ? null : (input.nextAttemptAt ?? at + 1000), isTerminal ? at : null, at, id, owner]);
+          SET status=?,last_error=?,next_attempt_at=?,finished_at=?,
+            attempts=GREATEST(attempts-?,0),lease_owner='',lease_expires_at=NULL,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status IN ('running','reply_pending')`, [status, input.errorCode || '', isTerminal ? null : (input.nextAttemptAt ?? at + 1000), isTerminal ? at : null, input.preserveAttempt ? 1 : 0, at, id, owner, at]);
         await assertLease(connection, result);
         return { status };
       });
