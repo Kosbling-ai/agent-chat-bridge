@@ -21,9 +21,13 @@ const config = {
 test('runtime configuration is explicit and rejects scope/secret overrides', () => {
   assert.equal(validateConfig(config).feishu.connectionId, 'test');
   assert.equal(validateConfig(config).feishu.catchup, true);
+  assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
+  assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, catchup: false } }).feishu.catchup, false);
   for (const invalid of [
     { ...config, codex: { ...config.codex, approvalPolicy: 'never' } },
+    { ...config, codex: { ...config.codex, jobRetryMs: 9_999 } },
+    { ...config, codex: { ...config.codex, jobMaxAttempts: 0 } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
     { ...config, feishu: { ...config.feishu, appSecret: 'synthetic' } },
     { ...config, hooks: [{ id: 'h', url: 'https://user:synthetic@example.invalid', tokenEnv: 'TEST_HOOK', conversationIds: [] }] },
@@ -113,6 +117,22 @@ test('error reporter is bounded, sanitized and cannot recursively report failure
   await reporter.close();
   assert.equal(output.filter(event => event.code === 'report_failed').length, 4);
   assert(!JSON.stringify(output).includes('SECRET_SYNTHETIC'));
+});
+test('structured retry logs retain only bounded safe execution facts', () => {
+  const output = [];
+  const log = createLogger({ write: value => output.push(JSON.parse(value)) });
+  log('warning', 'forward_execution', 'waiting', {
+    code: 'CODEX_THREAD_BUSY', rpcMethod: 'thread/resume', stage: 'pre_admission',
+    runId: '12345678-1234-1234-1234-123456789abc', attempt: 1, maxAttempts: 3,
+    nextRetryAt: 1_789_331_035_417, providerMessage: 'SYNTHETIC_SECRET',
+  });
+  assert.deepEqual(output[0], {
+    timestamp: output[0].timestamp, level: 'warning', module: 'bridge', component: 'service',
+    operation: 'forward_execution', status: 'waiting', code: 'CODEX_THREAD_BUSY',
+    rpc_method: 'thread/resume', stage: 'pre_admission', run_id: '12345678-1234-1234-1234-123456789abc',
+    attempt: 1, max_attempts: 3, next_retry_at: 1_789_331_035_417,
+  });
+  assert.equal(JSON.stringify(output).includes('SYNTHETIC_SECRET'), false);
 });
 test('SDK request wrapper enforces time, redirects and size without retries', async () => {
   let calls = 0;

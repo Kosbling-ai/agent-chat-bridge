@@ -60,6 +60,43 @@ test('terminal typing intent removes an add reaction that confirms late', async 
   assert.equal(job.result.typing.desired, false);
 });
 
+test('busy waiting reuses one card and does not repeat Typing until admission succeeds', async () => {
+  const job = jobFixture();
+  job.result = { execution: { bindingOpenId: 'group:binding' } };
+  const effects = [];
+  let reaction = 0;
+  const feedback = createExecutionFeedback({
+    jobs: { async patchFeedback({ key, value }) { job.result = { ...job.result, [key]: structuredClone(value) }; } },
+    sessions: {},
+    chat: {
+      async addReaction() { const id = `reaction-${++reaction}`; effects.push(`typing:add:${id}`); return { reaction_id: id }; },
+      async removeReaction({ reactionId }) { effects.push(`typing:remove:${reactionId}`); },
+      async listReactions() { effects.push('typing:list'); return { items: [] }; },
+    },
+    cardClient: { im: { v1: { message: {
+      async create() { effects.push('card:create'); return { code: 0, data: { message_id: 'card-message' } }; },
+      async patch() { effects.push('card:patch'); return { code: 0 }; },
+    } } } },
+  });
+
+  const first = await feedback.start(job);
+  await first.card.chain;
+  await feedback.wait(job, first);
+  const afterFirstWait = [...effects];
+  const second = feedback.restoreWaiting(job);
+  await feedback.wait(job, second);
+  assert.deepEqual(effects, afterFirstWait);
+
+  const admitted = feedback.restoreWaiting(job);
+  feedback.activate(job, admitted, { turnId: 'turn-1' });
+  await new Promise(resolve => setImmediate(resolve));
+  await admitted.card.chain;
+  assert.equal(effects.filter(value => value === 'card:create').length, 1);
+  assert.equal(effects.filter(value => value === 'card:patch').length, 2, 'one waiting patch and one confirmed-admission patch');
+  assert.deepEqual(effects.filter(value => value.startsWith('typing:add')), ['typing:add:reaction-1', 'typing:add:reaction-2']);
+  assert.deepEqual(effects.filter(value => value.startsWith('typing:remove')), ['typing:remove:reaction-1']);
+});
+
 test('lease loss while card intent persistence is blocked prevents the platform call', async () => {
   const job = jobFixture();
   job.sourceMessageId = null;

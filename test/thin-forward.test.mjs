@@ -5,6 +5,7 @@ import { validateConfig } from '../src/config.mjs';
 import { createForwardRuntime, publicRun } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createApi } from '../src/core/api.mjs';
+import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
 
 const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},auth:{clients:[{id:'caller',tokenEnv:'TEST_TOKEN',conversationIds:['chat'],admin:true}]},hooks:[]};
 const flush=()=>new Promise(resolve=>setTimeout(resolve,20));
@@ -166,17 +167,146 @@ test('prepared media prompt is reused without downloading again', async () => {
   assert.match(prompt, /safe\/image\.png/);
 });
 
-test('system busy returns to pending without consuming a failure attempt', async () => {
-  const jobs = memoryJobs({ status: 'pending', attempts: 99, executionNamespace: 'daily' });
+test('manual pre-admission busy fails once with an explicit reply and no retry', async () => {
+  const jobs = memoryJobs({ status: 'pending', callerId: 'live', executionNamespace: null, deliveryMode: 'bridge', result: {} });
+  let admissions = 0;
   const runtime = createForwardRuntime({
-    config: { owner: 'owner', pollMs: 1, maxAttempts: 1 }, jobs, sessions: {},
-    executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true }); } },
-    replies: { readResource: async () => null }, authorize: async () => true,
+    config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+    executor: { async execute() { admissions += 1; throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' }); } },
+    feedback: { async start() { return {}; }, async prepare() {}, async finish() { return false; } },
+    replies: { async prepare(_job, result) { return result; }, async deliver() { return { status: 'sent' }; }, readResource: async () => null }, authorize: async () => true,
   });
   runtime.start(); await flush(); await runtime.stop();
-  const retry = jobs.calls.find(([name]) => name === 'retry')[1];
-  assert.equal(retry.preserveAttempt, true);
-  assert.equal(jobs.job.status, 'pending');
+  assert.equal(admissions, 1);
+  assert.equal(jobs.calls.some(([name]) => name === 'retry'), false);
+  assert.equal(jobs.calls.filter(([name]) => name === 'reply_pending').length, 1);
+  assert.equal(jobs.job.status, 'failed');
+  assert.match(jobs.job.result.answer, /其他客户端占用/);
+  assert.equal(jobs.job.result.execution.notStarted, true);
+});
+
+test('only a persisted caller-derived system binding gets the 60-second wait policy', async () => {
+  let clock = 100_000;
+  const bindingOpenId = deriveExecutionScope('caller', 'daily');
+  const job = {
+    id: 'run', callerId: 'caller', chatId: 'chat', chatType: 'group', messageId: 'message',
+    senderOpenId: bindingOpenId, senderName: 'Caller', deliveryMode: 'caller', executionNamespace: 'daily',
+    prompt: 'work', attempts: 0, status: 'pending', result: { execution: { bindingOpenId } },
+    createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const calls = [];
+  const jobs = {
+    async claimReplyPending({ owner }) {
+      if (job.status !== 'reply_pending') return [];
+      Object.assign(job, { leaseOwner: owner });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async patchExecution({ execution }) {
+      job.result = { ...job.result, execution };
+      calls.push(['execution', structuredClone(execution)]);
+    },
+    async patchFeedback() {},
+    async markRetry(input) {
+      calls.push(['retry', input]);
+      if (input.preserveAttempt) job.attempts = Math.max(0, job.attempts - 1);
+      Object.assign(job, { status: input.held ? 'held' : 'pending', last_error: input.errorCode, nextAttemptAt: input.nextAttemptAt, leaseOwner: '' });
+    },
+    async markReplyPending({ result }) { Object.assign(job, { status: 'reply_pending', result }); },
+    async markFinishedWithoutReply({ status, result }) { Object.assign(job, { status, result }); },
+    async markFinished({ status, result }) { Object.assign(job, { status, result }); },
+  };
+  let admissions = 0;
+  const executor = { async execute(_input, options) {
+    admissions += 1;
+    if (admissions < 3) throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' });
+    await options.onStartIntent({ binding: { feishuOpenId: bindingOpenId }, threadId: 'thread', messageId: 'message', startedAt: clock });
+    await options.onBound({ threadId: 'thread', turnId: 'turn', startedAt: clock });
+    return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] };
+  } };
+  const runtime = createForwardRuntime({ config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000 }, jobs, sessions: {}, executor, feedback: { async prepare() {} }, replies: {}, now: () => clock });
+  const settled = async () => {
+    for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
+  };
+  runtime.start(); await flush(); await settled();
+  assert.equal(admissions, 1); assert.equal(job.nextAttemptAt, 160_000); assert.equal(job.attempts, 0);
+  clock = 160_000; await flush(); await settled();
+  assert.equal(admissions, 2); assert.equal(job.nextAttemptAt, 220_000); assert.equal(job.attempts, 0);
+  clock = 220_000; await flush(); await settled();
+  for (let count = 0; count < 100 && job.status === 'reply_pending'; count += 1) await new Promise(resolve => setImmediate(resolve));
+  await runtime.stop();
+  assert.equal(admissions, 3); assert.equal(job.status, 'completed');
+  assert(calls.filter(([name]) => name === 'retry').every(([, input]) => input.preserveAttempt === true));
+
+  for(const spoof of [
+    { executionNamespace: '', senderOpenId: 'system:pretend', result: { execution: { bindingOpenId: 'system:pretend' } } },
+    { executionNamespace: 'daily', senderOpenId: bindingOpenId, result: { execution: { bindingOpenId: 'system:mismatch' } } },
+  ]) {
+    const spoofJobs = memoryJobs({ status: 'pending', deliveryMode: 'caller', ...spoof });
+    const one = createForwardRuntime({ config: { owner: 'owner', pollMs: 1 }, jobs: spoofJobs, sessions: {}, executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission' }); } }, replies: {} });
+    one.start(); await flush(); await one.stop();
+    assert.equal(spoofJobs.calls.some(([name]) => name === 'retry'), false);
+    assert.equal(spoofJobs.job.status, 'failed');
+  }
+});
+
+test('other retryable admission failures stop after three 60-second-spaced claims', async () => {
+  let clock = 10_000;
+  const job = {
+    id: 'bounded-run', callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: 'bounded-message',
+    senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+    attempts: 0, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const retries = [];
+  let finalResults = 0;
+  const jobs = {
+    async claimReplyPending({ owner }) {
+      if (job.status !== 'reply_pending') return [];
+      Object.assign(job, { leaseOwner: owner });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async patchExecution({ execution }) { job.result = { ...job.result, execution }; },
+    async markRetry(input) {
+      retries.push(input);
+      Object.assign(job, { status: 'pending', last_error: input.errorCode, nextAttemptAt: input.nextAttemptAt, leaseOwner: '' });
+    },
+    async markReplyPending({ result }) { finalResults += 1; Object.assign(job, { status: 'reply_pending', result }); },
+    async markFinished({ status, result }) { Object.assign(job, { status, result }); },
+  };
+  let admissions = 0;
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {},
+    executor: { async execute() { admissions += 1; throw Object.assign(new Error('closing'), { code: 'CODEX_EXECUTOR_CLOSING', retryable: true, phase: 'pre_admission' }); } },
+    replies: {}, now: () => clock,
+  });
+  const settle = async () => {
+    for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
+  };
+  runtime.start();
+  await flush(); await settle();
+  assert.equal(job.nextAttemptAt, 70_000);
+  clock = 70_000; await flush(); await settle();
+  assert.equal(job.nextAttemptAt, 130_000);
+  clock = 130_000; await flush(); await settle();
+  for (let count = 0; count < 100 && job.status === 'reply_pending'; count += 1) await new Promise(resolve => setImmediate(resolve));
+  await runtime.stop();
+  assert.equal(admissions, 3);
+  assert.equal(job.attempts, 3);
+  assert.equal(retries.length, 2);
+  assert(retries.every(input => input.preserveAttempt !== true));
+  assert.equal(finalResults, 1);
+  assert.equal(job.status, 'failed');
 });
 
 test('claim failure marks the only worker unhealthy', async () => {
