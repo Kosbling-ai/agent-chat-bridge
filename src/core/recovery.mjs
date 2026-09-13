@@ -9,24 +9,32 @@ export function createRecoveryHandler({ store, codex, workspace, connectionId, l
     log('info', 'agent_recovery', 'started');
     let verifiedNative;
     try {
-      const attempt = await store.getAgentAttempt({ id: action.runId });
-      if (!attempt || attempt.connectionId !== connectionId || attempt.conversationId !== action.conversationId
-        || attempt.status !== 'unknown' || String(attempt.generation) !== String(action.expectedGeneration)) throw new Rejected('recovery_conflict');
-      const threadId = action.action === 'adopt_turn' ? action.nativeThreadId : attempt.nativeThreadId;
-      const turnId = action.action === 'adopt_turn' ? action.nativeTurnId : attempt.nativeTurnId;
-      // Missing IDs may only be abandoned on the trusted administrator's durable
-      // verification statement. This does not manufacture a retry or new turn.
-      if (threadId) {
-        const { thread } = await codex.readThread({ threadId, includeTurns: true });
-        if (!thread || thread.id !== threadId || typeof thread.cwd !== 'string' || resolve(thread.cwd) !== workspace) throw new Rejected('recovery_workspace_mismatch');
-        if (!Array.isArray(thread.turns)) throw new Rejected('recovery_turn_unresolved');
-        const turn = thread.turns.find(item => item.id === turnId);
-        if (turnId && !turn) throw new Rejected('recovery_turn_unresolved');
-        if (action.action === 'adopt_turn') {
-          if (!turn || !['inProgress', 'completed', 'failed', 'interrupted'].includes(turn.status)) throw new Rejected('recovery_turn_unresolved');
-          verifiedNative = { threadId, turnId };
-        } else if (thread.turns.some(item => !['completed', 'failed', 'interrupted'].includes(item.status))) throw new Rejected('recovery_turn_active');
-      } else if (action.action === 'adopt_turn') throw new Rejected('recovery_turn_unresolved');
+      if (action.action === 'abandon_guidance_verified') {
+        const guidance = await store.getSteerAttempt({ id: action.runId });
+        if (!guidance || guidance.connectionId !== connectionId || guidance.conversationId !== action.conversationId
+          || guidance.status !== 'unknown' || String(guidance.generation) !== String(action.expectedGeneration)) throw new Rejected('recovery_conflict');
+        // The administrator cancels only this guidance job's bookkeeping.
+        // Its unknown provider fact and parent execution remain untouched.
+      } else {
+        const attempt = await store.getAgentAttempt({ id: action.runId });
+        if (!attempt || attempt.connectionId !== connectionId || attempt.conversationId !== action.conversationId
+          || attempt.status !== 'unknown' || String(attempt.generation) !== String(action.expectedGeneration)) throw new Rejected('recovery_conflict');
+        const threadId = action.action === 'adopt_turn' ? action.nativeThreadId : attempt.nativeThreadId;
+        const turnId = action.action === 'adopt_turn' ? action.nativeTurnId : attempt.nativeTurnId;
+        // Missing IDs may only be abandoned on the trusted administrator's durable
+        // verification statement. This does not manufacture a retry or new turn.
+        if (threadId) {
+          const { thread } = await codex.readThread({ threadId, includeTurns: true });
+          if (!thread || thread.id !== threadId || typeof thread.cwd !== 'string' || resolve(thread.cwd) !== workspace) throw new Rejected('recovery_workspace_mismatch');
+          if (!Array.isArray(thread.turns)) throw new Rejected('recovery_turn_unresolved');
+          const turn = thread.turns.find(item => item.id === turnId);
+          if (turnId && !turn) throw new Rejected('recovery_turn_unresolved');
+          if (action.action === 'adopt_turn') {
+            if (!turn || !['inProgress', 'completed', 'failed', 'interrupted'].includes(turn.status)) throw new Rejected('recovery_turn_unresolved');
+            verifiedNative = { threadId, turnId };
+          } else if (thread.turns.some(item => !['completed', 'failed', 'interrupted'].includes(item.status))) throw new Rejected('recovery_turn_active');
+        } else if (action.action === 'adopt_turn') throw new Rejected('recovery_turn_unresolved');
+      }
     } catch (error) {
       if (error instanceof Rejected) {
         await store.finishRecovery({ id: action.id, leaseToken: action.leaseToken, outcome: 'rejected', errorCode: error.code });

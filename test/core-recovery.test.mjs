@@ -18,3 +18,11 @@ test('lost management COMMIT response observes applied state instead of contradi
   assert.equal(writes.length, 1); assert.equal(writes[0].outcome, 'applied');
   assert(logs.some(entry => entry[2] === 'succeeded' && entry[3]?.code === 'recovery_commit_confirmed'));
 });
+test('verified guidance abandonment validates durable identity without native RPC or native attempt reads', async () => {
+  for (const valid of [true, false]) {
+    const writes = [];
+    const handler = createRecoveryHandler({ workspace: '/workspace', connectionId: 'fixture', store: { getSteerAttempt: async () => ({ ...attempt, conversationId: valid ? 'chat' : 'other' }), finishRecovery: async input => writes.push(input) }, codex: {} });
+    await handler({ ...action, action: 'abandon_guidance_verified', nativeThreadId: undefined, nativeTurnId: undefined });
+    assert.equal(writes.length, 1); assert.equal(writes[0].outcome, valid ? 'applied' : 'rejected');
+  }
+});

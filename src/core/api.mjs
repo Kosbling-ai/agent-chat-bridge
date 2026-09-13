@@ -84,7 +84,7 @@ export function createApi({ config, store, chat, tokens }) {
       const input = fields(await body(request), ['runId', 'idempotencyKey', 'generation', 'action', 'evidence', 'nativeThreadId', 'nativeTurnId'], ['runId', 'idempotencyKey', 'action']);
       identifier(input.runId, 36);
       if (!Number.isSafeInteger(input.generation) || input.generation < 1) throw new ApiError('invalid_generation');
-      if (!['adopt_turn', 'abandon_verified'].includes(input.action) || typeof input.evidence !== 'string' || !input.evidence.trim() || input.evidence.length > 4096) throw new ApiError('invalid_recovery');
+      if (!['adopt_turn', 'abandon_verified', 'abandon_guidance_verified'].includes(input.action) || typeof input.evidence !== 'string' || !input.evidence.trim() || input.evidence.length > 4096) throw new ApiError('invalid_recovery');
       if (input.action === 'adopt_turn') { identifier(input.nativeThreadId, 255); identifier(input.nativeTurnId, 255); }
       else if (input.nativeThreadId !== undefined || input.nativeTurnId !== undefined) throw new ApiError('invalid_recovery');
       const job = await store.getJob({ id: input.runId });
