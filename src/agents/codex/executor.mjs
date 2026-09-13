@@ -233,7 +233,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   function duplicateResult(binding, event, turnId = '') {
     const key = String(event?.event_key || '');
     if (key.startsWith('assistant-final:') && event.event_type === 'agent_message' && event.role === 'assistant' && trim(event.text)) {
-      return { deferred: false, duplicate: true, reason: 'duplicate_final_answer', threadId: binding.codexSessionId, turnId, answer: limitText(trim(event.text), config.maxOutputChars || 3500) };
+      const rawAnswer = trim(event.text);
+      return { deferred: false, duplicate: true, reason: 'duplicate_final_answer', threadId: binding.codexSessionId, turnId, answer: limitText(rawAnswer, config.maxOutputChars || 3500), rawAnswer };
     }
     if (key.startsWith('error:')) {
       const detail = parseDetail(event);
@@ -358,6 +359,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         threadId: state.threadId,
         turnId: state.turnId,
         answer: limitText(answer, config.maxOutputChars || 3500),
+        rawAnswer: answer,
         attachments: collectOutboxAttachments(state.binding, state.outboxScanFromMs, { workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, log }),
       };
     }, async (error) => {

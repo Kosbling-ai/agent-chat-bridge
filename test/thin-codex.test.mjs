@@ -406,9 +406,24 @@ test('completed resume verifies native identity and scans attachments even with 
     const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
     const result = await executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'job', prompt: 'work', busyPolicy: 'steer' }, { resume: { threadId: 'thread-existing', turnId: 'known', startedAt } });
     assert.equal(result.answer, 'native');
+    assert.equal(result.rawAnswer, 'native');
     assert.deepEqual(result.attachments, [attachment]);
     assert.equal(runtime.calls.filter((call) => call.method === 'thread/resume').length, 1);
     assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 0);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('normal and duplicate final results retain rawAnswer beyond the display limit', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const store = memoryStore(); const runtime = fakeRuntime();
+    const executor = createCodexExecutor({ config: { ...config(cwd), maxOutputChars: 5 }, sessionStore: store, spawnImpl: runtime.spawnImpl });
+    const input = { bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'job', prompt: 'work', busyPolicy: 'steer' };
+    const result = await executor.execute(input);
+    assert.equal(result.answer, 'answe'); assert.equal(result.rawAnswer, 'answer turn-1');
+    const duplicate = await executor.execute(input);
+    assert.equal(duplicate.answer, 'answe'); assert.equal(duplicate.rawAnswer, 'answer turn-1');
     await executor.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
