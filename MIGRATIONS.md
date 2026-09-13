@@ -1,10 +1,30 @@
 # Versions and migrations
 
-Application version: `0.1.0`
+Application version: `0.1.1`
 
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.1.1 upgrade
+
+This batch changes final reply presentation and adds optional `codex.proxyEnv`
+references. Config schema stays 1; migration 001 and the database checksum are
+unchanged. Do not rerun initialization or reset the existing trial database.
+
+Before switching code, stop the existing writer gracefully and preserve the
+workspace and database. Start exactly one bridge instance with the reviewed
+configuration. Existing persisted text effects retain their original payload;
+only newly finalized replies use cards. Unknown native work and unknown sends
+retain their recovery state and must not be replayed during upgrade. Proxy
+references resolve at startup and affect only the Codex child; missing values
+fail before provider startup. See [proxy configuration](docs/codex-proxy.md).
+
+Rollback to 0.1.0 uses the same unchanged schema, but remove the optional
+`codex.proxyEnv` field before starting the old strict config validator. Stop
+the current writer first. Do not move the published v0.1.0 tag or erase external
+effects to simulate rollback. Dynamic progress cards and the broader migration
+parity audit remain outside this batch.
 
 ## 0.1.0 initial installation
 

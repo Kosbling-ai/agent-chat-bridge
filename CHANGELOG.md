@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1] — 2026-09-13
+
+- Restore final Agent replies and existing input-rejection notices as Feishu JSON 2.0 cards, preserving Markdown, bounded multipart delivery and durable outbox ordering. This does not add dynamic progress cards, stop callbacks or new native-failure notification semantics.
+- Add explicit `codex.proxyEnv` references to configure HTTP/SOCKS proxy variables only for the Codex child. Feishu SDK and bridge HTTP requests retain their existing environment.
+
+No database migration or config-schema bump is needed; the proxy mapping is optional. Version 0.1.0 and its tag remain immutable. This batch does not complete the wider production-feature migration or imply production acceptance.
+
+Validation uses targeted offline card/adapter/core/proxy tests and version/syntax checks. A pre-existing media test fails with `finish is not a function` on both the 0.1.0 baseline and the card branch; this batch does not claim a clean full-suite run. Real-platform validation of these changes remains pending.
+
 ## [0.1.0] — 2026-09-13
 
 Initial independent Feishu + Codex bridge source release candidate. This entire extraction batch shares one version.
