@@ -133,3 +133,9 @@ Admin GET `/v1/runs/:id/attempt` returns native and steering attempt facts. Unkn
 `test/core-steering.integration.test.mjs` verifies real Store serialization, parent completion before steer acknowledgement, one shared reply, rejected guidance deferred to the next turn, and unknown guidance not replayed after restart. Offline tests cover lost settlement responses and disabling new steering while retaining old uncertainty.
 
 Recovered steering intent is checked before any input preparation, output-directory access, rotation or new native attempt, even when new steering is disabled. Missing local media therefore cannot relabel an already submitted guidance request as input failure. Only the required `TurnSteerResponse.turnId` matching the recorded target is accepted; missing/mismatched IDs remain unknown. The expired-intent real Store regression asserts zero media, output-directory and native-attempt preparation calls.
+
+## Artifact publication and cleanup ownership
+
+A single-writer conversation guard allows native execution, steering and administrative reconciliation to share activity, while artifact cleanup is exclusive. Cleanup first takes local ownership, then checks durable active native runs and unresolved guidance; both survive process restart. New native/adopt work waits until filesystem cleanup and its durable acknowledgement leave the guard. No database lock is held over filesystem or provider work.
+
+Published output files must be complete and closed before the turn finishes. Background processes or retained file descriptors must not continue writing published artifacts after completion; this requirement is also included in private output prompts. Quarantine/version checks protect path replacement, but cannot protect arbitrary same-user background writers holding an inode open. The lifecycle guard prevents bridge-controlled later turns from creating that overlap.

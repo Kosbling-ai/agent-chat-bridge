@@ -7,6 +7,7 @@ import { createAnswerProjection } from './answer-projection.mjs';
 import { createRecoveryHandler } from './recovery.mjs';
 import { createSessionRotation } from './session-rotation.mjs';
 import { createSteeringHandler } from './steering.mjs';
+import { createConversationGuard } from './conversation-guard.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -21,6 +22,8 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
   let worker;
   let cleanupAt = 0, cleanupRunning = false, cleanupCursor;
   const active = new Set();
+  const conversationGuard = createConversationGuard();
+  const guardKey = row => JSON.stringify([row.connectionId ?? connectionId, row.conversationId]);
   const stopController = new AbortController();
   const scope = conversationId => ({ connectionId, conversationId });
   const recover = workspace ? createRecoveryHandler({ store, codex, workspace, connectionId, log }) : null;
@@ -262,9 +265,15 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
       for (const row of page.items) {
         if (stopping) break;
         try {
-          await outbound.cleanup({ ...parse(row.payload), confirmedSent: true });
-          await store.completeOutboxCleanup({ id: row.id, connectionId: row.connectionId, conversationId: row.conversationId });
-          log('info', 'artifact_cleanup', 'succeeded');
+          await conversationGuard.cleanup(guardKey(row), async () => {
+            // Local ownership closes check-to-filesystem races. Persisted native
+            // and guidance facts protect execution left active before restart.
+            const activity = await store.getConversationActivity({ connectionId: row.connectionId, conversationId: row.conversationId, agentId: 'codex' });
+            if (activity.activeRunId || activity.unresolvedGuidance) return;
+            await outbound.cleanup({ ...parse(row.payload), confirmedSent: true });
+            await store.completeOutboxCleanup({ id: row.id, connectionId: row.connectionId, conversationId: row.conversationId });
+            log('info', 'artifact_cleanup', 'succeeded');
+          });
         } catch { log('warning', 'artifact_cleanup', 'pending', { code: 'artifact_cleanup_pending' }); }
       }
       cleanupCursor = page.nextCursor ?? undefined;
@@ -293,8 +302,8 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
       try {
         if (active.size < 8) {
           if (outbound && !cleanupRunning && Date.now() >= cleanupAt) { cleanupAt = Date.now() + 1000; launch(cleanupArtifacts()); }
-          if (recover && codex.status().state === 'ready') for (const action of await store.claimRecoveries({ owner, leaseMs, limit: 1 })) launch(recover(action));
-          if (codex.status().state === 'ready') for (const job of await store.claimJobs({ kind: 'agent', owner, leaseMs, limit: 1 })) launch(execute(job));
+          if (recover && codex.status().state === 'ready') for (const action of await store.claimRecoveries({ owner, leaseMs, limit: 1 })) launch(conversationGuard.native(guardKey(action), () => stopping ? undefined : recover(action)));
+          if (codex.status().state === 'ready') for (const job of await store.claimJobs({ kind: 'agent', owner, leaseMs, limit: 1 })) launch(conversationGuard.native(guardKey(job), () => stopping ? undefined : execute(job)));
           for (const job of await store.claimJobs({ kind: 'hook', owner, leaseMs, limit: 1 })) launch(hook(job));
           for (const row of await store.claimOutbox({ owner, leaseMs, limit: 1 })) launch(deliver(row));
         }

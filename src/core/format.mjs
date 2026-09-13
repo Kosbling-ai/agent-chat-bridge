@@ -68,11 +68,12 @@ export { extractFinalAnswer, codexMessageText, buildCodexForwardPrompt };
 export function buildConversationPrompt({ event, text, context = [], newThread = false, group = {}, outboxDir }) {
   if (!event) return text; // Trusted background run prompt is already complete.
   const groupChat = event.conversationType !== 'p2p';
-  const sourcePrompt = buildCodexForwardPrompt({ chat_type: event.conversationType }, {
+  let sourcePrompt = buildCodexForwardPrompt({ chat_type: event.conversationType }, {
     currentPrompt: text, mergedPrompt: text,
     senderName: event.actor?.name ?? '', senderOpenId: event.actor?.openId ?? '',
     recentPrompts: context.map(item => ({ prompt: item.text, senderName: item.event?.actor?.name ?? '', senderOpenId: item.event?.actor?.openId ?? '' })),
   });
+  if (!groupChat && outboxDir) sourcePrompt += '\n\n回发文件发布约定：结束本轮回答前必须完成并关闭回发目录中的文件；回答结束后不得继续由后台任务或持有的文件句柄写入这些产物。';
   if (!newThread) return sourcePrompt;
   if (groupChat) {
     if (!group.name && !group.description) return sourcePrompt;
