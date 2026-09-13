@@ -1,0 +1,181 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { withConnection } from './connection.mjs';
+import { assertSchemaCurrent } from './migrations.mjs';
+import { acquireWriter } from './writer.mjs';
+import { StoreError } from './errors.mjs';
+
+const json = (value) => JSON.stringify(value);
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  return value;
+}
+const hash = (value) => createHash('sha256').update(json(canonical(value))).digest('hex');
+const decode = (row) => row && Object.fromEntries(Object.entries(row).map(([key, value]) => [key.replace(/_([a-z])/g, (_, c) => c.toUpperCase()), value]));
+function text(value, max = 255) { if (typeof value !== 'string' || !value.length || value.length > max) throw new StoreError('invalid_store_input'); return value; }
+function limit(value = 50) { if (!Number.isInteger(value) || value < 1 || value > 100) throw new StoreError('invalid_store_limit'); return value; }
+function scope(input) { return [text(input.connectionId, 128), text(input.conversationId)]; }
+function lease(input) { text(input.id, 36); text(input.leaseToken, 36); }
+
+export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWriterLost, now = Date.now }) {
+  await assertSchemaCurrent(pool);
+  const activeConnections = new Set();
+  const writer = await acquireWriter(pool, (error) => {
+    for(const connection of activeConnections)connection.destroy();
+    try { onWriterLost?.(error); } catch { /* host callback cannot revive the writer */ }
+  });
+  const read = (fn) => withConnection(pool, fn, { timeoutMs: operationTimeoutMs });
+  const write = async (fn) => {
+    writer.assert(); let active;
+    try { return await withConnection(pool, async (c) => { active=c;activeConnections.add(c);await writer.verify();const result=await fn(c);await writer.verify();return result; }, {timeoutMs:operationTimeoutMs,transaction:true}); }
+    finally {if(active)activeConnections.delete(active);}
+  };
+  async function insertJob(c, input) {
+    const [connectionId, conversationId] = scope(input);
+    if (!['agent', 'hook'].includes(input.kind)) throw new StoreError('invalid_job_kind');
+    const hookId = input.kind === 'hook' ? text(input.hookId, 128) : '';
+    const key = text(input.idempotencyKey);
+    const payloadHash = hash({ conversationId, payload: input.payload });
+    const id = randomUUID();
+    await c.execute(`INSERT INTO bridge_jobs (id,kind,connection_id,conversation_id,hook_id,idempotency_key,event_id,source_sequence,payload_hash,payload,next_attempt_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [id,input.kind,connectionId,conversationId,hookId,key,input.eventId ?? null,input.sourceSequence ?? null,payloadHash,json(input.payload),now(),now(),now()]);
+    const [[row]] = await c.execute('SELECT id,payload_hash FROM bridge_jobs WHERE connection_id=? AND kind=? AND hook_id=? AND idempotency_key=?', [connectionId,input.kind,hookId,key]);
+    if (row.payload_hash !== payloadHash) throw new StoreError('job_conflict');
+    return { id: row.id, duplicate: row.id !== id };
+  }
+  async function insertOutbox(c, input) {
+    const [connectionId, conversationId] = scope(input);
+    const key = text(input.idempotencyKey);
+    if (!['create','reply','reaction','upload','update'].includes(input.kind)) throw new StoreError('invalid_outbox_kind');
+    const payloadHash = hash({ conversationId, kind: input.kind, payload: input.payload });
+    const id = randomUUID();
+    await c.execute(`INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,job_id,platform_uuid,next_attempt_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [id,connectionId,conversationId,key,input.kind,payloadHash,json(input.payload),input.jobId ?? null,input.platformUuid ?? randomUUID(),now(),now(),now()]);
+    const [[row]] = await c.execute('SELECT id,payload_hash,platform_uuid,job_id FROM bridge_outbox WHERE connection_id=? AND idempotency_key=?', [connectionId,key]);
+    if (row.payload_hash !== payloadHash || row.job_id !== (input.jobId ?? null)) throw new StoreError('outbox_conflict');
+    return { id: row.id, platformUuid: row.platform_uuid, duplicate: row.id !== id };
+  }
+  async function owned(c, table, input) {
+    lease(input);
+    const [[row]] = await c.execute(`SELECT * FROM ${table} WHERE id=? FOR UPDATE`, [input.id]);
+    if (!row || row.lease_token !== input.leaseToken || row.status !== 'running' || Number(row.lease_expires_at) <= now()) throw new StoreError('stale_lease');
+    return row;
+  }
+  async function claim(table, input) {
+    const take = limit(input.limit); text(input.owner, 128);
+    if (!Number.isInteger(input.leaseMs) || input.leaseMs < 100 || input.leaseMs > 300000) throw new StoreError('invalid_lease');
+    return write(async (c) => {
+      let condition, params;
+      if (table === 'bridge_jobs') {
+        if (!['agent','hook'].includes(input.kind)) throw new StoreError('invalid_job_kind');
+        condition = `j.kind=? AND ((j.status='pending' AND j.next_attempt_at<=?) OR (j.status='running' AND j.lease_expires_at<=?))
+          AND (j.kind<>'hook' OR NOT EXISTS (SELECT 1 FROM bridge_jobs prior WHERE prior.connection_id=j.connection_id AND prior.conversation_id=j.conversation_id AND prior.hook_id=j.hook_id AND prior.kind='hook' AND prior.status NOT IN ('succeeded','failed','cancelled') AND prior.sequence<j.sequence))`;
+        params = [input.kind, now(), now()];
+      } else {
+        // An expired send lease is ambiguous, including after process death.
+        await c.execute("UPDATE bridge_outbox SET status='unknown',lease_token=NULL,lease_owner=NULL WHERE status='running' AND lease_expires_at<=?", [now()]);
+        condition = `(j.status='pending' AND j.next_attempt_at<=?) OR (j.status='unknown' AND j.kind IN ('create','reply') AND j.first_attempt_at>? AND j.next_attempt_at<=?)`;
+        params = [now(), now()-55*60*1000, now()];
+      }
+      const [rows] = await c.execute(`SELECT j.* FROM ${table} j WHERE ${condition} ORDER BY j.created_at,j.id LIMIT ${take} FOR UPDATE SKIP LOCKED`, params);
+      const result = [];
+      for (const row of rows) {
+        const token = randomUUID();
+        await c.execute(`UPDATE ${table} SET status='running',attempts=attempts+1,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=?${table === 'bridge_outbox' ? ',first_attempt_at=COALESCE(first_attempt_at,?)' : ''} WHERE id=?`, [input.owner,token,now()+input.leaseMs,now(),...(table === 'bridge_outbox' ? [now()] : []),row.id]);
+        result.push(decode({...row,status:'running',attempts:row.attempts+1,lease_token:token,lease_expires_at:now()+input.leaseMs,lease_owner:input.owner,...(table==='bridge_outbox'?{first_attempt_at:row.first_attempt_at ?? now()}:{})}));
+      }
+      return result;
+    });
+  }
+  return {
+    assertCurrent: () => assertSchemaCurrent(pool),
+    async close() { await writer.close(); await pool.end(); },
+    acceptInbound(input) { return write(async (c) => {
+      const [connectionId, conversationId] = scope(input);
+      const payloadHash = hash(input.semanticPayload ?? input.payload);
+      const id = randomUUID();
+      await c.execute(`INSERT INTO bridge_inbox (id,connection_id,event_key,event_type,message_id,revision,conversation_id,occurred_at,payload_hash,payload,policy_version,passive_context,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [id,connectionId,text(input.eventKey),text(input.eventType,64),input.messageId ?? '',input.revision ?? '',conversationId,input.occurredAt ?? now(),payloadHash,json(input.payload),text(input.policyVersion,128),input.passiveContext === true,now()]);
+      const [[row]] = await c.execute('SELECT id,sequence,payload_hash FROM bridge_inbox WHERE connection_id=? AND event_key=?', [connectionId,input.eventKey]);
+      if (row.payload_hash !== payloadHash) throw new StoreError('inbound_conflict');
+      if (row.id !== id) {
+        const [jobs] = await c.execute('SELECT id,kind,hook_id FROM bridge_jobs WHERE event_id=?', [row.id]);
+        return { eventId:row.id,sequence:row.sequence,duplicate:true,agentJobId:jobs.find((j)=>j.kind==='agent')?.id ?? null,hookJobIds:jobs.filter((j)=>j.kind==='hook').map((j)=>j.id) };
+      }
+      if(input.recalledMessageId)await c.execute('INSERT INTO bridge_message_tombstones (connection_id,message_id,created_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE message_id=message_id',[connectionId,text(input.recalledMessageId),now()]);
+      const common = { connectionId,conversationId,eventId:id,sourceSequence:row.sequence,idempotencyKey:input.eventKey };
+      const agent = input.agentJob ? await insertJob(c,{...common,kind:'agent',payload:input.agentJob.payload}) : null;
+      const hooks=[];
+      for (const hook of input.hooks ?? []) hooks.push((await insertJob(c,{...common,kind:'hook',hookId:hook.hookId,payload:hook.payload ?? input.payload})).id);
+      return {eventId:id,sequence:row.sequence,duplicate:false,agentJobId:agent?.id ?? null,hookJobIds:hooks};
+    }); },
+    enqueueJob: (input) => write((c)=>insertJob(c,input)),
+    recordOutbox: (input) => write((c)=>insertOutbox(c,input)),
+    claimJobs: (input) => claim('bridge_jobs',input),
+    claimOutbox: (input) => claim('bridge_outbox',input),
+    renewJob(input) { return write(async(c)=>{ await owned(c,'bridge_jobs',input); if (!Number.isInteger(input.leaseMs)||input.leaseMs<100||input.leaseMs>300000) throw new StoreError('invalid_lease'); await c.execute('UPDATE bridge_jobs SET lease_expires_at=? WHERE id=?',[now()+input.leaseMs,input.id]); return {renewed:true}; }); },
+    finishJobWithOutbox(input) { return write(async(c)=>{
+      const row=await owned(c,'bridge_jobs',input); const outbox=[];
+      const [[attempt]]=await c.execute('SELECT * FROM bridge_attempts WHERE job_id=?',[row.id]);
+      if(attempt){const [released]=await c.execute('UPDATE bridge_sessions SET active_run_id=NULL,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id=?',[now(),attempt.connection_id,attempt.conversation_id,attempt.agent_id,attempt.generation,row.id]);if(!released.affectedRows)throw new StoreError('session_conflict');}
+      for (const effect of input.outbox ?? []) outbox.push(await insertOutbox(c,{...effect,connectionId:row.connection_id,conversationId:row.conversation_id,jobId:row.id}));
+      await c.execute('UPDATE bridge_jobs SET status=?,result=?,lease_token=NULL,lease_owner=NULL,updated_at=? WHERE id=?',[outbox.length?'reply_pending':'succeeded',json(input.result ?? null),now(),input.id]);
+      return {status:outbox.length?'reply_pending':'succeeded',outbox};
+    }); },
+    holdAgentAttempt(input) { return write(async(c)=>{const row=await owned(c,'bridge_jobs',input);if(row.kind!=='agent')throw new StoreError('invalid_job_kind');await c.execute("UPDATE bridge_jobs SET status='unknown',error_code=?,lease_token=NULL,lease_owner=NULL,updated_at=? WHERE id=?",[text(input.errorCode,64),now(),input.id]);return {status:'unknown'};}); },
+    retryJob(input) { return write(async(c)=>{const row=await owned(c,'bridge_jobs',input);
+      if(input.terminal){const [[attempt]]=await c.execute('SELECT * FROM bridge_attempts WHERE job_id=?',[row.id]);if(attempt){const [r]=await c.execute('UPDATE bridge_sessions SET active_run_id=NULL,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id=?',[now(),attempt.connection_id,attempt.conversation_id,attempt.agent_id,attempt.generation,row.id]);if(!r.affectedRows)throw new StoreError('session_conflict');}}
+      await c.execute('UPDATE bridge_jobs SET status=?,next_attempt_at=?,error_code=?,lease_token=NULL,lease_owner=NULL,updated_at=? WHERE id=?',[input.terminal?'failed':'pending',input.nextAttemptAt ?? now(),text(input.errorCode,64),now(),input.id]);return {updated:true};}); },
+    settleOutbox(input) { return write(async(c)=>{
+      const row=await owned(c,'bridge_outbox',input);
+      if (!['sent','unknown','failed','pending'].includes(input.status)) throw new StoreError('invalid_outbox_status');
+      await c.execute('UPDATE bridge_outbox SET status=?,result=?,error_code=?,next_attempt_at=?,lease_token=NULL,lease_owner=NULL,updated_at=? WHERE id=?',[input.status,json(input.result ?? null),input.errorCode ?? null,input.nextAttemptAt ?? now(),now(),input.id]);
+      if (row.job_id && input.status==='sent') await c.execute("UPDATE bridge_jobs SET status='succeeded',updated_at=? WHERE id=? AND status='reply_pending' AND NOT EXISTS (SELECT 1 FROM bridge_outbox WHERE job_id=? AND status<>'sent')",[now(),row.job_id,row.job_id]);
+      return {status:input.status};
+    }); },
+    beginAgentAttempt(input) { return write(async(c)=>{
+      const job=await owned(c,'bridge_jobs',input);if(job.kind!=='agent')throw new StoreError('invalid_job_kind');
+      const [[existing]]=await c.execute('SELECT * FROM bridge_attempts WHERE job_id=?',[job.id]);
+      if(existing)return {...decode(existing),recoveryRequired:true};
+      const key=[job.connection_id,job.conversation_id,text(input.agentId,128)];
+      await c.execute('INSERT INTO bridge_sessions (connection_id,conversation_id,agent_id,updated_at) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE agent_id=agent_id',[...key,now()]);
+      const [[session]]=await c.execute('SELECT * FROM bridge_sessions WHERE connection_id=? AND conversation_id=? AND agent_id=? FOR UPDATE',key);
+      if(session.active_run_id)throw new StoreError('session_busy');
+      await c.execute('UPDATE bridge_sessions SET active_run_id=?,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=?',[job.id,now(),...key]);
+      await c.execute('INSERT INTO bridge_attempts (job_id,connection_id,conversation_id,agent_id,generation,native_thread_id,created_at) VALUES (?,?,?,?,?,?,?)',[job.id,...key,session.generation,session.native_thread_id,now()]);
+      return {jobId:job.id,generation:session.generation,nativeThreadId:session.native_thread_id,recoveryRequired:false};
+    }); },
+    bindAgentAttempt(input) { return write(async(c)=>{
+      await owned(c,'bridge_jobs',input);
+      const [[attempt]]=await c.execute('SELECT * FROM bridge_attempts WHERE job_id=? FOR UPDATE',[input.id]);
+      if(!attempt || String(attempt.generation)!==String(input.expectedGeneration))throw new StoreError('session_conflict');
+      if(attempt.native_thread_id && attempt.native_thread_id!==input.nativeThreadId)throw new StoreError('thread_conflict');
+      if(attempt.native_turn_id && attempt.native_turn_id!==(input.nativeTurnId ?? attempt.native_turn_id))throw new StoreError('turn_conflict');
+      const [result]=await c.execute('UPDATE bridge_sessions SET native_thread_id=?,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id=?',[text(input.nativeThreadId),now(),attempt.connection_id,attempt.conversation_id,attempt.agent_id,input.expectedGeneration,input.id]);
+      if(!result.affectedRows)throw new StoreError('session_conflict');
+      await c.execute('UPDATE bridge_attempts SET native_thread_id=?,native_turn_id=COALESCE(?,native_turn_id) WHERE job_id=?',[input.nativeThreadId,input.nativeTurnId ?? null,input.id]);return {bound:true};
+    }); },
+    bufferNativeEvent(input) { return write(async(c)=>{
+      const digest=hash(input.payload);await c.execute('INSERT INTO bridge_native_events (connection_id,event_key,native_thread_id,native_turn_id,payload_hash,payload,created_at) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE sequence=sequence',[text(input.connectionId,128),text(input.eventKey),input.nativeThreadId ?? null,input.nativeTurnId ?? null,digest,json(input.payload),now()]);
+      const [[row]]=await c.execute('SELECT sequence,payload_hash FROM bridge_native_events WHERE connection_id=? AND event_key=?',[input.connectionId,input.eventKey]);if(row.payload_hash!==digest)throw new StoreError('native_event_conflict');return {sequence:row.sequence};
+    }); },
+    readNativeEvents: (input)=>read(async(c)=>{const [rows]=await c.execute(`SELECT sequence,native_thread_id,native_turn_id,payload,created_at FROM bridge_native_events WHERE connection_id=? AND native_thread_id=? AND sequence>? ORDER BY sequence LIMIT ${limit(input.limit)}`,[text(input.connectionId,128),text(input.nativeThreadId),input.afterSequence ?? 0]);return rows.map(decode);}),
+    getJob: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_jobs WHERE id=?',[text(input.id,36)]);return decode(row) ?? null;}),
+    getOutbox: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_outbox WHERE id=?',[text(input.id,36)]);return decode(row) ?? null;}),
+    getSession: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_sessions WHERE connection_id=? AND conversation_id=? AND agent_id=?',[...scope(input),text(input.agentId,128)]);return decode(row) ?? null;}),
+    setSession(input) { return write(async(c)=>{
+      const key=[...scope(input),text(input.agentId,128)];
+      if (input.expectedGeneration===0) {try {await c.execute('INSERT INTO bridge_sessions (connection_id,conversation_id,agent_id,native_thread_id,active_run_id,updated_at) VALUES (?,?,?,?,?,?)',[...key,input.nativeThreadId ?? null,input.activeRunId ?? null,now()]);} catch(e){if(e.code==='ER_DUP_ENTRY') throw new StoreError('session_conflict');throw e;}return {generation:1};}
+      const [result]=await c.execute('UPDATE bridge_sessions SET native_thread_id=?,active_run_id=?,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id IS NULL',[input.nativeThreadId ?? null,input.activeRunId ?? null,now(),...key,input.expectedGeneration]);
+      if(!result.affectedRows)throw new StoreError('session_conflict'); return {generation:input.expectedGeneration};
+    }); },
+    resetSession(input) { return write(async(c)=>{const [result]=await c.execute('UPDATE bridge_sessions SET generation=generation+1,native_thread_id=NULL,updated_at=? WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id IS NULL',[now(),...scope(input),text(input.agentId,128),input.expectedGeneration]);if(!result.affectedRows)throw new StoreError('session_busy_or_conflict');return {generation:Number(input.expectedGeneration)+1};}); },
+    appendRunEvent(input) { return write(async(c)=>{const digest=hash({type:input.type,payload:input.payload}); await c.execute('INSERT INTO bridge_run_events (run_id,event_key,type,payload_hash,payload,created_at) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE sequence=sequence',[text(input.runId,36),text(input.eventKey),text(input.type,64),digest,json(input.payload),now()]);const [[row]]=await c.execute('SELECT sequence,payload_hash FROM bridge_run_events WHERE run_id=? AND event_key=?',[input.runId,input.eventKey]);if(row.payload_hash!==digest)throw new StoreError('run_event_conflict');return {sequence:row.sequence};}); },
+    readRunEvents: (input)=>read(async(c)=>{const [rows]=await c.execute(`SELECT sequence,run_id,event_key,type,payload,created_at FROM bridge_run_events WHERE run_id=? AND sequence>? ORDER BY sequence LIMIT ${limit(input.limit)}`,[text(input.runId,36),input.afterSequence ?? 0]);return rows.map(decode);}),
+    readPassiveContext: (input)=>read(async(c)=>{const [rows]=await c.execute(`SELECT sequence,id,message_id,payload,occurred_at FROM bridge_inbox WHERE connection_id=? AND conversation_id=? AND passive_context=TRUE AND context_run_id IS NULL AND NOT EXISTS (SELECT 1 FROM bridge_message_tombstones t WHERE t.connection_id=bridge_inbox.connection_id AND t.message_id=bridge_inbox.message_id) AND sequence>? ORDER BY sequence LIMIT ${limit(input.limit)}`,[...scope(input),input.afterSequence ?? 0]);return rows.map(decode);}),
+    consumePassiveContext(input) { return write(async(c)=>{await c.execute('UPDATE bridge_inbox SET context_run_id=? WHERE connection_id=? AND conversation_id=? AND passive_context=TRUE AND context_run_id IS NULL AND sequence<=?',[text(input.runId,36),...scope(input),input.throughSequence]);return {consumed:true};}); },
+    excludeMessage(input) { return write(async(c)=>{await c.execute('INSERT INTO bridge_message_tombstones (connection_id,message_id,created_at) VALUES (?,?,?) ON DUPLICATE KEY UPDATE message_id=message_id',[text(input.connectionId,128),text(input.messageId),now()]);return {excluded:true};}); },
+    getCursor: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT version,value FROM bridge_cursors WHERE connection_id=? AND cursor_key=?',[text(input.connectionId,128),text(input.key)]);return row ?? null;}),
+    setCursor(input) { return write(async(c)=>{const key=[text(input.connectionId,128),text(input.key)];if(input.expectedVersion===0){try{await c.execute('INSERT INTO bridge_cursors (connection_id,cursor_key,version,value,updated_at) VALUES (?,?,1,?,?)',[...key,json(input.value),now()]);}catch(e){if(e.code==='ER_DUP_ENTRY')throw new StoreError('cursor_conflict');throw e;}}else{const [r]=await c.execute('UPDATE bridge_cursors SET version=version+1,value=?,updated_at=? WHERE connection_id=? AND cursor_key=? AND version=?',[json(input.value),now(),...key,input.expectedVersion]);if(!r.affectedRows)throw new StoreError('cursor_conflict');}return {version:Number(input.expectedVersion)+1};}); },
+  };
+}

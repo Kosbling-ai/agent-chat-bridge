@@ -4,11 +4,23 @@
   "private": true,
   "type": "module",
   "description": "Independent chat and agent client — foundation only",
-  "engines": { "node": ">=24 <25" },
-  "bin": { "agent-chat-bridge": "./bin/agent-chat-bridge.mjs" },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "bin": {
+    "agent-chat-bridge": "./bin/agent-chat-bridge.mjs"
+  },
   "scripts": {
     "start": "node bin/agent-chat-bridge.mjs start",
     "test": "node --test",
-    "check": "node scripts/check.mjs"
+    "check": "node scripts/check.mjs",
+    "test:storage": "node scripts/test-storage.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.60.0",
+    "mysql2": "3.24.4"
+  },
+  "overrides": {
+    "axios": "1.18.0"
   }
 }
