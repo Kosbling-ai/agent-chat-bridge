@@ -19,7 +19,7 @@ test('active guidance shares one final reply, rejected guidance defers, unknown 
     steerCalls++; assert.equal(expectedTurnId, turns.get(threadId).id);
     if (mode !== 'accepted') throw Object.assign(new Error('synthetic'), { outcome: mode });
     await complete(threadId); // Parent can complete before the steer RPC response.
-    return {};
+    return { turnId: expectedTurnId };
   } };
   const chat = { sendMessage: async input => { sent.push(input); return { message_id: `message-${sent.length}` }; } };
   const enqueue = (conversationId, text) => store.enqueueJob({ connectionId: config.feishu.connectionId, conversationId, kind: 'agent', idempotencyKey: text, payload: { source: 'api', text } });

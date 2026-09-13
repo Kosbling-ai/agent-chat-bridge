@@ -133,6 +133,13 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
     log('info', 'agent_run', 'started');
     let attempt, rpcPhase;
     try {
+      const previousGuidance = await store.getSteerAttempt({ id: job.id });
+      if (['intent', 'unknown'].includes(previousGuidance?.status)) {
+        // This input may already be inside a native turn. No preparation failure
+        // or config toggle may relabel it as unsubmitted or create a new turn.
+        await steer(job, '');
+        return;
+      }
       if (rotate) {
         try { await rotate(job); }
         catch {

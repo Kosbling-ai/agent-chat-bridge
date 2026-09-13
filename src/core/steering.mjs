@@ -14,9 +14,11 @@ export function createSteeringHandler({ store, codex, log, enabled = true }) {
     let outcome = 'unknown', errorCode = 'steer_admission_unknown';
     if (admission.kind === 'new') {
       try {
-        await codex.steerTurn({ threadId: admission.nativeThreadId, expectedTurnId: admission.nativeTurnId,
+        const result = await codex.steerTurn({ threadId: admission.nativeThreadId, expectedTurnId: admission.nativeTurnId,
           input: [{ type: 'text', text: inputText }], clientUserMessageId: admission.clientMessageId });
-        outcome = 'accepted'; errorCode = undefined;
+        // TurnSteerResponse requires turnId. A missing/wrong ID does not prove
+        // non-admission and must never enter the rejected/deferred replay path.
+        if (result?.turnId === admission.nativeTurnId) { outcome = 'accepted'; errorCode = undefined; }
       } catch (error) {
         if (error.outcome === 'rejected') { outcome = 'rejected'; errorCode = 'steer_rpc_rejected'; }
       }

@@ -6,7 +6,7 @@ test('steer sends only a new durable intent and records explicit rejection or un
   for (const mode of ['accepted', 'rejected', 'unknown', 'recovery_required']) {
     const writes = [], calls = [];
     const handler = createSteeringHandler({ store: { beginSteerAttempt: async () => ({ kind: mode === 'recovery_required' ? mode : 'new', nativeThreadId: 'thread', nativeTurnId: 'turn', clientMessageId: 'guidance' }), finishSteerAttempt: async input => writes.push(input) },
-      codex: { steerTurn: async input => { calls.push(input); if (mode !== 'accepted') throw Object.assign(new Error('SYNTHETIC'), { outcome: mode }); } } });
+      codex: { steerTurn: async input => { calls.push(input); if (mode !== 'accepted') throw Object.assign(new Error('SYNTHETIC'), { outcome: mode }); return { turnId: 'turn' }; } } });
     assert.equal(await handler(job, 'guidance'), true);
     assert.equal(calls.length, mode === 'recovery_required' ? 0 : 1);
     assert.equal(writes[0].outcome, mode === 'recovery_required' ? 'unknown' : mode);
@@ -20,6 +20,13 @@ test('disabling steering does not replay an unresolved earlier steering intent a
 });
 test('accepted steering COMMIT loss is read back without contradicting the recorded outcome', async () => {
   let writes = 0;
-  const handler = createSteeringHandler({ store: { beginSteerAttempt: async () => ({ kind: 'new' }), finishSteerAttempt: async () => { writes++; throw new Error('synthetic lost commit'); }, getSteerAttempt: async () => ({ status: 'accepted' }) }, codex: { steerTurn: async () => ({}) } });
+  const handler = createSteeringHandler({ store: { beginSteerAttempt: async () => ({ kind: 'new', nativeTurnId: 'turn' }), finishSteerAttempt: async () => { writes++; throw new Error('synthetic lost commit'); }, getSteerAttempt: async () => ({ status: 'accepted' }) }, codex: { steerTurn: async () => ({ turnId: 'turn' }) } });
   assert(await handler(job, 'guidance')); assert.equal(writes, 1);
+});
+test('missing or mismatched required response turnId is unknown, never rejected', async () => {
+  for (const response of [{}, { turnId: 'other' }]) {
+    let outcome;
+    const handler = createSteeringHandler({ store: { beginSteerAttempt: async () => ({ kind: 'new', nativeThreadId: 'thread', nativeTurnId: 'turn' }), finishSteerAttempt: async input => { outcome = input.outcome; } }, codex: { steerTurn: async () => response } });
+    await handler(job, 'guidance'); assert.equal(outcome, 'unknown');
+  }
 });
