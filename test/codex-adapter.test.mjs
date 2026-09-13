@@ -10,7 +10,7 @@ import { createCodexAdapter } from '../src/agents/codex/adapter.mjs';
 const fixtureSource = `
 import readline from 'node:readline';
 const send=m=>process.stdout.write(JSON.stringify(m)+'\\n');
-const mode=process.env.MODE;let initialized=false;
+const mode=process.env.MODE;let initialized=false;let floodRequestId;
 if(mode==='ignore-term')process.on('SIGTERM',()=>{});
 process.stderr.write('SYNTHETIC_SECRET_STDERR');
 readline.createInterface({input:process.stdin}).on('line',line=>{
@@ -32,7 +32,13 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    send({id:'provider-1',method:'item/commandExecution/requestApproval',params:{threadId:'t1',turnId:'r1',command:'SYNTHETIC_SECRET_REQUEST'}});
    send({id:m.id,result:{turn:{id:'r1',status:'inProgress'}}});return;
  }
- if(mode==='flood'){for(let i=0;i<8;i++)send({method:'item/agentMessage/delta',params:{delta:'x'}});send({id:m.id,result:{}});return;}
+ if(mode==='flood'){
+   if(m.method==='fixture/release-flood'){
+     for(let i=0;i<8;i++)send({method:'item/agentMessage/delta',params:{delta:'x'}});
+     send({id:floodRequestId,result:{}});
+   }else{floodRequestId=m.id;send({method:'item/agentMessage/delta',params:{delta:'first'}});}
+   return;
+ }
  if(m.method==='thread/read'){
    setTimeout(()=>send({id:m.id,result:{thread:{id:m.params.threadId}}}),m.params.threadId==='slow'?40:1);return;
  }
@@ -144,11 +150,36 @@ test('initialization timeout and spawn error are bounded and redacted', options,
 });
 
 test('slow notification sink is bounded; rejected fault sink never becomes unhandled rejection', options, async t => {
-  const { adapter, logs } = await setup(t, 'flood', { maxQueuedNotifications: 2, rpcTimeoutMs: 100 }, { onNotification: () => new Promise(()=>{}), onFault: async()=>{ throw new Error('SYNTHETIC_SECRET_FAULT'); } });
+  let entered, rejectSink;
+  const sinkStarted = new Promise(resolve => { entered = resolve; });
+  const { adapter, logs, children } = await setup(t, 'flood', { maxQueuedNotifications: 2 }, {
+    onNotification: () => { entered(); return new Promise((_, reject) => { rejectSink = reject; }); },
+    onFault: async()=>{ throw new Error('SYNTHETIC_SECRET_FAULT'); },
+  });
   await adapter.start();
-  await assert.rejects(adapter.startThread(), { code: 'codex_notification_capacity' });
+  const admission = assert.rejects(adapter.startThread(), { code: 'codex_notification_capacity' });
+  // A protocol handshake, not a sleep, guarantees that this case has one
+  // genuinely in-flight callback before the queue is flooded.
+  await sinkStarted;
+  children[0].stdin.write(JSON.stringify({ method: 'fixture/release-flood' }) + '\n');
+  await admission;
+  rejectSink(new Error('SYNTHETIC_SECRET_PERSISTENCE'));
   await assert.rejects(adapter.close(), { code: 'codex_notification_delivery_failed', outcome: 'unknown' });
   assert(!JSON.stringify(logs).includes('SYNTHETIC_SECRET'));
+});
+
+test('overflow before a sink enters reports lost notifications without inventing a callback failure', options, async t => {
+  const { adapter, notices, faults, children } = await setup(t, 'silent', { maxQueuedNotifications: 2 });
+  await adapter.start();
+  const admission = assert.rejects(adapter.startThread(), { code: 'codex_notification_capacity' });
+  // Inject one synchronous transport data event: promise callbacks cannot run
+  // between these frames, irrespective of OS pipe chunking or scheduling.
+  const frames = Array.from({ length: 4 }, () => JSON.stringify({ method: 'item/agentMessage/delta', params: { delta: 'fixture' } })).join('\n') + '\n';
+  children[0].stdout.emit('data', Buffer.from(frames));
+  await admission;
+  await adapter.close();
+  assert.equal(notices.length, 0);
+  assert.deepEqual(faults, [{ code: 'codex_notification_capacity', outcome: 'unknown' }]);
 });
 
 test('close escalates SIGTERM to SIGKILL and rejects pending work', options, async t => {
