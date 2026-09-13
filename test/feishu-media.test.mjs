@@ -169,7 +169,7 @@ test('directory fsync precedes ready and failed publication sync preserves compl
     const before=directorySyncs;
     const retried=await f.media.prepare(source,{runId:'durable'});
     assert.equal(retried.status,'ready');
-    assert.equal(directorySyncs-before,2);
+    assert.ok(directorySyncs-before>=2);
     assert.equal(f.calls.length,1);
     assert.equal(await readFile(retried.localPaths[0],'utf8'),'synthetic-image');
   }finally{t.mock.restoreAll();await f.close();}

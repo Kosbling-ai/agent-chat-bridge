@@ -30,16 +30,17 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
     let cursor = workspacePath;
     for (const segment of rel.split('/')) {
       cursor = join(cursor, segment);
-      let created = false;
       if (create) {
-        try { await mkdir(cursor, { mode: 0o700 }); created = true; }
+        try { await mkdir(cursor, { mode: 0o700 }); }
         catch (error) { if (error.code !== 'EEXIST') throw error; }
       }
       const info = await lstat(cursor);
       if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid() || (info.mode & (cursor === root || inside(root, cursor) ? 0o077 : 0o022))) {
         throw new MediaError('unsafe_media_directory');
       }
-      if (created) await syncDirectory(dirname(cursor));
+      // Re-sync existing entries too: an earlier mkdir may have succeeded before
+      // its parent sync failed, including across constructor retries.
+      if (create) await syncDirectory(dirname(cursor));
     }
     if (await realpath(path) !== path) throw new MediaError('unsafe_media_directory');
   }
