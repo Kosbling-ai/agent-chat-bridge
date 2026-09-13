@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile, rm, utimes, symlink, link, open, readdir } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, utimes, symlink, link, open, readdir, rename, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createOutboundMedia } from '../src/channels/feishu/outbound-media.mjs';
@@ -184,4 +184,96 @@ test('failed preparation before a manifest cannot claim and silently swallow a s
   const restored = await createOutboundMedia({...f.config,maxTotalBytes:1024*1024});
   assert.equal((await restored.prepare({...scope,runId:'sufficient-space'})).artifacts.length,1);
   assert.equal(await readFile(join(f.dir,'unclaimed.txt'),'utf8'),'data');
+});
+
+
+test('cleanup never unlinks the next turns replacement after validation', async t => {
+  const f = await fixture(t); const path = await f.put('race.txt','original');
+  const prepared = await f.media.prepare(scope), source = await stat(path);
+  const probe = await open(path,'r'), prototype = Object.getPrototypeOf(probe), originalStat = prototype.stat;
+  await probe.close(); let injected = false, checks = 0;
+  t.mock.method(prototype,'stat',async function(...args){
+    const current = await originalStat.apply(this,args);
+    if(!injected && current.ino === source.ino && current.dev === source.dev && ++checks === 2){
+      injected = true; await writeFile(path,'new next-turn content');
+    }
+    return current;
+  });
+  await f.media.cleanup({scope,ref:prepared.artifacts[0].ref,confirmedSent:true});
+  t.mock.restoreAll();
+  assert.equal(injected,true); assert.equal(await readFile(path,'utf8'),'new next-turn content');
+});
+
+test('quarantine survives rename interruption and cleanup restart preserves a new active source', async t => {
+  const f = await fixture(t); const path = await f.put('interrupted.txt','original');
+  const prepared = await f.media.prepare(scope), ref = prepared.artifacts[0].ref;
+  const dir = join(f.config.spoolDir,(await readdir(f.config.spoolDir))[0]);
+  const quarantine = join(dir,`${ref.artifactId}.source`);
+  const probe = await open(dir,'r'), prototype = Object.getPrototypeOf(probe), originalSync = prototype.sync;
+  await probe.close(); let injected = false;
+  t.mock.method(prototype,'sync',async function(){
+    if(!injected && (await this.stat()).isDirectory() && (await readdir(dir)).includes(`${ref.artifactId}.source`)){
+      injected = true; throw Object.assign(new Error('synthetic rename sync failure'),{code:'EIO'});
+    }
+    return originalSync.call(this);
+  });
+  await assert.rejects(f.media.cleanup({scope,ref,confirmedSent:true}),{code:'EIO'});
+  t.mock.restoreAll();
+  assert.equal(await readFile(quarantine,'utf8'),'original');
+  await writeFile(path,'new active version');
+  const restarted = await createOutboundMedia(f.config);
+  await restarted.cleanup({scope,ref,confirmedSent:true});
+  assert.equal(await readFile(path,'utf8'),'new active version');
+  await assert.rejects(readFile(quarantine),{code:'ENOENT'});
+  await assert.rejects(readFile(join(dir,ref.artifactId)),{code:'ENOENT'});
+});
+
+test('changed quarantine cannot overwrite an occupied path and remains recoverable', async t => {
+  const f = await fixture(t); const path = await f.put('restore.txt','original');
+  const prepared = await f.media.prepare(scope), ref = prepared.artifacts[0].ref;
+  await f.put('restore.txt','updated!'); // Same stat fields, changed content.
+  const dir = join(f.config.spoolDir,(await readdir(f.config.spoolDir))[0]);
+  const quarantine = join(dir,`${ref.artifactId}.source`);
+  const probe = await open(dir,'r'), prototype = Object.getPrototypeOf(probe), originalSync = prototype.sync;
+  await probe.close(); let injected = false;
+  t.mock.method(prototype,'sync',async function(){
+    if(!injected && (await this.stat()).isDirectory() && (await readdir(dir)).includes(`${ref.artifactId}.source`)){
+      injected = true; await writeFile(path,'newer active content');
+    }
+    return originalSync.call(this);
+  });
+  await assert.rejects(f.media.cleanup({scope,ref,confirmedSent:true}),{code:'artifact_cleanup_pending'});
+  t.mock.restoreAll();
+  assert.equal(await readFile(path,'utf8'),'newer active content');
+  assert.equal(await readFile(quarantine,'utf8'),'updated!');
+  const restarted = await createOutboundMedia(f.config);
+  await assert.rejects(restarted.cleanup({scope,ref,confirmedSent:true}),{code:'artifact_cleanup_pending'});
+  const saved = join(f.dir,'saved-newer.txt'); await rename(path,saved);
+  const result = await restarted.cleanup({scope,ref,confirmedSent:true});
+  assert.equal(result.sourceChanged,true);
+  assert.equal(await readFile(path,'utf8'),'updated!'); assert.equal(await readFile(saved,'utf8'),'newer active content');
+  await assert.rejects(readFile(quarantine),{code:'ENOENT'});
+});
+
+test('a crash between no-overwrite restore and private unlink leaves a recoverable hardlink', async t => {
+  const f = await fixture(t); const path = await f.put('linked.txt','original');
+  const prepared = await f.media.prepare(scope), ref = prepared.artifacts[0].ref;
+  await f.put('linked.txt','updated!');
+  const dir = join(f.config.spoolDir,(await readdir(f.config.spoolDir))[0]);
+  const quarantine = join(dir,`${ref.artifactId}.source`);
+  const probe = await open(dir,'r'), prototype = Object.getPrototypeOf(probe), originalSync = prototype.sync;
+  await probe.close(); let injected = false;
+  t.mock.method(prototype,'sync',async function(){
+    if(!injected && (await this.stat()).isDirectory()){
+      let held;try{held=await stat(quarantine);}catch(error){if(error.code!=='ENOENT')throw error;}
+      if(held?.nlink===2){injected=true;throw Object.assign(new Error('synthetic restore sync failure'),{code:'EIO'});}
+    }
+    return originalSync.call(this);
+  });
+  await assert.rejects(f.media.cleanup({scope,ref,confirmedSent:true}),{code:'EIO'});
+  t.mock.restoreAll(); assert.equal(injected,true);assert.equal((await stat(quarantine)).nlink,2);
+  const restarted = await createOutboundMedia(f.config);
+  await restarted.cleanup({scope,ref,confirmedSent:true});
+  assert.equal(await readFile(path,'utf8'),'updated!'); assert.equal((await stat(path)).nlink,1);
+  await assert.rejects(readFile(quarantine),{code:'ENOENT'});
 });

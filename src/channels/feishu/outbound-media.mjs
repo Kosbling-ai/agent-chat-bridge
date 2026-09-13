@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, opendir, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, opendir, readFile, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { safeObserver } from '../../logger.mjs';
 
@@ -230,22 +230,65 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
       return exclusive(async () => {
         if (confirmedSent !== true) throw fail('artifact_send_unconfirmed');
         const artifact = await resolveRef(scope, ref);
-        const source = join(chatDir(scope), artifact.fileName);
-        await directory(chatDir(scope));
+        const sourceDirectory = chatDir(scope), dir = runDir(scope);
+        const source = join(sourceDirectory, artifact.fileName);
+        const quarantine = join(dir, `${artifact.artifactId}.source`);
+        await directory(sourceDirectory); await directory(dir);
         let sourceChanged = false;
-        let removeSource = false;
-        try {
-          const current = await readBounded(source, maxBytes);
-          if (sameFile(current.info, artifact.source) && digest(current.bytes) === artifact.sha256) removeSource = true;
-          else sourceChanged = true;
-        } catch (error) {
-          if (['unsafe_artifact_file', 'artifact_too_large', 'artifact_changed', 'ELOOP'].includes(error.code)) sourceChanged = true;
-          else if (error.code !== 'ENOENT') throw fail('artifact_cleanup_failed');
+        const inspect = async path => {
+          try { return await lstat(path); }
+          catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+        };
+        let held = await inspect(quarantine);
+        if (!held) {
+          const current = await inspect(source);
+          if (current) {
+            if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || !sameFile(current, artifact.source)) {
+              sourceChanged = true;
+            } else {
+              // Move the directory entry, never unlink the live Agent pathname.
+              // A concurrent replacement is then validated in quarantine.
+              try { await rename(source, quarantine); }
+              catch (error) { if (error.code !== 'ENOENT') throw fail('artifact_cleanup_pending'); }
+              held = await inspect(quarantine);
+              await syncDirectory(sourceDirectory); await syncDirectory(dir);
+            }
+          }
         }
-        if (removeSource) await unlink(source).catch(error => { if (error.code !== 'ENOENT') throw fail('artifact_cleanup_failed'); });
-        await directory(runDir(scope));
-        await unlink(join(runDir(scope), artifact.artifactId)).catch(error => { if (error.code !== 'ENOENT') throw error; });
-        // Keep the small manifest for replay/audit. Do not rescan completed runs.
+        if (held) {
+          const current = await inspect(source);
+          if (current && current.dev === held.dev && current.ino === held.ino) {
+            // Recovery after link-to-source succeeded but unlink-quarantine did not.
+            // Preserve the restored active path and finish only the private entry.
+            sourceChanged = true;
+            await unlink(quarantine);
+          } else {
+            let matching = false;
+            try {
+              const moved = await readBounded(quarantine, maxBytes);
+              matching = sameFile(moved.info, artifact.source) && digest(moved.bytes) === artifact.sha256;
+            } catch (error) {
+              if (!['unsafe_artifact_file','artifact_too_large','artifact_changed','ELOOP'].includes(error.code)) throw fail('artifact_cleanup_pending');
+            }
+            if (matching) await unlink(quarantine);
+            else {
+              sourceChanged = true;
+              // link is an atomic no-overwrite restore. Never rename over a new file.
+              try { await link(quarantine, source); }
+              catch {
+                log('warning','artifact_cleanup','pending',{code:'artifact_source_quarantined'});
+                throw fail('artifact_cleanup_pending');
+              }
+              await syncDirectory(sourceDirectory);
+              await unlink(quarantine);
+            }
+          }
+          await syncDirectory(sourceDirectory); await syncDirectory(dir);
+        }
+        await unlink(join(dir, artifact.artifactId)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+        // Only acknowledge cleanup after all rename/unlink directory entries persist.
+        await syncDirectory(sourceDirectory); await syncDirectory(dir);
+        // Keep the small manifest for replay/audit and source-version ownership.
         if (sourceChanged) log('warning', 'artifact_cleanup', 'source_retained', { code: 'artifact_source_changed' });
         return { cleaned: true, sourceChanged };
       });
