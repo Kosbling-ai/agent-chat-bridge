@@ -212,3 +212,27 @@ CREATE TABLE IF NOT EXISTS bridge_session_rotations (
   created_at BIGINT UNSIGNED NOT NULL,
   UNIQUE KEY rotation_idempotency (connection_id,conversation_id,agent_id,idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+
+CREATE TABLE IF NOT EXISTS bridge_steering (
+  sequence BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
+  guidance_job_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  target_run_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  connection_id VARCHAR(128) NOT NULL,
+  conversation_id VARCHAR(255) NOT NULL,
+  agent_id VARCHAR(128) NOT NULL,
+  generation BIGINT UNSIGNED NOT NULL,
+  native_thread_id VARCHAR(255) NOT NULL,
+  native_turn_id VARCHAR(255) NOT NULL,
+  client_message_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  status VARCHAR(16) NOT NULL DEFAULT 'intent',
+  error_code VARCHAR(64) NULL,
+  settled_lease_token CHAR(36) CHARACTER SET ascii NULL,
+  result_hash CHAR(64) CHARACTER SET ascii NULL,
+  created_at BIGINT UNSIGNED NOT NULL,
+  updated_at BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (guidance_job_id,target_run_id),
+  UNIQUE KEY steering_settled (guidance_job_id,settled_lease_token),
+  KEY steering_latest (guidance_job_id,sequence),
+  KEY steering_parent (target_run_id,status,sequence)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

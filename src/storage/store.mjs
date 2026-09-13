@@ -5,6 +5,7 @@ import { acquireWriter } from './writer.mjs';
 import { StoreError } from './errors.mjs';
 import { recoveryOperations } from './recovery.mjs';
 import { rotationOperations } from './rotation.mjs';
+import { steeringOperations } from './steering.mjs';
 
 const json = (value) => JSON.stringify(value);
 function canonical(value) {
@@ -162,6 +163,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
   return {
     ...recoveryOperations({ read, write, now, hash, decode, claimThread }),
     ...rotationOperations({write,now,hash}),
+    ...steeringOperations({read,write,now,hash,decode}),
     assertCurrent: () => assertSchemaCurrent(pool),
     async close() { await writer.close(); await pool.end(); },
     acceptInbound(input) {
@@ -331,6 +333,9 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
         const [[existing]] = await c.execute(`SELECT job_id,connection_id,conversation_id,agent_id,
           generation,native_thread_id,native_turn_id,created_at FROM bridge_attempts WHERE job_id=?`, [job.id]);
         if (existing) return { ...decode(existing), recoveryRequired: true };
+        const [[steering]] = await c.execute(`SELECT status FROM bridge_steering
+          WHERE guidance_job_id=? AND status IN ('intent','unknown') LIMIT 1`, [job.id]);
+        if (steering) throw new StoreError('steer_recovery_required');
         const key = [job.connection_id, job.conversation_id, text(input.agentId, 128)];
         await c.execute(`INSERT INTO bridge_sessions (connection_id,conversation_id,agent_id,updated_at)
           VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE agent_id=agent_id`, [...key, now()]);
