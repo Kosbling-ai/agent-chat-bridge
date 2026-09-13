@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS bridge_outbox (
   payload_hash CHAR(64) CHARACTER SET ascii NOT NULL,
   payload JSON NOT NULL,
   job_id CHAR(36) CHARACTER SET ascii NULL,
+  predecessor_id CHAR(36) CHARACTER SET ascii NULL,
   platform_uuid CHAR(36) CHARACTER SET ascii NOT NULL,
   status VARCHAR(24) NOT NULL DEFAULT 'pending',
   first_attempt_at BIGINT UNSIGNED NULL,

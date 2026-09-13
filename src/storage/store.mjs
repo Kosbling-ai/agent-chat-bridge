@@ -67,11 +67,11 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
     if (!['create','reply','reaction','upload','update'].includes(input.kind)) throw new StoreError('invalid_outbox_kind');
     const payloadHash = hash({ conversationId, kind: input.kind, payload: input.payload });
     const id = randomUUID();
-    await c.execute(`INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,job_id,platform_uuid,next_attempt_at,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [id,connectionId,conversationId,key,input.kind,payloadHash,json(input.payload),input.jobId ?? null,input.platformUuid ?? randomUUID(),now(),now(),now()]);
-    const [[row]] = await c.execute('SELECT id,payload_hash,platform_uuid,job_id FROM bridge_outbox WHERE connection_id=? AND idempotency_key=?', [connectionId,key]);
-    if (row.payload_hash !== payloadHash || row.job_id !== (input.jobId ?? null)) throw new StoreError('outbox_conflict');
-    return { id: row.id, platformUuid: row.platform_uuid, duplicate: row.id !== id };
+    await c.execute(`INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,job_id,predecessor_id,platform_uuid,next_attempt_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [id,connectionId,conversationId,key,input.kind,payloadHash,json(input.payload),input.jobId ?? null,input.predecessorId ?? null,input.platformUuid ?? randomUUID(),now(),now(),now()]);
+    const [[row]] = await c.execute('SELECT id,payload_hash,platform_uuid,job_id,predecessor_id FROM bridge_outbox WHERE connection_id=? AND idempotency_key=?', [connectionId,key]);
+    if (row.payload_hash !== payloadHash || row.job_id !== (input.jobId ?? null) || row.predecessor_id !== (input.predecessorId ?? null)) throw new StoreError('outbox_conflict');
+    return { id: row.id, platformUuid: row.platform_uuid, predecessorId: row.predecessor_id, duplicate: row.id !== id };
   }
   async function owned(c, table, input) {
     lease(input);
@@ -112,7 +112,11 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
       } else {
         // An expired send lease is ambiguous, including after process death.
         await c.execute("UPDATE bridge_outbox SET status='unknown',lease_token=NULL,lease_owner=NULL WHERE status='running' AND lease_expires_at<=? ORDER BY lease_expires_at,id LIMIT 100", [now()]);
-        condition = `(j.status='pending' AND j.next_attempt_at<=?) OR (j.status='unknown' AND j.kind IN ('create','reply') AND j.first_attempt_at>? AND j.next_attempt_at<=?)`;
+        condition = `((j.status='pending' AND j.next_attempt_at<=?) OR
+          (j.status='unknown' AND j.kind IN ('create','reply') AND j.first_attempt_at>? AND j.next_attempt_at<=?))
+          AND (j.predecessor_id IS NULL OR EXISTS (
+            SELECT 1 FROM bridge_outbox predecessor WHERE predecessor.id=j.predecessor_id AND predecessor.status='sent'
+          ))`;
         params = [now(), now()-55*60*1000, now()];
       }
       const [rows] = await c.execute(`SELECT j.* FROM ${table} j WHERE ${condition} ORDER BY j.created_at,j.id LIMIT ${take} FOR UPDATE SKIP LOCKED`, params);
@@ -171,11 +175,19 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
         const row = await owned(c, 'bridge_jobs', input);
         await releaseAttempt(c, row.id);
         const outbox = [];
+        let predecessorId = null;
+        let predecessorKey;
         for (const effect of input.outbox ?? []) {
-          outbox.push(await insertOutbox(c, {
-            ...effect, connectionId: row.connection_id,
+          if (effect.predecessorIdempotencyKey !== undefined && effect.predecessorIdempotencyKey !== predecessorKey) {
+            throw new StoreError('invalid_outbox_predecessor');
+          }
+          const recorded = await insertOutbox(c, {
+            ...effect, predecessorId, connectionId: row.connection_id,
             conversationId: row.conversation_id, jobId: row.id,
-          }));
+          });
+          outbox.push(recorded);
+          predecessorId = recorded.id;
+          predecessorKey = effect.idempotencyKey;
         }
         const status = outbox.length ? 'reply_pending' : 'succeeded';
         await c.execute(`UPDATE bridge_jobs SET status=?,result=?,lease_token=NULL,
@@ -220,6 +232,10 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
             WHERE id=? AND status='reply_pending' AND NOT EXISTS (
               SELECT 1 FROM bridge_outbox WHERE job_id=? AND status<>'sent'
             )`, [now(), row.job_id, row.job_id]);
+        }
+        if (row.job_id && input.status === 'failed') {
+          await c.execute(`UPDATE bridge_jobs SET status='delivery_failed',updated_at=?
+            WHERE id=? AND status='reply_pending'`, [now(), row.job_id]);
         }
         return { status: input.status };
       });
@@ -279,7 +295,13 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
     }); },
     readNativeEvents: (input)=>read(async(c)=>{const [rows]=await c.execute(`SELECT sequence,native_thread_id,native_turn_id,payload,created_at FROM bridge_native_events WHERE connection_id=? AND native_thread_id=? AND sequence>? ORDER BY sequence LIMIT ${limit(input.limit)}`,[text(input.connectionId,128),text(input.nativeThreadId),input.afterSequence ?? 0]);return rows.map(decode);}),
     getJob: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_jobs WHERE id=?',[text(input.id,36)]);return decode(row) ?? null;}),
-    getOutbox: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_outbox WHERE id=?',[text(input.id,36)]);return decode(row) ?? null;}),
+    getOutbox: (input) => read(async (c) => {
+      const [[row]] = await c.execute(`SELECT effect.*, predecessor.status AS predecessor_status,
+        (effect.predecessor_id IS NOT NULL AND (predecessor.id IS NULL OR predecessor.status<>'sent')) AS blocked
+        FROM bridge_outbox effect LEFT JOIN bridge_outbox predecessor ON predecessor.id=effect.predecessor_id
+        WHERE effect.id=?`, [text(input.id, 36)]);
+      return row ? { ...decode(row), blocked: Boolean(row.blocked) } : null;
+    }),
     getSession: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_sessions WHERE connection_id=? AND conversation_id=? AND agent_id=?',[...scope(input),text(input.agentId,128)]);return decode(row) ?? null;}),
     setSession(input) { return write(async(c)=>{
       const key=[...scope(input),text(input.agentId,128)];
