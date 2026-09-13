@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Independent chat and agent client — foundation only",
+  "description": "Independent Feishu and Codex client with durable hooks and message delivery",
   "engines": {
     "node": ">=24 <25"
   },
