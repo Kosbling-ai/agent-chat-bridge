@@ -72,7 +72,7 @@ export class CodexAppServerClient {
     child.on('error', (error) => { if (this.child === child) this.fail(error, child); });
     child.once('exit', (code, signal) => this.handleExit(new Error(`codex app-server exited${code == null ? '' : ` code=${code}`}${signal ? ` signal=${signal}` : ''}`), child));
     await this.request('initialize', {
-      clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.1.1' },
+      clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.2.0' },
       capabilities: { experimentalApi: true },
     }, { skipStart: true });
     if (this.child !== child) throw new Error('codex app-server child changed during initialize');

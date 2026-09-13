@@ -1,10 +1,22 @@
 # Versions and migrations
 
-Application version: `0.1.1`
+Application version: `0.2.0`
 
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.0 development migration
+
+Version 0.2.0 is unreleased. Migrations `002-codex-sessions.sql` and `003-forward-runtime.sql` add the Codex binding/event tables and the forward/inbound/message-event tables to a **dedicated bridge schema**. Migration 003 also adds the indexes and source-message receipt field used by exact event reads and API-created runs.
+
+Do not point this build at the Kosbling production/P database and do not treat the similarly named production-derived tables as an in-place conversion. The bridge schema also contains migration 001 communication tables and has its own checksum ledger. For a new development instance, create an empty dedicated schema and run the explicit migrate command. For an existing 0.1.1 bridge trial, stop its only writer, preserve the database and workspace/outbox together, review the new configuration and run the same explicit migration once. Startup itself never applies DDL.
+
+Configuration `schemaVersion` stays 1. Add every authorized group to `routing.groups`. Omitted `capabilities` means `['bridge','hook']`; use `['bridge']`, `['hook']`, or `[]` deliberately. A group listed only in `hooks[].conversationIds` is no longer sufficient. Keep one Feishu bot/WebSocket and one Codex app-server/executor for the instance. Existing API clients must account for `deliveryMode`, the run execution/delivery split, decimal-string event cursors, controlled resource indexes and `409 unsupported_execution_model` on generation-ledger management writes.
+
+Rollback after applying migrations 002–003 requires stopping the writer and restoring the pre-migration bridge database and matching workspace/outbox, or starting 0.1.1 against a separate compatible schema. Version 0.1.1's strict schema assertion does not accept the later ledger. Do not delete later ledger rows, replay unknown external effects or reuse the Kosbling production database as a rollback shortcut.
+
+No current P instance, production data, credentials or real provider was touched to prepare this migration. The Kosbling business producer still needs a separately reviewed change for scheduled submissions, caller-mode result consumption and hook-triggered lark-cli reads before any production replacement can be considered.
 
 ## 0.1.1 upgrade
 

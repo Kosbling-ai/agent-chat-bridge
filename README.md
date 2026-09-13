@@ -1,12 +1,14 @@
 # agent-chat-bridge
 
-Version: `0.1.1` — final reply cards and optional Codex proxy configuration. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
+[简体中文](README.zh-CN.md)
+
+Version: `0.2.0` is the current unreleased development version. Version 0.1.1 remains the latest released source. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
-The runtime assembles MySQL, Codex app-server, one Feishu WebSocket owner, scoped hooks and authenticated task/chat APIs. It implements private image input, Agent-generated file delivery, first-receipt catchup, durable active-turn guidance, audited recovery, idle/rules/archived thread replacement and sealed resource retirement. Business edit/reconcile and document/table/contact tools remain outside the bridge. See the [capability matrix and boundaries](docs/runtime.md).
+The runtime assembles an independent MySQL schema, one Codex app-server/executor, one Feishu bot and WebSocket owner, scoped hooks and authenticated run/chat APIs. Version 0.2.0 moves the production-derived forward lease, reply-pending delivery, native recovery, bounded group context, execution card, Typing, stop callback and replies into the bridge. Business parsing, polling, cron scheduling, lark-cli queries and document/table/contact tools remain outside it. See the [forward runtime contract](docs/runtime.md) and [Chinese supplement](docs/zh-CN/forward-runtime.md).
 
-Earlier isolated-MySQL tests used synthetic providers. The latest retirement/cursor and error-only recovery changes have fast unit and source-check coverage; their integrated paths await the requested later local testing. No real bot/model acceptance or production replacement has been completed. The [local validation checklist](docs/local-validation.md) records what remains, including deliberate differences from the old predecessor/orphan interruption behavior.
+Synthetic tests and a disposable MySQL container cover the new runtime and storage paths. Final implementation review remains open. No real bot/model acceptance, deployment, business-producer adaptation, or production replacement has been completed.
 
 Requires Node.js 24.x, npm and MySQL 8.4. Dependencies are pinned in package-lock.json. No real provider or business database is used by default tests.
 
@@ -16,7 +18,7 @@ node bin/agent-chat-bridge.mjs --help
 node bin/agent-chat-bridge.mjs check-config --config ./examples/bridge.json
 ```
 
-Configure explicit environment references and an owned workspace before migration/start. Never put tokens in JSON, `.env`, logs or source control. [Runtime configuration and API](docs/runtime.md), [Store](docs/storage.md), [Codex adapter](docs/codex-adapter.md), [optional Codex proxy](docs/codex-proxy.md), [optional Feishu proxy](docs/feishu-proxy.md), [boundaries](docs/boundaries.md).
+Configure explicit environment references and an owned workspace before migration/start. Never put tokens in JSON, `.env`, logs or source control. [Runtime configuration and API](docs/runtime.md), [Store](docs/storage.md), [Codex executor](docs/codex-adapter.md), [optional Codex proxy](docs/codex-proxy.md), [optional Feishu proxy](docs/feishu-proxy.md), [boundaries](docs/boundaries.md).
 
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
 
