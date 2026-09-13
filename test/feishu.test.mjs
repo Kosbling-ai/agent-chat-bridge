@@ -91,6 +91,20 @@ test('durable failures throw sanitized errors; observer failure cannot change AC
   await assert.rejects(receive(event), (error) => error.code === 'feishu_ingress_failed' && !error.message.includes('secret'));
 });
 
+test('retryable ingress failures warn, and asynchronous terminal error reporting cannot escape', async () => {
+  const logs = []; let reports = 0;
+  const { receive, adapter } = ingress(async () => { throw new Error('temporary store issue'); }, {
+    log: (...args) => logs.push(args), reportError: async () => { reports++; throw new Error('reporter secret'); },
+  });
+  await assert.rejects(receive(event));
+  assert.equal(logs[0][0], 'warning'); assert.equal(reports, 0);
+  adapter.status(); adapter.status(); // Unsupported probe is terminal and reported once.
+  await new Promise(setImmediate);
+  assert.equal(reports, 1);
+  assert.ok(logs.some((entry) => entry[1] === 'feishu_error_reporting' && entry[3].code === 'feishu_reporting_failed'));
+  assert.equal(JSON.stringify(logs).includes('secret'), false);
+});
+
 test('deadline aborts storage and throws even if persistence later resolves', async () => {
   let finish; let signal;
   const { receive } = ingress((_, context) => { signal = context.signal; return new Promise((resolve) => { finish = resolve; }); }, { deadlineMs: 10 });

@@ -31,7 +31,12 @@ export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '
   function observe(level, status, code, durationMs) {
     try { log(level, 'feishu_ingress', status, { code, durationMs }); } catch {}
     if (level === 'error') {
-      try { reportError(new FeishuIngressError(code), { module: 'bridge', component: 'feishu', operation: 'ingress', status }); } catch {}
+      const reportingFailed = () => {
+        try { log('warning', 'feishu_error_reporting', 'failed', { code: 'feishu_reporting_failed' }); } catch {}
+      };
+      try {
+        Promise.resolve(reportError(new FeishuIngressError(code), { module: 'bridge', component: 'feishu', operation: 'ingress', status })).catch(reportingFailed);
+      } catch { reportingFailed(); }
     }
   }
   async function receive(type, payload) {
@@ -54,7 +59,9 @@ export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '
       return undefined;
     } catch (error) {
       const code = error instanceof FeishuIngressError ? error.code : 'feishu_ingress_failed';
-      observe('error', 'failed', code, Date.now() - started);
+      // A rejected ingress remains eligible for platform redelivery; terminal
+      // retry exhaustion is owned by core, not this per-attempt adapter.
+      observe('warning', 'retryable_failure', code, Date.now() - started);
       throw new FeishuIngressError(code);
     } finally {
       clearTimeout(timer);
