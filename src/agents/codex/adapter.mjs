@@ -58,7 +58,7 @@ export function createCodexAdapter(options, dependencies = {}) {
 
   function lifecycle(level, operation, status, code) {
     // Fixed fields only. Provider stderr, messages, paths and env are never logged.
-    try { log(level, operation, status, code ? { code } : {}); } catch { /* logger must not crash cleanup */ }
+    try { Promise.resolve(log(level, operation, status, code ? { code } : {})).catch(() => {}); } catch { /* logger must not crash cleanup */ }
   }
   function bounded(promise, milliseconds, code) {
     return new Promise((resolve, reject) => {

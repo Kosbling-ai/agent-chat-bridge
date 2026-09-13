@@ -58,7 +58,7 @@ async function setup(t, mode = 'normal', overrides = {}, callbacks = {}) {
     },
     onNotification: callbacks.onNotification || (async message => { notices.push(message); }),
     onFault: callbacks.onFault || (async value => { faults.push(value); }),
-    log: (...args) => logs.push(args),
+    log: callbacks.log || ((...args) => logs.push(args)),
   });
   t.after(async () => {
     await adapter.close().catch(() => {});
@@ -69,6 +69,12 @@ async function setup(t, mode = 'normal', overrides = {}, callbacks = {}) {
 }
 const input = [{ type: 'text', text: 'synthetic request' }];
 const options = { timeout: 5000 };
+
+test('async logger rejection never escapes lifecycle cleanup', options, async t => {
+  const { adapter } = await setup(t, 'normal', {}, { log: async () => { throw new Error('SYNTHETIC_SECRET_LOG'); } });
+  await adapter.start(); await adapter.close();
+  await new Promise(resolve => setImmediate(resolve));
+});
 
 test('handshake, split frames, correlated out-of-order RPC and fixed workspace', options, async t => {
   const { adapter, directory } = await setup(t);
