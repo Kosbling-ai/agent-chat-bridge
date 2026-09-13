@@ -9,7 +9,16 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
   }
   const columns = `id,run_id,connection_id,conversation_id,caller_id,action,expected_generation,
     native_thread_id,native_turn_id,evidence,status,lease_token,lease_expires_at,error_code,created_at`;
-  async function target(c, runId, generation) {
+  async function target(c, runId, generation, action) {
+    if (action === 'abandon_guidance_verified') {
+      // Serialize against steering settlement, but never lock or mutate its parent.
+      const [[job]] = await c.execute('SELECT status FROM bridge_jobs WHERE id=? FOR UPDATE', [runId]);
+      const [[attempt]] = await c.execute(`SELECT connection_id,conversation_id,agent_id,generation,status
+        FROM bridge_steering WHERE guidance_job_id=? ORDER BY sequence DESC LIMIT 1 FOR UPDATE`, [runId]);
+      if (!job || job.status !== 'unknown' || !attempt || attempt.status !== 'unknown'
+          || String(attempt.generation) !== String(generation)) throw new StoreError('recovery_conflict');
+      return { attempt };
+    }
     // Same lock order as execution: job, attempt, then session.
     const [[job]] = await c.execute('SELECT status FROM bridge_jobs WHERE id=? FOR UPDATE', [runId]);
     const [[attempt]] = await c.execute(`SELECT connection_id,conversation_id,agent_id,generation,
@@ -39,11 +48,12 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       const runId = field(input.runId, 36);
       const callerId = field(input.callerId, 128);
       const key = field(input.idempotencyKey);
-      if (!['adopt_turn', 'abandon_verified'].includes(input.action)
+      if (!['adopt_turn', 'abandon_verified', 'abandon_guidance_verified'].includes(input.action)
           || !/^[1-9][0-9]{0,19}$/.test(String(input.expectedGeneration))) throw new StoreError('invalid_recovery');
       const evidence = field(input.evidence, 4096);
       const threadId = input.nativeThreadId == null ? null : field(input.nativeThreadId);
       const turnId = input.nativeTurnId == null ? null : field(input.nativeTurnId);
+      if (input.action === 'abandon_guidance_verified' && (threadId || turnId)) throw new StoreError('invalid_recovery');
       if (input.action === 'adopt_turn' && (!threadId || !turnId)) throw new StoreError('invalid_recovery');
       const digest = hash({ runId, action: input.action, generation: String(input.expectedGeneration), evidence, threadId, turnId });
       return write(async (c) => {
@@ -59,7 +69,7 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
           WHERE caller_id=? AND idempotency_key=?`, [callerId, key]);
         if (row.payload_hash !== digest) throw new StoreError('recovery_conflict');
         if (row.id !== id) return { id: row.id, duplicate: true };
-        const { attempt } = await target(c, runId, input.expectedGeneration);
+        const { attempt } = await target(c, runId, input.expectedGeneration, input.action);
         await c.execute('UPDATE bridge_recoveries SET connection_id=?,conversation_id=? WHERE id=?', [
           attempt.connection_id, attempt.conversation_id, id,
         ]);
@@ -104,8 +114,13 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
         }
         if (row.status !== 'running' || Number(row.lease_expires_at) <= now()) throw new StoreError('stale_lease');
         if (input.outcome === 'applied') {
-          const { attempt, key } = await target(c, row.run_id, row.expected_generation);
-          if (row.action === 'adopt_turn') {
+          const { attempt, key } = await target(c, row.run_id, row.expected_generation, row.action);
+          if (row.action === 'abandon_guidance_verified') {
+            if (verified) throw new StoreError('invalid_recovery');
+            // Cancellation is an administrative decision, not proof the provider did not execute.
+            await c.execute(`UPDATE bridge_jobs SET status='cancelled',lease_token=NULL,lease_owner=NULL,
+              lease_expires_at=NULL,updated_at=? WHERE id=?`, [now(), row.run_id]);
+          } else if (row.action === 'adopt_turn') {
             if (!verified || verified.threadId !== row.native_thread_id || verified.turnId !== row.native_turn_id
                 || (attempt.native_thread_id && attempt.native_thread_id !== verified.threadId)
                 || (attempt.native_turn_id && attempt.native_turn_id !== verified.turnId)) throw new StoreError('recovery_conflict');
