@@ -55,7 +55,7 @@ test('real Store core: immediate completion, independent hook, API authorization
       return { thread: { turns: [completed.get(threadId)].filter(Boolean) } };
     },
   };
-  const chat = { async sendMessage(input) { sent.push(input); if (input.content.text.startsWith('AAA')) { if (failFirstChunk) throw Object.assign(new Error('synthetic rejection'), { outcome: 'failed' }); await firstChunkGate; } return { message_id: `sent-${sent.length}` }; }, async replyMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async getMessage({ messageId }) { return { items: [{ message_id: messageId, chat_id: messageId === 'foreign' ? 'forbidden' : 'chat' }] }; } };
+  const chat = { async sendMessage(input) { sent.push(input); if (input.content.body.elements[0].content.startsWith('AAA')) { if (failFirstChunk) throw Object.assign(new Error('synthetic rejection'), { outcome: 'failed' }); await firstChunkGate; } return { message_id: `sent-${sent.length}` }; }, async replyMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async getMessage({ messageId }) { return { items: [{ message_id: messageId, chat_id: messageId === 'foreign' ? 'forbidden' : 'chat' }] }; } };
   const token = 'synthetic-bridge-token-for-tests-only';
   const event = { schemaVersion: 1, channel: 'feishu', connectionId: 'fixture', eventId: 'e1', eventKey: 'receive:e1', type: 'message.received', source: 'live', receivedAt: 1, occurredAt: 1, conversationId: 'chat', conversationType: 'p2p', messageId: 'm1', revision: '', actor: { type: 'user', openId: 'human' }, isApp: false, isSelf: false, message: { kind: 'text', parsedContent: { text: 'Synthetic question' }, content: '{"text":"Synthetic question"}', mentions: [] }, platform: { feishu: { eventType: 'receive' } } };
   try {
@@ -112,12 +112,12 @@ test('real Store core: immediate completion, independent hook, API authorization
     runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => new Response(null, { status: 204 }) });
     runtime.start();
     await eventually(() => store.getJob({ id: recovery.id }), row => row.status === 'succeeded');
-    assert(sent.some(effect => effect.content.text === 'Recovered answer'), 'restarted completed turn uses persisted stream fallback');
+    assert(sent.some(effect => effect.content.body.elements[0].content === 'Recovered answer'), 'restarted completed turn uses persisted stream fallback');
     assert.equal(turns, before, 'unknown admission must not replay on worker restart');
     mode = 'normal';
     const unsupported = await runtime.ingest({ ...event, eventId: 'e2', eventKey: 'receive:e2', conversationId: 'unsupported', messageId: 'm2', message: { kind: 'image', parsedContent: { image_key: 'synthetic' }, mentions: [] } });
     await eventually(() => store.getJob({ id: unsupported.agentJobId }), row => row.status === 'succeeded');
-    assert.equal(turns, before); assert.match(sent.at(-1).content.text, /暂不支持.*尚未交给 Agent/);
+    assert.equal(turns, before); assert.match(sent.at(-1).content.body.elements[0].content, /暂不支持.*尚未交给 Agent/);
     mode = 'live';
     const live = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'live', idempotencyKey: 'live', payload: { text: 'synthetic' } });
     await eventually(async () => { const [[row]] = await pool.execute('SELECT native_turn_id FROM bridge_attempts WHERE job_id=?', [live.id]); return row; }, row => row?.native_turn_id);
@@ -145,7 +145,7 @@ test('real Store core: immediate completion, independent hook, API authorization
     assert.equal(sent.length, count + 1, 'second chunk cannot start before first platform confirmation');
     releaseChunk();
     await eventually(() => store.getJob({ id: multipart.id }), row => row.status === 'succeeded');
-    assert(sent[count].content.text.startsWith('AAA')); assert(sent[count + 1].content.text.startsWith('BBB'));
+    assert(sent[count].content.body.elements[0].content.startsWith('AAA')); assert(sent[count + 1].content.body.elements[0].content.startsWith('BBB'));
     failFirstChunk = true;
     const failed = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'delivery-failed', idempotencyKey: 'delivery-failed', payload: { text: 'synthetic' } });
     await eventually(() => store.getJob({ id: failed.id }), row => row.status === 'delivery_failed');
@@ -170,6 +170,6 @@ test('real Store core: immediate completion, independent hook, API authorization
     mode = 'stream-fallback';
     const streamed = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'streamed', idempotencyKey: 'streamed', payload: { text: 'synthetic' } });
     await eventually(() => store.getJob({ id: streamed.id }), row => row.status === 'succeeded');
-    assert.equal(sent.at(-1).content.text, 'Recovered streamed answer');
+    assert.equal(sent.at(-1).content.body.elements[0].content, 'Recovered streamed answer');
   } finally { releaseChunk?.(); await server?.close(); await runtime?.stop(); await store.close(); }
 });

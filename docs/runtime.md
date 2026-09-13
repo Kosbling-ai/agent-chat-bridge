@@ -153,3 +153,28 @@ Fast unit tests cover seal-before-files ordering, acknowledgement loss, source-c
 A persisted error for the bound thread/turn with `willRetry !== true` wakes a native thread read. Only `completed`, `failed` or `interrupted` can finish that attempt; an in-progress/missing/unknown turn or failed read remains pending with the existing IDs. `willRetry: true` keeps waiting for the provider. Neither branch starts another model turn.
 
 This is a deliberate reliability change: the old runtime rejected its local promise on non-retrying errors and let transport classify retry/failure. The old predecessor and orphan handlers also interrupted native turns. Bridge does not reproduce broad automatic interruption: durable admission/generation, explicit known-turn reads and audited unknown reconciliation replace that behavior. Strict predecessor/orphan timing is therefore not behaviorally identical, and unknown work can require an operator instead of automatic interruption/retry. Fast observation tests cover error-only streams, terminal/retrying controls, read rejection, missing turn and unknown status; no new live-model or end-to-end test was run.
+
+### Final reply cards
+
+Agent final answers and existing unsupported/failed input notices use Feishu
+JSON 2.0 interactive cards, with a Markdown body and status header. The final
+renderer adapts the production Kosbling-Agent card's pure presentation logic;
+its title is the neutral `Agent`. It does not import business callbacks or SQL.
+
+Each complete serialized card is capped at 20,000 UTF-8 bytes, including JSON
+escaping and scaffolding (below the adapter's 30,000-byte content limit and the
+source renderer's 28,000-byte budget). Longer answers are split without dropping
+Unicode code points or truncating content. Markdown is preserved verbatim in
+each part; formatting constructs spanning parts may need separate rendering by
+the chat client. Parts use the existing durable outbox predecessor chain: a
+later part cannot be claimed before the earlier part is confirmed sent. The
+same UUID and card content survive safe delivery retries; an unknown send is
+not replaced with a second text/post fallback. Already persisted old text
+effects keep their original content when upgrading.
+
+This restores final cards, not the production progress-card observer or stop
+button. There is no streaming card update or callback subscription in this
+change. Native terminal failures retain their existing failed-job semantics;
+this change does not add a failure notification where none existed. Input
+rejection notices remain non-admitted inputs, rather than claiming the Agent
+processed unsupported media.

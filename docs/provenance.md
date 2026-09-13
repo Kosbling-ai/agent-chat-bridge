@@ -7,3 +7,11 @@ Production behavior and selected pure transformation logic were carried forward 
 Feishu and Codex protocol clients use the declared pinned dependencies and Codex app-server protocol. Dependencies are installed through npm rather than vendored into this repository and retain their own licenses/notices.
 
 No project license has been selected yet. Making this repository public does not by itself grant permission under an open-source license, and this provenance statement does not substitute for one. License selection remains a separate owner decision.
+
+The final-only renderer in `src/channels/feishu/reply-card.mjs` adapts the
+schema-2.0 header, Markdown body, summary and status presentation from
+`kosbling-agent/feishu-transport/scripts/execution-card.mjs` in the existing
+Kosbling automation project. Business branding, public-progress imports, SQL
+observers and stop callbacks are not included. The bridge supplies its own
+bounded splitting and durable outbox delivery. This source attribution does not
+resolve the repository's pending license decision.
