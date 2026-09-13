@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS bridge_sessions (
   generation BIGINT UNSIGNED NOT NULL DEFAULT 1,
   native_thread_id VARCHAR(255) NULL,
   active_run_id CHAR(36) CHARACTER SET ascii NULL,
+  last_message_at BIGINT UNSIGNED NULL,
   updated_at BIGINT UNSIGNED NOT NULL,
   PRIMARY KEY (connection_id, conversation_id, agent_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
@@ -194,4 +195,20 @@ CREATE TABLE IF NOT EXISTS bridge_recoveries (
   UNIQUE KEY recovery_idempotency (caller_id,idempotency_key),
   KEY recovery_claim (status,lease_expires_at,created_at,id),
   KEY recovery_run (run_id,id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+
+CREATE TABLE IF NOT EXISTS bridge_session_rotations (
+  id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  connection_id VARCHAR(128) NOT NULL,
+  conversation_id VARCHAR(255) NOT NULL,
+  agent_id VARCHAR(128) NOT NULL,
+  idempotency_key VARCHAR(255) NOT NULL,
+  payload_hash CHAR(64) CHARACTER SET ascii NOT NULL,
+  reason VARCHAR(32) NOT NULL,
+  previous_generation BIGINT UNSIGNED NOT NULL,
+  generation BIGINT UNSIGNED NOT NULL,
+  retired_thread_id VARCHAR(255) NOT NULL,
+  created_at BIGINT UNSIGNED NOT NULL,
+  UNIQUE KEY rotation_idempotency (connection_id,conversation_id,agent_id,idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

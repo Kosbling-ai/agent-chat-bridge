@@ -13,7 +13,7 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
     // Same lock order as execution: job, attempt, then session.
     const [[job]] = await c.execute('SELECT status FROM bridge_jobs WHERE id=? FOR UPDATE', [runId]);
     const [[attempt]] = await c.execute(`SELECT connection_id,conversation_id,agent_id,generation,
-      native_thread_id,native_turn_id FROM bridge_attempts WHERE job_id=? FOR UPDATE`, [runId]);
+      native_thread_id,native_turn_id,created_at FROM bridge_attempts WHERE job_id=? FOR UPDATE`, [runId]);
     if (!job || !attempt || job.status !== 'unknown' || String(attempt.generation) !== String(generation)) {
       throw new StoreError('recovery_conflict');
     }
@@ -111,8 +111,9 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
                 || (attempt.native_turn_id && attempt.native_turn_id !== verified.turnId)) throw new StoreError('recovery_conflict');
             await claimThread(c, ...key, verified.threadId);
             await c.execute('UPDATE bridge_attempts SET native_thread_id=?,native_turn_id=? WHERE job_id=?', [verified.threadId, verified.turnId, row.run_id]);
-            await c.execute(`UPDATE bridge_sessions SET native_thread_id=?,updated_at=?
-              WHERE connection_id=? AND conversation_id=? AND agent_id=?`, [verified.threadId, now(), ...key]);
+            await c.execute(`UPDATE bridge_sessions SET native_thread_id=?,updated_at=?,
+              last_message_at=GREATEST(COALESCE(last_message_at,0),?)
+              WHERE connection_id=? AND conversation_id=? AND agent_id=?`, [verified.threadId, now(), attempt.created_at, ...key]);
             await c.execute(`UPDATE bridge_jobs SET status='pending',next_attempt_at=?,lease_token=NULL,
               lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?`, [now(), now(), row.run_id]);
           } else {

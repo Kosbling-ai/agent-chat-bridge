@@ -4,6 +4,7 @@ import { assertSchemaCurrent } from './migrations.mjs';
 import { acquireWriter } from './writer.mjs';
 import { StoreError } from './errors.mjs';
 import { recoveryOperations } from './recovery.mjs';
+import { rotationOperations } from './rotation.mjs';
 
 const json = (value) => JSON.stringify(value);
 function canonical(value) {
@@ -160,6 +161,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
   }
   return {
     ...recoveryOperations({ read, write, now, hash, decode, claimThread }),
+    ...rotationOperations({write,now,hash}),
     assertCurrent: () => assertSchemaCurrent(pool),
     async close() { await writer.close(); await pool.end(); },
     acceptInbound(input) {
@@ -350,7 +352,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
       return write(async (c) => {
         await owned(c, 'bridge_jobs', input);
         const [[attempt]] = await c.execute(`SELECT connection_id,conversation_id,agent_id,
-          generation,native_thread_id,native_turn_id FROM bridge_attempts WHERE job_id=? FOR UPDATE`, [input.id]);
+          generation,native_thread_id,native_turn_id,created_at FROM bridge_attempts WHERE job_id=? FOR UPDATE`, [input.id]);
         if (!attempt || String(attempt.generation) !== String(input.expectedGeneration)) {
           throw new StoreError('session_conflict');
         }
@@ -360,9 +362,10 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
         if (attempt.native_turn_id && attempt.native_turn_id !== (input.nativeTurnId ?? attempt.native_turn_id)) {
           throw new StoreError('turn_conflict');
         }
-        const [result] = await c.execute(`UPDATE bridge_sessions SET native_thread_id=?,updated_at=?
+        const [result] = await c.execute(`UPDATE bridge_sessions SET native_thread_id=?,updated_at=?,
+          last_message_at=IF(? IS NOT NULL,GREATEST(COALESCE(last_message_at,0),?),last_message_at)
           WHERE connection_id=? AND conversation_id=? AND agent_id=? AND generation=? AND active_run_id=?`, [
-          text(input.nativeThreadId), now(), attempt.connection_id, attempt.conversation_id,
+          text(input.nativeThreadId), now(), input.nativeTurnId ?? null, attempt.created_at, attempt.connection_id, attempt.conversation_id,
           attempt.agent_id, input.expectedGeneration, input.id,
         ]);
         if (!result.affectedRows) throw new StoreError('session_conflict');
