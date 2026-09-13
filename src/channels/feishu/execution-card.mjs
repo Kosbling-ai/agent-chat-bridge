@@ -3,7 +3,7 @@ import { publicText } from '../../shared/public-progress.mjs';
 const statuses = { running: '执行中', completed: '已完成', failed: '执行失败', interrupted: '已中断', retrying: '连接恢复中', deferred: '补充已转达' };
 const panel = (id, title, elements) => ({ tag: 'collapsible_panel', element_id: id, expanded: false, header: { title: { tag: 'plain_text', content: title }, icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' }, icon_position: 'follow_text', icon_expanded_angle: -180 }, elements });
 const md = (content) => ({ tag: 'markdown', content });
-export function renderExecutionCard(state, answer = '') {
+export function renderExecutionCard(state, answer = '', displayName = 'agent-chat-bridge') {
   const entries = (state.entries || []).slice(-24);
   const elements = [];
   let group = [];
@@ -23,16 +23,16 @@ export function renderExecutionCard(state, answer = '') {
   if (!elements.length) elements.push(md('已收到，正在处理你的请求。'));
   elements.push(md(`**${statuses[state.status] || '执行中'}**${state.delivery === 'fallback' ? ' · 结果将通过普通消息送达' : ''}`));
   if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: '停止执行' }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
-  let card = { schema: '2.0', config: { update_multi: true, summary: { content: `agent-chat-bridge · ${statuses[state.status] || '执行中'}` } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: 'agent-chat-bridge' } }, body: { elements } };
+  let card = { schema: '2.0', config: { update_multi: true, summary: { content: `${displayName} · ${statuses[state.status] || '执行中'}` } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: displayName } }, body: { elements } };
   // IM cards are limited to 30 KB, including UTF-8 and JSON scaffolding.
   while (Buffer.byteLength(JSON.stringify(card)) > 28000 && card.body.elements.length > (answer ? 2 : 1)) card.body.elements.shift();
   if (Buffer.byteLength(JSON.stringify(card)) > 28000) throw new Error('card final answer exceeds budget');
   return card;
 }
 export class ExecutionCard {
-  constructor({ client, chatId, uuid, saved, persist = async () => {}, audit = async () => {}, intervalMs = 1000, logger = console, jobId = '', messageId = '' }) {
+  constructor({ client, chatId, uuid, saved, persist = async () => {}, audit = async () => {}, intervalMs = 1000, logger = console, jobId = '', messageId = '', displayName = 'agent-chat-bridge' }) {
     this.client = client; this.chatId = chatId; this.uuid = uuid; this.persist = persist; this.audit = audit; this.logger = logger; this.jobId = String(jobId).slice(0, 64); this.messageId = String(messageId).slice(0, 80);
-    this.intervalMs = Math.max(1000, Number(intervalMs) || 1000);
+    this.intervalMs = Math.max(1000, Number(intervalMs) || 1000); this.displayName = displayName;
     this.state = { status: 'running', entries: [], jobId: this.jobId, ...saved };
     this.chain = Promise.resolve(); this.timer = null; this.closed = false; this.dirty = false;
     this.startedAt = Date.now(); this.failures = 0; this.inFlight = false;
@@ -79,19 +79,30 @@ export class ExecutionCard {
   }
   async update(answer = '') {
     const snapshot = this.snapshot();
-    const card = renderExecutionCard(snapshot, answer);
+    const card = renderExecutionCard(snapshot, answer, this.displayName);
+    const operation = this.state.messageId ? 'patch' : 'create';
+    const desiredRevision = Number(this.state.desiredRevision || 0) + 1;
+    const intent = { ...snapshot, desiredRevision, deliveryState: { operation, status: 'intent', at: Date.now() } };
+    // The durable desired state must exist before a platform side effect. A
+    // failed lease/persistence callback prevents the request from being sent.
+    await this.persist(intent);
+    this.state.desiredRevision = desiredRevision;
+    this.state.deliveryState = intent.deliveryState;
     if (!this.state.messageId) {
       // Deterministic UUID handles an ambiguous create response or a crash before persistence.
       const response = await this.client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: this.chatId, msg_type: 'interactive', content: JSON.stringify(card), uuid: this.uuid } });
       checkResponse(response);
       this.state.messageId = response?.data?.message_id;
       if (!this.state.messageId) throw new Error('card message id missing');
-      snapshot.messageId = this.state.messageId;
-      await this.persist(snapshot).catch(() => this.log('fallback', 'warn', { operation: 'persist_card' }));
+      this.state.ackedRevision = desiredRevision;
+      this.state.deliveryState = { operation, status: 'confirmed', at: Date.now() };
+      await this.persist(this.snapshot());
       await this.log('started');
     } else {
       checkResponse(await this.client.im.v1.message.patch({ path: { message_id: this.state.messageId }, data: { content: JSON.stringify(card) } }));
-      await this.persist(snapshot).catch(() => this.log('fallback', 'warn', { operation: 'persist_card' }));
+      this.state.ackedRevision = desiredRevision;
+      this.state.deliveryState = { operation, status: 'confirmed', at: Date.now() };
+      await this.persist(this.snapshot());
     }
   }
   async pause() {

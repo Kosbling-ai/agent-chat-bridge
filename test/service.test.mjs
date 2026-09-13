@@ -4,13 +4,12 @@ import { validateConfig } from '../src/config.mjs';
 import { createApi } from '../src/core/api.mjs';
 import { createLogger, createErrorReporter } from '../src/logger.mjs';
 import { boundedFeishuHttp, startService } from '../src/service.mjs';
-import { createCodexAdapter } from '../src/agents/codex/adapter.mjs';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { createRuntime } from '../src/core/runtime.mjs';
+import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 
 const config = {
   schemaVersion: 1, storage: Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `TEST_${key.toUpperCase()}`])),
@@ -61,18 +60,18 @@ test('public chat read proxies are absent while send-scope checks remain interna
 test('group defaults allow all human members; explicit member filter does not limit hooks', async () => {
   const observed = [];
   const groupConfig = validateConfig({ ...config, routing: { ...config.routing, groups: [{ conversationId: 'chat', trigger: 'all', passiveContext: true }] }, hooks: [{ id: 'h', url: 'http://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: ['chat'] }] });
-  const runtime = createRuntime({ config: groupConfig, store: { acceptInbound: async value => { observed.push(value); return {}; } }, codex: {}, chat: {} });
+  const runtime = createCommunicationRuntime({ config: groupConfig, store: { acceptInbound: async value => { observed.push(value); return {}; } }, chat: {} });
   const event = { connectionId: 'test', eventKey: 'synthetic', type: 'message.received', conversationId: 'chat', conversationType: 'group', messageId: 'm', actor: { type: 'user', openId: 'not-enumerated' }, message: { kind: 'text', parsedContent: { text: 'synthetic' } } };
   await runtime.ingest(event);
-  assert(observed[0].agentJob); assert.equal(observed[0].hooks.length, 1);
-  const restricted = createRuntime({ config: { ...groupConfig, routing: { ...groupConfig.routing, groups: [{ ...groupConfig.routing.groups[0], userIds: [] }] } }, store: { acceptInbound: async value => { observed.push(value); return {}; } }, codex: {}, chat: {} });
+  assert(observed[0].forwardJob); assert.equal(observed[0].hooks.length, 1);
+  const restricted = createCommunicationRuntime({ config: { ...groupConfig, routing: { ...groupConfig.routing, groups: [{ ...groupConfig.routing.groups[0], userIds: [] }] } }, store: { acceptInbound: async value => { observed.push(value); return {}; } }, chat: {} });
   await restricted.ingest(event);
-  assert.equal(observed[1].agentJob, undefined); assert.equal(observed[1].hooks.length, 1);
+  assert.equal(observed[1].forwardJob, undefined); assert.equal(observed[1].hooks.length, 1);
 });
 test('run API accepts existing long cron prompts and caps UTF-8 bytes including JSON escape allowance', async () => {
   const accepted = [];
   const token = 'synthetic-long-token-for-local-test';
-  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: { enqueueJob: async value => { accepted.push(value); return { id: 'run' }; } }, chat: {} });
+  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: {}, forwardRuntime:{submit:async value=>{accepted.push(value);return{id:'run'};}}, chat: {} });
   const request = text => Object.assign(Readable.from([Buffer.from(JSON.stringify({ conversationId: 'chat', idempotencyKey: 'cron', text }))]), { method: 'POST', url: '/v1/runs', headers: { authorization: `Bearer ${token}` } });
   assert.equal((await api(request('中'.repeat(10000)))).status, 202);
   assert.equal((await api(request('\u0001'.repeat(64 * 1024)))).status, 202);
@@ -127,26 +126,24 @@ test('failed async warning sinks never become unhandled rejections', async () =>
   await reporter.close();
   await new Promise(resolve => setImmediate(resolve));
 });
-test('startup cancellation closes an actual spawned child while Feishu start is pending', { timeout: 5000 }, async t => {
+test('startup cancellation closes an idle executor while Feishu start is pending', { timeout: 5000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-service-start-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const fixture = join(directory, 'fixture.mjs');
   await writeFile(fixture, "import readline from 'node:readline';readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.method==='initialize')process.stdout.write(JSON.stringify({id:m.id,result:{}})+'\\n');});");
-  let child, storeClosed = false, socketStopped = false, enter;
+  let executorClosed = false, storeClosed = false, socketStopped = false, enter;
   const entered = new Promise(resolve => { enter = resolve; });
   const controller = new AbortController();
   const runtimeConfig = validateConfig({ ...config, codex: { bin: process.execPath, cwd: directory, envNames: [] } });
   const started = startService({ config: runtimeConfig, configPath: join(directory, 'config.json'), env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, signal: controller.signal, log: async () => { throw new Error('synthetic log'); }, dependencies: {
     pool: () => ({}), store: async () => ({ close: async () => { storeClosed = true; } }),
-    codex: (options, callbacks) => createCodexAdapter({ ...options, shutdownGraceMs: 100 }, { ...callbacks, spawnProcess: (_bin, _args, opts) => { child = spawn(process.execPath, [fixture], opts); return child; } }),
+    executor: () => ({status:()=>({closing:false,restartPending:null}),close:async()=>{executorClosed=true;}}),
     sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} }, chat: () => ({ downloadResource: async () => { throw new Error('unexpected download'); }, uploadImage() {}, uploadFile() {}, sendMessage() {} }),
     feishu: () => ({ start: () => { enter(); return new Promise(() => {}); }, stop: () => { socketStopped = true; } }),
   } });
-  t.after(() => { if (child?.exitCode === null && child?.signalCode === null) child.kill('SIGKILL'); });
   const rejected = assert.rejects(started, { code: 'startup_cancelled' });
   await entered;
-  assert(child.pid > 0);
   controller.abort();
   await rejected;
-  assert(storeClosed); assert(socketStopped); assert(child.exitCode !== null || child.signalCode !== null);
+  assert(storeClosed); assert(socketStopped); assert(executorClosed);
 });

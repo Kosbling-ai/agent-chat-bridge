@@ -7,12 +7,18 @@ import { ConfigError } from './config.mjs';
 import { createPoolFromEnvironment } from './storage/connection.mjs';
 import { createMysqlStore } from './storage/store.mjs';
 import { migrate } from './storage/migrations.mjs';
-import { createCodexAdapter } from './agents/codex/adapter.mjs';
+import { createCodexExecutor } from './agents/codex/executor.mjs';
+import { createCodexSessionStore } from './storage/codex-sessions.mjs';
+import { createForwardJobStore } from './storage/forward-jobs.mjs';
+import { createInboundMessageStore } from './storage/inbound-messages.mjs';
 import { createFeishuAdapter } from './channels/feishu/adapter.mjs';
 import { createFeishuChatClient } from './channels/feishu/chat-client.mjs';
 import { createFeishuMedia } from './channels/feishu/media.mjs';
 import { createOutboundMedia } from './channels/feishu/outbound-media.mjs';
-import { createRuntime } from './core/runtime.mjs';
+import { createForwardRuntime } from './core/forward-runtime.mjs';
+import { createCommunicationRuntime } from './core/communication-runtime.mjs';
+import { createExecutionFeedback } from './channels/feishu/execution-feedback.mjs';
+import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
 import { createApi } from './core/api.mjs';
@@ -66,9 +72,9 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, replies: createFeishuReplies, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
   const pool = factories.pool(config.storage, env);
-  let store, codex, feishu, runtime, catchup, http;
+  let store, executor, feishu, communication, forward, catchup, http;
   let writerHealthy = true;
   let closing;
   let rejectCancelled;
@@ -77,14 +83,14 @@ export async function startService({ config, configPath, env = process.env, log,
   const abort = () => {
     rejectCancelled(new ConfigError('startup_cancelled'));
     safeObserver(() => feishu?.stop())();
-    safeObserver(() => codex?.close())();
+    safeObserver(() => executor?.close())();
   };
   const checkCancelled = () => { if (signal?.aborted) throw new ConfigError('startup_cancelled'); };
   signal?.addEventListener('abort', abort, { once: true });
   const close = () => closing ??= (async () => {
     signal?.removeEventListener('abort', abort);
     const failures = [];
-    for (const operation of [() => http?.close(), () => feishu?.stop(), () => catchup?.stop(), () => runtime?.stop(), () => codex?.close(), () => store ? store.close() : pool.end(), () => reporter?.close()]) {
+    for (const operation of [() => http?.close(), () => feishu?.stop(), () => catchup?.stop(), () => communication?.stop(), () => forward?.stop(), () => executor?.close(), () => store ? store.close() : pool.end(), () => reporter?.close()]) {
       try { await operation(); } catch { failures.push(true); }
     }
     if (failures.length) throw new Error('service_shutdown_failed');
@@ -92,9 +98,13 @@ export async function startService({ config, configPath, env = process.env, log,
   try {
     store = await factories.store({ pool, onWriterLost: () => { writerHealthy = false; log('error', 'store_writer', 'failed', { code: 'writer_lost' }); } });
     checkCancelled();
-    codex = factories.codex({ bin, cwd, env: childEnv, threadDefaults: { approvalPolicy: 'never', sandbox: 'workspace-write', ...(config.codex.model ? { model: config.codex.model } : {}) } }, {
-      onNotification: message => runtime.notification(message), onFault: event => runtime.onFault(event), log,
-    });
+    // The default pool has already validated this reference. Dependency-injected
+    // unit stores may omit database credentials and use this inert identifier.
+    const schema=typeof env[config.storage.databaseEnv]==='string'&&env[config.storage.databaseEnv]?env[config.storage.databaseEnv]:'bridge_test';
+    const sessions=pool?.query?factories.sessions({pool,schema}):{};
+    const jobs=factories.jobs({pool});
+    const inbound=factories.inbound({pool});
+    executor=factories.executor({config:{...config.codex,bin,cwd,approvalPolicy:'never',sandbox:'workspace-write',serviceName:'Agent Chat Bridge'},sessionStore:sessions,childEnv,log});
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
     const proxyAgent = config.feishu.httpProxyEnv ? factories.feishuProxyAgent(secret(env, config.feishu.httpProxyEnv)) : undefined;
@@ -104,20 +114,24 @@ export async function startService({ config, configPath, env = process.env, log,
     const media = await factories.media({ chat, workspace: cwd, inboxDir: resolve(cwd, '.agent-chat-bridge/inbox'), maxTotalBytes: config.feishu.mediaBudgetBytes, log });
     const outbound = await factories.outbound({ chat, workspace: cwd, outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'), spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'), maxTotalBytes: config.feishu.outputBudgetBytes, log });
     checkCancelled();
-    runtime = createRuntime({ config, store, codex, chat, media, outbound, workspace: cwd, hookTokens, log });
-    feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
-    const api = createApi({ config, store, chat, tokens });
-    await Promise.race([codex.start(), cancelled]);
-    checkCancelled();
+    const replies=factories.replies({chat,outboxRoot:resolve(cwd,'data/feishu-outbox'),log});
+    const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
+    const feedback=factories.feedback({jobs,sessions,chat,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
+    forward=factories.forward({config:{},jobs,sessions,inbound,executor,feedback,replies,authorize:async()=>true,log});
+    communication=factories.communication({config,store,inbound,chat,outbound,hookTokens,log});
+    feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest, onCardAction: feedback.handleCardAction, log });
+    const api = createApi({ config, store, forwardRuntime:forward, chat, tokens });
     await Promise.race([feishu.start(), cancelled]);
     checkCancelled();
-    if (config.feishu.catchup !== false) catchup = factories.catchup({ connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, chat, store, onEvent: runtime.ingest, listConversations: () => listCatchupConversations({ config, store }), log });
-    runtime.start();
+    if (config.feishu.catchup !== false) catchup = factories.catchup({ connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, chat, store, onEvent: communication.ingest, listConversations: () => listCatchupConversations({ config, store }), log });
+    forward.start();
+    communication.start();
     catchup?.start();
     http = await startServer({ config, log, api, readiness: async () => {
       let storeReady = writerHealthy;
       try { await store.assertCurrent(); } catch { storeReady = false; }
-      const components = { store: storeReady, codex: codex.status().state === 'ready', feishu: feishu.status().connected, workers: runtime.status().running };
+      const executorStatus=executor.status();
+      const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
       return { ready: Object.values(components).every(Boolean), components };
     } });
     checkCancelled();

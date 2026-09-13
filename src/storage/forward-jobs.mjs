@@ -198,7 +198,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
           FROM assistant_codex_forward_jobs WHERE public_run_id=? LIMIT 1`, [required(input.id, 36)]);
         if (!found) return [];
         const execution = parse(found.result_json).execution || {};
-        if (!execution.threadId) return [];
+        if (!execution.bindingOpenId || !execution.threadId) return [];
         const after = String(input.after ?? '0');
         if (!/^\d+$/.test(after)) throw new StoreError('invalid_store_input');
         const take = Math.max(1, Math.min(100, Number(input.limit || 50)));
@@ -206,7 +206,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
           FROM assistant_codex_events
           WHERE feishu_open_id=? AND chat_id=? AND codex_session_id=? AND message_id=? AND id>?
             AND event_type IN ('public_progress','agent_message','error','session_rollover')
-          ORDER BY id LIMIT ${take}`, [found.sender_open_id, found.chat_id, execution.threadId, found.message_id, after]);
+          ORDER BY id LIMIT ${take}`, [execution.bindingOpenId, found.chat_id, execution.threadId, found.message_id, after]);
         return rows.map(item => ({
           id: String(item.id), type: item.event_type, role: item.role, title: item.title, text: item.text,
           ...(item.event_type === 'public_progress' ? { progress: parse(item.detail_json) } : {}),

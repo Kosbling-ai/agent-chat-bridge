@@ -38,7 +38,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     );
     await store.patchExecution({
       id: first.id, leaseOwner: 'worker-a',
-      execution: { threadId: 'thread', turnId: 'turn', startedAt: 1000 },
+      execution: { bindingOpenId: 'group:binding', threadId: 'thread', turnId: 'turn', startedAt: 1000 },
     });
     await store.patchFeedback({
       id: first.id, leaseOwner: 'worker-a', key: 'typing',
@@ -61,6 +61,14 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal(result.status, 'completed');
     assert.equal(result.result.rawAnswer, 'raw');
     assert.equal(result.result.typing.reactionId, 'reaction');
+    await pool.execute(`INSERT INTO assistant_codex_events
+      (codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?),(?,?,?,?,?,?,?,?,?,?,?)`, [
+      'thread','group:binding','chat','system:daily:1','visible','public_progress','activity','Progress','',JSON.stringify({kind:'tool',id:'safe'}),1200,
+      'thread','system:other','chat','system:daily:1','hidden','public_progress','activity','Other','',JSON.stringify({kind:'tool',id:'hidden'}),1200,
+    ]);
+    const events=await store.readEvents({id:first.id,after:'0',limit:10});
+    assert.deepEqual(events.map(event=>event.title),['Progress']);
 
     const communication = await createMysqlStore({ pool, now: () => now });
     const receipt = {

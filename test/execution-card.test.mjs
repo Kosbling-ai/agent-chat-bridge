@@ -40,6 +40,7 @@ test('slow SDK keeps only one request in flight and final waits for it once', as
   const { card, calls } = fixture(null, { create: async () => { creates++; await new Promise((r) => { release = r; }); return { code: 0, data: { message_id: 'om_card' } }; } });
   card.push({ kind: 'started' });
   for (let i = 0; i < 500; i++) { card.push(tool(`t${i}`)); card.enqueue(); }
+  await tick();
   assert.equal(creates, 1);
   const final = card.finish('done'); release(); await final;
   assert.equal(calls.length, 1); assert.equal(calls[0].method, 'patch');
@@ -100,13 +101,13 @@ test('observer read failure cannot reject final delivery', async () => {
   assert.equal(await card.finish('完整最终答复'), true);
 });
 
-test('audit and metadata failure never downgrade confirmed final delivery', async () => {
+test('metadata failure never claims confirmed final delivery', async () => {
   let patches = 0;
   const card = new ExecutionCard({ client: { im: { v1: { message: { async patch() { patches++; return { code: 0 }; } } } } }, saved: { messageId: 'om_card', entries: [] }, logger: quiet,
     persist: async () => { throw new Error('db unavailable'); }, audit: async () => { throw new Error('audit unavailable'); } });
-  assert.equal(await card.finish('完整答案'), true);
-  assert.equal(patches, 1);
-  assert.notEqual(card.snapshot().delivery, 'fallback');
+  await assert.rejects(card.finish('完整答案'), /db unavailable/);
+  assert.equal(patches, 0);
+  assert.equal(card.snapshot().delivery, 'fallback');
 });
 
 test('fallback cannot send normal result until its choice is persisted', async () => {
