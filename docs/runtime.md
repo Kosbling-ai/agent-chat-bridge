@@ -26,6 +26,8 @@ Inbox and independent agent/hook jobs commit before the Feishu handler resolves.
 
 Same-conversation work is **durably deferred** and later resumes the shared native thread. This stage does not steer an active turn. Reset requires admin plus conversation authorization and exact generation, and rejects active/unknown runs. Passive context reads are bounded to 100 rows per turn. Active task cancellation on message recall and history catch-up have not been wired; recalled pending Agent jobs are not retroactively cancelled.
 
+RPC failures are classified by phase: an explicit refusal of this run's thread/turn admission may fail the run and release its session. A rejected native read, including the final item read after a terminal notification, cannot prove that an admitted turn failed. The known attempt remains pending for reconciliation with its session binding intact; successful later reads finish delivery without a new turn/start.
+
 Hook subscriptions are static `{id,url,tokenEnv,conversationIds}`. Each delivery is `{deliveryId,event}`, with `Idempotency-Key: deliveryId`. The consumer must durably accept/deduplicate before returning **204**. This acknowledges durable receipt, not completion of business processing. Redirects are forbidden, requests time out after 3 seconds, bodies are cancelled immediately, and delivery retries stop after 8 attempts. Hook failure never recreates Agent output. Business document/Base APIs remain outside this service.
 
 ## Authenticated HTTP APIs

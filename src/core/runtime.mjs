@@ -81,7 +81,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
   }
   async function execute(job) {
     log('info', 'agent_run', 'started');
-    let attempt;
+    let attempt, rpcPhase;
     try {
       if (parse(job.payload).unsupported) {
         await store.finishJobWithOutbox({ id: job.id, leaseToken: job.leaseToken, result: { status: 'unsupported_input' }, outbox: [{ idempotencyKey: `run:${job.id}:unsupported`, kind: 'reply', payload: { messageId: parse(job.payload).messageId, kind: 'text', content: { text: '当前桥接版本仅支持文本输入；这条消息尚未交给 Agent。' } } }] });
@@ -91,11 +91,13 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
       attempt = await store.beginAgentAttempt({ id: job.id, leaseToken: job.leaseToken, agentId: 'codex' });
       if (attempt.recoveryRequired) {
         if (!attempt.nativeThreadId || !attempt.nativeTurnId) { await hold(job, 'agent_admission_unknown'); return; }
+        rpcPhase = 'recovery_read';
         const result = await codex.readThread({ threadId: attempt.nativeThreadId, includeTurns: true });
         const turn = result.thread?.turns?.find(item => item.id === attempt.nativeTurnId);
         if (turn && turn.status !== 'inProgress') { await finish(job, turn); return; }
         if (!turn) { await hold(job, 'agent_turn_unresolved'); return; }
       } else {
+        rpcPhase = 'thread_admission';
         const thread = attempt.nativeThreadId
           ? await codex.resumeThread({ threadId: attempt.nativeThreadId }) : await codex.startThread();
         if (!thread.thread?.id) throw Object.assign(new Error('invalid_thread_result'), { outcome: 'unknown' });
@@ -105,12 +107,14 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
         const lines = context.map(item => parse(item.payload).message?.parsedContent?.text).filter(value => typeof value === 'string');
         const payload = parse(job.payload);
         const inputText = [...lines, payload.text].join('\n');
+        rpcPhase = 'turn_admission';
         const result = await codex.startTurn({ threadId: attempt.nativeThreadId, input: [{ type: 'text', text: inputText }], clientUserMessageId: job.id });
         if (!result.turn?.id) throw Object.assign(new Error('invalid_turn_result'), { outcome: 'unknown' });
         attempt.nativeTurnId = result.turn.id;
         await store.bindAgentAttempt({ id: job.id, leaseToken: job.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: attempt.nativeThreadId, nativeTurnId: attempt.nativeTurnId });
         if (context.length) await store.consumePassiveContext({ ...scope(job.conversationId), runId: job.id, throughSequence: context.at(-1).sequence });
       }
+      rpcPhase = 'observe_turn';
       const turn = await awaitTurn(job, attempt, attempt.nativeTurnId);
       if (turn) await finish(job, turn);
       else if (attempt.nativeThreadId && attempt.nativeTurnId) {
@@ -121,8 +125,13 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     } catch (error) {
       if (error.code === 'session_busy') {
         await store.retryJob({ id: job.id, leaseToken: job.leaseToken, errorCode: 'session_busy', nextAttemptAt: Date.now() + 1000 });
-      } else if (attempt && error.outcome === 'rejected') {
+      } else if (attempt && !attempt.recoveryRequired && error.outcome === 'rejected' && ['thread_admission', 'turn_admission'].includes(rpcPhase)) {
         await store.retryJob({ id: job.id, leaseToken: job.leaseToken, terminal: true, errorCode: 'agent_rpc_rejected' });
+      } else if (attempt?.nativeThreadId && attempt?.nativeTurnId) {
+        // A read/observation rejection says nothing about the admitted turn's
+        // effects. Retain the attempt and session for a later native read.
+        await store.retryJob({ id: job.id, leaseToken: job.leaseToken, errorCode: 'agent_recovery_pending', nextAttemptAt: Date.now() + 1000 });
+        log('warning', 'agent_recovery', 'pending', { code: 'agent_recovery_pending' });
       } else if (attempt) await hold(job, 'agent_execution_unknown');
       else throw error;
     }

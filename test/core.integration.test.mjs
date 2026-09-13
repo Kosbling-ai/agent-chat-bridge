@@ -23,6 +23,7 @@ test('real Store core: immediate completion, independent hook, API authorization
   let firstChunkGate, releaseChunk, failFirstChunk = false;
   const sent = [];
   const completed = new Map();
+  const rejectReads = new Set(), readAttempts = new Map();
   const codex = {
     status: () => ({ state: 'ready' }),
     async startThread() { return { thread: { id: `thread-${++threadStarts}` } }; },
@@ -30,14 +31,20 @@ test('real Store core: immediate completion, independent hook, API authorization
     async startTurn({ threadId }) {
       turns++;
       if (mode === 'unknown') throw Object.assign(new Error('synthetic'), { outcome: 'unknown' });
+      if (mode === 'rejected') throw Object.assign(new Error('synthetic admission rejected'), { outcome: 'rejected' });
       const turn = { id: `turn-${turns}`, status: mode === 'live' ? 'inProgress' : 'completed', items: [{ type: 'agentMessage', text: mode === 'multipart' ? 'A'.repeat(12000) + 'B'.repeat(12000) : 'Synthetic answer' }] };
       completed.set(threadId, turn);
       if (mode === 'live') return { turn: { id: turn.id, status: 'inProgress' } };
       // The Store commits this notification before RPC admission is returned.
-      await runtime.notification({ method: 'turn/completed', params: { threadId, turn } });
+      if (mode === 'thin-terminal') rejectReads.add(threadId);
+      await runtime.notification({ method: 'turn/completed', params: { threadId, turn: mode === 'thin-terminal' ? { id: turn.id, status: 'completed', items: [] } : turn } });
       return { turn: { id: turn.id, status: 'inProgress' } };
     },
-    async readThread({ threadId }) { return { thread: { turns: [completed.get(threadId)].filter(Boolean) } }; },
+    async readThread({ threadId }) {
+      readAttempts.set(threadId, (readAttempts.get(threadId) ?? 0) + 1);
+      if (rejectReads.has(threadId)) throw Object.assign(new Error('synthetic read rejected'), { code: 'codex_rpc_rejected', outcome: 'rejected' });
+      return { thread: { turns: [completed.get(threadId)].filter(Boolean) } };
+    },
   };
   const chat = { async sendMessage(input) { sent.push(input); if (input.content.text.startsWith('AAA')) { if (failFirstChunk) throw Object.assign(new Error('synthetic rejection'), { outcome: 'failed' }); await firstChunkGate; } return { message_id: `sent-${sent.length}` }; }, async replyMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async getMessage({ messageId }) { return { items: [{ message_id: messageId, chat_id: messageId === 'foreign' ? 'forbidden' : 'chat' }] }; } };
   const token = 'synthetic-bridge-token-for-tests-only';
@@ -92,8 +99,14 @@ test('real Store core: immediate completion, independent hook, API authorization
     assert.equal((await store.getJob({ id: live.id })).status, 'pending');
     const binding = await store.getSession({ connectionId: 'fixture', conversationId: 'live', agentId: 'codex' });
     completed.get(binding.nativeThreadId).status = 'completed';
+    rejectReads.add(binding.nativeThreadId);
     runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => new Response(null, { status: 204 }) });
     runtime.start();
+    await eventually(async () => readAttempts.get(binding.nativeThreadId), value => value > 0);
+    await eventually(() => store.getJob({ id: live.id }), row => row.status === 'pending');
+    assert.equal((await store.getSession({ connectionId: 'fixture', conversationId: 'live', agentId: 'codex' })).activeRunId, live.id);
+    assert.equal(turns, beforeStop, 'a rejected recovery read must not repeat admission');
+    rejectReads.delete(binding.nativeThreadId);
     await eventually(() => store.getJob({ id: live.id }), row => row.status === 'succeeded');
     assert.equal(turns, beforeStop, 'graceful restart must recover known turn without replay');
     mode = 'multipart';
@@ -113,5 +126,19 @@ test('real Store core: immediate completion, independent hook, API authorization
     await new Promise(resolve => setTimeout(resolve, 350));
     assert.equal(sent.length, sentAfterFailure, 'failed predecessor keeps later chunks blocked');
     assert.equal(turns, turnsAfterFailure, 'delivery failure cannot rerun completed model work');
+    mode = 'thin-terminal';
+    const thin = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'thin-terminal', idempotencyKey: 'thin-terminal', payload: { text: 'synthetic' } });
+    await eventually(() => store.getJob({ id: thin.id }), row => row.status === 'pending' && row.errorCode === 'agent_recovery_pending');
+    const thinBinding = await store.getSession({ connectionId: 'fixture', conversationId: 'thin-terminal', agentId: 'codex' });
+    assert.equal(thinBinding.activeRunId, thin.id);
+    assert(readAttempts.get(thinBinding.nativeThreadId) > 0);
+    const admittedTurns = turns;
+    rejectReads.delete(thinBinding.nativeThreadId);
+    await eventually(() => store.getJob({ id: thin.id }), row => row.status === 'succeeded');
+    assert.equal(turns, admittedTurns, 'terminal supplement read rejection must retain successful model execution');
+    mode = 'rejected';
+    const denied = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'denied', idempotencyKey: 'denied', payload: { text: 'synthetic' } });
+    await eventually(() => store.getJob({ id: denied.id }), row => row.status === 'failed');
+    assert.equal((await store.getSession({ connectionId: 'fixture', conversationId: 'denied', agentId: 'codex' })).activeRunId, null);
   } finally { releaseChunk?.(); await server?.close(); await runtime?.stop(); await store.close(); }
 });
