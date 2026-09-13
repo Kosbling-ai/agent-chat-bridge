@@ -98,3 +98,45 @@ test('image count is bounded before download and late failed download closes its
     await new Promise(setImmediate);assert.equal(stream.destroyed,true);
   }finally{await f.close();}
 });
+test('file queue cancellation returns before a gated predecessor and never runs cancelled work',{timeout:3000},async()=>{
+  const {createMediaFiles}=await import('../src/channels/feishu/media-files.mjs');
+  const f=await fixture();
+  let release,entered;
+  const gate=new Promise(resolve=>{release=resolve;});
+  const started=new Promise(resolve=>{entered=resolve;});
+  try{
+    const files=await createMediaFiles({...f.params,maxTotalBytes:4096});
+    const first=files.prepare({runId:'first',identity:'first',resources:['one'],maxBytes:100,download:async()=>{entered();await gate;return {stream:Readable.from([Buffer.from('one')]),extension:'.png'};}});
+    await started;
+    const controller=new AbortController();let downloaded=false;
+    const second=files.prepare({runId:'second',identity:'second',resources:['two'],maxBytes:100,signal:controller.signal,download:async()=>{downloaded=true;throw Error('must not run');}});
+    controller.abort();await assert.rejects(second,{code:'media_cancelled'});
+    assert.equal(downloaded,false);release();await first;await new Promise(setImmediate);
+    assert.equal(downloaded,false);assert.equal((await readdir(f.params.inboxDir)).length,1);
+  }finally{release?.();await f.close();}
+});
+test('abort between resource return and file open destroys the real stream',{timeout:3000},async()=>{
+  const {createMediaFiles}=await import('../src/channels/feishu/media-files.mjs');
+  const f=await fixture();
+  try{
+    const files=await createMediaFiles({...f.params,maxTotalBytes:4096});
+    const controller=new AbortController();const stream=new Readable({read(){}});
+    await assert.rejects(files.prepare({runId:'abort-gap',identity:'gap',resources:['one'],maxBytes:100,signal:controller.signal,download:async()=>{
+      controller.abort();return {stream,extension:'.png'};
+    }}),{code:'media_cancelled'});
+    await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(stream.destroyed,true);
+  }finally{await f.close();}
+});
+test('file open failure destroys an already acquired resource stream',{timeout:3000},async()=>{
+  const {createMediaFiles}=await import('../src/channels/feishu/media-files.mjs');
+  const f=await fixture();const stream=new Readable({read(){}});
+  try{
+    const files=await createMediaFiles({...f.params,maxTotalBytes:4096});
+    await assert.rejects(files.prepare({runId:'open-fail',identity:'open',resources:['one'],maxBytes:100,download:async()=>{
+      const [dir]=await readdir(f.params.inboxDir);await rm(join(f.params.inboxDir,dir),{recursive:true});
+      return {stream,extension:'.png'};
+    }}));
+    assert.equal(stream.destroyed,true);
+  }finally{await f.close();}
+});

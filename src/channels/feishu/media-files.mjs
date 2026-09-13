@@ -36,10 +36,20 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
   }
   await checkedDirectory(root, true);
   let queue = Promise.resolve();
-  const exclusive = task => {
-    const pending = queue.then(task);
+  const exclusive = (task, signal) => {
+    const pending = queue.then(() => {
+      if (signal?.aborted) throw new MediaError('media_cancelled');
+      return task();
+    });
     queue = pending.catch(() => {});
-    return pending;
+    if (!signal) return pending;
+    let abort;
+    const cancelled = new Promise((_, reject) => {
+      abort = () => reject(new MediaError('media_cancelled'));
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    });
+    return Promise.race([pending, cancelled]).finally(() => signal.removeEventListener('abort', abort));
   };
   async function usage() {
     let total = 0, count = 0;
@@ -96,17 +106,22 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
             const { stream, extension } = await download(key);
             const name = `${digest(key)}${extension}`;
             const finalPath = join(dir, name);
-            // A previous successful resource without a complete manifest may
-            // belong to a crashed download. Do not overwrite/delete it blindly.
-            try { await lstat(finalPath); throw new MediaError('media_incomplete_recovery'); }
-            catch (error) { if (error.code !== 'ENOENT') { stream.destroy(); throw error; } }
-            partial = join(dir, `${digest(key)}.${randomUUID()}.part`);
-            const handle = await open(partial, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+            let handle;
             let bytes = 0;
             const hash = createHash('sha256');
             const abort = () => stream.destroy(new MediaError('media_cancelled'));
+            // A cancellation may happen between download resolution and listener
+            // registration. Attach first, then check, and always destroy the stream.
+            stream.on('error', () => {});
             signal?.addEventListener('abort', abort, { once: true });
             try {
+              if (signal?.aborted) throw new MediaError('media_cancelled');
+              // Preserve any prior complete resource without a committed manifest.
+              try { await lstat(finalPath); throw new MediaError('media_incomplete_recovery'); }
+              catch (error) { if (error.code !== 'ENOENT') throw error; }
+              partial = join(dir, `${digest(key)}.${randomUUID()}.part`);
+              handle = await open(partial, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+              if (signal?.aborted) throw new MediaError('media_cancelled');
               for await (const chunk of stream) {
                 bytes += chunk.length;
                 if (bytes > maxBytes) throw new MediaError('media_too_large');
@@ -114,22 +129,30 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
                 hash.update(chunk);
                 await handle.writeFile(chunk);
               }
+              if (signal?.aborted) throw new MediaError('media_cancelled');
               if (!bytes) throw new MediaError('media_empty');
               await handle.sync();
-            } finally { signal?.removeEventListener('abort', abort); stream.destroy(); await handle.close(); }
+            } finally {
+              signal?.removeEventListener('abort', abort);
+              stream.destroy();
+              if (handle) await handle.close();
+            }
             await checkedDirectory(dir);
+            if (signal?.aborted) throw new MediaError('media_cancelled');
             await rename(partial, finalPath);
             partial = undefined;
             created.push(finalPath);
             used += bytes;
             files.push({ name, bytes, sha256: hash.digest('hex') });
           }
+          if (signal?.aborted) throw new MediaError('media_cancelled');
           const encoded = JSON.stringify({ version: 1, identity, files });
           if (used + Buffer.byteLength(encoded) > maxTotalBytes) throw new MediaError('media_storage_full');
           partial = join(dir, `${randomUUID()}.part`);
           const handle = await open(partial, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
           try { await handle.writeFile(encoded); await handle.sync(); } finally { await handle.close(); }
           await checkedDirectory(dir);
+          if (signal?.aborted) throw new MediaError('media_cancelled');
           await rename(partial, manifestPath);
           partial = undefined;
           return files.map(file => join(dir, file.name));
@@ -139,7 +162,7 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
           await rmdir(dir).catch(() => {}); // Only an empty directory; never removes retained resources.
           throw error;
         }
-      });
+      }, signal);
     },
     release(runId) {
       return exclusive(async () => {
