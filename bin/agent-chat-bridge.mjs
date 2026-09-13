@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 import { ConfigError, loadConfig } from '../src/config.mjs';
 import { createLogger } from '../src/logger.mjs';
-import { startServer } from '../src/server.mjs';
+import { startService, migrateService } from '../src/service.mjs';
 
-const HELP = `agent-chat-bridge (foundation only)
+const HELP = `agent-chat-bridge
 
 Usage:
   agent-chat-bridge --help
   agent-chat-bridge check-config --config <path>
   agent-chat-bridge start --config <path>
+  agent-chat-bridge migrate --config <path>
 
 An explicit JSON config path is required; no config or .env auto-discovery.
 check-config validates syntax only and never resolves environment secrets.
-start runs local HTTP health endpoints; Feishu, Codex and Store are not wired.
-GET /health/live returns 200; GET /health/ready returns 503.
+start assembles explicitly configured Feishu, Codex and MySQL components.
+Health-only configuration remains live but readiness returns 503.
+migrate explicitly applies the configured Store schema; start never migrates.
 `;
 
 const log = createLogger();
@@ -22,19 +24,22 @@ try {
   if (command === '--help' && flag === undefined) {
     process.stdout.write(HELP);
   } else {
-    if (!['check-config', 'start'].includes(command) || flag !== '--config'
+    if (!['check-config', 'start', 'migrate'].includes(command) || flag !== '--config'
         || !path || path.startsWith('--') || extra.length) {
       throw new ConfigError('invalid_arguments');
     }
     const config = await loadConfig(path);
     if (command === 'check-config') {
       log('info', 'check_config', 'succeeded');
+    } else if (command === 'migrate') {
+      await migrateService({ config });
+      log('info', 'migration', 'succeeded');
     } else {
-      const service = await startServer({ config, log });
+      const service = await startService({ config, configPath: path, log });
       const shutdown = () => {
-        service.close().catch(() => {
+        service.close().then(() => { if (config.storage) process.exit(0); }).catch(() => {
           log('error', 'shutdown', 'failed', { code: 'shutdown_failed' });
-          process.exitCode = 1;
+          process.exit(1);
         });
       };
       process.on('SIGTERM', shutdown);
@@ -46,4 +51,7 @@ try {
     code: error instanceof ConfigError ? error.code : 'startup_failed',
   });
   process.exitCode = 1;
+  // Locked SDK owns a cache interval even after WS close. All service cleanup
+  // has completed before startup rejects; do not leave a failed CLI resident.
+  process.stdout.write('', () => process.exit(1));
 }

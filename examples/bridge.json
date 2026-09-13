@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "listen": { "host": "127.0.0.1", "port": 18830 },
+  "storage": {
+    "hostEnv": "BRIDGE_DB_HOST", "portEnv": "BRIDGE_DB_PORT", "userEnv": "BRIDGE_DB_USER",
+    "passwordEnv": "BRIDGE_DB_PASSWORD", "databaseEnv": "BRIDGE_DB_DATABASE"
+  },
+  "codex": { "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"] },
+  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id" },
+  "routing": {
+    "version": "1",
+    "privateUserIds": ["replace_with_allowed_open_id"],
+    "groups": [{ "conversationId": "replace_with_chat_id", "userIds": ["replace_with_allowed_open_id"], "trigger": "mention", "passiveContext": true }]
+  },
+  "auth": { "clients": [{ "id": "application", "tokenEnv": "BRIDGE_API_TOKEN", "conversationIds": ["replace_with_chat_id"], "admin": false }] },
+  "hooks": [],
+  "errorReporting": { "url": "http://127.0.0.1:18831/errors", "tokenEnv": "BRIDGE_ERROR_TOKEN" }
+}

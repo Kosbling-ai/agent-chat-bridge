@@ -21,7 +21,7 @@ export function isLoopback(host) {
 }
 
 export function validateConfig(raw) {
-  object(raw, ['schemaVersion', 'listen', 'auth'], 'invalid_config_fields');
+  object(raw, ['schemaVersion', 'listen', 'auth', 'storage', 'codex', 'feishu', 'routing', 'hooks', 'errorReporting'], 'invalid_config_fields');
   if (raw.schemaVersion !== 1) throw new ConfigError('unsupported_config_version');
   const listen = raw.listen === undefined ? {} : raw.listen;
   object(listen, ['host', 'port', 'allowRemote'], 'invalid_listen_fields');
@@ -33,17 +33,79 @@ export function validateConfig(raw) {
 
   let tokenEnv;
   if (raw.auth !== undefined) {
-    object(raw.auth, ['tokenEnv'], 'invalid_auth_fields');
+    object(raw.auth, ['tokenEnv', 'clients'], 'invalid_auth_fields');
     tokenEnv = raw.auth.tokenEnv;
-    if (typeof tokenEnv !== 'string' || !/^[A-Z_][A-Z0-9_]{0,127}$/.test(tokenEnv)) {
+    if (tokenEnv !== undefined && (typeof tokenEnv !== 'string' || !/^[A-Z_][A-Z0-9_]{0,127}$/.test(tokenEnv))) {
       throw new ConfigError('invalid_token_env_reference');
     }
   }
+  const runtime = validateRuntime(raw);
   return Object.freeze({
     schemaVersion: 1,
     listen: Object.freeze({ host, port, allowRemote }),
-    auth: tokenEnv ? Object.freeze({ tokenEnv }) : undefined,
+    auth: raw.auth ? Object.freeze({ ...(tokenEnv ? { tokenEnv } : {}), ...(runtime.auth ?? {}) }) : undefined,
+    ...runtime.components,
   });
+}
+
+function string(value, code = 'invalid_runtime_config') {
+  if (typeof value !== 'string' || !value || value.length > 2048) throw new ConfigError(code);
+  return value;
+}
+function reference(value) {
+  if (typeof value !== 'string' || !/^[A-Z_][A-Z0-9_]{0,127}$/.test(value)) throw new ConfigError('invalid_environment_reference');
+  return value;
+}
+function strings(value) {
+  if (!Array.isArray(value) || value.length > 1000) throw new ConfigError('invalid_scope');
+  return [...new Set(value.map(v => string(v)))];
+}
+function validateRuntime(raw) {
+  const enabled = ['storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
+  if (!enabled) {
+    if (raw.hooks !== undefined || raw.auth?.clients !== undefined || raw.errorReporting !== undefined) throw new ConfigError('runtime_components_required');
+    return { components: {} };
+  }
+  for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
+  object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
+  const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
+  object(raw.codex, ['bin', 'cwd', 'envNames', 'model'], 'invalid_codex_fields');
+  const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(reference) };
+  if (raw.codex.model !== undefined) codex.model = string(raw.codex.model);
+  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId'], 'invalid_feishu_fields');
+  const feishu = { connectionId: string(raw.feishu.connectionId), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: string(raw.feishu.botOpenId) };
+  object(raw.routing, ['version', 'privateUserIds', 'groups'], 'invalid_routing_fields');
+  if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
+  const groups = raw.routing.groups.map(group => {
+    object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext'], 'invalid_group_fields');
+    if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
+    return { conversationId: string(group.conversationId), userIds: strings(group.userIds), trigger: group.trigger, passiveContext: group.passiveContext };
+  });
+  if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
+  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), groups };
+  if (!Array.isArray(raw.auth?.clients) || !raw.auth.clients.length || raw.auth.clients.length > 100 || raw.auth.tokenEnv !== undefined) throw new ConfigError('runtime_auth_clients_required');
+  const clients = raw.auth.clients.map(client => {
+    object(client, ['id', 'tokenEnv', 'conversationIds', 'admin'], 'invalid_client_fields');
+    if (typeof client.admin !== 'boolean') throw new ConfigError('invalid_client_admin');
+    return { id: string(client.id), tokenEnv: reference(client.tokenEnv), conversationIds: strings(client.conversationIds), admin: client.admin };
+  });
+  if (new Set(clients.map(c => c.id)).size !== clients.length) throw new ConfigError('duplicate_client');
+  if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
+  const hooks = (raw.hooks ?? []).map(hook => {
+    object(hook, ['id', 'url', 'tokenEnv', 'conversationIds'], 'invalid_hook_fields');
+    let url; try { url = new URL(hook.url); } catch { throw new ConfigError('invalid_hook_url'); }
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_hook_url');
+    return { id: string(hook.id), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds: strings(hook.conversationIds) };
+  });
+  if (new Set(hooks.map(h => h.id)).size !== hooks.length) throw new ConfigError('duplicate_hook');
+  let errorReporting;
+  if (raw.errorReporting !== undefined) {
+    object(raw.errorReporting, ['url', 'tokenEnv'], 'invalid_error_reporting');
+    let url; try { url = new URL(raw.errorReporting.url); } catch { throw new ConfigError('invalid_error_reporting'); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_error_reporting');
+    errorReporting = { url: url.href, tokenEnv: reference(raw.errorReporting.tokenEnv) };
+  }
+  return { auth: { clients }, components: { storage, codex, feishu, routing, hooks, ...(errorReporting ? { errorReporting } : {}) } };
 }
 
 export async function loadConfig(path) {

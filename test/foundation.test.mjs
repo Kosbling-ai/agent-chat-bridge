@@ -98,7 +98,7 @@ function run(t, args, { cwd = root, env = {} } = {}) {
 test('help and strict arguments require an explicit configuration', async (t) => {
   const help = await run(t, ['--help']).finished;
   assert.equal(help.code, 0);
-  assert.match(help.stdout, /foundation only/);
+  assert.match(help.stdout, /Health-only configuration/);
   const { dir } = await fixture(t);
   for (const args of [[], ['start'], ['start', '--config'], ['unknown'], ['--help', '--extra'], ['start', '--config', 'x', '--extra']]) {
     const result = await run(t, args, { cwd: dir }).finished;

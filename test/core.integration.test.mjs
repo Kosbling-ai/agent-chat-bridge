@@ -1,0 +1,83 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createPoolFromEnvironment } from '../src/storage/connection.mjs';
+import { migrate } from '../src/storage/migrations.mjs';
+import { createMysqlStore } from '../src/storage/store.mjs';
+import { createRuntime } from '../src/core/runtime.mjs';
+import { createApi } from '../src/core/api.mjs';
+import { startServer } from '../src/server.mjs';
+
+const enabled = Boolean(process.env.BRIDGE_TEST_PASSWORD);
+const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `BRIDGE_TEST_${key.toUpperCase()}`]));
+async function eventually(read, predicate) {
+  const end = Date.now() + 6000;
+  while (Date.now() < end) { const value = await read(); if (predicate(value)) return value; await new Promise(resolve => setTimeout(resolve, 30)); }
+  throw new Error('condition_timeout');
+}
+test('real Store core: immediate completion, independent hook, API authorization and unknown recovery', { skip: !enabled, timeout: 30000 }, async () => {
+  const pool = createPoolFromEnvironment(refs);
+  await migrate(pool);
+  let store = await createMysqlStore({ pool });
+  const config = { listen: { host: '127.0.0.1', port: 0 }, feishu: { connectionId: 'fixture', botOpenId: 'bot' }, auth: { clients: [{ id: 'tester', conversationIds: ['chat', 'unknown', 'unsupported'], admin: true }] }, routing: { version: '1', privateUserIds: ['human'], groups: [] }, hooks: [{ id: 'hook', url: 'http://synthetic.invalid', conversationIds: ['chat'] }] };
+  let runtime, server, mode = 'normal', turns = 0, threadStarts = 0, hooks = 0;
+  const sent = [];
+  const completed = new Map();
+  const codex = {
+    status: () => ({ state: 'ready' }),
+    async startThread() { return { thread: { id: `thread-${++threadStarts}` } }; },
+    async resumeThread({ threadId }) { return { thread: { id: threadId } }; },
+    async startTurn({ threadId }) {
+      turns++;
+      if (mode === 'unknown') throw Object.assign(new Error('synthetic'), { outcome: 'unknown' });
+      const turn = { id: `turn-${turns}`, status: 'completed', items: [{ type: 'agentMessage', text: 'Synthetic answer' }] };
+      completed.set(threadId, turn);
+      // The Store commits this notification before RPC admission is returned.
+      await runtime.notification({ method: 'turn/completed', params: { threadId, turn } });
+      return { turn: { id: turn.id, status: 'inProgress' } };
+    },
+    async readThread({ threadId }) { return { thread: { turns: [completed.get(threadId)].filter(Boolean) } }; },
+  };
+  const chat = { async sendMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async replyMessage(input) { sent.push(input); return { message_id: `sent-${sent.length}` }; }, async getMessage({ messageId }) { return { items: [{ message_id: messageId, chat_id: messageId === 'foreign' ? 'forbidden' : 'chat' }] }; } };
+  const token = 'synthetic-bridge-token-for-tests-only';
+  const event = { schemaVersion: 1, channel: 'feishu', connectionId: 'fixture', eventId: 'e1', eventKey: 'receive:e1', type: 'message.received', source: 'live', receivedAt: 1, occurredAt: 1, conversationId: 'chat', conversationType: 'p2p', messageId: 'm1', revision: '', actor: { type: 'user', openId: 'human' }, isApp: false, isSelf: false, message: { kind: 'text', parsedContent: { text: 'Synthetic question' }, content: '{"text":"Synthetic question"}', mentions: [] }, platform: { feishu: { eventType: 'receive' } } };
+  try {
+    runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => { hooks++; return new Response(null, { status: 503 }); } });
+    const accepted = await runtime.ingest(event);
+    assert.equal((await runtime.ingest({ ...event, receivedAt: 99 })).agentJobId, accepted.agentJobId);
+    runtime.start();
+    await eventually(() => store.getJob({ id: accepted.agentJobId }), row => row.status === 'succeeded');
+    assert.equal(turns, 1); assert.equal(sent.length, 1);
+    assert.equal((await store.getJob({ id: accepted.hookJobIds[0] })).status, 'pending');
+    assert(hooks >= 1);
+    assert.equal((await store.readRunEvents({ runId: accepted.agentJobId })).length, 1);
+    const api = createApi({ config, store, chat, tokens: { tester: token } });
+    server = await startServer({ config, api, log() {}, readiness: async () => ({ ready: true }) });
+    const url = `http://127.0.0.1:${server.server.address().port}`;
+    assert.equal((await fetch(`${url}/v1/runs/${accepted.agentJobId}`)).status, 401);
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    assert.equal((await fetch(`${url}/v1/runs/${accepted.agentJobId}`, { headers })).status, 200);
+    assert.equal((await fetch(`${url}/v1/messages/foreign`, { headers })).status, 403);
+    assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'forbidden', idempotencyKey: 'x', text: 'synthetic' }) })).status, 403);
+    assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'chat', idempotencyKey: 'x', text: 'synthetic', cwd: '/tmp' }) })).status, 400);
+    mode = 'unknown';
+    const result = await (await fetch(`${url}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'unknown', idempotencyKey: 'unknown', text: 'synthetic' }) })).json();
+    await eventually(() => store.getJob({ id: result.id }), row => row.status === 'unknown');
+    assert.equal((await fetch(`${url}/v1/sessions/reset`, { method: 'POST', headers, body: JSON.stringify({ conversationId: 'unknown', generation: 1 }) })).status, 409);
+    const before = turns;
+    await runtime.stop();
+    const recovery = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'recovered', idempotencyKey: 'recovered', payload: { text: 'already admitted' } });
+    const [claim] = await store.claimJobs({ kind: 'agent', owner: 'crashed-worker', limit: 1, leaseMs: 100 });
+    const attempt = await store.beginAgentAttempt({ id: claim.id, leaseToken: claim.leaseToken, agentId: 'codex' });
+    completed.set('recovery-thread', { id: 'recovery-turn', status: 'completed', items: [{ type: 'agentMessage', text: 'Recovered answer' }] });
+    await store.bindAgentAttempt({ id: claim.id, leaseToken: claim.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: 'recovery-thread', nativeTurnId: 'recovery-turn' });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    runtime = createRuntime({ config, store, codex, chat, hookTokens: { hook: 'synthetic' }, fetchImpl: async () => new Response(null, { status: 204 }) });
+    runtime.start();
+    await eventually(() => store.getJob({ id: recovery.id }), row => row.status === 'succeeded');
+    assert.equal(turns, before, 'unknown admission must not replay on worker restart');
+    mode = 'normal';
+    const unsupported = await runtime.ingest({ ...event, eventId: 'e2', eventKey: 'receive:e2', conversationId: 'unsupported', messageId: 'm2', message: { kind: 'image', parsedContent: { image_key: 'synthetic' }, mentions: [] } });
+    await eventually(() => store.getJob({ id: unsupported.agentJobId }), row => row.status === 'succeeded');
+    assert.equal(turns, before); assert.match(sent.at(-1).content.text, /仅支持文本/);
+  } finally { await server?.close(); await runtime?.stop(); await store.close(); }
+});
