@@ -52,7 +52,8 @@ Create/reply retries preserve platform UUID within the Store's conservative 55-m
 | Capability | This stage |
 | --- | --- |
 | Inbound text → Codex → text reply | implemented; real Store + synthetic providers tested |
-| Inbound post/image/file → Agent | explicit durable unsupported result and text notice; media ingestion still required before full migration |
+| Inbound private image/post → Agent | internal image download and textual path prompt; durable job before prepare, known attempt recovery skips downloads |
+| Inbound group post / private file/audio/media | group captions only; originally unsupported private binary types retain explicit rejection |
 | Outbound text/post/interactive/image/file | durable create/reply API wired to adapter; platform acceptance not live tested |
 | Reaction add/remove | Write API + adapter wired; unknown writes held |
 | Upload image/file | bounded durable API wired; unknown upload held |
@@ -75,3 +76,11 @@ Run `npm test`, `npm run check`, and `node scripts/test-storage.mjs test/core.in
 Service starts catchup after native/WS startup and stops it before workers/Store teardown. It combines configured Agent groups and explicitly declared hook `catchupGroupIds` with keyset-paged previously received private chats, with a hard 1000-conversation bound. Hook `catchupGroupIds` defaults to an empty list and must be a subset of its `conversationIds`. An arbitrary hook target never implies group type; previously received private chats are discovered through Store. Conflicting explicit group and observed private types reject catchup rather than poison canonical receipts. No bot-wide chat enumeration or public read API is exposed. Default private lookback/overlap remains three hours/five minutes.
 
 Live/history canonical first receipt is atomic in Store. Changed history content never fabricates an edit hook. If a history sender lacks the open ID needed for private/group-member admission, or mention IDs cannot identify the configured bot, core rejects before canonical registration. The page checkpoint remains retryable so incomplete history cannot suppress a later complete live event. Groups allowing all members do not require open IDs merely for membership. SDK 1.60.0 message.list has no user_id_type parameter; this safeguard does not guess or translate identities.
+
+## Agent input media lifecycle
+
+The service constructs the internal Feishu image preparer under the configured Codex workspace at `.agent-chat-bridge/inbox`. `feishu.mediaBudgetBytes` defaults to 128 MiB (20 MiB to 1 GiB allowed); individual files remain capped at 20 MiB. No HTTP caller supplies an input path.
+
+Ingress only persists authorized jobs. The worker prepares private image/post inputs before its first native attempt, renews its lease before admission, and adds validated local paths using the existing textual prompt format. Existing native attempts skip preparation during recovery. Text and group post captions use the legacy text extractor; group images are ignored. Failed downloads and unsupported private types produce explicit durable result facts/replies without native execution. Interrupted preparation returns the unadmitted job to pending.
+
+Input resources survive completed turns and restarts. Core does not invoke release until a later retirement workflow can prove there are no native recovery references; there is no age-based deletion. The budget therefore fails explicitly when retained resources fill it. Automatic Agent output upload/send is a separate integration and is not implied by input preparation.

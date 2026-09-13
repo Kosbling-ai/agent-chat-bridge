@@ -9,6 +9,7 @@ import { migrate } from './storage/migrations.mjs';
 import { createCodexAdapter } from './agents/codex/adapter.mjs';
 import { createFeishuAdapter } from './channels/feishu/adapter.mjs';
 import { createFeishuChatClient } from './channels/feishu/chat-client.mjs';
+import { createFeishuMedia } from './channels/feishu/media.mjs';
 import { createRuntime } from './core/runtime.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
@@ -51,7 +52,7 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, catchup: createCatchup, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, catchup: createCatchup, sdk, ...dependencies };
   const pool = factories.pool(config.storage, env);
   let store, codex, feishu, runtime, catchup, http;
   let writerHealthy = true;
@@ -85,7 +86,9 @@ export async function startService({ config, configPath, env = process.env, log,
     const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance);
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
     const chat = factories.chat({ client });
-    runtime = createRuntime({ config, store, codex, chat, hookTokens, log });
+    const media = await factories.media({ chat, workspace: cwd, inboxDir: resolve(cwd, '.agent-chat-bridge/inbox'), maxTotalBytes: config.feishu.mediaBudgetBytes, log });
+    checkCancelled();
+    runtime = createRuntime({ config, store, codex, chat, media, hookTokens, log });
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
     const api = createApi({ config, store, chat, tokens });
     await Promise.race([codex.start(), cancelled]);

@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { safeObserver } from '../logger.mjs';
 import { extractFinalAnswer, buildConversationPrompt } from './format.mjs';
+import { extractMessageText } from '../channels/feishu/media.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const nativeIds = ({ params = {} }) => ({ nativeThreadId: params.threadId ?? params.thread?.id, nativeTurnId: params.turnId ?? params.turn?.id });
 
-export function createRuntime({ config, store, codex, chat, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
+export function createRuntime({ config, store, codex, chat, media, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
   log = safeObserver(log);
   const connectionId = config.feishu.connectionId;
   const owner = randomUUID();
@@ -15,6 +16,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
   let stopping = false, started = false, healthy = true;
   let worker;
   const active = new Set();
+  const stopController = new AbortController();
   const scope = conversationId => ({ connectionId, conversationId });
   function fault(code) { healthy = false; log('error', 'core', 'failed', { code }); }
   async function ingest(event, context = {}) {
@@ -33,7 +35,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     const allowed = human && (event.conversationType === 'p2p' ? config.routing.privateUserIds.includes(event.actor.openId) : Boolean(group && (group.userIds === undefined || group.userIds.includes(event.actor.openId))));
     const mentioned = event.message?.mentions?.some(mention => mention.openId === config.feishu.botOpenId);
     const triggered = allowed && event.type === 'message.received' && (event.conversationType === 'p2p' || group?.trigger === 'all' || mentioned);
-    const text = event.message?.kind === 'text' ? event.message.parsedContent?.text : undefined;
+    const text = extractMessageText(event);
     // Unsupported attachment-only input is retained in inbox/hooks, never misread as text.
     const agentJob = triggered ? { payload: { text: typeof text === 'string' ? text : '', unsupported: !(typeof text === 'string' && text.trim()), messageId: event.messageId, source: 'chat', event } } : undefined;
     const hooks = config.hooks.filter(hook => hook.conversationIds.includes(event.conversationId) && !event.isSelf && !event.isApp).map(hook => ({ hookId: hook.id, payload: event }));
@@ -120,9 +122,21 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     log('info', 'agent_run', 'started');
     let attempt, rpcPhase;
     try {
-      if (parse(job.payload).unsupported) {
-        await store.finishJobWithOutbox({ id: job.id, leaseToken: job.leaseToken, result: { status: 'unsupported_input' }, outbox: [{ idempotencyKey: `run:${job.id}:unsupported`, kind: 'reply', payload: { messageId: parse(job.payload).messageId, kind: 'text', content: { text: '当前桥接版本仅支持文本输入；这条消息尚未交给 Agent。' } } }] });
-        log('warning', 'agent_run', 'rejected', { code: 'unsupported_input' });
+      const payload = parse(job.payload);
+      let prepared;
+      if (media && payload.event && !await store.getAgentAttempt({ id: job.id })) {
+        prepared = await media.prepare(payload.event, { runId: job.id, signal: stopController.signal });
+        await store.renewJob({ id: job.id, leaseToken: job.leaseToken, leaseMs });
+        if (stopping) {
+          await store.retryJob({ id: job.id, leaseToken: job.leaseToken, errorCode: 'input_prepare_interrupted', nextAttemptAt: Date.now() + 1000 });
+          return;
+        }
+      }
+      const rejected = prepared && prepared.status !== 'ready' ? prepared.status : (!prepared && payload.unsupported && !media ? 'unsupported' : null);
+      if (rejected) {
+        const reply = prepared?.replyText ?? (rejected === 'failed' ? '图片准备失败，这条消息尚未交给 Agent，请重试或改用文字。' : '这条消息的附件类型暂不支持，尚未交给 Agent，请改用文字或图片。');
+        await store.finishJobWithOutbox({ id: job.id, leaseToken: job.leaseToken, result: { status: `input_${rejected}`, ...(prepared?.reason ? { code: prepared.reason } : {}) }, outbox: rejected === 'ignored' ? [] : [{ idempotencyKey: `run:${job.id}:input-status`, kind: 'reply', payload: { messageId: payload.messageId, kind: 'text', content: { text: reply } } }] });
+        log(rejected === 'failed' ? 'error' : 'warning', 'agent_run', 'rejected', { code: `input_${rejected}` });
         return;
       }
       attempt = await store.beginAgentAttempt({ id: job.id, leaseToken: job.leaseToken, agentId: 'codex' });
@@ -142,9 +156,8 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
         attempt.nativeThreadId = thread.thread.id;
         await store.bindAgentAttempt({ id: job.id, leaseToken: job.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: attempt.nativeThreadId });
         const context = await store.readPassiveContext({ ...scope(job.conversationId), limit: 100 });
-        const contextEntries = context.map(item => { const event = parse(item.payload); return { event, text: event.message?.parsedContent?.text }; }).filter(item => typeof item.text === 'string');
-        const payload = parse(job.payload);
-        const inputText = buildConversationPrompt({ event: payload.event, text: payload.text, context: contextEntries, newThread, group: config.routing.groups.find(group => group.conversationId === job.conversationId) });
+        const contextEntries = context.map(item => { const event = parse(item.payload); return { event, text: extractMessageText(event) }; }).filter(item => item.text);
+        const inputText = buildConversationPrompt({ event: payload.event, text: prepared ? [prepared.text, prepared.addendum].filter(Boolean).join('\n\n') : payload.text, context: contextEntries, newThread, group: config.routing.groups.find(group => group.conversationId === job.conversationId) });
         rpcPhase = 'turn_admission';
         const result = await codex.startTurn({ threadId: attempt.nativeThreadId, input: [{ type: 'text', text: inputText }], clientUserMessageId: job.id });
         if (!result.turn?.id) throw Object.assign(new Error('invalid_turn_result'), { outcome: 'unknown' });
@@ -224,6 +237,6 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     onFault: async () => log('error', 'codex_connection', 'failed', { code: 'codex_connection_failed' }),
     status: () => ({ running: started && !stopping && healthy }),
     start() { if (started) throw new Error('runtime_already_started'); started = true; worker = loop(); },
-    async stop() { stopping = true; await worker; await Promise.allSettled(active); },
+    async stop() { stopping = true; stopController.abort(); await worker; await Promise.allSettled(active); },
   };
 }

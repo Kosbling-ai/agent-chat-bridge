@@ -112,7 +112,7 @@ test('real Store core: immediate completion, independent hook, API authorization
     mode = 'normal';
     const unsupported = await runtime.ingest({ ...event, eventId: 'e2', eventKey: 'receive:e2', conversationId: 'unsupported', messageId: 'm2', message: { kind: 'image', parsedContent: { image_key: 'synthetic' }, mentions: [] } });
     await eventually(() => store.getJob({ id: unsupported.agentJobId }), row => row.status === 'succeeded');
-    assert.equal(turns, before); assert.match(sent.at(-1).content.text, /仅支持文本/);
+    assert.equal(turns, before); assert.match(sent.at(-1).content.text, /暂不支持.*尚未交给 Agent/);
     mode = 'live';
     const live = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'live', idempotencyKey: 'live', payload: { text: 'synthetic' } });
     await eventually(async () => { const [[row]] = await pool.execute('SELECT native_turn_id FROM bridge_attempts WHERE job_id=?', [live.id]); return row; }, row => row?.native_turn_id);
