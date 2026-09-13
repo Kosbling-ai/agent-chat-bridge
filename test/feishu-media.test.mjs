@@ -91,9 +91,13 @@ test('image count is bounded before download and late failed download closes its
   try{
     const result=await f.media.prepare(event('post',{content:[[{tag:'img',image_key:'a'},{tag:'img',image_key:'b'}]]}),{runId:'count'});
     assert.equal(result.reason,'media_too_many');assert.equal(f.calls.length,0);
-    let finish;
-    const late=await createFeishuMedia({...f.params,timeoutMs:10,chat:{downloadResource:()=>new Promise(resolve=>{finish=resolve;})}});
-    assert.equal((await late.prepare(event('image',{image_key:'late'}),{runId:'late'})).status,'failed');
+    let finish, markStarted;
+    const started=new Promise(resolve=>{markStarted=resolve;});
+    const late=await createFeishuMedia({...f.params,chat:{downloadResource:()=>new Promise(resolve=>{finish=resolve;markStarted();})}});
+    const controller=new AbortController();
+    const preparing=late.prepare(event('image',{image_key:'late'}),{runId:'late',signal:controller.signal});
+    await started;controller.abort();
+    assert.equal((await preparing).status,'failed');
     const stream=Readable.from([Buffer.from('late')]);finish({stream,contentType:'image/png'});
     await new Promise(setImmediate);assert.equal(stream.destroyed,true);
   }finally{await f.close();}
