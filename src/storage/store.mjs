@@ -433,7 +433,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
           EXISTS(SELECT 1 FROM bridge_steering guidance JOIN bridge_jobs job ON job.id=guidance.guidance_job_id
             WHERE guidance.connection_id=? AND guidance.conversation_id=? AND guidance.agent_id=?
               AND guidance.status IN ('intent','unknown') AND job.status IN ('pending','running','unknown') LIMIT 1) AS unresolved_guidance`,[...key,...key]);
-        return {activeRunId:row.active_run_id,unresolvedGuidance:Boolean(row.unresolved_guidance)};
+        return {activeRunId:row.active_run_id,unresolvedGuidance:Number(row.unresolved_guidance) === 1};
       });
     },
     getSession: (input)=>read(async(c)=>{const [[row]]=await c.execute('SELECT * FROM bridge_sessions WHERE connection_id=? AND conversation_id=? AND agent_id=?',[...scope(input),text(input.agentId,128)]);return decode(row) ?? null;}),

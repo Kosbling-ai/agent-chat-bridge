@@ -19,6 +19,8 @@ test('real MySQL conversation activity retains unknown native and guidance facts
     await store.bindAgentAttempt({...row,expectedGeneration:attempt.generation,nativeThreadId:`thread-${chat}`,nativeTurnId:`turn-${chat}`});return row;
   }
   try{
+    const [[raw]]=await pool.query('SELECT EXISTS(SELECT 1 WHERE FALSE) AS no_match, EXISTS(SELECT 1) AS has_match');
+    assert.equal(raw.no_match,'0'); assert.equal(raw.has_match,'1');
     assert.deepEqual(await store.getConversationActivity(scope('missing')),{activeRunId:null,unresolvedGuidance:false});
     const active=await parent('first');assert.deepEqual(await store.getConversationActivity(scope('first')),{activeRunId:active.id,unresolvedGuidance:false});
     const guidance=await create('first');await store.beginSteerAttempt({...guidance,agentId:'codex'});
