@@ -364,17 +364,34 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       };
     }, async (error) => {
       const observationUnknown = error?.outcome === 'unknown';
-      await sessionStore.saveCodexRealtimeEvent(state.binding, {
+      const observationEvent = {
         messageId: state.messageId,
         eventKey: `${observationUnknown ? 'observation-error' : 'error'}:${state.messageId || state.turnId}`,
         eventType: 'error', role: 'activity',
         title: observationUnknown ? 'Codex 状态待核对' : 'Codex 会话失败',
         text: error.message, createdAt: now(),
         detail: { turnId: state.turnId, turnStatus: observationUnknown ? 'unknown' : (error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed') },
-      });
+      };
+      if (observationUnknown) {
+        try { await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent); }
+        catch { logObservationPersistenceFailure(state, 'event'); }
+        try { await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: error.message }); }
+        catch { logObservationPersistenceFailure(state, 'touch'); }
+        throw error;
+      }
+      await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent);
       await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: error.message });
       throw error;
     });
+  }
+
+  function logObservationPersistenceFailure(state, stage) {
+    try {
+      log('error', {
+        module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_observation_loss', status: 'failed',
+        stage, threadId: state.threadId, turnId: state.turnId,
+      });
+    } catch { /* diagnostics must not replace the native unknown result */ }
   }
 
   async function execute(input, options = {}) {
@@ -483,13 +500,15 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function prepareKnownResume(binding, input, resume) {
+    loadedThreads.delete(resume.threadId);
     pendingKnownTurns.add(resume.turnId);
     let snapshot;
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }));
       snapshot = exactTurnSnapshot(response?.thread, resume.turnId);
-      loadedThreads.add(resume.threadId);
+      const otherActiveIds = inProgressTurnIds(response?.thread).filter((turnId) => turnId !== resume.turnId);
+      if (snapshot.status !== 'unknown' && otherActiveIds.length === 0) loadedThreads.add(resume.threadId);
     }
     catch (error) { pendingKnownTurns.delete(resume.turnId); throw error; }
     if (snapshot.status === 'unknown') { pendingKnownTurns.delete(resume.turnId); throw coded('persisted turn could not be confirmed', 'CODEX_TURN_UNKNOWN', { retryable: true, outcome: 'unknown' }); }

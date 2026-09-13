@@ -305,6 +305,41 @@ test('child exit, RPC reset, and close settle active observers as unknown withou
   });
 });
 
+test('observation persistence failures retain the original unknown identity', async (t) => {
+  const input = { bindingOpenId: 'system:x', chatId: 'chat', chatType: 'group', messageId: 'job', prompt: 'work', busyPolicy: 'reject' };
+  for (const stage of ['event', 'touch']) {
+    await t.test(stage, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+      try {
+        const store = memoryStore(); const logs = [];
+        if (stage === 'event') {
+          const save = store.saveCodexRealtimeEvent;
+          store.saveCodexRealtimeEvent = async (binding, event) => {
+            if (event.eventKey.startsWith('observation-error:')) throw new Error('synthetic observation event failure');
+            return save(binding, event);
+          };
+        } else {
+          store.touchCodexBinding = async () => { throw new Error('synthetic observation touch failure'); };
+        }
+        const runtime = fakeRuntime({ completeStarts: false });
+        const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, log: (level, detail) => logs.push([level, detail]) });
+        const running = executor.execute(input);
+        while (executor.status().activeTurns !== 1) await new Promise((resolve) => setImmediate(resolve));
+        runtime.children[0].emit('exit', 1, null);
+        const error = await running.then(() => null, (reason) => reason);
+        assert.equal(error.code, 'CODEX_OBSERVATION_LOST');
+        assert.equal(error.outcome, 'unknown');
+        assert.deepEqual([error.threadId, error.turnId], ['thread-1', 'turn-1']);
+        assert.ok(Number.isFinite(error.startedAt));
+        assert.ok(logs.some(([level, detail]) => level === 'error' && detail.operation === 'persist_observation_loss' && detail.stage === stage && detail.threadId === 'thread-1' && detail.turnId === 'turn-1'));
+        assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 1);
+        while (executor.status().activeTurns) await new Promise((resolve) => setImmediate(resolve));
+        await executor.close();
+      } finally { rmSync(cwd, { recursive: true, force: true }); }
+    });
+  }
+});
+
 test('a fresh child resumes its binding after idle close before starting another turn', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
@@ -390,6 +425,40 @@ test('concurrent exact resumes share one observer while mismatched resume cannot
     assert.deepEqual(results.map((result) => result.answer), ['restored', 'restored']);
     await executor.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('known resume never marks a thread start-safe when another native turn is active', async (t) => {
+  const binding = { feishuOpenId: 'system:x', chatId: 'chat', chatType: 'group', codexSessionId: 'thread-existing', threadName: 'system', created: false };
+  const resumeInput = { bindingOpenId: 'system:x', chatId: 'chat', chatType: 'group', messageId: 'old-job', prompt: 'old', busyPolicy: 'reject' };
+  const nextInput = { ...resumeInput, messageId: 'new-job', prompt: 'new' };
+  await t.test('completed requested turn plus unbound active turn', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+    try {
+      const runtime = fakeRuntime({ resumeTurns: [
+        { id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known result' }] },
+        { id: 'unbound', status: 'inProgress' },
+      ] });
+      const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore([binding]), spawnImpl: runtime.spawnImpl });
+      const result = await executor.execute(resumeInput, { resume: { threadId: 'thread-existing', turnId: 'known', startedAt: 10 } });
+      assert.equal(result.rawAnswer, 'known result');
+      await assert.rejects(executor.execute(nextInput), { code: 'CODEX_THREAD_HELD', outcome: 'unknown' });
+      assert.equal(runtime.calls.filter((call) => call.method === 'thread/resume').length, 2);
+      assert.equal(runtime.calls.filter((call) => ['turn/start', 'turn/steer', 'turn/interrupt'].includes(call.method)).length, 0);
+      await executor.close();
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+  await t.test('missing requested turn plus unbound active turn', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+    try {
+      const runtime = fakeRuntime({ resumeTurns: [{ id: 'unbound', status: 'inProgress' }] });
+      const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore([binding]), spawnImpl: runtime.spawnImpl });
+      await assert.rejects(executor.execute(resumeInput, { resume: { threadId: 'thread-existing', turnId: 'missing', startedAt: 10 } }), { code: 'CODEX_TURN_UNKNOWN', outcome: 'unknown' });
+      await assert.rejects(executor.execute(nextInput), { code: 'CODEX_THREAD_HELD', outcome: 'unknown' });
+      assert.equal(runtime.calls.filter((call) => call.method === 'thread/resume').length, 2);
+      assert.equal(runtime.calls.filter((call) => ['turn/start', 'turn/steer', 'turn/interrupt'].includes(call.method)).length, 0);
+      await executor.close();
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
 });
 
 test('completed resume verifies native identity and scans attachments even with a stored final event', async () => {
