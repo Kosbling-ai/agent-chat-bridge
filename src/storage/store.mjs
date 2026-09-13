@@ -233,6 +233,19 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
           await c.execute(`INSERT INTO bridge_message_tombstones (connection_id,message_id,created_at)
             VALUES (?,?,?) ON DUPLICATE KEY UPDATE message_id=message_id`, [connectionId,text(input.recalledMessageId),now()]);
         }
+        if (input.inboundMessage) {
+          const message = input.inboundMessage;
+          await c.execute(`INSERT IGNORE INTO assistant_inbound_messages
+            (message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,content_text,content_json,
+              mentions_json,raw_event_json,bot_mentioned,group_context_candidate,message_created_at,
+              message_updated_at,received_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [input.messageId, conversationId, conversationType,
+            message.messageType || 'text', message.senderOpenId || '', message.senderName || '', message.text || '',
+            json(message.content || { text: message.text || '' }), json(message.mentions || []),
+            json({ source, eventKey: input.eventKey, revision: input.revision || '' }), message.botMentioned ? 1 : 0,
+            message.groupContextCandidate ? 1 : 0, message.createdAt ?? input.occurredAt ?? now(),
+            message.updatedAt ?? message.createdAt ?? input.occurredAt ?? now(), now(), now()]);
+        }
         const common = { connectionId,conversationId,eventId:id,sourceSequence:row.sequence,idempotencyKey:input.eventKey };
         let forwardRunId = null;
         if (input.forwardJob) {

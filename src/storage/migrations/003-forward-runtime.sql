@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS assistant_codex_forward_jobs (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id BIGINT NOT NULL AUTO_INCREMENT,
   public_run_id CHAR(36) CHARACTER SET ascii NOT NULL,
   request_key_hash CHAR(64) CHARACTER SET ascii NULL,
   request_hash CHAR(64) CHARACTER SET ascii NULL,
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS assistant_codex_forward_jobs (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS assistant_inbound_messages (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id BIGINT NOT NULL AUTO_INCREMENT,
   message_id VARCHAR(191) NOT NULL,
   chat_id VARCHAR(191) NOT NULL,
   chat_type VARCHAR(64) NOT NULL DEFAULT '',
@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS assistant_inbound_messages (
   content_json MEDIUMTEXT NOT NULL,
   mentions_json MEDIUMTEXT NOT NULL,
   raw_event_json MEDIUMTEXT NOT NULL,
-  bot_mentioned TINYINT(1) NOT NULL DEFAULT 0,
-  group_context_candidate TINYINT(1) NOT NULL DEFAULT 0,
+  bot_mentioned TINYINT NOT NULL DEFAULT 0,
+  group_context_candidate TINYINT NOT NULL DEFAULT 0,
   codex_context_session_id VARCHAR(191) NOT NULL DEFAULT '',
   codex_context_turn_id VARCHAR(191) NOT NULL DEFAULT '',
   codex_context_forwarded_at BIGINT NULL,
@@ -68,11 +68,11 @@ CREATE TABLE IF NOT EXISTS assistant_inbound_messages (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS assistant_message_events (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id BIGINT NOT NULL AUTO_INCREMENT,
   message_id VARCHAR(191) NOT NULL,
   chat_id VARCHAR(191) NOT NULL,
   event VARCHAR(64) NOT NULL,
-  ok TINYINT(1) NOT NULL,
+  ok TINYINT NOT NULL,
   reason TEXT NOT NULL,
   detail TEXT NOT NULL,
   chat_type VARCHAR(64) NOT NULL,

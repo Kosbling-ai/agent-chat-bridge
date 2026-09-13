@@ -94,15 +94,125 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       });
     },
     claimReplyPending(input) {
-      const owner=required(input.owner,191); const leaseMs=Number(input.leaseMs||60000); const take=Math.max(1,Math.min(5,Number(input.limit||1)));
-      return write(async connection=>{ const at=now(); const [candidates]=await connection.execute(`SELECT id FROM assistant_codex_forward_jobs WHERE status='reply_pending' AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY updated_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`,[at,at]); if(!candidates.length)return[]; const ids=candidates.map(x=>String(x.id)); await connection.execute(`UPDATE assistant_codex_forward_jobs SET reply_attempts=reply_attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? WHERE id IN (${ids.map(()=>'?').join(',')})`,[owner,at+leaseMs,at,...ids]); const [rows]=await connection.execute(`SELECT id AS internal_id, assistant_codex_forward_jobs.* FROM assistant_codex_forward_jobs WHERE id IN (${ids.map(()=>'?').join(',')}) ORDER BY updated_at,id`,ids); return rows.map(row); });
+      const owner = required(input.owner, 191);
+      const leaseMs = Number(input.leaseMs || 60000);
+      const take = Math.max(1, Math.min(5, Number(input.limit || 1)));
+      return write(async connection => {
+        const at = now();
+        const [candidates] = await connection.execute(`SELECT id FROM assistant_codex_forward_jobs
+          WHERE status='reply_pending' AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+            AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+          ORDER BY updated_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [at, at]);
+        if (!candidates.length) return [];
+        const ids = candidates.map(item => String(item.id));
+        const slots = ids.map(() => '?').join(',');
+        await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET reply_attempts=reply_attempts+1,lease_owner=?,lease_expires_at=?,updated_at=?
+          WHERE id IN (${slots})`, [owner, at + leaseMs, at, ...ids]);
+        const [rows] = await connection.execute(`SELECT id AS internal_id, assistant_codex_forward_jobs.*
+          FROM assistant_codex_forward_jobs WHERE id IN (${slots}) ORDER BY updated_at,id`, ids);
+        return rows.map(row);
+      });
     },
-    renew(input) { const [id,owner]=leaseArgs(input); return write(async connection=>{ const [result]=await connection.execute("UPDATE assistant_codex_forward_jobs SET lease_expires_at=?,updated_at=? WHERE public_run_id=? AND lease_owner=? AND status IN ('running','reply_pending')",[now()+Number(input.leaseMs||60000),now(),id,owner]); await assertLease(connection,result); return {renewed:true}; }); },
-    patchExecution(input) { const [id,owner]=leaseArgs(input); return write(async connection=>{ const encoded=safeJson(input.execution); const [result]=await connection.execute("UPDATE assistant_codex_forward_jobs SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,'$.execution',CAST(? AS JSON)),updated_at=? WHERE public_run_id=? AND lease_owner=? AND status='running'",[encoded,now(),id,owner]); await assertLease(connection,result); return {updated:true}; }); },
-    patchFeedback(input) { const [id,owner]=leaseArgs(input); const key=required(input.key,32); if(!['executionCard','typing','stop'].includes(key))throw new StoreError('invalid_store_input'); return write(async connection=>{ const [result]=await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,'$.${key}',CAST(? AS JSON)),updated_at=? WHERE public_run_id=? AND lease_owner=? AND status IN ('running','reply_pending')`,[safeJson(input.value),now(),id,owner]); await assertLease(connection,result); return {updated:true}; }); },
-    markReplyPending(input) { const [id,owner]=leaseArgs(input); return write(async connection=>{ const value={...input.result,execution:input.execution??input.result?.execution}; const [result]=await connection.execute("UPDATE assistant_codex_forward_jobs SET status='reply_pending',result_json=?,last_error=?,lease_expires_at=?,updated_at=? WHERE public_run_id=? AND lease_owner=? AND status='running'",[safeJson(value),input.errorCode||'',now(),now(),id,owner]); await assertLease(connection,result); return {status:'reply_pending'}; }); },
-    markFinished(input) { const [id,owner]=leaseArgs(input); if(!['completed','failed','deferred'].includes(input.status))throw new StoreError('invalid_store_input'); return write(async connection=>{ const at=now(); const [result]=await connection.execute("UPDATE assistant_codex_forward_jobs SET status=?,result_json=?,last_error=?,finished_at=?,reply_sent_at=?,lease_owner='',lease_expires_at=NULL,updated_at=? WHERE public_run_id=? AND lease_owner=? AND status='reply_pending'",[input.status,safeJson(input.result||{}),input.errorCode||'',at,input.replySent===false?null:at,at,id,owner]); await assertLease(connection,result); return {status:input.status}; }); },
-    markRetry(input) { const [id,owner]=leaseArgs(input); return write(async connection=>{ const terminal=Boolean(input.terminal); const status=terminal?'failed':input.held?'held':(input.replyPending?'reply_pending':'pending'); const at=now(); const [result]=await connection.execute("UPDATE assistant_codex_forward_jobs SET status=?,last_error=?,next_attempt_at=?,finished_at=?,lease_owner='',lease_expires_at=NULL,updated_at=? WHERE public_run_id=? AND lease_owner=? AND status IN ('running','reply_pending')",[status,input.errorCode||'',terminal?null:(input.nextAttemptAt??at+1000),terminal?at:null,at,id,owner]); await assertLease(connection,result); return {status}; }); },
-    readEvents(input) { return read(async connection=>{ const [[found]]=await connection.execute('SELECT message_id FROM assistant_codex_forward_jobs WHERE public_run_id=? LIMIT 1',[required(input.id,36)]); if(!found)return[]; const after=String(input.after??'0'); if(!/^\d+$/.test(after))throw new StoreError('invalid_store_input'); const take=Math.max(1,Math.min(100,Number(input.limit||50))); const [rows]=await connection.execute(`SELECT id,codex_session_id,feishu_open_id,chat_id,message_id,event_type,role,title,text,detail_json,created_at FROM assistant_codex_events WHERE message_id=? AND id>? ORDER BY id LIMIT ${take}`,[found.message_id,after]); return rows.map(item=>({...item,id:String(item.id),detail:parse(item.detail_json)})); }); },
+    renew(input) {
+      const [id, owner] = leaseArgs(input);
+      return write(async connection => {
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET lease_expires_at=?,updated_at=? WHERE public_run_id=? AND lease_owner=?
+            AND status IN ('running','reply_pending')`, [at + Number(input.leaseMs || 60000), at, id, owner]);
+        await assertLease(connection, result);
+        return { renewed: true };
+      });
+    },
+    patchExecution(input) {
+      const [id, owner] = leaseArgs(input);
+      return write(async connection => {
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+            '$.execution',CAST(? AS JSON)),updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND status='running'`, [safeJson(input.execution), now(), id, owner]);
+        await assertLease(connection, result);
+        return { updated: true };
+      });
+    },
+    patchFeedback(input) {
+      const [id, owner] = leaseArgs(input);
+      const key = required(input.key, 32);
+      if (!['executionCard', 'typing', 'stop'].includes(key)) throw new StoreError('invalid_store_input');
+      return write(async connection => {
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+            '$.${key}',CAST(? AS JSON)),updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND status IN ('running','reply_pending')`, [safeJson(input.value), now(), id, owner]);
+        await assertLease(connection, result);
+        return { updated: true };
+      });
+    },
+    markReplyPending(input) {
+      const [id, owner] = leaseArgs(input);
+      const value = { ...input.result, execution: input.execution ?? input.result?.execution };
+      return write(async connection => {
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET status='reply_pending',
+            result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
+            last_error=?,lease_expires_at=?,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND status='running'`, [safeJson(value), input.errorCode || '', at, at, id, owner]);
+        await assertLease(connection, result);
+        return { status: 'reply_pending' };
+      });
+    },
+    markFinished(input) {
+      const [id, owner] = leaseArgs(input);
+      if (!['completed', 'failed', 'deferred'].includes(input.status)) throw new StoreError('invalid_store_input');
+      return write(async connection => {
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET status=?,
+            result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
+            last_error=?,finished_at=?,reply_sent_at=?,lease_owner='',lease_expires_at=NULL,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND status='reply_pending'`, [input.status, safeJson(input.result || {}), input.errorCode || '', at, input.replySent === false ? null : at, at, id, owner]);
+        await assertLease(connection, result);
+        return { status: input.status };
+      });
+    },
+    markRetry(input) {
+      const [id, owner] = leaseArgs(input);
+      return write(async connection => {
+        const isTerminal = Boolean(input.terminal);
+        const status = isTerminal ? 'failed' : input.held ? 'held' : input.replyPending ? 'reply_pending' : 'pending';
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET status=?,last_error=?,next_attempt_at=?,finished_at=?,lease_owner='',lease_expires_at=NULL,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND status IN ('running','reply_pending')`, [status, input.errorCode || '', isTerminal ? null : (input.nextAttemptAt ?? at + 1000), isTerminal ? at : null, at, id, owner]);
+        await assertLease(connection, result);
+        return { status };
+      });
+    },
+    readEvents(input) {
+      return read(async connection => {
+        const [[found]] = await connection.execute(`SELECT sender_open_id,chat_id,message_id,result_json
+          FROM assistant_codex_forward_jobs WHERE public_run_id=? LIMIT 1`, [required(input.id, 36)]);
+        if (!found) return [];
+        const execution = parse(found.result_json).execution || {};
+        if (!execution.threadId) return [];
+        const after = String(input.after ?? '0');
+        if (!/^\d+$/.test(after)) throw new StoreError('invalid_store_input');
+        const take = Math.max(1, Math.min(100, Number(input.limit || 50)));
+        const [rows] = await connection.execute(`SELECT id,event_type,role,title,text,detail_json,created_at
+          FROM assistant_codex_events
+          WHERE feishu_open_id=? AND chat_id=? AND codex_session_id=? AND message_id=? AND id>?
+            AND event_type IN ('public_progress','agent_message','error','session_rollover')
+          ORDER BY id LIMIT ${take}`, [found.sender_open_id, found.chat_id, execution.threadId, found.message_id, after]);
+        return rows.map(item => ({
+          id: String(item.id), type: item.event_type, role: item.role, title: item.title, text: item.text,
+          ...(item.event_type === 'public_progress' ? { progress: parse(item.detail_json) } : {}),
+          createdAt: Number(item.created_at),
+        }));
+      });
+    },
   });
 }
