@@ -147,3 +147,9 @@ Every 30 seconds the worker scans a bounded cursor page of terminal Agent jobs. 
 Output release retains manifests while their source-version claim or quarantine is still needed. Failed/unknown output stays retained for controlled reconciliation; retirement does not retry a model or platform upload. Rebinding/adopting a resource-retired native thread returns `resource_retired` (HTTP 409).
 
 Fast unit tests cover seal-before-files ordering, acknowledgement loss, source-claim retention, local execution exclusion, rejected seals and cursor replay. `test/core-resource-retirement.integration.test.mjs` is prepared for later local MySQL/filesystem integration; it has not been executed in this stage because real and end-to-end testing was paused at the user’s request.
+
+## Native error observation and recovery differences
+
+A persisted error for the bound thread/turn with `willRetry !== true` wakes a native thread read. Only `completed`, `failed` or `interrupted` can finish that attempt; an in-progress/missing/unknown turn or failed read remains pending with the existing IDs. `willRetry: true` keeps waiting for the provider. Neither branch starts another model turn.
+
+This is a deliberate reliability change: the old runtime rejected its local promise on non-retrying errors and let transport classify retry/failure. The old predecessor and orphan handlers also interrupted native turns. Bridge does not reproduce broad automatic interruption: durable admission/generation, explicit known-turn reads and audited unknown reconciliation replace that behavior. Strict predecessor/orphan timing is therefore not behaviorally identical, and unknown work can require an operator instead of automatic interruption/retry. Fast observation tests cover error-only streams, terminal/retrying controls, read rejection, missing turn and unknown status; no new live-model or end-to-end test was run.

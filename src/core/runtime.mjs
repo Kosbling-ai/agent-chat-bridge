@@ -10,6 +10,7 @@ import { createSteeringHandler } from './steering.mjs';
 import { createConversationGuard } from './conversation-guard.mjs';
 import { admitThread } from './thread-admission.mjs';
 import { createResourceRetirement } from './resource-retirement.mjs';
+import { observeNativeTurn, isTerminalTurn } from './observe-turn.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -64,32 +65,8 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
     await store.holdAgentAttempt({ id: job.id, leaseToken: job.leaseToken, errorCode: code });
     log('error', 'agent_run', 'recovery_required', { code });
   }
-  async function awaitTurn(job, attempt, turnId) {
-    let cursor = 0, renewedAt = Date.now();
-    while (!stopping) {
-      const rows = await store.readNativeEvents({ connectionId, nativeThreadId: attempt.nativeThreadId, nativeTurnId: turnId, afterSequence: cursor, limit: 100 });
-      for (const row of rows) {
-        cursor = row.sequence;
-        const event = parse(row.payload);
-        const ids = nativeIds(event);
-        if (ids.nativeTurnId !== turnId) continue;
-        await store.appendRunEvent({ runId: job.id, eventKey: `native:${row.sequence}`, type: event.method, payload: event.params });
-        if (event.method === 'turn/completed') {
-          // Some protocol versions omit item bodies from terminal notifications.
-          if (extractFinalAnswer(event.params.turn)) return event.params.turn;
-          const result = await codex.readThread({ threadId: attempt.nativeThreadId, includeTurns: true });
-          const recovered = result.thread?.turns?.find(turn => turn.id === turnId);
-          return recovered ?? null;
-        }
-      }
-      if (Date.now() - renewedAt > 15000) {
-        await store.renewJob({ id: job.id, leaseToken: job.leaseToken, leaseMs });
-        renewedAt = Date.now();
-      }
-      if (codex.status().state !== 'ready') return null;
-      if (rows.length < 100) await sleep(100);
-    }
-    return null;
+  function awaitTurn(job, attempt, turnId) {
+    return observeNativeTurn({ store, codex, connectionId, job, attempt, turnId, leaseMs, stopped: () => stopping });
   }
   async function durableFinalAnswer(job, attempt, turn) {
     const final = extractFinalAnswer({ items: (turn.items ?? []).filter(item => item?.phase === 'final_answer') });
@@ -182,8 +159,8 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
         rpcPhase = 'recovery_read';
         const result = await codex.readThread({ threadId: attempt.nativeThreadId, includeTurns: true });
         const turn = result.thread?.turns?.find(item => item.id === attempt.nativeTurnId);
-        if (turn && turn.status !== 'inProgress') { await finish(job, turn, attempt); return; }
-        if (!turn) { await hold(job, 'agent_turn_unresolved'); return; }
+        if (isTerminalTurn(turn)) { await finish(job, turn, attempt); return; }
+        if (!turn || turn.status !== 'inProgress') throw new Error('agent_turn_unresolved');
       } else {
         rpcPhase = 'thread_admission';
         const oldGeneration = attempt.generation;
