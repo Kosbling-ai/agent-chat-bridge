@@ -277,3 +277,47 @@ test('a crash between no-overwrite restore and private unlink leaves a recoverab
   assert.equal(await readFile(path,'utf8'),'updated!'); assert.equal((await stat(path)).nlink,1);
   await assert.rejects(readFile(quarantine),{code:'ENOENT'});
 });
+
+test('sealed output retirement preserves live source claims, removes changed claims and replays deletion', async t => {
+  const f = await fixture(t);
+  const source = await f.put('report.pdf','first');
+  await f.media.prepare(scope);
+  assert.deepEqual(await f.media.releaseRun(scope),{retired:false});
+  assert.equal((await f.media.prepare({...scope,runId:'other'})).artifacts.length,0);
+  await writeFile(source,'changed');
+  assert.deepEqual(await f.media.releaseRun(scope),{retired:true});
+  assert.deepEqual(await f.media.releaseRun(scope),{retired:true});
+  assert.equal(await readFile(source,'utf8'),'changed');
+  const next = await f.media.prepare({...scope,runId:'new-version',sinceMs:Date.now()});
+  assert.equal(next.artifacts.length,1);
+});
+
+test('more than 2048 completed empty runs retire without filling the bounded spool', {timeout:60000}, async t => {
+  const f = await fixture(t);
+  for(let i=0;i<2050;i++) {
+    const run={...scope,runId:`empty-${i}`};
+    assert.equal((await f.media.prepare(run)).artifacts.length,0);
+    assert.deepEqual(await f.media.releaseRun(run),{retired:true});
+  }
+  assert.deepEqual(await readdir(f.config.spoolDir),[]);
+});
+
+test('retirement replays a crash after manifest deletion before directory durability acknowledgement', async t => {
+  const f=await fixture(t);
+  await f.media.prepare(scope);
+  const [name]=await readdir(f.config.spoolDir);
+  const dir=join(f.config.spoolDir,name), info=await stat(dir);
+  const handle=await open(dir,'r'), prototype=Object.getPrototypeOf(handle);await handle.close();
+  const original=prototype.sync;let seen=0;
+  prototype.sync=async function(){
+    const current=await this.stat();
+    if(current.ino===info.ino && current.dev===info.dev && ++seen===2)throw new Error('synthetic directory sync loss');
+    return original.call(this);
+  };
+  try{await assert.rejects(f.media.releaseRun(scope),/synthetic directory sync loss/);}
+  finally{prototype.sync=original;}
+  assert.deepEqual(await readdir(dir),[]);
+  const restarted=await createOutboundMedia(f.config);
+  assert.deepEqual(await restarted.releaseRun(scope),{retired:true});
+  assert.deepEqual(await readdir(f.config.spoolDir),[]);
+});

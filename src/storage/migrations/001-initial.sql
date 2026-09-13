@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS bridge_jobs (
   payload_hash CHAR(64) CHARACTER SET ascii NOT NULL,
   payload JSON NOT NULL,
   result JSON NULL,
+  input_resource_state VARCHAR(16) NOT NULL DEFAULT 'pending',
+  output_resource_state VARCHAR(16) NOT NULL DEFAULT 'pending',
   status VARCHAR(24) NOT NULL DEFAULT 'pending',
   attempts INT UNSIGNED NOT NULL DEFAULT 0,
   next_attempt_at BIGINT UNSIGNED NOT NULL,
@@ -46,6 +48,7 @@ CREATE TABLE IF NOT EXISTS bridge_jobs (
   KEY jobs_claim (kind, status, next_attempt_at, created_at),
   KEY jobs_lease (status, lease_expires_at),
   KEY jobs_conversation (connection_id, conversation_id, hook_id, kind, sequence, status),
+  KEY jobs_resources (connection_id,kind,id,status),
   KEY jobs_event (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
@@ -88,6 +91,7 @@ CREATE TABLE IF NOT EXISTS bridge_sessions (
   active_run_id CHAR(36) CHARACTER SET ascii NULL,
   last_message_at BIGINT UNSIGNED NULL,
   updated_at BIGINT UNSIGNED NOT NULL,
+  KEY sessions_thread (connection_id,native_thread_id),
   PRIMARY KEY (connection_id, conversation_id, agent_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
@@ -120,7 +124,8 @@ CREATE TABLE IF NOT EXISTS bridge_attempts (
  generation BIGINT UNSIGNED NOT NULL,
  native_thread_id VARCHAR(255) NULL,
  native_turn_id VARCHAR(255) NULL,
- created_at BIGINT UNSIGNED NOT NULL
+ created_at BIGINT UNSIGNED NOT NULL,
+ KEY attempts_thread (connection_id,native_thread_id,job_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 CREATE TABLE IF NOT EXISTS bridge_native_events (
  sequence BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -168,6 +173,7 @@ CREATE TABLE IF NOT EXISTS bridge_thread_owners (
   native_thread_id VARCHAR(255) NOT NULL,
   conversation_id VARCHAR(255) NOT NULL,
   agent_id VARCHAR(128) NOT NULL,
+  resource_retired_at BIGINT UNSIGNED NULL,
   PRIMARY KEY (connection_id,native_thread_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
@@ -192,6 +198,7 @@ CREATE TABLE IF NOT EXISTS bridge_recoveries (
   result_hash CHAR(64) CHARACTER SET ascii NULL,
   created_at BIGINT UNSIGNED NOT NULL,
   updated_at BIGINT UNSIGNED NOT NULL,
+  KEY recoveries_thread (connection_id,native_thread_id,status),
   UNIQUE KEY recovery_idempotency (caller_id,idempotency_key),
   KEY recovery_claim (status,lease_expires_at,created_at,id),
   KEY recovery_run (run_id,id)
@@ -237,5 +244,6 @@ CREATE TABLE IF NOT EXISTS bridge_steering (
   UNIQUE KEY steering_settled (guidance_job_id,settled_lease_token),
   KEY steering_latest (guidance_job_id,sequence),
   KEY steering_parent (target_run_id,status,sequence),
+  KEY steering_thread (connection_id,native_thread_id,status,guidance_job_id),
   KEY steering_scope (connection_id,conversation_id,agent_id,status,guidance_job_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

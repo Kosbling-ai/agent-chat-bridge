@@ -1,3 +1,4 @@
+import { resourceOperations } from './resources.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { withConnection } from './connection.mjs';
 import { assertSchemaCurrent } from './migrations.mjs';
@@ -49,8 +50,9 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
     text(nativeThreadId);
     await c.execute(`INSERT INTO bridge_thread_owners (connection_id,native_thread_id,conversation_id,agent_id)
       VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE native_thread_id=native_thread_id`, [connectionId,nativeThreadId,conversationId,agentId]);
-    const [[owner]] = await c.execute(`SELECT conversation_id,agent_id FROM bridge_thread_owners
-      WHERE connection_id=? AND native_thread_id=?`, [connectionId,nativeThreadId]);
+    const [[owner]] = await c.execute(`SELECT conversation_id,agent_id,resource_retired_at FROM bridge_thread_owners
+      WHERE connection_id=? AND native_thread_id=? FOR UPDATE`, [connectionId,nativeThreadId]);
+    if (owner.resource_retired_at != null) throw new StoreError('resource_retired');
     if (owner.conversation_id !== conversationId || owner.agent_id !== agentId) throw new StoreError('thread_scope_conflict');
   }
   async function lockRegistration(c, connectionId, conversationId) {
@@ -90,6 +92,13 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
           WHERE id=? AND connection_id=? AND conversation_id=?`, [text(input.predecessorId,36),connectionId,conversationId]);
         if (!predecessor || predecessor.kind !== 'artifact_upload' || predecessor.job_id !== input.jobId
             || hash(predecessor.payload.ref) !== hash(ref)) throw new StoreError('invalid_artifact_effect');
+      }
+    }
+    if (input.jobId) {
+      const [[job]] = await c.execute('SELECT output_resource_state FROM bridge_jobs WHERE id=? FOR UPDATE',[input.jobId]);
+      if (job && job.output_resource_state !== 'pending') {
+        const [[existing]] = await c.execute('SELECT id FROM bridge_outbox WHERE connection_id=? AND idempotency_key=?',[connectionId,key]);
+        if (!existing) throw new StoreError('resource_retired');
       }
     }
     const payloadHash = hash({ conversationId, kind: input.kind, payload: input.payload });
@@ -161,6 +170,7 @@ export async function createMysqlStore({ pool, operationTimeoutMs = 1800, onWrit
     });
   }
   return {
+    ...resourceOperations({ read, write, now, decode }),
     ...recoveryOperations({ read, write, now, hash, decode, claimThread }),
     ...rotationOperations({write,now,hash,owned}),
     ...steeringOperations({read,write,now,hash,decode}),

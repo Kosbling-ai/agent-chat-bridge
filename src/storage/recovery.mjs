@@ -70,6 +70,11 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
         if (row.payload_hash !== digest) throw new StoreError('recovery_conflict');
         if (row.id !== id) return { id: row.id, duplicate: true };
         const { attempt } = await target(c, runId, input.expectedGeneration, input.action);
+        if (input.action === 'adopt_turn') {
+          const [[owner]] = await c.execute(`SELECT resource_retired_at FROM bridge_thread_owners
+            WHERE connection_id=? AND native_thread_id=? FOR UPDATE`, [attempt.connection_id,threadId]);
+          if (owner?.resource_retired_at != null) throw new StoreError('resource_retired');
+        }
         await c.execute('UPDATE bridge_recoveries SET connection_id=?,conversation_id=? WHERE id=?', [
           attempt.connection_id, attempt.conversation_id, id,
         ]);

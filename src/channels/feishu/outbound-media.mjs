@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, open, opendir, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, opendir, readFile, readdir, realpath, rename, rmdir, unlink } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { safeObserver } from '../../logger.mjs';
 
@@ -225,6 +225,54 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
       const key = artifact.kind === 'image' ? 'image_key' : 'file_key';
       if (typeof uploadResult?.[key] !== 'string' || !uploadResult[key] || uploadResult[key].length > 512) throw fail('invalid_artifact_upload_result');
       return chat.sendMessage({ conversationId: scope.conversationId, kind: artifact.kind, content: { [key]: uploadResult[key] }, uuid });
+    },
+    // Only core with a durable Store output seal may call this under its chat guard.
+    releaseRun(scope) {
+      return exclusive(async () => {
+        validScope(scope);
+        const dir = runDir(scope);
+        try { await directory(dir); }
+        catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          await syncDirectory(spoolRoot);
+          return { retired: true };
+        }
+        const names = await readdir(dir);
+        if (names.length > 4096) throw fail('artifact_scan_limit');
+        if (names.some(name => name.endsWith('.source'))) return { retired: false };
+        let manifest;
+        try { manifest = await load(scope); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        let comparedBytes = 0;
+        for (const artifact of manifest?.artifacts ?? []) {
+          const path = join(chatDir(scope),artifact.fileName);
+          try {
+            const info = await lstat(path);
+            if (!sameFile(info,artifact.source)) continue;
+            comparedBytes += info.size;
+            if (comparedBytes > maxTotalBytes) throw fail('artifact_scan_limit');
+            const current = await readBounded(path,maxBytes);
+            if (sameFile(current.info,artifact.source) && digest(current.bytes) === artifact.sha256) {
+              return { retired: false }; // This manifest still owns a source version another run could see.
+            }
+          } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        }
+        // Delete the manifest last. A crash retains either its claims, or only a
+        // sealed run's orphan directory which this same operation can finish.
+        const files = names.filter(name => name !== 'manifest.json');
+        for (const name of files) {
+          if (!/^[a-f0-9]{64}$/.test(name) && !/^[a-f0-9-]{36}\.part$/.test(name)) throw fail('unexpected_artifact_entry');
+          const path = join(dir,name), info = await lstat(path);
+          if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid()) throw fail('unsafe_artifact_file');
+          await unlink(path);
+        }
+        await syncDirectory(dir);
+        if (names.includes('manifest.json')) await unlink(join(dir,'manifest.json'));
+        await syncDirectory(dir);
+        await rmdir(dir);
+        await syncDirectory(spoolRoot);
+        return { retired: true };
+      });
     },
     cleanup({ scope, ref, confirmedSent }) {
       return exclusive(async () => {
