@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0] — Unreleased
+
+- Replace the generation worker service path with one leased forward worker backed by the production-derived forward, inbound-message and message-event tables in new migrations 002–003. Persist native start/binding, reply-pending delivery, bounded group context and recovery; a known turn is observed without resubmission and an unknown native outcome is held.
+- Run one Feishu bot/WebSocket and one Codex app-server/executor. Keep hook/outbox communication independent from Agent routing. Authorized groups use `capabilities` (`bridge`, `hook`, or both); hook filtering does not depend on Agent mention/member triggers.
+- Add `executionNamespace` and `deliveryMode` to idempotent run registration. Caller delivery stores `rawAnswer`, safe progress and controlled attachment resources without automatic cards, Typing or replies. Bridge delivery persists cards, Typing, stop and per-item reply receipts, including explicit unknown outcomes that are not automatically resent.
+- Preserve ordinary run/event pagination through a safe public projection. Generation-ledger attempt reads and recovery/reset writes return `409 unsupported_execution_model`; existing recovery records remain readable within their original authorization scope.
+- Keep business polling, lark-cli reads, scheduling, message-ID deduplication and specialized cards in the business producer. Bridge hooks remain lightweight event notifications.
+
+This is development metadata, not a tag, published release, deployment, production replacement or completed Kosbling producer migration. Validation uses synthetic providers and a disposable MySQL 8.4 container; no real Feishu or Codex acceptance was run.
+
+Database migrations 002 and 003 target the bridge's own schema. They do not convert or transparently upgrade the Kosbling production/P schema. The configuration schema remains 1, but group authorization now validates optional `capabilities`; review existing hook-only groups before using this version.
+
 ## [0.1.1] — 2026-09-13
 
 - Restore final Agent replies and existing input-rejection notices as Feishu JSON 2.0 cards, preserving Markdown, bounded multipart delivery and durable outbox ordering. This does not add dynamic progress cards, stop callbacks or new native-failure notification semantics.

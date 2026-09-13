@@ -1,0 +1,5 @@
+{
+  "feishu": {
+    "httpProxyEnv": "BRIDGE_FEISHU_PROXY_URL"
+  }
+}

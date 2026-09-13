@@ -3,8 +3,14 @@ import { readFile } from 'node:fs/promises';
 import { withConnection } from './connection.mjs';
 import { StoreError } from './errors.mjs';
 
-const SQL = await readFile(new URL('./migrations/001-initial.sql', import.meta.url), 'utf8');
-const CHECKSUM = createHash('sha256').update(SQL).digest('hex');
+const MIGRATIONS = await Promise.all([
+  [1, './migrations/001-initial.sql'],
+  [2, './migrations/002-codex-sessions.sql'],
+  [3, './migrations/003-forward-runtime.sql'],
+].map(async ([version, path]) => {
+  const sql = await readFile(new URL(path, import.meta.url), 'utf8');
+  return { version, sql, checksum: createHash('sha256').update(sql).digest('hex') };
+}));
 const LEDGER = `CREATE TABLE IF NOT EXISTS bridge_schema_migrations (
   version INT UNSIGNED PRIMARY KEY, checksum CHAR(64) CHARACTER SET ascii NOT NULL,
   applied_at BIGINT UNSIGNED NOT NULL
@@ -18,8 +24,8 @@ export async function assertSchemaCurrent(pool) {
       if (error.code === 'ER_NO_SUCH_TABLE') throw new StoreError('schema_migration_required');
       throw error;
     }
-    if (rows.length !== 1 || Number(rows[0].version) !== 1 || rows[0].checksum !== CHECKSUM) throw new StoreError('schema_version_mismatch');
-    return { version: 1 };
+    if (rows.length !== MIGRATIONS.length || rows.some((row, index) => Number(row.version) !== MIGRATIONS[index].version || row.checksum !== MIGRATIONS[index].checksum)) throw new StoreError('schema_version_mismatch');
+    return { version: MIGRATIONS.at(-1).version };
   });
 }
 
@@ -34,13 +40,16 @@ export async function migrate(pool) {
     try {
       await connection.query(LEDGER);
       const [versions] = await connection.query('SELECT version, checksum FROM bridge_schema_migrations ORDER BY version');
-      if (versions.length) {
-        if (versions.length !== 1 || Number(versions[0].version) !== 1 || versions[0].checksum !== CHECKSUM) throw new StoreError('schema_version_mismatch');
-        return { version: 1, applied: false };
+      if (versions.length > MIGRATIONS.length || versions.some((row, index) => Number(row.version) !== MIGRATIONS[index]?.version || row.checksum !== MIGRATIONS[index]?.checksum)) {
+        throw new StoreError('schema_version_mismatch');
       }
-      for (const statement of SQL.split(';').map((s) => s.trim()).filter(Boolean)) await connection.query(statement);
-      await connection.execute('INSERT INTO bridge_schema_migrations (version, checksum, applied_at) VALUES (1, ?, ?)', [CHECKSUM, Date.now()]);
-      return { version: 1, applied: true };
+      let applied = false;
+      for (const migration of MIGRATIONS.slice(versions.length)) {
+        for (const statement of migration.sql.split(';').map((s) => s.trim()).filter(Boolean)) await connection.query(statement);
+        await connection.execute('INSERT INTO bridge_schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)', [migration.version, migration.checksum, Date.now()]);
+        applied = true;
+      }
+      return { version: MIGRATIONS.at(-1).version, applied };
     } finally {
       await connection.query('SELECT RELEASE_LOCK(?)', [lock]);
     }

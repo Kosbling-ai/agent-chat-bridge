@@ -83,6 +83,9 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
     removeReaction({ messageId, reactionId }) {
       return call('messageReaction', 'delete', { path: { message_id: required(messageId), reaction_id: required(reactionId) } }, true);
     },
+    listReactions({ messageId, pageSize = 50 }) {
+      return call('messageReaction', 'list', { path: { message_id: required(messageId) }, params: page({ pageSize }) });
+    },
     uploadImage({ bytes }) {
       if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > Math.min(maxMediaBytes, 10 * 1024 * 1024)) throw new FeishuChatError('invalid_media_bytes', 'failed');
       return call('image', 'create', { data: { image_type: 'message', image: bytes } }, true, false, 'image_key');

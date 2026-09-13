@@ -16,7 +16,7 @@ export function probeFeishuConnection(wsClient) {
 
 // onEvent must commit inbox + routing atomically, enforce signal/deadline in
 // its storage operations, and deduplicate late/uncertain commits on redelivery.
-export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '', onEvent,
+export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '', onEvent, onCardAction,
   deadlineMs = 2000, log = () => {}, reportError = () => {} }) {
   if (!sdk?.EventDispatcher || !wsClient || typeof onEvent !== 'function' || !connectionId) {
     throw new Error('invalid_feishu_adapter_dependencies');
@@ -71,9 +71,23 @@ export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '
       active.delete(cancel);
     }
   }
+  async function receiveCardAction(payload) {
+    if (state === 'stopped') throw new FeishuIngressError('feishu_stopped');
+    if (typeof onCardAction !== 'function') return {};
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => onCardAction(payload)),
+        new Promise(resolve => { timer = setTimeout(() => resolve({ toast: { type: 'info', content: '正在确认停止请求，请稍后查看卡片' } }), 2500); }),
+      ]);
+    } catch {
+      return { toast: { type: 'error', content: '暂未确认停止，请稍后重试' } };
+    } finally { clearTimeout(timer); }
+  }
   const dispatcher = new sdk.EventDispatcher({}).register({
     [RECEIVE]: (data) => receive(RECEIVE, data),
     [RECALL]: (data) => receive(RECALL, data),
+    'card.action.trigger': receiveCardAction,
   });
   return {
     dispatcher,

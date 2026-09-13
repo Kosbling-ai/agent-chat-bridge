@@ -6,11 +6,11 @@
     "passwordEnv": "BRIDGE_DB_PASSWORD", "databaseEnv": "BRIDGE_DB_DATABASE"
   },
   "codex": { "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"] },
-  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id" },
+  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id", "displayName": "Agent" },
   "routing": {
     "version": "1",
     "privateUserIds": ["replace_with_allowed_open_id"],
-    "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "passiveContext": true }]
+    "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "passiveContext": true, "capabilities": ["bridge", "hook"] }]
   },
   "auth": { "clients": [{ "id": "application", "tokenEnv": "BRIDGE_API_TOKEN", "conversationIds": ["replace_with_chat_id"], "admin": false }] },
   "hooks": [],

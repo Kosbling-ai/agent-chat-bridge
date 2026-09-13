@@ -13,7 +13,7 @@ function identifier(value, max = 512) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw new ApiError('invalid_identifier');
   return value;
 }
-export function createApi({ config, store, chat, tokens }) {
+export function createApi({ config, store, forwardRuntime, chat, tokens }) {
   const connectionId = config.feishu.connectionId;
   const clients = config.auth.clients.map(client => {
     const token = tokens[client.id];
@@ -59,40 +59,40 @@ export function createApi({ config, store, chat, tokens }) {
     const url = new URL(request.url, 'http://bridge.local');
     const path = url.pathname;
     if (request.method === 'POST' && path === '/v1/runs') {
-      const input = fields(await body(request, 512 * 1024), ['conversationId', 'idempotencyKey', 'text'], ['conversationId', 'idempotencyKey']);
+      const input = fields(await body(request, 512 * 1024), ['conversationId', 'idempotencyKey', 'text', 'executionNamespace', 'deliveryMode'], ['conversationId', 'idempotencyKey']);
       if (typeof input.text !== 'string' || !input.text.trim()) throw new ApiError('invalid_text');
       if (Buffer.byteLength(input.text) > 64 * 1024) throw new ApiError('text_too_large', 413);
+      if (input.executionNamespace !== undefined && (typeof input.executionNamespace !== 'string' || !/^[a-z0-9][a-z0-9._:/-]{0,127}$/i.test(input.executionNamespace))) throw new ApiError('invalid_execution_namespace');
+      if (input.deliveryMode !== undefined && !['bridge','caller'].includes(input.deliveryMode)) throw new ApiError('invalid_delivery_mode');
       authorize(client, input.conversationId);
-      const idempotencyKey = identifier(`api:${client.id}:${input.idempotencyKey}`, 255);
-      const result = await store.enqueueJob({ connectionId, conversationId: input.conversationId, kind: 'agent', idempotencyKey, payload: { text: input.text, source: 'api', callerId: client.id } });
+      const idempotencyKey = identifier(input.idempotencyKey, 255);
+      const result = await forwardRuntime.submit({source:'api',callerId:client.id,idempotencyKey,executionNamespace:input.executionNamespace,message:{conversationId:input.conversationId,conversationType:'group',text:input.text},actor:{type:'service',id:client.id},prompt:input.text,deliveryMode:input.deliveryMode||'bridge'});
       return { status: 202, body: { id: result.id, duplicate: result.duplicate } };
     }
+    const resource = /^\/v1\/runs\/([\w-]+)\/resources\/(\d+)$/.exec(path);
+    if(request.method==='GET'&&resource){const current=await forwardRuntime.getRun({id:resource[1]});if(!current)throw new ApiError('not_found',404);authorize(client,current.conversationId);const value=await forwardRuntime.getResource({id:resource[1],index:Number(resource[2])});if(!value)throw new ApiError('not_found',404);return{status:200,body:value};}
     const run = /^\/v1\/runs\/([\w-]+)(\/(?:events|attempt))?$/.exec(path);
     if (request.method === 'GET' && run) {
-      const row = await store.getJob({ id: run[1] });
-      if (!row || row.connectionId !== connectionId || row.kind !== 'agent') throw new ApiError('not_found', 404);
+      const row = await forwardRuntime.getRun({ id: run[1] });
+      if (!row) throw new ApiError('not_found', 404);
       authorize(client, row.conversationId);
       if (run[2] === '/attempt') {
         if (!client.admin) throw new ApiError('forbidden', 403);
-        const [attempt, steering] = await Promise.all([store.getAgentAttempt({ id: row.id }), store.getSteerAttempt({ id: row.id })]);
-        return { status: 200, body: { attempt, steering } };
+        throw new ApiError('unsupported_execution_model',409);
       }
-      return { status: 200, body: run[2] ? { events: await store.readRunEvents({ runId: row.id, ...pagination(url) }) } : publicJob(row) };
+      if (!run[2]) return { status: 200, body: row };
+      const page=pagination(url);
+      const events = await forwardRuntime.readRunEvents({ id: row.id, after: page.afterSequence, limit: page.limit });
+      return { status: 200, body: { events: events.items, nextCursor: events.nextCursor } };
     }
     if (request.method === 'POST' && path === '/v1/recoveries') {
       if (!client.admin) throw new ApiError('forbidden', 403);
-      const input = fields(await body(request), ['runId', 'idempotencyKey', 'generation', 'action', 'evidence', 'nativeThreadId', 'nativeTurnId'], ['runId', 'idempotencyKey', 'action']);
+      const input = fields(await body(request), ['runId', 'idempotencyKey', 'generation', 'action', 'evidence', 'nativeThreadId', 'nativeTurnId'], ['runId']);
       identifier(input.runId, 36);
-      if (!Number.isSafeInteger(input.generation) || input.generation < 1) throw new ApiError('invalid_generation');
-      if (!['adopt_turn', 'abandon_verified', 'abandon_guidance_verified'].includes(input.action) || typeof input.evidence !== 'string' || !input.evidence.trim() || input.evidence.length > 4096) throw new ApiError('invalid_recovery');
-      if (input.action === 'adopt_turn') { identifier(input.nativeThreadId, 255); identifier(input.nativeTurnId, 255); }
-      else if (input.nativeThreadId !== undefined || input.nativeTurnId !== undefined) throw new ApiError('invalid_recovery');
-      const job = await store.getJob({ id: input.runId });
-      if (!job || job.connectionId !== connectionId || job.kind !== 'agent') throw new ApiError('not_found', 404);
+      const job = await forwardRuntime.getRun({ id: input.runId });
+      if (!job) throw new ApiError('not_found', 404);
       authorize(client, job.conversationId);
-      const result = await store.enqueueRecovery({ runId: job.id, callerId: client.id, idempotencyKey: identifier(input.idempotencyKey, 255), expectedGeneration: input.generation, action: input.action, evidence: input.evidence,
-        ...(input.action === 'adopt_turn' ? { nativeThreadId: input.nativeThreadId, nativeTurnId: input.nativeTurnId } : {}) });
-      return { status: 202, body: result };
+      throw new ApiError('unsupported_execution_model',409);
     }
     const recovery = /^\/v1\/recoveries\/([\w-]+)$/.exec(path);
     if (request.method === 'GET' && recovery) {
@@ -149,8 +149,7 @@ export function createApi({ config, store, chat, tokens }) {
       const input = fields(await body(request), ['conversationId', 'generation'], ['conversationId']);
       authorize(client, input.conversationId);
       if (!client.admin) throw new ApiError('forbidden', 403);
-      if (!Number.isInteger(input.generation) || input.generation < 1) throw new ApiError('invalid_generation');
-      return { status: 200, body: await store.resetSession({ connectionId, conversationId: input.conversationId, agentId: 'codex', expectedGeneration: input.generation }) };
+      throw new ApiError('unsupported_execution_model',409);
     }
     throw new ApiError('not_found', 404);
   };

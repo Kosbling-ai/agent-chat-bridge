@@ -1,12 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { validateConfig } from '../src/config.mjs';
 import { startService } from '../src/service.mjs';
-import { createCodexAdapter } from '../src/agents/codex/adapter.mjs';
 
 const proxyNames = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'];
 const base = {
@@ -56,24 +54,21 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     const proxyEnv = mapped ? Object.fromEntries(proxyNames.map(name => [name, name.toLowerCase() === 'no_proxy' ? 'BRIDGE_CODEX_NO_PROXY' : 'BRIDGE_CODEX_PROXY'])) : undefined;
     const snapshot = { ...injected };
     const parentProxy = Object.fromEntries(proxyNames.map(name => [name, process.env[name]]));
-    let child, resolveObserved, resolveSocket;
+    let resolveObserved, resolveSocket;
     const observed = new Promise(resolve => { resolveObserved = resolve; });
     const socket = new Promise(resolve => { resolveSocket = resolve; });
     const controller = new AbortController();
     const config = validateConfig({ ...base, codex: { bin: process.execPath, cwd: directory, envNames: ['PATH', 'HOME', ...selected], ...(proxyEnv ? { proxyEnv } : {}) } });
     const service = startService({ config, configPath: join(directory, 'config.json'), env: injected, signal: controller.signal, dependencies: {
       pool: () => ({}),
-      store: async () => ({ close: async () => {}, bufferNativeEvent: async ({ payload }) => { resolveObserved(payload.params); } }),
-      codex: (options, callbacks) => createCodexAdapter(options, { ...callbacks, spawnProcess: (_bin, args, options) => {
-        assert.deepEqual(args, ['app-server', '--listen', 'stdio://']);
-        child = spawn(process.execPath, [fixture], options); return child;
-      } }),
+      store: async () => ({ close: async () => {} }),
+      executor: ({childEnv}) => { resolveObserved(Object.fromEntries(observedNames.map(name=>[name,childEnv[name]??null]))); return {status:()=>({closing:false,restartPending:null}),close:async()=>{}}; },
       sdk: { Client: class { constructor(options) { assert.equal(options.appId, injected.TEST_APP); assert(!('proxy' in options)); } }, WSClient: class {}, defaultHttpInstance: {} },
       chat: () => ({}), media: async () => ({}), outbound: async () => ({}),
       feishu: () => ({ start: () => { resolveSocket(); return new Promise(() => {}); }, stop() {} }),
     } });
     const closed = assert.rejects(service, { code: 'startup_cancelled' });
-    t.after(() => { controller.abort(); if (child?.exitCode === null && child?.signalCode === null) child.kill('SIGKILL'); });
+    t.after(() => { controller.abort(); });
     try {
       const [actual] = await Promise.all([observed, socket]);
       for (const name of observedNames) assert.equal(actual[name], proxyEnv?.[name] ? injected[proxyEnv[name]] : selected.includes(name) ? injected[name] : null, name);
