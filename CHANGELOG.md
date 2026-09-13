@@ -1,6 +1,13 @@
 # Changelog
 
-## [0.2.0] — Unreleased
+## [0.2.1] — Unreleased
+
+- Use the Codex app-server protocol value `auto_review` for `approvalsReviewer` on thread start, thread resume and turn start. The previous `auto` value is not part of the current protocol enum and caused an existing binding to fail before native turn admission.
+- Classify rejected Codex RPCs with a stable bridge error code and RPC method while keeping provider error text out of logs and persisted public state. A rejected turn-start remains conservatively unconfirmed.
+
+No schema or configuration migration is required. Validation uses a schema-strict synthetic app-server; no real message or model turn is part of this patch's acceptance.
+
+## [0.2.0] — Development snapshot
 
 - Replace the generation worker service path with one leased forward worker backed by the production-derived forward, inbound-message and message-event tables in new migrations 002–003. Persist native start/binding, reply-pending delivery, bounded group context and recovery; a known turn is observed without resubmission and an unknown native outcome is held.
 - Run one Feishu bot/WebSocket and one Codex app-server/executor. Keep hook/outbox communication independent from Agent routing. Authorized groups use `capabilities` (`bridge`, `hook`, or both); hook filtering does not depend on Agent mention/member triggers.

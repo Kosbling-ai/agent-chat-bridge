@@ -72,7 +72,7 @@ export class CodexAppServerClient {
     child.on('error', (error) => { if (this.child === child) this.fail(error, child); });
     child.once('exit', (code, signal) => this.handleExit(new Error(`codex app-server exited${code == null ? '' : ` code=${code}`}${signal ? ` signal=${signal}` : ''}`), child));
     await this.request('initialize', {
-      clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.2.0' },
+      clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.2.1' },
       capabilities: { experimentalApi: true },
     }, { skipStart: true });
     if (this.child !== child) throw new Error('codex app-server child changed during initialize');
@@ -94,7 +94,12 @@ export class CodexAppServerClient {
         error.code = 'CODEX_RPC_TIMEOUT'; error.outcome = 'unknown'; reject(error); this.fail(error, child);
       }, duration);
       timer.unref?.();
-      this.pending.set(id, { method, child, timer, resolve, reject });
+      this.pending.set(id, {
+        method, child, timer, resolve, reject,
+        threadId: typeof params?.threadId === 'string' ? params.threadId : undefined,
+        expectedTurnId: typeof params?.expectedTurnId === 'string' ? params.expectedTurnId
+          : method === 'turn/interrupt' && typeof params?.turnId === 'string' ? params.turnId : undefined,
+      });
     });
     try { child.stdin.write(`${JSON.stringify({ id, method, params })}\n`); }
     catch (error) { this.rejectPending(id, error); this.fail(error, child); }
@@ -137,8 +142,11 @@ export class CodexAppServerClient {
     const pending = this.pending.get(message.id);
     if (!pending || pending.child !== child) return;
     this.pending.delete(message.id); clearTimeout(pending.timer);
-    if (message.error) pending.reject(classifyCodexRpcError(message.error));
-    else pending.resolve(message.result);
+    if (message.error) {
+      const error = classifyCodexRpcError(message.error, pending);
+      emitLog(this.log, 'warning', 'rpc_request', 'rejected', { rpc_method: error.rpcMethod, error_code: error.code });
+      pending.reject(error);
+    } else pending.resolve(message.result);
   }
 
   close(reason = 'shutdown') {

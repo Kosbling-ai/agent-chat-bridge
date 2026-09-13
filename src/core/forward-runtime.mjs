@@ -211,20 +211,20 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         await feedback?.prepare?.(job, {}, state).catch(() => {});
         await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
         await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, held: true, errorCode: error.code || 'native_outcome_unknown' });
-        log('warning', 'forward_execution', 'held', { code: error.code || 'native_outcome_unknown' });
+        log('warning', 'forward_execution', 'held', { code: error.code || 'native_outcome_unknown', stage: error.rpcMethod || 'execute' });
         return;
       }
       if (retryable(error) && (error.code === 'CODEX_THREAD_BUSY' || job.attempts < maxAttempts)) {
         await feedback?.prepare?.(job, {}, state).catch(() => {});
         await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, preserveAttempt: error.code === 'CODEX_THREAD_BUSY', errorCode: error.code || 'forward_execution_failed', nextAttemptAt: now() + 1000 });
-        log('warning', 'forward_execution', 'retrying', { code: error.code || 'forward_execution_failed' });
+        log('warning', 'forward_execution', 'retrying', { code: error.code || 'forward_execution_failed', stage: error.rpcMethod || 'execute' });
         return;
       }
       execution = { ...execution, terminal: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', finishedAt: now() };
       const failed = { failed: true, turnStatus: execution.terminal, answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : '执行未完成，请稍后重试。', rawAnswer: '', attachments: [], execution };
       await feedback?.prepare?.(job, failed, state);
       await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: error.code || 'forward_execution_failed' });
-      log('error', 'forward_execution', 'failed', { code: error.code || 'forward_execution_failed' });
+      log('error', 'forward_execution', 'failed', { code: error.code || 'forward_execution_failed', stage: error.rpcMethod || 'execute' });
     }
   }
 

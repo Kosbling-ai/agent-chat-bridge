@@ -1,6 +1,7 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
+import { classifyCodexRpcError as classifyProtocolError } from './protocol-errors.mjs';
 
 export const DEFAULT_IDLE_CLOSE_MS = 60_000;
 export const DEFAULT_CLOSE_GRACE_MS = 5_000;
@@ -19,9 +20,16 @@ export function resolveSharedHome({ configuredHome = '', inheritedHome = process
   }
   return selected;
 }
-export function classifyCodexRpcError(value) {
-  const error = new Error(typeof value === 'string' ? value : value?.message || value?.description || 'Codex RPC failed');
-  if (/\bactive writer\b/i.test(error.message)) {
+export function classifyCodexRpcError(value, request = {}) {
+  const providerText = typeof value === 'string' ? value : value?.message || value?.description || '';
+  const reason = classifyProtocolError(value, request);
+  const error = new Error('Codex RPC was rejected');
+  error.code = reason?.kind === 'thread_archived' ? 'CODEX_THREAD_ARCHIVED'
+    : request.method === 'turn/start' ? 'CODEX_TURN_START_UNCONFIRMED' : 'CODEX_RPC_REJECTED';
+  error.outcome = request.method === 'turn/start' && !reason ? 'unknown' : 'rejected';
+  error.rpcMethod = /^[a-z][a-z0-9_-]*\/[a-z][a-z0-9_-]*$/i.test(request.method || '') ? request.method : 'unknown';
+  if (reason) error.reason = reason;
+  if (/\bactive writer\b/i.test(providerText)) {
     error.message = 'Codex thread is active in another client';
     error.code = 'CODEX_THREAD_BUSY';
     error.retryable = true;

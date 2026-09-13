@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { createCodexExecutor, projectCodexItem } from '../src/agents/codex/executor.mjs';
 import { CodexAppServerClient, codexAppServerArgs } from '../src/agents/codex/app-server-client.mjs';
 import { IdleLifecycle } from '../src/agents/codex/idle-lifecycle.mjs';
+import { steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from '../src/agents/codex/codex-turn-recovery.mjs';
 import { deriveExecutionScope, codexBindingOpenId } from '../src/agents/codex/thread-scope.mjs';
 import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 import { outboxRelativeDirectory } from '../src/agents/codex/prompt.mjs';
@@ -54,6 +55,11 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, comple
       if (hangMethods.has(message.method)) return;
       const respond = (result, delayMs = 0) => setTimeout(() => instance.send({ id: message.id, result }), delayMs);
       if (message.method === 'initialize') respond({});
+      else if (['thread/start', 'thread/resume', 'turn/start'].includes(message.method)
+        && Object.hasOwn(message.params, 'approvalsReviewer')
+        && !['user', 'auto_review', 'guardian_subagent'].includes(message.params.approvalsReviewer)) {
+        instance.send({ id: message.id, error: { code: -32602, message: 'SYNTHETIC_SECRET invalid approvalsReviewer' } });
+      }
       else if (message.method === 'thread/start') {
         const id = `thread-${++threadNumber}`; loaded.add(id); respond({ thread: { id } });
       } else if (message.method === 'thread/resume') {
@@ -77,7 +83,7 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, comple
 }
 
 function config(cwd) {
-  return { bin: '/synthetic/codex', cwd, sharedHome: join(cwd, 'home'), rpcTimeoutMs: 1000, closeGraceMs: 20, idleCloseMs: 10, networkAccess: false, model: 'gpt-test', reasoningEffort: 'medium', sandbox: 'workspace-write', approvalPolicy: 'auto', approvalsReviewer: 'auto', allowedGroupChatIds: new Set() };
+  return { bin: '/synthetic/codex', cwd, sharedHome: join(cwd, 'home'), rpcTimeoutMs: 1000, closeGraceMs: 20, idleCloseMs: 10, networkAccess: false, model: 'gpt-test', reasoningEffort: 'medium', sandbox: 'workspace-write', approvalPolicy: 'auto', approvalsReviewer: 'auto_review', allowedGroupChatIds: new Set() };
 }
 
 test('system scopes are caller/namespace isolated while chat remains in the binding key', () => {
@@ -104,6 +110,91 @@ test('app-server starts lazily with a controlled environment and explicit policy
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test('executor uses the schema reviewer enum for new and resumed threads and turns', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  const input = { bindingOpenId: 'ou-human', chatId: 'chat', chatType: 'p2p', messageId: 'm1', senderOpenId: 'ou-human', senderName: 'User', prompt: 'hello', busyPolicy: 'steer' };
+  try {
+    const defaultConfig = config(cwd);
+    delete defaultConfig.approvalsReviewer;
+    const createdRuntime = fakeRuntime();
+    const created = createCodexExecutor({ config: defaultConfig, sessionStore: memoryStore(), childEnv: { PATH: '/safe/bin' }, spawnImpl: createdRuntime.spawnImpl });
+    await created.execute(input);
+    for (const method of ['thread/start', 'turn/start']) {
+      assert.equal(createdRuntime.calls.find(call => call.method === method).params.approvalsReviewer, 'auto_review');
+    }
+    await created.close();
+
+    const resumedRuntime = fakeRuntime();
+    const resumedStore = memoryStore([{ feishuOpenId: 'ou-human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', created: false }]);
+    const resumed = createCodexExecutor({ config: defaultConfig, sessionStore: resumedStore, childEnv: { PATH: '/safe/bin' }, spawnImpl: resumedRuntime.spawnImpl });
+    await resumed.execute({ ...input, messageId: 'm2' });
+    for (const method of ['thread/resume', 'turn/start']) {
+      assert.equal(resumedRuntime.calls.find(call => call.method === method).params.approvalsReviewer, 'auto_review');
+    }
+    await resumed.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('RPC rejection exposes only a stable code and request stage', async () => {
+  const logs = [];
+  const child = new FakeChild((message, instance) => {
+    if (message.method === 'initialize') instance.send({ id: message.id, result: {} });
+    else instance.send({ id: message.id, error: { code: -32602, message: 'SYNTHETIC_SECRET provider detail' } });
+  });
+  const client = new CodexAppServerClient({ config: config('/private/tmp'), spawnImpl: () => child, log: (...args) => logs.push(args) });
+  await assert.rejects(client.request('thread/resume', { threadId: 'thread-existing' }), error => {
+    assert.equal(error.code, 'CODEX_RPC_REJECTED');
+    assert.equal(error.rpcMethod, 'thread/resume');
+    assert.equal(error.outcome, 'rejected');
+    assert.equal(error.message, 'Codex RPC was rejected');
+    return true;
+  });
+  assert.doesNotMatch(JSON.stringify(logs), /SYNTHETIC_SECRET/);
+  assert.match(JSON.stringify(logs), /CODEX_RPC_REJECTED/);
+  assert.match(JSON.stringify(logs), /thread\/resume/);
+  await client.close();
+});
+
+test('client-safe RPC reasons retain mismatch recovery boundaries', async () => {
+  const expected = '01a0130b-c44b-7923-bd40-aecef0e86ff8';
+  const older = '01a00f75-2d21-7163-912d-bdfb80d328b4';
+  const oldest = '019fffff-0000-7000-8000-000000000001';
+  const newer = '01a01339-f7dc-76a2-becf-d9188b65870d';
+
+  function clientFor(handler) {
+    const child = new FakeChild((message, instance) => {
+      if (message.method === 'initialize') instance.send({ id: message.id, result: {} });
+      else handler(message, instance);
+    });
+    return new CodexAppServerClient({ config: config('/private/tmp'), spawnImpl: () => child });
+  }
+
+  let steerAttempts = 0;
+  const recovering = clientFor((message, child) => {
+    if (message.method === 'turn/interrupt') {
+      child.send({ id: message.id, error: { code: -32000, message: `expected active turn id \`${older}\` but found \`${oldest}\`` } });
+    } else if (++steerAttempts === 1) {
+      child.send({ id: message.id, error: { code: -32000, message: `expected active turn id \`${expected}\` but found \`${older}\`` } });
+    } else if (steerAttempts === 2) {
+      child.send({ id: message.id, error: { code: -32000, message: 'no active turn to steer' } });
+    } else child.send({ id: message.id, result: { turnId: expected } });
+  });
+  assert.equal((await steerTurnWithMismatchRecovery({
+    request: recovering.request.bind(recovering), threadId: 'thread', expectedTurnId: expected,
+    input: [{ type: 'text', text: 'synthetic' }], wait: async () => {},
+  })).turnId, expected);
+  await recovering.close();
+
+  const superseded = clientFor((message, child) => {
+    child.send({ id: message.id, error: { code: -32000, message: `expected active turn id \`${expected}\` but found \`${newer}\`` } });
+  });
+  await assert.rejects(steerTurnWithMismatchRecovery({
+    request: superseded.request.bind(superseded), threadId: 'thread', expectedTurnId: expected,
+    input: [{ type: 'text', text: 'synthetic' }], wait: async () => {},
+  }), TurnRecoverySupersededError);
+  await superseded.close();
+});
+
 test('idle lifecycle gates new work until owned close finishes', async () => {
   let finish; let entered = false;
   const lifecycle = new IdleLifecycle({ close: () => new Promise((resolve) => { finish = resolve; }), idleMs: 50 });
@@ -128,7 +219,7 @@ test('executor binds, records start intent/bound, and completes from an event ra
     const threadStart = runtime.calls.find((call) => call.method === 'thread/start');
     const turnStart = runtime.calls.find((call) => call.method === 'turn/start');
     assert.equal(threadStart.params.approvalPolicy, 'auto');
-    assert.equal(threadStart.params.approvalsReviewer, 'auto');
+    assert.equal(threadStart.params.approvalsReviewer, 'auto_review');
     assert.equal(threadStart.params.sandbox, 'workspace-write');
     assert.equal(threadStart.params.model, 'gpt-test');
     assert.equal(threadStart.params.config.model_reasoning_effort, 'medium');

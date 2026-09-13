@@ -1,7 +1,15 @@
 const ACTIVE_TURN_MISMATCH_RE = /expected active turn id\s+[`'"]?([^`'"\s]+)[`'"]?\s+but found\s+[`'"]?([^`'"\s]+)[`'"]?/i;
 const NO_ACTIVE_TURN_RE = /(?:^|:\s*)no active turn(?:\s+to\s+(?:steer|interrupt))?\b/i;
+const safeId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,512}$/.test(value);
 
 export function parseActiveTurnMismatch(error, expectedTurnId = '') {
+  const reason = error?.reason;
+  if (reason?.kind === 'active_turn_mismatch') {
+    const expected = reason.expectedTurnId;
+    const actual = reason.actualTurnId;
+    if (!safeId(expected) || !safeId(actual) || (expectedTurnId && expected !== expectedTurnId)) return null;
+    return { expectedTurnId: expected, actualTurnId: actual, text: 'active_turn_mismatch' };
+  }
   const text = String(error?.message || error || '').trim();
   const match = text.match(ACTIVE_TURN_MISMATCH_RE);
   if (!match) return null;
@@ -11,6 +19,7 @@ export function parseActiveTurnMismatch(error, expectedTurnId = '') {
   return { expectedTurnId: expected, actualTurnId: actual, text };
 }
 export function isNoActiveTurnError(error) {
+  if (error?.reason?.kind === 'no_active_turn') return true;
   return NO_ACTIVE_TURN_RE.test(String(error?.message || error || '').trim());
 }
 
