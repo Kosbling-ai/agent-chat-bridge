@@ -5,6 +5,7 @@ import { extractFinalAnswer, buildConversationPrompt } from './format.mjs';
 import { extractMessageText } from '../channels/feishu/media.mjs';
 import { createAnswerProjection } from './answer-projection.mjs';
 import { createRecoveryHandler } from './recovery.mjs';
+import { createSessionRotation } from './session-rotation.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -22,6 +23,7 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
   const stopController = new AbortController();
   const scope = conversationId => ({ connectionId, conversationId });
   const recover = workspace ? createRecoveryHandler({ store, codex, workspace, connectionId, log }) : null;
+  const rotate = workspace ? createSessionRotation({ store, codex, workspace, connectionId, config: config.codex ?? {}, log }) : null;
   function fault(code) { healthy = false; log('error', 'core', 'failed', { code }); }
   async function ingest(event, context = {}) {
     if (stopping || context.signal?.aborted) throw new Error('ingress_stopped');
@@ -129,6 +131,14 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
     log('info', 'agent_run', 'started');
     let attempt, rpcPhase;
     try {
+      if (rotate) {
+        try { await rotate(job); }
+        catch {
+          await store.retryJob({ id: job.id, leaseToken: job.leaseToken, errorCode: 'session_rotation_pending', nextAttemptAt: Date.now() + 1000 });
+          log('warning', 'session_rotation', 'pending', { code: 'session_rotation_pending' });
+          return;
+        }
+      }
       const payload = parse(job.payload);
       const outboxDir = outbound && payload.event?.conversationType === 'p2p' ? await outbound.directory({ ...scope(job.conversationId), runId: job.id }) : undefined;
       let prepared;

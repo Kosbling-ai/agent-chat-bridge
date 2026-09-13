@@ -74,9 +74,15 @@ function validateRuntime(raw) {
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
   object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
-  object(raw.codex, ['bin', 'cwd', 'envNames', 'model'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'envNames', 'model', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(reference) };
   if (raw.codex.model !== undefined) codex.model = string(raw.codex.model);
+  codex.rolloverIdleMs = raw.codex.rolloverIdleMs ?? 2 * 24 * 60 * 60 * 1000;
+  if (!Number.isSafeInteger(codex.rolloverIdleMs) || codex.rolloverIdleMs < 0 || codex.rolloverIdleMs > 365 * 24 * 60 * 60 * 1000) throw new ConfigError('invalid_idle_rollover');
+  codex.rolloverOnRulesUpdate = raw.codex.rolloverOnRulesUpdate ?? true;
+  if (typeof codex.rolloverOnRulesUpdate !== 'boolean') throw new ConfigError('invalid_rules_rollover');
+  codex.rulesFiles = strings(raw.codex.rulesFiles ?? ['AGENTS.md']);
+  if (codex.rulesFiles.length > 20 || codex.rulesFiles.some(path => path.startsWith('/') || path.split(/[\\/]/).includes('..'))) throw new ConfigError('invalid_rules_files');
   object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes'], 'invalid_feishu_fields');
   if (raw.feishu.catchup !== undefined && typeof raw.feishu.catchup !== 'boolean') throw new ConfigError('invalid_catchup_flag');
   const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };

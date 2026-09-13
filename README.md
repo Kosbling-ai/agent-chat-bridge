@@ -2,7 +2,7 @@
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
-The runtime now assembles MySQL, Codex app-server, Feishu WebSocket and authenticated task/chat APIs. **This is an integration stage, not yet a production replacement:** text execution is verified with a real isolated Store and synthetic providers; inbound media, edit/card/catch-up and operator recovery work remain. See the [capability matrix](docs/runtime.md).
+The runtime assembles MySQL, Codex app-server, one Feishu WebSocket owner, scoped hooks and authenticated task/chat APIs. Private image input, Agent-generated file delivery, first-receipt catchup and audited operator recovery have local integration coverage with isolated MySQL and synthetic providers. Business edit/reconcile and document/table/contact tools remain outside the bridge. This is not yet a production replacement; see the [capability matrix and remaining boundaries](docs/runtime.md).
 
 Requires Node.js 24.x, npm and MySQL 8.4. Dependencies are pinned in package-lock.json. No real provider or business database is used by default tests.
 

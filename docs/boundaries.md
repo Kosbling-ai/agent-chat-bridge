@@ -1,33 +1,13 @@
-# Integration boundaries after B0
+# Integration boundaries
 
-B0 implements only CLI/configuration and HTTP lifecycle. This document describes
-responsibilities for subsequent implementation; it does not define working APIs.
+- **Feishu client** owns the bot WebSocket and durable receipt before acknowledgement. Public operations are scoped send/reply/upload/reaction writes. Message lookup is internal for reply/reaction authorization, history reads are internal for receive-gap catchup, and resource downloads support private Agent images. There is no public generic Feishu read proxy.
+- **Core** owns conversation routing, persistent execution/guidance intent, native notification recovery, output delivery and audited operator actions. The same message may independently trigger a hook and the Agent. Hook acknowledgement means durable receipt, not business completion.
+- **Codex adapter** owns subprocess/stdio RPC, finite deadlines, known server-request policy and protocol-specific error classification. Workspace and environment are explicit trusted configuration; callers cannot override approval policy, sandbox or cwd. Other agents/channels are extension boundaries, not implemented providers.
+- **Store** is a separate MySQL schema with versioned migrations, inbox/jobs/sessions/outbox and permanent native thread ownership. Consumers use the service API and hooks, not direct SQL. It contains no business schema or credentials.
+- **Static hooks** configure URL, token environment reference and conversation scope. Consumers retain their own durable receipt, business state, retries, reconciliation, SDK/REST and lark-cli tools. A hook's optional catchupGroupIds explicitly identifies group targets; arbitrary conversation IDs do not establish chat type.
+- **Media** uses controlled workspace directories and opaque internal references. Input paths are retained while native recovery can reference them. Output upload/send are separate ordered effects, with durable cleanup only after confirmed send. Unknown effects are never erased by time-based cleanup.
+- **Service API** authenticates every task/chat/management request and enforces conversation scope. Trusted admin recovery requires audit evidence, fixed-workspace/native-turn verification and Store generation/ownership checks; it does not provide force retry or arbitrary filesystem access.
 
-- **Feishu client**: one WebSocket owner, durable receipt before acknowledgement,
-  existing chat send/read/reply/reaction/media operations. Document/table APIs
-  remain in the business application.
-- **Core**: chat/session routing and recovery. The same message can trigger an
-  application hook and an @Agent conversation. Hook receipt is independent of
-  business completion. Reliable queues are internal machinery, not a public
-  event-bus or workflow framework.
-- **Codex client**: stdio RPC, thread/turn lifecycle and provider-specific recovery.
-  An explicit workspace and credential/environment policy are required when
-  implemented. Unknown server requests must not be silently approved.
-- **Store**: independent schema/migrations, session/inbox/job/outbox state.
-  Business applications do not directly access these tables. Initial backend
-  planned: MySQL, with environment references for connection credentials.
-- **Static HTTP hooks**: configured ID, URL, credential environment reference,
-  chat/event scope and passive-context policy. No dynamic subscriber registry.
-  Consumers persist their own receipt before acknowledgement; business execution
-  and its retries remain theirs.
-- **Service API**: authenticated, scoped operations for chat and Agent use.
-  Attachments use controlled resources; arbitrary filesystem paths, actor IDs or
-  workspace paths must not let a caller exceed its configured access.
+Kosbling remains an Agent-side business environment and hook consumer. Document, Base, contact and business history/edit reconciliation remain there; the bridge does not wrap all Feishu APIs or import lark-cli. No dynamic subscriber registry, workflow framework or UI is needed for this separation.
 
-Future config fields must be implemented and validated with their runtime
-consumer. Feishu secrets, database secrets and hook credentials must use
-environment references rather than JSON plaintext. No production credentials,
-business rules or existing native Agent state should be copied into this repo.
-
-Do not add fake adapters or a fake Store to make readiness green. Integration
-readiness must be derived from the actual assembled components and their status.
+Readiness reflects actual Store/writer, Codex, Feishu connection and worker state. No fake adapter or fake Store makes it green. Secrets enter only through environment references; no production credentials, private business rules or native Agent state are copied into the public repository. No deployment or publication is implied by local integration tests.
