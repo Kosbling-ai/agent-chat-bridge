@@ -51,6 +51,7 @@ export function createCodexAdapter(options, dependencies = {}) {
   let faultReported = false;
   let buffered = '';
   let queued = 0;
+  let notificationFailure;
   let notificationChain = Promise.resolve();
   const decoder = new StringDecoder('utf8');
   const pending = new Map();
@@ -73,8 +74,8 @@ export function createCodexAdapter(options, dependencies = {}) {
     pending.clear();
   }
   function fail(code) {
-    if (state === 'stopping' || state === 'stopped' || state === 'failed') return;
-    state = 'failed';
+    if (state === 'stopped' || state === 'failed' || faultReported) return;
+    if (state !== 'stopping') state = 'failed';
     const reason = error(code, { outcome: 'unknown' });
     rejectPending(reason);
     lifecycle('error', 'codex_connection', 'failed', code);
@@ -116,7 +117,10 @@ export function createCodexAdapter(options, dependencies = {}) {
     notificationChain = notificationChain.then(async () => {
       if (faultReported || state === 'stopped') return;
       await bounded(Promise.resolve().then(() => onNotification(message)), rpcTimeoutMs, 'codex_notification_timeout');
-    }).catch(() => fail('codex_notification_delivery_failed')).finally(() => { queued--; });
+    }).catch(() => {
+      notificationFailure = error('codex_notification_delivery_failed', { outcome: 'unknown' });
+      fail(notificationFailure.code);
+    }).finally(() => { queued--; });
   }
   function receive(message) {
     if (!record(message)) { fail('codex_invalid_frame'); return; }
@@ -185,7 +189,7 @@ export function createCodexAdapter(options, dependencies = {}) {
         childClosed = new Promise((resolve) => { resolveClosed = resolve; });
         child = spawnProcess(bin, ['app-server', '--listen', 'stdio://'], { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
         child.once('error', () => fail('codex_spawn_failed'));
-        child.once('exit', () => fail('codex_process_exited'));
+        child.once('exit', () => { if (state !== 'stopping') fail('codex_process_exited'); });
         child.once('close', () => {
           resolveClosed();
           if (state !== 'stopping' && state !== 'failed') fail('codex_process_closed');
@@ -225,7 +229,14 @@ export function createCodexAdapter(options, dependencies = {}) {
       lifecycle('info', 'codex_shutdown', 'started');
       rejectPending(error('codex_closed', { outcome: 'unknown' }));
       shutdownPromise = (async () => {
-        try { await terminate(); await bounded(notificationChain, rpcTimeoutMs, 'codex_notification_timeout'); }
+        try {
+          await terminate();
+          await bounded(notificationChain, rpcTimeoutMs, 'codex_notification_timeout');
+          if (notificationFailure) throw notificationFailure;
+        } catch (reason) {
+          fail(reason instanceof CodexAdapterError ? reason.code : 'codex_shutdown_failed');
+          throw reason;
+        }
         finally { state = 'stopped'; lifecycle('info', 'codex_shutdown', 'finished'); }
       })();
       return shutdownPromise;

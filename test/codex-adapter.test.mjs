@@ -141,7 +141,7 @@ test('slow notification sink is bounded; rejected fault sink never becomes unhan
   const { adapter, logs } = await setup(t, 'flood', { maxQueuedNotifications: 2, rpcTimeoutMs: 100 }, { onNotification: () => new Promise(()=>{}), onFault: async()=>{ throw new Error('SYNTHETIC_SECRET_FAULT'); } });
   await adapter.start();
   await assert.rejects(adapter.startThread(), { code: 'codex_notification_capacity' });
-  await adapter.close();
+  await assert.rejects(adapter.close(), { code: 'codex_notification_delivery_failed', outcome: 'unknown' });
   assert(!JSON.stringify(logs).includes('SYNTHETIC_SECRET'));
 });
 
@@ -162,7 +162,26 @@ test('a single stalled notification fails observably instead of blocking later w
   await adapter.start();
   await adapter.startTurn({ threadId: 't1', input });
   assert.equal((await failure).code, 'codex_notification_delivery_failed');
-  await adapter.close();
+  await assert.rejects(adapter.close(), { code: 'codex_notification_delivery_failed', outcome: 'unknown' });
+});
+
+test('shutdown rejects and reports unknown when an in-flight durable callback fails', options, async t => {
+  let entered, rejectSink;
+  const started = new Promise(resolve => { entered = resolve; });
+  const { adapter, faults, logs } = await setup(t, 'normal', {}, {
+    onNotification: () => { entered(); return new Promise((_, reject) => { rejectSink = reject; }); },
+  });
+  await adapter.start();
+  await adapter.startTurn({ threadId: 't1', input });
+  await started;
+  const closed = adapter.close();
+  const rejected = assert.rejects(closed, { code: 'codex_notification_delivery_failed', outcome: 'unknown' });
+  rejectSink(new Error('SYNTHETIC_SECRET_PERSISTENCE'));
+  await rejected;
+  assert.equal(faults.length, 1);
+  assert.equal(faults[0].outcome, 'unknown');
+  assert(logs.some(row => JSON.stringify(row).includes('codex_notification_delivery_failed')));
+  assert(!JSON.stringify(logs).includes('SYNTHETIC_SECRET_PERSISTENCE'));
 });
 
 test('pending capacity and local frame rejection never create additional provider work', options, async t => {
