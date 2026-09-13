@@ -10,13 +10,14 @@ const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const nativeIds = ({ params = {} }) => ({ nativeThreadId: params.threadId ?? params.thread?.id, nativeTurnId: params.turnId ?? params.turn?.id });
 
-export function createRuntime({ config, store, codex, chat, media, workspace, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
+export function createRuntime({ config, store, codex, chat, media, outbound, workspace, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
   log = safeObserver(log);
   const connectionId = config.feishu.connectionId;
   const owner = randomUUID();
   const leaseMs = 60000;
   let stopping = false, started = false, healthy = true;
   let worker;
+  let cleanupAt = 0, cleanupRunning = false, cleanupCursor;
   const active = new Set();
   const stopController = new AbortController();
   const scope = conversationId => ({ connectionId, conversationId });
@@ -103,15 +104,25 @@ export function createRuntime({ config, store, codex, chat, media, workspace, ho
       await store.retryJob({ id: job.id, leaseToken: job.leaseToken, terminal: true, errorCode: 'agent_turn_failed' });
       return;
     }
-    const text = await durableFinalAnswer(job, attempt, turn);
+    let text = await durableFinalAnswer(job, attempt, turn);
     const payload = parse(job.payload);
+    const artifactScope = { ...scope(job.conversationId), runId: job.id };
+    let output;
+    if (outbound && payload.event?.conversationType === 'p2p') {
+      const native = await store.getAgentAttempt({ id: job.id });
+      output = await outbound.prepare({ ...artifactScope, conversationType: 'p2p', sinceMs: Number(native.createdAt) });
+      if (output.failures.length || output.omitted) text += `\n\n附件处理提示：${output.failures.length} 个文件准备失败，${output.omitted} 个文件超过单次发送数量上限。`;
+    }
     // Independent text effects are small enough for the platform JSON limit.
     const pieces = [];
     let piece = '';
     for (const char of text) { if (Buffer.byteLength(piece + char) > 12000) { pieces.push(piece); piece = ''; } piece += char; }
     if (piece) pieces.push(piece);
     const outbox = pieces.map((content, index) => ({ idempotencyKey: `run:${job.id}:text:${index}`, kind: payload.messageId ? 'reply' : 'create', payload: { kind: 'text', content: { text: content }, ...(payload.messageId ? { messageId: payload.messageId } : {}) } }));
-    await store.finishJobWithOutbox({ id: job.id, leaseToken: job.leaseToken, result: { nativeTurnId: turn.id, status: turn.status }, outbox });
+    for (const artifact of output?.artifacts ?? []) for (const effect of ['upload', 'send']) outbox.push({ idempotencyKey: `run:${job.id}:artifact:${artifact.ref.artifactId}:${effect}`, kind: `artifact_${effect}`, payload: { scope: artifactScope, ref: artifact.ref } });
+    await store.finishJobWithOutbox({ id: job.id, leaseToken: job.leaseToken, result: { nativeTurnId: turn.id, status: turn.status,
+      ...(output ? { artifactCount: output.artifacts.length, artifactFailures: output.failures, artifactOmitted: output.omitted } : {}) }, outbox });
+    if (output?.failures.length) log('error', 'artifact_prepare', 'failed', { code: 'artifact_prepare_partial_failure' });
     log('info', 'agent_run', 'succeeded');
   }
   async function execute(job) {
@@ -119,6 +130,7 @@ export function createRuntime({ config, store, codex, chat, media, workspace, ho
     let attempt, rpcPhase;
     try {
       const payload = parse(job.payload);
+      const outboxDir = outbound && payload.event?.conversationType === 'p2p' ? await outbound.directory({ ...scope(job.conversationId), runId: job.id }) : undefined;
       let prepared;
       if (media && payload.event && !await store.getAgentAttempt({ id: job.id })) {
         prepared = await media.prepare(payload.event, { runId: job.id, signal: stopController.signal });
@@ -153,7 +165,7 @@ export function createRuntime({ config, store, codex, chat, media, workspace, ho
         await store.bindAgentAttempt({ id: job.id, leaseToken: job.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: attempt.nativeThreadId });
         const context = await store.readPassiveContext({ ...scope(job.conversationId), limit: 100 });
         const contextEntries = context.map(item => { const event = parse(item.payload); return { event, text: extractMessageText(event) }; }).filter(item => item.text);
-        const inputText = buildConversationPrompt({ event: payload.event, text: prepared ? [prepared.text, prepared.addendum].filter(Boolean).join('\n\n') : payload.text, context: contextEntries, newThread, group: config.routing.groups.find(group => group.conversationId === job.conversationId) });
+        const inputText = buildConversationPrompt({ event: payload.event, text: prepared ? [prepared.text, prepared.addendum].filter(Boolean).join('\n\n') : payload.text, context: contextEntries, newThread, outboxDir, group: config.routing.groups.find(group => group.conversationId === job.conversationId) });
         rpcPhase = 'turn_admission';
         const result = await codex.startTurn({ threadId: attempt.nativeThreadId, input: [{ type: 'text', text: inputText }], clientUserMessageId: job.id });
         if (!result.turn?.id) throw Object.assign(new Error('invalid_turn_result'), { outcome: 'unknown' });
@@ -191,12 +203,33 @@ export function createRuntime({ config, store, codex, chat, media, workspace, ho
       else if (row.kind === 'create') result = await chat.sendMessage({ ...payload, conversationId: row.conversationId, uuid: row.platformUuid });
       else if (row.kind === 'reaction') result = payload.reactionId ? await chat.removeReaction(payload) : await chat.addReaction(payload);
       else if (row.kind === 'upload') result = payload.mediaType === 'image' ? await chat.uploadImage({ bytes: Buffer.from(payload.base64, 'base64') }) : await chat.uploadFile({ bytes: Buffer.from(payload.base64, 'base64'), fileName: payload.fileName });
+      else if (row.kind === 'artifact_upload' && outbound) result = await outbound.upload(payload);
+      else if (row.kind === 'artifact_send' && outbound) {
+        const effect = await store.getOutbox({ id: row.id });
+        if (effect?.predecessorStatus !== 'sent') throw Object.assign(new Error('artifact_predecessor_unconfirmed'), { outcome: 'failed' });
+        result = await outbound.send({ ...payload, uploadResult: parse(effect.predecessorResult), uuid: row.platformUuid });
+      }
       else throw Object.assign(new Error('unsupported_delivery'), { outcome: 'failed' });
       await store.settleOutbox({ id: row.id, leaseToken: row.leaseToken, status: 'sent', result });
     } catch (error) {
       await store.settleOutbox({ id: row.id, leaseToken: row.leaseToken, status: error.outcome === 'failed' ? 'failed' : 'unknown', errorCode: 'chat_delivery_unconfirmed', nextAttemptAt: Date.now() + 5000 });
       log('warning', 'chat_delivery', 'unconfirmed', { code: 'chat_delivery_unconfirmed' });
     }
+  }
+  async function cleanupArtifacts() {
+    cleanupRunning = true;
+    try {
+      const page = await store.listPendingCleanup({ afterId: cleanupCursor, limit: 10 });
+      for (const row of page.items) {
+        if (stopping) break;
+        try {
+          await outbound.cleanup({ ...parse(row.payload), confirmedSent: true });
+          await store.completeOutboxCleanup({ id: row.id, connectionId: row.connectionId, conversationId: row.conversationId });
+          log('info', 'artifact_cleanup', 'succeeded');
+        } catch { log('warning', 'artifact_cleanup', 'pending', { code: 'artifact_cleanup_pending' }); }
+      }
+      cleanupCursor = page.nextCursor ?? undefined;
+    } finally { cleanupRunning = false; }
   }
   async function hook(job) {
     const configHook = config.hooks.find(item => item.id === job.hookId);
@@ -220,6 +253,7 @@ export function createRuntime({ config, store, codex, chat, media, workspace, ho
     while (!stopping && healthy) {
       try {
         if (active.size < 8) {
+          if (outbound && !cleanupRunning && Date.now() >= cleanupAt) { cleanupAt = Date.now() + 1000; launch(cleanupArtifacts()); }
           if (recover && codex.status().state === 'ready') for (const action of await store.claimRecoveries({ owner, leaseMs, limit: 1 })) launch(recover(action));
           if (codex.status().state === 'ready') for (const job of await store.claimJobs({ kind: 'agent', owner, leaseMs, limit: 1 })) launch(execute(job));
           for (const job of await store.claimJobs({ kind: 'hook', owner, leaseMs, limit: 1 })) launch(hook(job));

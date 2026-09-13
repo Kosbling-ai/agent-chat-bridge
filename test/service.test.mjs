@@ -139,7 +139,7 @@ test('startup cancellation closes an actual spawned child while Feishu start is 
   const started = startService({ config: runtimeConfig, configPath: join(directory, 'config.json'), env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, signal: controller.signal, log: async () => { throw new Error('synthetic log'); }, dependencies: {
     pool: () => ({}), store: async () => ({ close: async () => { storeClosed = true; } }),
     codex: (options, callbacks) => createCodexAdapter({ ...options, shutdownGraceMs: 100 }, { ...callbacks, spawnProcess: (_bin, _args, opts) => { child = spawn(process.execPath, [fixture], opts); return child; } }),
-    sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} }, chat: () => ({ downloadResource: async () => { throw new Error('unexpected download'); } }),
+    sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} }, chat: () => ({ downloadResource: async () => { throw new Error('unexpected download'); }, uploadImage() {}, uploadFile() {}, sendMessage() {} }),
     feishu: () => ({ start: () => { enter(); return new Promise(() => {}); }, stop: () => { socketStopped = true; } }),
   } });
   t.after(() => { if (child?.exitCode === null && child?.signalCode === null) child.kill('SIGKILL'); });

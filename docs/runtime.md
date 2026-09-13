@@ -55,6 +55,7 @@ Create/reply retries preserve platform UUID within the Store's conservative 55-m
 | Inbound private image/post → Agent | internal image download and textual path prompt; durable job before prepare, known attempt recovery skips downloads |
 | Inbound group post / private file/audio/media | group captions only; originally unsupported private binary types retain explicit rejection |
 | Outbound text/post/interactive/image/file | durable create/reply API wired to adapter; platform acceptance not live tested |
+| Private Agent-generated files | snapshot → upload → predecessor-confirmed send → durable cleanup; unknown upload held |
 | Reaction add/remove | Write API + adapter wired; unknown writes held |
 | Upload image/file | bounded durable API wired; unknown upload held |
 | Internal resource/history reads | Agent media and catch-up only; business reads remain outside the public bridge API |
@@ -83,7 +84,7 @@ The service constructs the internal Feishu image preparer under the configured C
 
 Ingress only persists authorized jobs. The worker prepares private image/post inputs before its first native attempt, renews its lease before admission, and adds validated local paths using the existing textual prompt format. Existing native attempts skip preparation during recovery. Text and group post captions use the legacy text extractor; group images are ignored. Failed downloads and unsupported private types produce explicit durable result facts/replies without native execution. Interrupted preparation returns the unadmitted job to pending.
 
-Input resources survive completed turns and restarts. Core does not invoke release until a later retirement workflow can prove there are no native recovery references; there is no age-based deletion. The budget therefore fails explicitly when retained resources fill it. Automatic Agent output upload/send is a separate integration and is not implied by input preparation.
+Input resources survive completed turns and restarts. Core does not invoke release until a later retirement workflow can prove there are no native recovery references; there is no age-based deletion. The budget therefore fails explicitly when retained resources fill it. Automatic Agent output upload/send is wired through the separate durable output lifecycle below.
 
 ## Final answer projection
 
@@ -100,3 +101,13 @@ Only unknown original runs qualify. `adopt_turn` requires explicit native thread
 Provider read rejection leaves the administrative action leased for later read-only retry; it does not imply execution rejection. A lost application COMMIT response is reconciled through the persisted action state. Unconfirmed application is reported without converting it into a contradictory rejection. Fixed error codes/logs never include native error payloads or audit evidence.
 
 `node scripts/test-storage.mjs test/core-recovery.integration.test.mjs` verifies real Store registration, authorization, successful adoption/abandonment, active-turn refusal, workspace checks, ownership conflicts, idempotence and zero new native admissions. Synthetic protocol tests cover rejected reads and lost COMMIT responses. No real provider or administrative action against production was executed.
+
+## Private Agent output delivery
+
+Service creates disjoint workspace directories `.agent-chat-bridge/outbox` and `.agent-chat-bridge/outbound-spool`; the former supplies each new private thread's output prompt. After completion, core scans using the persisted original native attempt time, snapshots up to nine selected files, and commits text plus separate upload/send effects atomically. Group output stays text-only. Preparation failures and omitted counts remain in the run result and an explicit text notice; successful text does not imply every file succeeded.
+
+An artifact send can only read a confirmed upload predecessor result. The 55-minute same-UUID send retry policy applies to artifact_send; unknown artifact_upload never retries automatically. File uploads preserve the old 28 MiB cap, with an internal 32 MiB HTTP bound for multipart overhead and the separate image 10 MiB limit. `feishu.outputBudgetBytes` defaults to 512 MiB and accepts 28 MiB through 1 GiB. The public upload endpoint remains separately bounded at 2 MiB and never accepts internal artifact references or paths.
+
+A confirmed artifact send atomically sets cleanup_pending. A bounded sweep retries filesystem cleanup and clears the flag only on success; restart cleanup cannot resend or rerun the Agent. Source modifications are retained by the module's identity/hash checks. Unknown uploads/sends keep their snapshots and source files, and remain observable through blocked delivery facts. There is no age-based deletion.
+
+`node scripts/test-storage.mjs test/core-outbound.integration.test.mjs` uses real MySQL, local 3 MiB PDF bytes and synthetic model/chat callbacks to prove upload predecessor gating, actual key-based send, cleanup failure/restart without duplicate execution, and held unknown upload. It does not contact a provider.

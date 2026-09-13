@@ -10,6 +10,7 @@ import { createCodexAdapter } from './agents/codex/adapter.mjs';
 import { createFeishuAdapter } from './channels/feishu/adapter.mjs';
 import { createFeishuChatClient } from './channels/feishu/chat-client.mjs';
 import { createFeishuMedia } from './channels/feishu/media.mjs';
+import { createOutboundMedia } from './channels/feishu/outbound-media.mjs';
 import { createRuntime } from './core/runtime.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
@@ -27,7 +28,7 @@ export async function migrateService({ config, env = process.env }) {
   try { return await migrate(pool); } finally { await pool.end(); }
 }
 export function boundedFeishuHttp(base) {
-  const options = value => ({ ...value, timeout: 10000, maxContentLength: 24 * 1024 * 1024, maxBodyLength: 24 * 1024 * 1024, maxRedirects: 0 });
+  const options = value => ({ ...value, timeout: 10000, maxContentLength: 32 * 1024 * 1024, maxBodyLength: 32 * 1024 * 1024, maxRedirects: 0 });
   const http = { request: value => base.request(options(value)) };
   for (const method of ['get', 'delete', 'head', 'options']) http[method] = (url, value) => base[method](url, options(value));
   for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value));
@@ -52,7 +53,7 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, catchup: createCatchup, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, sdk, ...dependencies };
   const pool = factories.pool(config.storage, env);
   let store, codex, feishu, runtime, catchup, http;
   let writerHealthy = true;
@@ -85,10 +86,11 @@ export async function startService({ config, configPath, env = process.env, log,
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
     const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance);
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
-    const chat = factories.chat({ client });
+    const chat = factories.chat({ client, maxMediaBytes: 28 * 1024 * 1024 });
     const media = await factories.media({ chat, workspace: cwd, inboxDir: resolve(cwd, '.agent-chat-bridge/inbox'), maxTotalBytes: config.feishu.mediaBudgetBytes, log });
+    const outbound = await factories.outbound({ chat, workspace: cwd, outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'), spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'), maxTotalBytes: config.feishu.outputBudgetBytes, log });
     checkCancelled();
-    runtime = createRuntime({ config, store, codex, chat, media, workspace: cwd, hookTokens, log });
+    runtime = createRuntime({ config, store, codex, chat, media, outbound, workspace: cwd, hookTokens, log });
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
     const api = createApi({ config, store, chat, tokens });
     await Promise.race([codex.start(), cancelled]);
