@@ -24,7 +24,7 @@ test('group mention can register forward and hook branches without either consum
   assert.equal(accepted[0].forwardJob.prompt,'Human：hello');
 });
 
-function memoryJobs(initial){let job={id:'run',internalId:'1',callerId:'caller',chatId:'chat',chatType:'group',messageId:'message',senderOpenId:'system:scope',senderName:'Caller',deliveryMode:'caller',executionNamespace:'daily',prompt:'work',attempts:1,result:{},createdAt:1,leaseOwner:'owner',...initial};const calls=[];return{calls,get job(){return job;},upsert:async()=>({...job,duplicate:false}),claimReplyPending:async()=>job.status==='reply_pending'?[job]:[],claim:async()=>job.status==='pending'?[job={...job,status:'running',leaseOwner:'owner'}]:[],renew:async()=>({renewed:true}),patchExecution:async({execution})=>{calls.push(['execution',execution]);job={...job,result:{...job.result,execution}};},patchFeedback:async()=>{},markReplyPending:async({result})=>{calls.push(['reply_pending']);job={...job,status:'reply_pending',result};},markFinished:async({status,result})=>{calls.push(['finished',status]);job={...job,status,result,replySentAt:null};},markRetry:async input=>{calls.push(['retry',input]);job={...job,status:input.held?'held':input.terminal?'failed':'pending',last_error:input.errorCode};},getRun:async()=>job,readEvents:async()=>[]};}
+function memoryJobs(initial){let job={id:'run',internalId:'1',callerId:'caller',chatId:'chat',chatType:'group',messageId:'message',senderOpenId:'system:scope',senderName:'Caller',deliveryMode:'caller',executionNamespace:'daily',prompt:'work',attempts:1,result:{},createdAt:1,leaseOwner:'owner',...initial};const calls=[];const finish=async({status,result})=>{calls.push(['finished',status]);job={...job,status,result,replySentAt:null};};return{calls,get job(){return job;},upsert:async()=>({...job,duplicate:false}),claimReplyPending:async()=>job.status==='reply_pending'?[job]:[],claim:async()=>job.status==='pending'?[job={...job,status:'running',leaseOwner:'owner'}]:[],renew:async()=>({renewed:true}),patchExecution:async({execution})=>{calls.push(['execution',execution]);job={...job,result:{...job.result,execution}};},patchFeedback:async()=>{},markReplyPending:async({result})=>{calls.push(['reply_pending']);job={...job,status:'reply_pending',result};},markFinished:finish,markFinishedWithoutReply:finish,markRetry:async input=>{calls.push(['retry',input]);job={...job,status:input.held?'held':input.terminal?'failed':'pending',last_error:input.errorCode};},getRun:async()=>job,readEvents:async()=>[]};}
 
 test('forward runtime persists start/bound, caller result and known-turn inspect-only resume',async()=>{
   const jobs=memoryJobs({status:'pending'});const options=[];const executor={execute:async(_input,value)=>{options.push(value);await value.onStartIntent({binding:{feishuOpenId:'group:binding'},threadId:'thread',messageId:'message',startedAt:2});await value.onBound({threadId:'thread',turnId:'turn',startedAt:2});return{threadId:'thread',turnId:'turn',answer:'shown',rawAnswer:'full machine answer',attachments:[]};}};
@@ -91,6 +91,21 @@ test('media preparation feeds a durable image addendum to executor input', async
   assert.equal(jobs.calls.filter(([name]) => name === 'execution')[0][1].inputStatus, 'ready');
 });
 
+test('prepared media prompt is reused without downloading again', async () => {
+  const jobs = memoryJobs({ status: 'pending', result: { inputEvent: { messageId: 'message', message: { kind: 'image' } }, execution: { inputStatus: 'ready', preparedPrompt: 'User：\n\n（图片路径：safe/image.png）' } } });
+  let preparations = 0;
+  let prompt;
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+    media: { async prepare() { preparations += 1; throw new Error('must_not_prepare_again'); } },
+    executor: { async execute(input) { prompt = input.prompt; return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
+    replies: {}, authorize: async () => true,
+  });
+  runtime.start(); await flush(); await runtime.stop();
+  assert.equal(preparations, 0);
+  assert.match(prompt, /safe\/image\.png/);
+});
+
 test('system busy returns to pending without consuming a failure attempt', async () => {
   const jobs = memoryJobs({ status: 'pending', attempts: 99, executionNamespace: 'daily' });
   const runtime = createForwardRuntime({
@@ -129,6 +144,7 @@ test('one forward worker admits another human job while the first turn is active
     async patchExecution() {},
     async markReplyPending() {},
     async markFinished() {},
+    async markFinishedWithoutReply() {},
     async markRetry() {},
     async getRun() { return null; },
     async readEvents() { return []; },

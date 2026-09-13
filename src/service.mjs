@@ -67,7 +67,7 @@ export async function startService({ config, configPath, env = process.env, log,
   // Custom source names avoid changing the SDK's ambient proxy environment.
   // Explicit proxy mappings override same-name envNames only in the child.
   for (const [name, source] of Object.entries(proxyEnv)) childEnv[name] = secret(env, source);
-  const sharedHome = childEnv.CODEX_HOME || childEnv.HOME || resolve(cwd, '.agent-chat-bridge/codex-home');
+  const sharedHome = childEnv.CODEX_HOME || (childEnv.HOME ? resolve(childEnv.HOME, '.codex') : resolve(cwd, '.agent-chat-bridge/codex-home'));
   const tokens = Object.fromEntries(config.auth.clients.map(client => [client.id, secret(env, client.tokenEnv)]));
   const hookTokens = Object.fromEntries(config.hooks.map(hook => [hook.id, secret(env, hook.tokenEnv)]));
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };

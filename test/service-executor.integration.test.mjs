@@ -71,6 +71,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     async patchExecution({ id, execution }) { const job = forwardJobs.find(item => item.id === id); job.result = { ...job.result, execution }; },
     async markReplyPending({ id, result }) { const job = forwardJobs.find(item => item.id === id); Object.assign(job, { status: 'reply_pending', result }); },
     async markFinished({ id, status, result }) { const job = forwardJobs.find(item => item.id === id); Object.assign(job, { status, result }); },
+    async markFinishedWithoutReply({ id, status, result }) { const job = forwardJobs.find(item => item.id === id); Object.assign(job, { status, result }); },
     async markRetry({ id, held }) { const job = forwardJobs.find(item => item.id === id); job.status = held ? 'held' : 'pending'; },
     async getRun() { return null; }, async readEvents() { return []; },
   };
@@ -96,7 +97,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await access(`${observed}.steer`);
   const childEnv = JSON.parse(await readFile(observed, 'utf8'));
   assert.equal(childEnv.UNSELECTED_SECRET, undefined);
-  assert.equal(childEnv.CODEX_HOME, directory);
+  assert.equal(childEnv.CODEX_HOME, join(directory, '.codex'));
   assert.deepEqual(executorConfig.rulesPaths, ['AGENTS.md']);
   assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['api-chat', 'chat']);
   assert.equal(forwardJobs[1].status, 'deferred');

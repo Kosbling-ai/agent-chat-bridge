@@ -115,15 +115,15 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         return;
       }
 
-      let prompt = execution.preparedPrompt || job.prompt;
-      if (!execution.threadId && media && job.result?.inputEvent) {
+      const inputPrepared = execution.inputStatus === 'ready' && typeof execution.preparedPrompt === 'string';
+      let prompt = inputPrepared ? execution.preparedPrompt : job.prompt;
+      if (!execution.threadId && !inputPrepared && media && job.result?.inputEvent) {
         const prepared = await media.prepare(job.result.inputEvent, { runId: job.id, signal: lease.signal });
         lease.assertOwned();
         if (prepared.status !== 'ready') {
           const result = { inputStatus: prepared.status, errorCode: prepared.reason || `input_${prepared.status}`, answer: prepared.replyText || '', rawAnswer: '', attachments: [], execution: { ...execution, inputStatus: prepared.status } };
           if (prepared.status === 'ignored') {
-            await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result });
-            await jobs.markFinished({ id: job.id, leaseOwner: owner, status: 'completed', result, replySent: false });
+            await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: owner, status: 'completed', result });
           } else {
             await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result, errorCode: result.errorCode });
           }
@@ -167,8 +167,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       execution = { ...execution, threadId: result.threadId || execution.threadId, turnId: result.turnId || execution.turnId, terminal: result.deferred ? 'deferred' : 'completed', unconfirmed: false, finishedAt: now() };
       if (inbound && !result.deferred) await inbound.markForwarded({ entries: job.contextEntries, threadId: result.threadId, turnId: result.turnId });
       if (result.deferred) {
-        await jobs.markReplyPending({ id: job.id, leaseOwner: owner, result: { ...result, execution } });
-        await jobs.markFinished({ id: job.id, leaseOwner: owner, status: 'deferred', result: { ...result, execution }, replySent: false });
+        await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: owner, status: 'deferred', result: { ...result, execution } });
         return;
       }
       await feedback?.prepare?.(job, result, state);

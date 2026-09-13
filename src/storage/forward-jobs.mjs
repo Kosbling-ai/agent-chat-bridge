@@ -182,6 +182,21 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         return { status: input.status };
       });
     },
+    markFinishedWithoutReply(input) {
+      const [id, owner] = leaseArgs(input);
+      if (!['completed', 'deferred'].includes(input.status)) throw new StoreError('invalid_store_input');
+      return write(async connection => {
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET status=?,
+            result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
+            last_error=?,finished_at=?,reply_sent_at=NULL,lease_owner='',lease_expires_at=NULL,updated_at=?
+          WHERE public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='running'`, [input.status, safeJson(input.result || {}), input.errorCode || '', at, at, id, owner, at]);
+        await assertLease(connection, result);
+        return { status: input.status };
+      });
+    },
     markRetry(input) {
       const [id, owner] = leaseArgs(input);
       return write(async connection => {

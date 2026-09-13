@@ -88,6 +88,43 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     await store.markRetry({ id: busy.id, leaseOwner: 'worker-busy', preserveAttempt: true, errorCode: 'CODEX_THREAD_BUSY', nextAttemptAt: now + 1000 });
     assert.equal((await store.getRun({ id: busy.id })).attempts, 0);
 
+    const deferred = await store.upsert({ ...input, idempotencyKey: 'runtime-deferred', messageId: 'runtime-deferred' });
+    const ignored = await store.upsert({ ...input, idempotencyKey: 'runtime-ignored', messageId: 'runtime-ignored' });
+    for (const run of [deferred, ignored]) {
+      await pool.execute(`UPDATE assistant_codex_forward_jobs
+        SET result_json=JSON_SET(result_json,'$.inputEvent',CAST(? AS JSON))
+        WHERE public_run_id=?`, [JSON.stringify({ messageId: run.messageId, message: { kind: 'image' } }), run.id]);
+    }
+    const executed = [];
+    const runtimeWorker = createForwardRuntime({
+      config: { owner: 'runtime-worker', pollMs: 2, leaseMs: 10_000 },
+      jobs: store,
+      sessions: {},
+      media: { async prepare(event) {
+        if (event.messageId === 'runtime-ignored') return { status: 'ignored', reason: 'group_media_ignored', replyText: '' };
+        return { status: 'ready', addendum: '（图片路径：safe/runtime.png）' };
+      } },
+      executor: { async execute(value) {
+        executed.push(value.messageId);
+        return { deferred: true, accepted: true, threadId: 'thread-runtime', turnId: 'turn-runtime' };
+      } },
+      replies: {},
+      authorize: async () => true,
+    });
+    runtimeWorker.start();
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [deferredRun, ignoredRun] = await Promise.all([store.getRun({ id: deferred.id }), store.getRun({ id: ignored.id })]);
+      if (deferredRun.status === 'deferred' && ignoredRun.status === 'completed') break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    await runtimeWorker.stop();
+    const [deferredRun, ignoredRun] = await Promise.all([store.getRun({ id: deferred.id }), store.getRun({ id: ignored.id })]);
+    assert.equal(deferredRun.status, 'deferred');
+    assert.equal(deferredRun.result.execution.inputStatus, 'ready');
+    assert.equal(ignoredRun.status, 'completed');
+    assert.equal(ignoredRun.result.inputStatus, 'ignored');
+    assert.deepEqual(executed, ['runtime-deferred']);
+
     const communication = await createMysqlStore({ pool, now: () => now });
     const receipt = {
       connectionId: 'fixture', conversationId: 'chat', source: 'live', conversationType: 'group',
