@@ -18,6 +18,8 @@ function validName(name) {
     && !/[\\/\x00-\x1f]/.test(name) && Buffer.byteLength(name) <= 255;
 }
 const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs;
+const sourceStatKey = (name, info) => digest(JSON.stringify([name,info.dev,info.ino,info.size,info.mtimeMs]));
+const sourceVersion = (name, info, sha256) => digest(JSON.stringify([sourceStatKey(name,info),sha256]));
 
 // This protects against unsafe paths and detects changed artifacts; it is not a
 // filesystem sandbox against another process with the same operating-system UID.
@@ -67,32 +69,54 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
       return { bytes: Buffer.concat(chunks), info: { dev: before.dev, ino: before.ino, size: before.size, mtimeMs: before.mtimeMs } };
     } finally { await handle.close(); }
   }
-  async function load(scope) {
-    validScope(scope);
-    const dir = runDir(scope); await directory(dir);
-    const { bytes } = await readBounded(join(dir, 'manifest.json'), 65536);
-    const manifest = JSON.parse(bytes.toString('utf8'));
-    if (manifest.version !== 1 || manifest.identity !== identity(scope) || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > 9
+  function validateManifest(manifest, expectedIdentity) {
+    if (manifest.version !== 1 || manifest.identity !== expectedIdentity || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > 9
       || manifest.artifacts.some(item => !/^[a-f0-9]{64}$/.test(item.artifactId) || !validName(item.fileName)
         || !/^[a-f0-9]{64}$/.test(item.sha256) || !Number.isSafeInteger(item.size) || item.size < 0 || item.size > maxBytes
+        || !item.source || ['dev','ino','size'].some(key => !Number.isSafeInteger(item.source[key]) || item.source[key] < 0)
+        || !Number.isFinite(item.source.mtimeMs) || item.source.size !== item.size
         || !['image', 'file'].includes(item.kind) || !['stream', 'pdf', 'doc', 'xls', 'ppt', 'mp4', 'opus'].includes(item.fileType))) {
       throw fail('invalid_artifact_manifest');
     }
     return manifest;
   }
-  async function usage() {
+  async function load(scope) {
+    validScope(scope);
+    const dir = runDir(scope); await directory(dir);
+    const { bytes } = await readBounded(join(dir, 'manifest.json'), 65536);
+    return validateManifest(JSON.parse(bytes.toString('utf8')), identity(scope));
+  }
+  async function usage(scope) {
     let total = 0, count = 0;
+    const claimed = new Set(), claimedStats = new Set();
     for await (const entry of await opendir(spoolRoot)) {
       if (++count > 4096 || !/^[a-f0-9]{64}$/.test(entry.name)) throw fail('artifact_storage_limit');
       const dir = join(spoolRoot, entry.name); await directory(dir);
       for await (const file of await opendir(dir)) {
         if (++count > 4096) throw fail('artifact_storage_limit');
-        const stat = await lstat(join(dir, file.name));
+        const path = join(dir, file.name);
+        const stat = await lstat(path);
         if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw fail('unsafe_artifact_file');
         total += stat.size;
+        if (total > maxTotalBytes) throw fail('artifact_storage_full');
+        if (file.name !== 'manifest.json') continue;
+        // The published manifest is also the source-version claim: no second
+        // claim file can commit without its recoverable run snapshot metadata.
+        const { bytes } = await readBounded(path, 65536);
+        const manifest = JSON.parse(bytes.toString('utf8'));
+        const ids = JSON.parse(manifest.identity);
+        if (!Array.isArray(ids) || ids.length !== 3) throw fail('invalid_artifact_manifest');
+        const owner = {connectionId:ids[0],conversationId:ids[1],runId:ids[2]};
+        validScope(owner); validateManifest(manifest, identity(owner));
+        if (digest(identity(owner)) !== entry.name) throw fail('invalid_artifact_manifest');
+        if (owner.connectionId !== scope.connectionId || owner.conversationId !== scope.conversationId) continue;
+        for (const artifact of manifest.artifacts) {
+          claimedStats.add(sourceStatKey(artifact.fileName,artifact.source));
+          claimed.add(sourceVersion(artifact.fileName,artifact.source,artifact.sha256));
+        }
       }
     }
-    return total;
+    return {total,claimed,claimedStats};
   }
   let queue = Promise.resolve();
   const exclusive = operation => { const next = queue.then(operation); queue = next.catch(() => {}); return next; };
@@ -118,24 +142,39 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
         if (scope.conversationType !== 'p2p') return { artifacts: [], failures: [], omitted: 0 };
         if (!Number.isFinite(scope.sinceMs) || scope.sinceMs <= 0) throw fail('invalid_artifact_turn_time');
         const dir = runDir(scope);
-        try { return result(scope, await load(scope)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        try {
+          const manifest = await load(scope);
+          await syncDirectory(dir); await syncDirectory(spoolRoot);
+          return result(scope, manifest);
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
         const source = chatDir(scope); await directory(source, true); await directory(dir, true);
-        let count = 0;
+        const inventory = await usage(scope);
+        let used = inventory.total, comparedBytes = 0, count = 0;
         const candidates = [];
         for await (const entry of await opendir(source)) {
           if (++count > 4096) throw fail('artifact_scan_limit');
           if (!entry.isFile() || !validName(entry.name)) continue;
           const info = await lstat(join(source, entry.name));
-          if (info.mtimeMs >= scope.sinceMs - 1000) candidates.push({ name: entry.name, time: info.mtimeMs });
+          if (info.mtimeMs < scope.sinceMs - 1000) continue;
+          if (inventory.claimedStats.has(sourceStatKey(entry.name,info))) {
+            // Same stat fields do not prove identical bytes (mtime can be restored).
+            comparedBytes += info.size;
+            if (comparedBytes > maxTotalBytes) throw fail('artifact_scan_limit');
+            const current = await readBounded(join(source,entry.name),maxBytes);
+            comparedBytes += current.bytes.length - info.size;
+            if (comparedBytes > maxTotalBytes) throw fail('artifact_scan_limit');
+            if (inventory.claimed.has(sourceVersion(entry.name,current.info,digest(current.bytes)))) continue;
+          }
+          candidates.push({ name: entry.name, time: info.mtimeMs });
         }
         candidates.sort((a, b) => a.time - b.time || a.name.localeCompare(b.name));
         const selected = candidates.slice(-9), artifacts = [], failures = [];
         const omitted = Math.max(0, candidates.length - 9);
-        let used = await usage();
         for (const item of selected) {
           try {
             const { bytes, info } = await readBounded(join(source, item.name), maxBytes);
             const sha256 = digest(bytes), artifactId = digest(JSON.stringify([identity(scope), item.name, sha256]));
+            if (inventory.claimed.has(sourceVersion(item.name,info,sha256))) continue;
             const path = join(dir, artifactId);
             if (used + bytes.length + 65536 > maxTotalBytes) throw fail('artifact_storage_full');
             // A pre-manifest crash may leave this content-addressed snapshot.
@@ -158,9 +197,11 @@ export async function createOutboundMedia({ workspace, outboxDir, spoolDir, chat
           }
         }
         const manifest = { version: 1, identity: identity(scope), artifacts, failures, omitted };
+        const encoded = JSON.stringify(manifest);
+        if (Buffer.byteLength(encoded) > 65536 || used + Buffer.byteLength(encoded) > maxTotalBytes) throw fail('artifact_storage_full');
         const temporary = join(dir, `${randomUUID()}.part`);
         const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-        try { await handle.writeFile(JSON.stringify(manifest)); await handle.sync(); } finally { await handle.close(); }
+        try { await handle.writeFile(encoded); await handle.sync(); } finally { await handle.close(); }
         await directory(dir); await rename(temporary, join(dir, 'manifest.json'));
         await syncDirectory(dir); await syncDirectory(spoolRoot);
         return result(scope, manifest);
