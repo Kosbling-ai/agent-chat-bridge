@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, opendir, readdir, readFile, realpath, rename, rm, rmdir, unlink } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 export class MediaError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -21,16 +21,25 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
   if (!inside(resolve(workspace), resolve(inboxDir))) throw new MediaError('invalid_media_directory');
   const root = resolve(workspacePath, relative(resolve(workspace), resolve(inboxDir)));
   if (!inside(workspacePath, root)) throw new MediaError('invalid_media_directory');
+  async function syncDirectory(path) {
+    const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { await handle.sync(); } finally { await handle.close(); }
+  }
   async function checkedDirectory(path, create = false) {
     const rel = relative(workspacePath, path);
     let cursor = workspacePath;
     for (const segment of rel.split('/')) {
       cursor = join(cursor, segment);
-      if (create) await mkdir(cursor, { mode: 0o700 }).catch(error => { if (error.code !== 'EEXIST') throw error; });
+      let created = false;
+      if (create) {
+        try { await mkdir(cursor, { mode: 0o700 }); created = true; }
+        catch (error) { if (error.code !== 'EEXIST') throw error; }
+      }
       const info = await lstat(cursor);
       if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid() || (info.mode & (cursor === root || inside(root, cursor) ? 0o077 : 0o022))) {
         throw new MediaError('unsafe_media_directory');
       }
+      if (created) await syncDirectory(dirname(cursor));
     }
     if (await realpath(path) !== path) throw new MediaError('unsafe_media_directory');
   }
@@ -94,12 +103,15 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
             const info = await regular(path);
             if (info.size > maxBytes || info.size !== file.bytes || digest(await readFile(path)) !== file.sha256) throw new MediaError('media_integrity_failed');
           }
+          await syncDirectory(dir);
+          await syncDirectory(root);
           return manifest.files.map(file => join(dir, file.name));
         }
         let used = await usage();
         const created = [];
         const files = [];
         let partial;
+        let manifestPublished = false;
         try {
           for (const key of resources) {
             if (signal?.aborted) throw new MediaError('media_cancelled');
@@ -155,11 +167,17 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
           if (signal?.aborted) throw new MediaError('media_cancelled');
           await rename(partial, manifestPath);
           partial = undefined;
+          manifestPublished = true;
+          // File fsync does not persist rename or the run-directory entry.
+          await syncDirectory(dir);
+          await syncDirectory(root);
           return files.map(file => join(dir, file.name));
         } catch (error) {
           if (partial) await unlink(partial).catch(() => {});
-          for (const path of created) await unlink(path).catch(() => {});
-          await rmdir(dir).catch(() => {}); // Only an empty directory; never removes retained resources.
+          if (!manifestPublished) {
+            for (const path of created) await unlink(path).catch(() => {});
+            await rmdir(dir).catch(() => {});
+          } // Only an empty directory; never removes retained resources.
           throw error;
         }
       }, signal);
@@ -172,6 +190,7 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
         // Validate every entry before recursive removal. No symlink traversal.
         for (const file of await readdir(dir)) await regular(join(dir, file));
         await rm(dir, { recursive: true });
+        await syncDirectory(root);
       });
     },
   };

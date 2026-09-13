@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, symlink } from 'node:fs/promises';
+import { mkdtemp, open, readFile, readdir, rm, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -139,4 +139,38 @@ test('file open failure destroys an already acquired resource stream',{timeout:3
     }}));
     assert.equal(stream.destroyed,true);
   }finally{await f.close();}
+});
+
+
+test('directory fsync precedes ready and failed publication sync preserves complete files for replay',{timeout:3000},async(t)=>{
+  const f=await fixture();
+  const directory=await open(f.params.inboxDir,'r');
+  const prototype=Object.getPrototypeOf(directory);
+  const original=prototype.sync;
+  await directory.close();
+  let directorySyncs=0,failPublished=true;
+  t.mock.method(prototype,'sync',async function(){
+    if((await this.stat()).isDirectory()){
+      directorySyncs++;
+      const runs=await readdir(f.params.inboxDir);
+      if(failPublished && runs.length && (await readdir(join(f.params.inboxDir,runs[0]))).includes('manifest.json')){
+        failPublished=false;
+        throw Object.assign(new Error('synthetic directory sync failure'),{code:'EIO'});
+      }
+    }
+    return original.call(this);
+  });
+  try{
+    const source=event('image',{image_key:'image'});
+    const failed=await f.media.prepare(source,{runId:'durable'});
+    assert.equal(failed.status,'failed');
+    const [run]=await readdir(f.params.inboxDir);
+    assert.equal((await readdir(join(f.params.inboxDir,run))).length,2);
+    const before=directorySyncs;
+    const retried=await f.media.prepare(source,{runId:'durable'});
+    assert.equal(retried.status,'ready');
+    assert.equal(directorySyncs-before,2);
+    assert.equal(f.calls.length,1);
+    assert.equal(await readFile(retried.localPaths[0],'utf8'),'synthetic-image');
+  }finally{t.mock.restoreAll();await f.close();}
 });
