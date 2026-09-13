@@ -61,7 +61,7 @@ Create/reply retries preserve platform UUID within the Store's conservative 55-m
 | Business edit/reconcile and recall cancellation | Business edit/reconcile remains outside bridge; old recall did not cancel execution |
 | Reconnect catch-up | service starts internal first-receipt gap recovery by default; `feishu.catchup:false` disables it |
 | Active steer | deferred-only now; migration must assess behavior difference |
-| Automatic unknown-admission recovery without native ID | explicitly unavailable; operator workflow required |
+| Unknown admission without native ID | no automatic replay; scoped admin recovery API supports audited adopt or verified abandon |
 
 This matrix is a staging boundary, not a declaration that existing required media/chat behavior may be removed. The missing existing capabilities remain follow-up work before production replacement. File input was unsupported in the old bridge; cancelling Codex on recall was not old behavior and is not an implied migration requirement.
 
@@ -90,3 +90,13 @@ Input resources survive completed turns and restarts. Core does not invoke relea
 Normal completion and restart recovery replay the same persisted assistant projection. Supported shapes are `agentMessage.text`, explicit assistant `message.text` or content strings/text/input_text/output_text, the two agent-message delta methods, completed items, and terminal item arrays. User, tool, reasoning and unknown-role message content never becomes reply fallback. Terminal explicit final answers take precedence; otherwise durable final answers survive later commentary, then terminal/stream assistant text is used. The last two rules deliberately correct the old fallback's commentary overwrite and unknown-role-as-assistant behavior.
 
 Delta accumulation keeps the previous 12,000-character tail, with at most 128 active item accumulators. Native replay is turn-filtered, paged by durable receipt sequence and capped at 100,000 events. If replay cannot reach the end within the bound, the run remains recoverable instead of committing a partial reply. Frozen production projection/extraction functions are replayed with identical event sequences in `test/core-answer.test.mjs`; explicit old/new divergences have separate assertions.
+
+## Controlled unknown-admission recovery
+
+Admin clients with the target conversation scope can GET `/v1/runs/:id/attempt` and POST `/v1/recoveries` with `{runId,idempotencyKey,generation,action,evidence,nativeThreadId?,nativeTurnId?}`. Evidence is required, at most 4096 characters, and kept only in Store audit. POST returns 202 after registration; GET `/v1/recoveries/:id` exposes action/status/error facts without evidence. Non-admin and foreign-conversation clients are rejected. Conflicts return 409.
+
+Only unknown original runs qualify. `adopt_turn` requires explicit native thread/turn IDs: the worker reads the thread, verifies its configured workspace and turn existence/status, then the Store atomically enforces generation/active run and permanent thread ownership. The original run becomes pending for read recovery, never turn/start. `abandon_verified` requires the administrator's explicit reconciliation statement; a known thread is read and any active/indeterminate turn rejects abandonment. Missing native IDs may be abandoned from that explicit statement, cancelling the original run and releasing its generation without creating a replacement job. There is no force-retry endpoint and no native interrupt side effect.
+
+Provider read rejection leaves the administrative action leased for later read-only retry; it does not imply execution rejection. A lost application COMMIT response is reconciled through the persisted action state. Unconfirmed application is reported without converting it into a contradictory rejection. Fixed error codes/logs never include native error payloads or audit evidence.
+
+`node scripts/test-storage.mjs test/core-recovery.integration.test.mjs` verifies real Store registration, authorization, successful adoption/abandonment, active-turn refusal, workspace checks, ownership conflicts, idempotence and zero new native admissions. Synthetic protocol tests cover rejected reads and lost COMMIT responses. No real provider or administrative action against production was executed.

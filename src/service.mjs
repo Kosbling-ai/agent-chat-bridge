@@ -88,7 +88,7 @@ export async function startService({ config, configPath, env = process.env, log,
     const chat = factories.chat({ client });
     const media = await factories.media({ chat, workspace: cwd, inboxDir: resolve(cwd, '.agent-chat-bridge/inbox'), maxTotalBytes: config.feishu.mediaBudgetBytes, log });
     checkCancelled();
-    runtime = createRuntime({ config, store, codex, chat, media, hookTokens, log });
+    runtime = createRuntime({ config, store, codex, chat, media, workspace: cwd, hookTokens, log });
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
     const api = createApi({ config, store, chat, tokens });
     await Promise.race([codex.start(), cancelled]);

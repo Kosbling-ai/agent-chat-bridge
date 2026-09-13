@@ -4,12 +4,13 @@ import { safeObserver } from '../logger.mjs';
 import { extractFinalAnswer, buildConversationPrompt } from './format.mjs';
 import { extractMessageText } from '../channels/feishu/media.mjs';
 import { createAnswerProjection } from './answer-projection.mjs';
+import { createRecoveryHandler } from './recovery.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const nativeIds = ({ params = {} }) => ({ nativeThreadId: params.threadId ?? params.thread?.id, nativeTurnId: params.turnId ?? params.turn?.id });
 
-export function createRuntime({ config, store, codex, chat, media, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
+export function createRuntime({ config, store, codex, chat, media, workspace, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
   log = safeObserver(log);
   const connectionId = config.feishu.connectionId;
   const owner = randomUUID();
@@ -19,6 +20,7 @@ export function createRuntime({ config, store, codex, chat, media, hookTokens = 
   const active = new Set();
   const stopController = new AbortController();
   const scope = conversationId => ({ connectionId, conversationId });
+  const recover = workspace ? createRecoveryHandler({ store, codex, workspace, connectionId, log }) : null;
   function fault(code) { healthy = false; log('error', 'core', 'failed', { code }); }
   async function ingest(event, context = {}) {
     if (stopping || context.signal?.aborted) throw new Error('ingress_stopped');
@@ -218,6 +220,7 @@ export function createRuntime({ config, store, codex, chat, media, hookTokens = 
     while (!stopping && healthy) {
       try {
         if (active.size < 8) {
+          if (recover && codex.status().state === 'ready') for (const action of await store.claimRecoveries({ owner, leaseMs, limit: 1 })) launch(recover(action));
           if (codex.status().state === 'ready') for (const job of await store.claimJobs({ kind: 'agent', owner, leaseMs, limit: 1 })) launch(execute(job));
           for (const job of await store.claimJobs({ kind: 'hook', owner, leaseMs, limit: 1 })) launch(hook(job));
           for (const row of await store.claimOutbox({ owner, leaseMs, limit: 1 })) launch(deliver(row));

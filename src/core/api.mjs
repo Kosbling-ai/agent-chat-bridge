@@ -67,12 +67,39 @@ export function createApi({ config, store, chat, tokens }) {
       const result = await store.enqueueJob({ connectionId, conversationId: input.conversationId, kind: 'agent', idempotencyKey, payload: { text: input.text, source: 'api', callerId: client.id } });
       return { status: 202, body: { id: result.id, duplicate: result.duplicate } };
     }
-    const run = /^\/v1\/runs\/([\w-]+)(\/events)?$/.exec(path);
+    const run = /^\/v1\/runs\/([\w-]+)(\/(?:events|attempt))?$/.exec(path);
     if (request.method === 'GET' && run) {
       const row = await store.getJob({ id: run[1] });
       if (!row || row.connectionId !== connectionId || row.kind !== 'agent') throw new ApiError('not_found', 404);
       authorize(client, row.conversationId);
+      if (run[2] === '/attempt') {
+        if (!client.admin) throw new ApiError('forbidden', 403);
+        return { status: 200, body: { attempt: await store.getAgentAttempt({ id: row.id }) } };
+      }
       return { status: 200, body: run[2] ? { events: await store.readRunEvents({ runId: row.id, ...pagination(url) }) } : publicJob(row) };
+    }
+    if (request.method === 'POST' && path === '/v1/recoveries') {
+      if (!client.admin) throw new ApiError('forbidden', 403);
+      const input = fields(await body(request), ['runId', 'idempotencyKey', 'generation', 'action', 'evidence', 'nativeThreadId', 'nativeTurnId'], ['runId', 'idempotencyKey', 'action']);
+      identifier(input.runId, 36);
+      if (!Number.isSafeInteger(input.generation) || input.generation < 1) throw new ApiError('invalid_generation');
+      if (!['adopt_turn', 'abandon_verified'].includes(input.action) || typeof input.evidence !== 'string' || !input.evidence.trim() || input.evidence.length > 4096) throw new ApiError('invalid_recovery');
+      if (input.action === 'adopt_turn') { identifier(input.nativeThreadId, 255); identifier(input.nativeTurnId, 255); }
+      else if (input.nativeThreadId !== undefined || input.nativeTurnId !== undefined) throw new ApiError('invalid_recovery');
+      const job = await store.getJob({ id: input.runId });
+      if (!job || job.connectionId !== connectionId || job.kind !== 'agent') throw new ApiError('not_found', 404);
+      authorize(client, job.conversationId);
+      const result = await store.enqueueRecovery({ runId: job.id, callerId: client.id, idempotencyKey: identifier(input.idempotencyKey, 255), expectedGeneration: input.generation, action: input.action, evidence: input.evidence,
+        ...(input.action === 'adopt_turn' ? { nativeThreadId: input.nativeThreadId, nativeTurnId: input.nativeTurnId } : {}) });
+      return { status: 202, body: result };
+    }
+    const recovery = /^\/v1\/recoveries\/([\w-]+)$/.exec(path);
+    if (request.method === 'GET' && recovery) {
+      if (!client.admin) throw new ApiError('forbidden', 403);
+      const action = await store.getRecovery({ id: identifier(recovery[1], 36) });
+      if (!action || action.connectionId !== connectionId) throw new ApiError('not_found', 404);
+      authorize(client, action.conversationId);
+      return { status: 200, body: action };
     }
     if (request.method === 'POST' && path === '/v1/deliveries') {
       const input = fields(await body(request, 3 * 1024 * 1024), ['conversationId', 'idempotencyKey', 'kind', 'messageId', 'content', 'messageKind', 'emojiType', 'reactionId', 'mediaType', 'base64', 'fileName'], ['conversationId', 'idempotencyKey', 'kind']);
