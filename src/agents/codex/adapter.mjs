@@ -1,14 +1,16 @@
 import { spawn } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { classifyCodexRpcError } from './protocol-errors.mjs';
 
 export class CodexAdapterError extends Error {
-  constructor(code, { outcome = 'not_started', rpcCode } = {}) {
+  constructor(code, { outcome = 'not_started', rpcCode, reason } = {}) {
     super(code);
     this.name = 'CodexAdapterError';
     this.code = code;
     this.outcome = outcome;
     if (Number.isInteger(rpcCode)) this.rpcCode = rpcCode;
+    if (reason) this.reason = reason;
   }
 }
 
@@ -104,7 +106,7 @@ export function createCodexAdapter(options, dependencies = {}) {
     const id = nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => fail('codex_rpc_timeout'), rpcTimeoutMs);
-      pending.set(id, { resolve, reject, timer });
+      pending.set(id, { resolve, reject, timer, method, threadId: params?.threadId, expectedTurnId: params?.expectedTurnId ?? params?.turnId });
       try { send({ id, method, params }); } catch (reason) {
         clearTimeout(timer);
         pending.delete(id);
@@ -149,7 +151,7 @@ export function createCodexAdapter(options, dependencies = {}) {
     clearTimeout(entry.timer);
     if (Object.hasOwn(message, 'error')) {
       // Do not propagate untrusted provider error messages into logs/API errors.
-      entry.reject(error('codex_rpc_rejected', { outcome: 'rejected', rpcCode: message.error?.code }));
+      entry.reject(error('codex_rpc_rejected', { outcome: 'rejected', rpcCode: message.error?.code, reason: classifyCodexRpcError(message.error, entry) }));
     } else entry.resolve(message.result);
   }
   function data(chunk) {

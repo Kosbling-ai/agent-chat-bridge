@@ -28,6 +28,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  if(mode==='malformed'){process.stdout.write('not JSON SYNTHETIC_SECRET\\n');return;}
  if(mode==='oversized'){process.stdout.write('x'.repeat(4096));return;}
  if(mode==='reject'){send({id:m.id,error:{code:-32001,message:'SYNTHETIC_SECRET_REJECT'}});return;}
+ if(mode==='archived'){send({id:m.id,error:{code:-32001,message:'SYNTHETIC_SECRET session '+m.params.threadId+' is archived'}});return;}
  if(mode==='request'){
    send({id:'provider-1',method:'item/commandExecution/requestApproval',params:{threadId:'t1',turnId:'r1',command:'SYNTHETIC_SECRET_REQUEST'}});
    send({id:m.id,result:{turn:{id:'r1',status:'inProgress'}}});return;
@@ -129,6 +130,17 @@ test('RPC rejection is explicit and redacted without destroying healthy connecti
   await adapter.start();
   await assert.rejects(adapter.startThread(), e => e.code === 'codex_rpc_rejected' && e.outcome === 'rejected' && e.rpcCode === -32001 && !e.message.includes('SECRET'));
   assert.equal(adapter.status().state, 'ready'); assert.equal(faults.length, 0); assert(!JSON.stringify(logs).includes('SECRET'));
+});
+
+test('RPC safe archived reason survives redaction only for the requested thread', options, async t => {
+  const { adapter, logs } = await setup(t, 'archived');
+  await adapter.start();
+  await assert.rejects(adapter.resumeThread({ threadId: 'thread-1' }), error => {
+    assert.deepEqual(error.reason, { kind: 'thread_archived', threadId: 'thread-1' });
+    assert(!JSON.stringify(error).includes('SYNTHETIC_SECRET'));
+    return error.outcome === 'rejected';
+  });
+  assert(!JSON.stringify(logs).includes('SYNTHETIC_SECRET'));
 });
 
 for (const [mode, expected] of [['silent', 'codex_rpc_timeout'], ['exit', 'codex_process_exited'], ['malformed', 'codex_invalid_frame'], ['oversized', 'codex_frame_too_large']]) {
