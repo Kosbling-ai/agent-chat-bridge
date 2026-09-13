@@ -74,7 +74,8 @@ export function createApi({ config, store, chat, tokens }) {
       authorize(client, row.conversationId);
       if (run[2] === '/attempt') {
         if (!client.admin) throw new ApiError('forbidden', 403);
-        return { status: 200, body: { attempt: await store.getAgentAttempt({ id: row.id }) } };
+        const [attempt, steering] = await Promise.all([store.getAgentAttempt({ id: row.id }), store.getSteerAttempt({ id: row.id })]);
+        return { status: 200, body: { attempt, steering } };
       }
       return { status: 200, body: run[2] ? { events: await store.readRunEvents({ runId: row.id, ...pagination(url) }) } : publicJob(row) };
     }

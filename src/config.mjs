@@ -74,9 +74,11 @@ function validateRuntime(raw) {
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
   object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
-  object(raw.codex, ['bin', 'cwd', 'envNames', 'model', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'envNames', 'model', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'steering'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(reference) };
   if (raw.codex.model !== undefined) codex.model = string(raw.codex.model);
+  codex.steering = raw.codex.steering ?? true;
+  if (typeof codex.steering !== 'boolean') throw new ConfigError('invalid_steering_flag');
   codex.rolloverIdleMs = raw.codex.rolloverIdleMs ?? 2 * 24 * 60 * 60 * 1000;
   if (!Number.isSafeInteger(codex.rolloverIdleMs) || codex.rolloverIdleMs < 0 || codex.rolloverIdleMs > 365 * 24 * 60 * 60 * 1000) throw new ConfigError('invalid_idle_rollover');
   codex.rolloverOnRulesUpdate = raw.codex.rolloverOnRulesUpdate ?? true;

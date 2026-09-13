@@ -6,6 +6,7 @@ import { extractMessageText } from '../channels/feishu/media.mjs';
 import { createAnswerProjection } from './answer-projection.mjs';
 import { createRecoveryHandler } from './recovery.mjs';
 import { createSessionRotation } from './session-rotation.mjs';
+import { createSteeringHandler } from './steering.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -24,6 +25,7 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
   const scope = conversationId => ({ connectionId, conversationId });
   const recover = workspace ? createRecoveryHandler({ store, codex, workspace, connectionId, log }) : null;
   const rotate = workspace ? createSessionRotation({ store, codex, workspace, connectionId, config: config.codex ?? {}, log }) : null;
+  const steer = createSteeringHandler({ store, codex, log, enabled: config.codex?.steering !== false });
   function fault(code) { healthy = false; log('error', 'core', 'failed', { code }); }
   async function ingest(event, context = {}) {
     if (stopping || context.signal?.aborted) throw new Error('ingress_stopped');
@@ -157,6 +159,9 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
         log(rejected === 'failed' ? 'error' : 'warning', 'agent_run', 'rejected', { code: `input_${rejected}` });
         return;
       }
+      if (steer && await steer(job, buildConversationPrompt({ event: payload.event,
+        text: prepared ? [prepared.text, prepared.addendum].filter(Boolean).join('\n\n') : payload.text,
+        newThread: false, group: config.routing.groups.find(group => group.conversationId === job.conversationId) }))) return;
       attempt = await store.beginAgentAttempt({ id: job.id, leaseToken: job.leaseToken, agentId: 'codex' });
       if (attempt.recoveryRequired) {
         if (!attempt.nativeThreadId || !attempt.nativeTurnId) { await hold(job, 'agent_admission_unknown'); return; }
