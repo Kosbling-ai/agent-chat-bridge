@@ -97,7 +97,8 @@ export class CodexAppServerClient {
       this.pending.set(id, {
         method, child, timer, resolve, reject,
         threadId: typeof params?.threadId === 'string' ? params.threadId : undefined,
-        expectedTurnId: typeof params?.expectedTurnId === 'string' ? params.expectedTurnId : undefined,
+        expectedTurnId: typeof params?.expectedTurnId === 'string' ? params.expectedTurnId
+          : method === 'turn/interrupt' && typeof params?.turnId === 'string' ? params.turnId : undefined,
       });
     });
     try { child.stdin.write(`${JSON.stringify({ id, method, params })}\n`); }

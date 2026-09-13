@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { createCodexExecutor, projectCodexItem } from '../src/agents/codex/executor.mjs';
 import { CodexAppServerClient, codexAppServerArgs } from '../src/agents/codex/app-server-client.mjs';
 import { IdleLifecycle } from '../src/agents/codex/idle-lifecycle.mjs';
+import { steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from '../src/agents/codex/codex-turn-recovery.mjs';
 import { deriveExecutionScope, codexBindingOpenId } from '../src/agents/codex/thread-scope.mjs';
 import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 import { outboxRelativeDirectory } from '../src/agents/codex/prompt.mjs';
@@ -152,6 +153,46 @@ test('RPC rejection exposes only a stable code and request stage', async () => {
   assert.match(JSON.stringify(logs), /CODEX_RPC_REJECTED/);
   assert.match(JSON.stringify(logs), /thread\/resume/);
   await client.close();
+});
+
+test('client-safe RPC reasons retain mismatch recovery boundaries', async () => {
+  const expected = '01a0130b-c44b-7923-bd40-aecef0e86ff8';
+  const older = '01a00f75-2d21-7163-912d-bdfb80d328b4';
+  const oldest = '019fffff-0000-7000-8000-000000000001';
+  const newer = '01a01339-f7dc-76a2-becf-d9188b65870d';
+
+  function clientFor(handler) {
+    const child = new FakeChild((message, instance) => {
+      if (message.method === 'initialize') instance.send({ id: message.id, result: {} });
+      else handler(message, instance);
+    });
+    return new CodexAppServerClient({ config: config('/private/tmp'), spawnImpl: () => child });
+  }
+
+  let steerAttempts = 0;
+  const recovering = clientFor((message, child) => {
+    if (message.method === 'turn/interrupt') {
+      child.send({ id: message.id, error: { code: -32000, message: `expected active turn id \`${older}\` but found \`${oldest}\`` } });
+    } else if (++steerAttempts === 1) {
+      child.send({ id: message.id, error: { code: -32000, message: `expected active turn id \`${expected}\` but found \`${older}\`` } });
+    } else if (steerAttempts === 2) {
+      child.send({ id: message.id, error: { code: -32000, message: 'no active turn to steer' } });
+    } else child.send({ id: message.id, result: { turnId: expected } });
+  });
+  assert.equal((await steerTurnWithMismatchRecovery({
+    request: recovering.request.bind(recovering), threadId: 'thread', expectedTurnId: expected,
+    input: [{ type: 'text', text: 'synthetic' }], wait: async () => {},
+  })).turnId, expected);
+  await recovering.close();
+
+  const superseded = clientFor((message, child) => {
+    child.send({ id: message.id, error: { code: -32000, message: `expected active turn id \`${expected}\` but found \`${newer}\`` } });
+  });
+  await assert.rejects(steerTurnWithMismatchRecovery({
+    request: superseded.request.bind(superseded), threadId: 'thread', expectedTurnId: expected,
+    input: [{ type: 'text', text: 'synthetic' }], wait: async () => {},
+  }), TurnRecoverySupersededError);
+  await superseded.close();
 });
 
 test('idle lifecycle gates new work until owned close finishes', async () => {
