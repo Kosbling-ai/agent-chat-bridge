@@ -100,10 +100,13 @@ function validateRuntime(raw) {
   if (new Set(clients.map(c => c.id)).size !== clients.length) throw new ConfigError('duplicate_client');
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
-    object(hook, ['id', 'url', 'tokenEnv', 'conversationIds'], 'invalid_hook_fields');
+    object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds'], 'invalid_hook_fields');
     let url; try { url = new URL(hook.url); } catch { throw new ConfigError('invalid_hook_url'); }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_hook_url');
-    return { id: identifier(hook.id, 128), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds: strings(hook.conversationIds).map(id => identifier(id, 255)) };
+    const conversationIds = strings(hook.conversationIds).map(id => identifier(id, 255));
+    const catchupGroupIds = strings(hook.catchupGroupIds ?? []).map(id => identifier(id, 255));
+    if (catchupGroupIds.some(id => !conversationIds.includes(id))) throw new ConfigError('invalid_hook_catchup_scope');
+    return { id: identifier(hook.id, 128), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds, catchupGroupIds };
   });
   if (new Set(hooks.map(h => h.id)).size !== hooks.length) throw new ConfigError('duplicate_hook');
   let errorReporting;

@@ -16,8 +16,8 @@ export async function listCatchupConversations({ config, store }) {
     if (page.nextCursor && cursor && page.nextCursor <= cursor) throw new Error('catchup_scope_cursor_invalid');
     cursor = page.nextCursor;
   } while (cursor);
-  // Hook scopes may include private chats already known through ingress. Do not
-  // overwrite their observed type with the default for configured business groups.
-  for (const hook of config.hooks) for (const conversationId of hook.conversationIds) if (!conversations.has(conversationId)) add({ conversationId, conversationType: 'group' });
+  // An arbitrary hook target does not establish its chat type. Only explicit
+  // group declarations may bootstrap catchup before a live receipt identifies it.
+  for (const hook of config.hooks) for (const conversationId of hook.catchupGroupIds ?? []) add({ conversationId, conversationType: 'group' });
   return [...conversations.values()];
 }
