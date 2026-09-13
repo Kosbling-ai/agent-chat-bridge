@@ -8,6 +8,7 @@ import { createRecoveryHandler } from './recovery.mjs';
 import { createSessionRotation } from './session-rotation.mjs';
 import { createSteeringHandler } from './steering.mjs';
 import { createConversationGuard } from './conversation-guard.mjs';
+import { admitThread } from './thread-admission.mjs';
 
 const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -182,9 +183,11 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
         if (!turn) { await hold(job, 'agent_turn_unresolved'); return; }
       } else {
         rpcPhase = 'thread_admission';
-        const newThread = !attempt.nativeThreadId;
-        const thread = attempt.nativeThreadId
-          ? await codex.resumeThread({ threadId: attempt.nativeThreadId }) : await codex.startThread();
+        const oldGeneration = attempt.generation;
+        const admission = await admitThread({ store, codex, job, attempt });
+        if (admission.recoveryRequired) { await hold(job, 'agent_admission_unknown'); return; }
+        if (attempt.generation !== oldGeneration) log('warning', 'agent_run', 'fallback', { code: 'archived_thread_replaced' });
+        const { thread, newThread } = admission;
         if (!thread.thread?.id) throw Object.assign(new Error('invalid_thread_result'), { outcome: 'unknown' });
         attempt.nativeThreadId = thread.thread.id;
         await store.bindAgentAttempt({ id: job.id, leaseToken: job.leaseToken, expectedGeneration: attempt.generation, nativeThreadId: attempt.nativeThreadId });
