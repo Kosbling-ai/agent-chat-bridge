@@ -187,7 +187,13 @@ export async function createMediaFiles({ workspace, inboxDir, maxTotalBytes }) {
       return exclusive(async () => {
         await checkedDirectory(root);
         const dir = join(root, directoryName(runId));
-        try { await checkedDirectory(dir); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+        try { await checkedDirectory(dir); }
+        catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          // A prior removal may have succeeded before its parent sync failed.
+          await syncDirectory(root);
+          return;
+        }
         // Validate every entry before recursive removal. No symlink traversal.
         for (const file of await readdir(dir)) await regular(join(dir, file));
         await rm(dir, { recursive: true });

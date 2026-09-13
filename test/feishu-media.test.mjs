@@ -174,3 +174,28 @@ test('directory fsync precedes ready and failed publication sync preserves compl
     assert.equal(await readFile(retried.localPaths[0],'utf8'),'synthetic-image');
   }finally{t.mock.restoreAll();await f.close();}
 });
+
+test('release retries parent durability after deletion even when the run is already absent', {timeout:3000}, async t => {
+  const f=await fixture();
+  try {
+    assert.equal((await f.media.prepare(event('image',{image_key:'image'}),{runId:'retire'})).status,'ready');
+    const rootInfo=await stat(f.params.inboxDir);
+    const handle=await open(f.params.inboxDir,'r');
+    const prototype=Object.getPrototypeOf(handle),original=prototype.sync;await handle.close();
+    let calls=0,fail=true;
+    t.mock.method(prototype,'sync',async function(){
+      const info=await this.stat();
+      if(info.dev===rootInfo.dev && info.ino===rootInfo.ino) {
+        calls++;
+        if(fail)throw Object.assign(new Error('synthetic root sync failure'),{code:'EIO'});
+      }
+      return original.call(this);
+    });
+    await assert.rejects(f.media.release('retire'),{code:'EIO'});
+    assert.deepEqual(await readdir(f.params.inboxDir),[]);
+    await assert.rejects(f.media.release('retire'),{code:'EIO'});
+    assert.equal(calls,2);
+    fail=false;
+    await f.media.release('retire');assert.equal(calls,3);
+  }finally{t.mock.restoreAll();await f.close();}
+});
