@@ -5,6 +5,7 @@ import { createApi } from '../src/core/api.mjs';
 import { createLogger, createErrorReporter } from '../src/logger.mjs';
 import { boundedFeishuHttp } from '../src/service.mjs';
 import { Readable } from 'node:stream';
+import { createRuntime } from '../src/core/runtime.mjs';
 
 const config = {
   schemaVersion: 1, storage: Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `TEST_${key.toUpperCase()}`])),
@@ -26,6 +27,27 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
 test('API tokens must be distinct and sufficiently long', () => {
   const validated = validateConfig(config);
   assert.throws(() => createApi({ config: validated, store: {}, chat: {}, tokens: { tester: 'short' } }), { code: 'invalid_auth_environment' });
+});
+test('group defaults allow all human members; explicit member filter does not limit hooks', async () => {
+  const observed = [];
+  const groupConfig = validateConfig({ ...config, routing: { ...config.routing, groups: [{ conversationId: 'chat', trigger: 'all', passiveContext: true }] }, hooks: [{ id: 'h', url: 'http://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: ['chat'] }] });
+  const runtime = createRuntime({ config: groupConfig, store: { acceptInbound: async value => { observed.push(value); return {}; } }, codex: {}, chat: {} });
+  const event = { connectionId: 'test', eventKey: 'synthetic', type: 'message.received', conversationId: 'chat', conversationType: 'group', messageId: 'm', actor: { type: 'user', openId: 'not-enumerated' }, message: { kind: 'text', parsedContent: { text: 'synthetic' } } };
+  await runtime.ingest(event);
+  assert(observed[0].agentJob); assert.equal(observed[0].hooks.length, 1);
+  const restricted = createRuntime({ config: { ...groupConfig, routing: { ...groupConfig.routing, groups: [{ ...groupConfig.routing.groups[0], userIds: [] }] } }, store: { acceptInbound: async value => { observed.push(value); return {}; } }, codex: {}, chat: {} });
+  await restricted.ingest(event);
+  assert.equal(observed[1].agentJob, undefined); assert.equal(observed[1].hooks.length, 1);
+});
+test('run API accepts existing long cron prompts and caps UTF-8 bytes including JSON escape allowance', async () => {
+  const accepted = [];
+  const token = 'synthetic-long-token-for-local-test';
+  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: { enqueueJob: async value => { accepted.push(value); return { id: 'run' }; } }, chat: {} });
+  const request = text => Object.assign(Readable.from([Buffer.from(JSON.stringify({ conversationId: 'chat', idempotencyKey: 'cron', text }))]), { method: 'POST', url: '/v1/runs', headers: { authorization: `Bearer ${token}` } });
+  assert.equal((await api(request('中'.repeat(10000)))).status, 202);
+  assert.equal((await api(request('\u0001'.repeat(64 * 1024)))).status, 202);
+  await assert.rejects(api(request('中'.repeat(22000))), { status: 413, code: 'text_too_large' });
+  assert.equal(accepted.length, 2);
 });
 test('chat effect registration covers media/reaction and checks reply membership', async () => {
   const effects = [];

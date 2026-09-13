@@ -18,7 +18,7 @@ export function createRuntime({ config, store, codex, chat, hookTokens = {}, fet
     if (stopping || context.signal?.aborted) throw new Error('ingress_stopped');
     const group = config.routing.groups.find(item => item.conversationId === event.conversationId);
     const human = !event.isApp && !event.isSelf && event.actor.type === 'user';
-    const allowed = human && (event.conversationType === 'p2p' ? config.routing.privateUserIds.includes(event.actor.openId) : group?.userIds.includes(event.actor.openId));
+    const allowed = human && (event.conversationType === 'p2p' ? config.routing.privateUserIds.includes(event.actor.openId) : Boolean(group && (group.userIds === undefined || group.userIds.includes(event.actor.openId))));
     const mentioned = event.message?.mentions?.some(mention => mention.openId === config.feishu.botOpenId);
     const triggered = allowed && event.type === 'message.received' && (event.conversationType === 'p2p' || group?.trigger === 'all' || mentioned);
     const text = event.message?.kind === 'text' ? event.message.parsedContent?.text : undefined;

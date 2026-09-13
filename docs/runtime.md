@@ -20,7 +20,7 @@ Migration is explicit and should use the deployment's controlled migration crede
 
 ## Routing and execution
 
-Private messages require actor.openId in privateUserIds. Group routing requires an explicit group and allowed userIds, then either mention or all trigger. Self/app messages are excluded from Agent and hook routing. Passive context is an explicit group policy, independent from hooks, and only contains admitted human messages not triggering Agent. The first routing snapshot is preserved on duplicate input. Recall tombstones exclude passive context even when recall arrives first; recalls never launch another model turn.
+Private messages require actor.openId in privateUserIds. Group routing requires an explicit group, then either mention or all trigger. All human group members are admitted by default; optional group.userIds narrows membership only when explicitly configured (an empty list admits none). Hook conversation scopes remain independent from Agent user/group admission. Self/app messages are excluded from Agent and hook routing. Passive context is an explicit group policy, independent from hooks, and only contains admitted human messages not triggering Agent. The first routing snapshot is preserved on duplicate input. Recall tombstones exclude passive context even when recall arrives first; recalls never launch another model turn.
 
 Inbox and independent agent/hook jobs commit before the Feishu handler resolves. Agent work persists an attempt before native RPC; thread/turn binding uses lease/generation fencing. Native notifications are buffered durably before admission bookkeeping, then associated by thread/turn. Random receive keys preserve repeated deltas as distinct receipts; they are not semantic deduplication keys. Terminal effects use stable per-run outbox keys and fenced atomic completion. A known admitted turn can recover by thread/read; a missing native admission ID becomes status=unknown, locks the session and is never replayed automatically. GET run exposes that state. There is currently no operator recovery mutation for an unknown session; production migration must supply a reviewed recovery workflow before relying on it.
 
@@ -34,7 +34,7 @@ All `/v1/` operations require `Authorization: Bearer <token>`. Run/delivery read
 
 | Endpoint | Contract |
 | --- | --- |
-| POST /v1/runs | `{conversationId,idempotencyKey,text}` → 202 `{id,duplicate}`; text <=2048 chars |
+| POST /v1/runs | `{conversationId,idempotencyKey,text}` → 202 `{id,duplicate}`; text <=64 KiB UTF-8; JSON body <=512 KiB including escaping |
 | GET /v1/runs/:id | durable status/result/errorCode/timestamps |
 | GET /v1/runs/:id/events | `after` sequence, `limit` 1–100; read-only |
 | POST /v1/deliveries | common `{conversationId,idempotencyKey,kind,...}` → 202; see below |

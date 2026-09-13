@@ -53,7 +53,9 @@ export function createApi({ config, store, chat, tokens }) {
     const url = new URL(request.url, 'http://bridge.local');
     const path = url.pathname;
     if (request.method === 'POST' && path === '/v1/runs') {
-      const input = fields(await body(request), ['conversationId', 'idempotencyKey', 'text'], ['conversationId', 'idempotencyKey', 'text']);
+      const input = fields(await body(request, 512 * 1024), ['conversationId', 'idempotencyKey', 'text'], ['conversationId', 'idempotencyKey']);
+      if (typeof input.text !== 'string' || !input.text.trim()) throw new ApiError('invalid_text');
+      if (Buffer.byteLength(input.text) > 64 * 1024) throw new ApiError('text_too_large', 413);
       authorize(client, input.conversationId);
       const result = await store.enqueueJob({ connectionId, conversationId: input.conversationId, kind: 'agent', idempotencyKey: `api:${client.id}:${input.idempotencyKey}`, payload: { text: input.text, source: 'api', callerId: client.id } });
       return { status: 202, body: { id: result.id, duplicate: result.duplicate } };

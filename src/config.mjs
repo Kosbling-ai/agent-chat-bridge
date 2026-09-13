@@ -79,7 +79,7 @@ function validateRuntime(raw) {
   const groups = raw.routing.groups.map(group => {
     object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext'], 'invalid_group_fields');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
-    return { conversationId: string(group.conversationId), userIds: strings(group.userIds), trigger: group.trigger, passiveContext: group.passiveContext };
+    return { conversationId: string(group.conversationId), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, passiveContext: group.passiveContext };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), groups };
