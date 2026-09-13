@@ -236,5 +236,6 @@ CREATE TABLE IF NOT EXISTS bridge_steering (
   PRIMARY KEY (guidance_job_id,target_run_id),
   UNIQUE KEY steering_settled (guidance_job_id,settled_lease_token),
   KEY steering_latest (guidance_job_id,sequence),
-  KEY steering_parent (target_run_id,status,sequence)
+  KEY steering_parent (target_run_id,status,sequence),
+  KEY steering_scope (connection_id,conversation_id,agent_id,status,guidance_job_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
