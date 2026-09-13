@@ -1,5 +1,7 @@
 # agent-chat-bridge
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Version: `0.1.0` — initial development release. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
