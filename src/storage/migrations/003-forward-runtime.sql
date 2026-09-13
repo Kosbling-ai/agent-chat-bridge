@@ -1,7 +1,3 @@
-ALTER TABLE assistant_codex_events
-  ADD KEY idx_assistant_codex_events_progress
-    (feishu_open_id,chat_id,codex_session_id,message_id,created_at,id);
-
 CREATE TABLE IF NOT EXISTS assistant_codex_forward_jobs (
   id BIGINT NOT NULL AUTO_INCREMENT,
   public_run_id CHAR(36) CHARACTER SET ascii NOT NULL,

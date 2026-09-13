@@ -10,6 +10,7 @@ import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
 import { createApi } from '../src/core/api.mjs';
 import { createFeishuReplies } from '../src/channels/feishu/replies.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
+import { observeExecutionCard } from '../src/channels/feishu/execution-card.mjs';
 import { validateConfig } from '../src/config.mjs';
 import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
 import { Readable } from 'node:stream';
@@ -91,20 +92,45 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
       await delayed.beginTransaction();
       await delayed.execute(`INSERT INTO assistant_codex_events
         (id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000001,'late-thread','group:late','late-chat','late-message','tool:late','public_progress','activity','Late','',JSON.stringify({kind:'tool',id:'late',status:'completed'}),1302]);
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000001,'late-thread','group:late','late-chat','late-message','tool:late','public_progress','activity','Late','',JSON.stringify({kind:'tool',id:'late',status:'completed'}),1300]);
       await pool.execute(`INSERT INTO assistant_codex_events
         (id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000002,'late-thread','group:late','late-chat','late-message','tool:visible','public_progress','activity','Visible','',JSON.stringify({kind:'tool',id:'visible',status:'running'}),1301]);
       const binding = { feishuOpenId: 'group:late', chatId: 'late-chat' };
-      const visible = await progressStore.readPublicProgress({ binding, threadId: 'late-thread', messageId: 'late-message', cursor: { at: 1300, id: '0' } });
-      assert.deepEqual(visible.map(row => String(row.id)), ['9000002']);
+      let cardState = { entries: [] };
+      let firstCursorPersisted;
+      const firstCursor = new Promise(resolve => { firstCursorPersisted = resolve; });
+      const card = {
+        chain: Promise.resolve(),
+        snapshot: () => structuredClone(cardState),
+        push(event) {
+          const index = cardState.entries.findIndex(item => item.id === event.id);
+          if (index >= 0) cardState.entries[index] = event;
+          else cardState.entries.push(event);
+        },
+        setObserverCursor(cursor, seen) {
+          cardState = { ...cardState, observerCursor: structuredClone(cursor), observerSeen: structuredClone(seen) };
+          firstCursorPersisted();
+        },
+        async persist(value) { cardState = structuredClone(value); },
+        async log() {},
+        stop() {},
+      };
+      const load = cursor => progressStore.readPublicProgress({
+        binding, threadId: 'late-thread', messageId: 'late-message', cursor, limit: 100,
+      }).then(rows => rows.map(row => ({ ...row, progress_json: row.detail_json })));
+      const observer = observeExecutionCard({ card, since: 1200, load });
+      await firstCursor;
+      assert.deepEqual(cardState.entries.map(entry => entry.id), ['visible']);
+      assert.deepEqual(cardState.observerCursor, { at: 1200, id: '0' });
       await delayed.commit();
-      const late = await progressStore.readPublicProgress({ binding, threadId: 'late-thread', messageId: 'late-message', cursor: { at: 1301, id: '9000002' } });
-      assert.deepEqual(late.map(row => String(row.id)), ['9000001']);
+      const saved = await observer.stop();
+      assert.deepEqual(saved.entries.map(entry => entry.id).sort(), ['late', 'visible']);
       await pool.execute(`UPDATE assistant_codex_events SET detail_json=?,created_at=?
         WHERE codex_session_id=? AND event_key=?`, [JSON.stringify({kind:'tool',id:'visible',status:'failed'}),1303,'late-thread','tool:visible']);
-      const updated = await progressStore.readPublicProgress({ binding, threadId: 'late-thread', messageId: 'late-message', cursor: { at: 1302, id: '9000001' } });
-      assert.deepEqual(updated.map(row => [String(row.id), JSON.parse(row.detail_json).status]), [['9000002','failed']]);
+      const resumed = observeExecutionCard({ card, since: 1200, cursor: saved.observerCursor, load });
+      const updated = await resumed.stop();
+      assert.equal(updated.entries.find(entry => entry.id === 'visible').status, 'failed');
     } finally {
       delayed.release();
     }

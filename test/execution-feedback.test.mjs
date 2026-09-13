@@ -60,6 +60,37 @@ test('terminal typing intent removes an add reaction that confirms late', async 
   assert.equal(job.result.typing.desired, false);
 });
 
+test('lease loss while card intent persistence is blocked prevents the platform call', async () => {
+  const job = jobFixture();
+  job.sourceMessageId = null;
+  let releasePersist;
+  let persistenceStarted;
+  let lost = false;
+  let creates = 0;
+  const started = new Promise(resolve => { persistenceStarted = resolve; });
+  const feedback = createExecutionFeedback({
+    jobs: {
+      async patchFeedback({ key }) {
+        assert.equal(key, 'executionCard');
+        persistenceStarted();
+        await new Promise(resolve => { releasePersist = resolve; });
+      },
+    },
+    sessions: {}, chat: {}, executor: {},
+    cardClient: { im: { v1: { message: { async create() { creates += 1; return { code: 0, data: { message_id: 'card' } }; } } } } },
+  });
+  const state = await feedback.start(job, {
+    assertOwned() {
+      if (lost) throw Object.assign(new Error('lease lost'), { code: 'forward_lease_lost' });
+    },
+  });
+  await started;
+  lost = true;
+  releasePersist();
+  await state.card.chain;
+  assert.equal(creates, 0);
+});
+
 test('stop callback is fenced to the original sender/card/turn and replay does not interrupt twice', async () => {
   const job = jobFixture();
   let interrupts = 0;

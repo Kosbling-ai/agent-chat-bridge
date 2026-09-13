@@ -18,6 +18,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
   async function persist(job, state, key, value) {
     state.control.assertOwned?.();
     await jobs.patchFeedback({ id: job.id, leaseOwner: job.leaseOwner, key, value });
+    state.control.assertOwned?.();
     state.result = { ...state.result, [key]: structuredClone(value) };
   }
 

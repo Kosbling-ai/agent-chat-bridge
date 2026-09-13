@@ -10,6 +10,7 @@ import { IdleLifecycle } from '../src/agents/codex/idle-lifecycle.mjs';
 import { deriveExecutionScope, codexBindingOpenId } from '../src/agents/codex/thread-scope.mjs';
 import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 import { outboxRelativeDirectory } from '../src/agents/codex/prompt.mjs';
+import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
 
 class FakeStream extends EventEmitter {
   setEncoding() {}
@@ -229,6 +230,66 @@ test('caller abort and onBound failure never stop or replay the native turn', as
     assert.equal(runtime.calls.filter((call) => call.method === 'turn/interrupt').length, 0);
     runtime.children[0].send({ method: 'turn/completed', params: { threadId: 'thread-2', turnId: 'turn-2', turn: { id: 'turn-2', status: 'completed', items: [] } } });
     while (executor.status().activeTurns) await new Promise((resolve) => setImmediate(resolve));
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('forward lease loss abandons feedback through the real executor abort path', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const appServer = fakeRuntime({ completeStarts: false });
+    const sessions = memoryStore();
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: sessions, childEnv: {}, spawnImpl: appServer.spawnImpl });
+    let claimed = false;
+    let observerStarted = false;
+    let abandoned = 0;
+    let resolveAbandoned;
+    const abandonedSignal = new Promise(resolve => { resolveAbandoned = resolve; });
+    const job = {
+      id: '00000000-0000-4000-8000-000000000001', callerId: 'live', chatId: 'chat', chatType: 'p2p',
+      messageId: 'message', sourceMessageId: 'message', senderOpenId: 'person', senderName: 'Person',
+      deliveryMode: 'bridge', prompt: 'work', attempts: 1, result: {}, createdAt: 1,
+    };
+    const jobs = {
+      async claimReplyPending() { return []; },
+      async claimFeedbackPending() { return []; },
+      async claim({ owner }) {
+        if (claimed) return [];
+        claimed = true;
+        job.leaseOwner = owner;
+        return [job];
+      },
+      async renew() {
+        if (observerStarted) throw Object.assign(new Error('lost'), { code: 'forward_lease_lost' });
+        return { renewed: true };
+      },
+      async patchExecution({ execution }) { job.result.execution = structuredClone(execution); },
+      async markReplyPending() { throw new Error('aborted execution must not become reply pending'); },
+      async markRetry() { throw new Error('aborted execution must not be retried by the stale owner'); },
+    };
+    const feedback = {
+      async start() { return { observer: { active: true }, card: { active: true } }; },
+      observe() { observerStarted = true; },
+      abandon(state) {
+        abandoned += 1;
+        state.observer = null;
+        state.card = null;
+        resolveAbandoned();
+      },
+    };
+    const runtime = createForwardRuntime({
+      config: { owner: 'process', pollMs: 1, leaseMs: 100, heartbeatMs: 5 },
+      jobs, sessions, executor, feedback, replies: {}, authorize: async () => true,
+    });
+    runtime.start();
+    await abandonedSignal;
+    assert.equal(abandoned, 1);
+    assert.equal(executor.status().activeTurns, 1);
+    appServer.children[0].send({ method: 'turn/completed', params: {
+      threadId: 'thread-1', turnId: 'turn-1', turn: { id: 'turn-1', status: 'completed', items: [] },
+    } });
+    while (executor.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+    await runtime.stop();
     await executor.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
