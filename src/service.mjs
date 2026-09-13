@@ -2,6 +2,7 @@ import { access, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import * as sdk from '@larksuiteoapi/node-sdk';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { ConfigError } from './config.mjs';
 import { createPoolFromEnvironment } from './storage/connection.mjs';
 import { createMysqlStore } from './storage/store.mjs';
@@ -27,8 +28,16 @@ export async function migrateService({ config, env = process.env }) {
   const pool = createPoolFromEnvironment(config.storage, env);
   try { return await migrate(pool); } finally { await pool.end(); }
 }
-export function boundedFeishuHttp(base) {
-  const options = value => ({ ...value, timeout: 10000, maxContentLength: 32 * 1024 * 1024, maxBodyLength: 32 * 1024 * 1024, maxRedirects: 0 });
+export function createFeishuProxyAgent(value, options) {
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.hash) throw new Error('invalid');
+    return new HttpsProxyAgent(url, options);
+  } catch { throw new ConfigError('invalid_feishu_proxy'); }
+}
+export function boundedFeishuHttp(base, { proxyAgent } = {}) {
+  const options = value => ({ ...value, timeout: 10000, maxContentLength: 32 * 1024 * 1024, maxBodyLength: 32 * 1024 * 1024, maxRedirects: 0,
+    ...(proxyAgent ? { proxy: false, httpAgent: proxyAgent, httpsAgent: proxyAgent } : {}) });
   const http = { request: value => base.request(options(value)) };
   for (const method of ['get', 'delete', 'head', 'options']) http[method] = (url, value) => base[method](url, options(value));
   for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value));
@@ -57,7 +66,7 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, codex: createCodexAdapter, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
   const pool = factories.pool(config.storage, env);
   let store, codex, feishu, runtime, catchup, http;
   let writerHealthy = true;
@@ -88,14 +97,15 @@ export async function startService({ config, configPath, env = process.env, log,
     });
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
-    const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance);
+    const proxyAgent = config.feishu.httpProxyEnv ? factories.feishuProxyAgent(secret(env, config.feishu.httpProxyEnv)) : undefined;
+    const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance, { proxyAgent });
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
     const chat = factories.chat({ client, maxMediaBytes: 28 * 1024 * 1024 });
     const media = await factories.media({ chat, workspace: cwd, inboxDir: resolve(cwd, '.agent-chat-bridge/inbox'), maxTotalBytes: config.feishu.mediaBudgetBytes, log });
     const outbound = await factories.outbound({ chat, workspace: cwd, outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'), spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'), maxTotalBytes: config.feishu.outputBudgetBytes, log });
     checkCancelled();
     runtime = createRuntime({ config, store, codex, chat, media, outbound, workspace: cwd, hookTokens, log });
-    feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
+    feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: runtime.ingest, log });
     const api = createApi({ config, store, chat, tokens });
     await Promise.race([codex.start(), cancelled]);
     checkCancelled();
