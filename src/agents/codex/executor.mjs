@@ -133,7 +133,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     return {
       cwd: config.cwd,
       approvalPolicy: config.approvalPolicy || 'auto',
-      approvalsReviewer: config.approvalsReviewer || 'auto',
+      approvalsReviewer: config.approvalsReviewer || 'auto_review',
       sandbox: config.sandbox || 'workspace-write',
       ...(config.model ? { model: config.model } : {}),
       ...extra,
@@ -438,8 +438,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       binding = await maybeRollover(binding, normalized.messageId);
       try { await ensureThreadReady(binding); }
       catch (error) {
-        if (!/session\s+[^\s]+\s+is archived/i.test(error.message)) throw error;
-        const archivedSessionId = String(error.message).match(/\bsession\s+([^\s]+)\s+is archived\b/i)?.[1]?.replace(/^[\"']+|[\"'.,;:]+$/g, '') || binding.codexSessionId;
+        if (error?.code !== 'CODEX_THREAD_ARCHIVED') throw error;
+        const archivedSessionId = binding.codexSessionId;
         binding = await rollover(binding, normalized.messageId, 'codex_session_archived', {
           outText: 'Codex 原会话已归档，后续飞书消息承接到新 Codex 会话。',
           inText: '因原 Codex 会话已归档，本会话开始承接后续飞书消息。',
@@ -455,12 +455,11 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       try {
         response = await client.request('turn/start', {
           threadId: binding.codexSessionId, input: [textInput(prompt)], cwd: config.cwd,
-          approvalPolicy: config.approvalPolicy || 'auto', approvalsReviewer: config.approvalsReviewer || 'auto',
+          approvalPolicy: config.approvalPolicy || 'auto', approvalsReviewer: config.approvalsReviewer || 'auto_review',
           ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
         });
       } catch (error) {
-        const archived = String(error?.message || '').match(/\bsession\s+([^\s]+)\s+is archived\b/i)?.[1]?.replace(/^['"]+|['".,;:]+$/g, '');
-        if (archived === binding.codexSessionId) {
+        if (error?.code === 'CODEX_THREAD_ARCHIVED') {
           loadedThreads.delete(binding.codexSessionId);
           throw coded('Codex thread was archived before turn start', 'CODEX_THREAD_ARCHIVED', { retryable: true, outcome: 'rejected' });
         }

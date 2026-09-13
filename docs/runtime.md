@@ -1,6 +1,6 @@
 # Forward runtime and API
 
-The unreleased 0.2.0 development version replaces the 0.1.1 generation worker with one leased Codex forward worker. It keeps the communication worker for hook delivery and registered chat outbox effects. One Feishu bot and WebSocket client feed both routes; one Codex app-server and forward worker start or observe Codex work.
+The unreleased 0.2.1 development version replaces the 0.1.1 generation worker with one leased Codex forward worker. It keeps the communication worker for hook delivery and registered chat outbox effects. One Feishu bot and WebSocket client feed both routes; one Codex app-server and forward worker start or observe Codex work. Thread start, resume and turn start use the protocol-defined `auto_review` approval reviewer.
 
 The implementation is validated with synthetic providers and disposable MySQL. It has not been connected to a real bot or model, deployed, or wired into the Kosbling business producer. The producer migration is separate work.
 
@@ -68,4 +68,4 @@ node scripts/test-storage.mjs test/storage-forward.integration.test.mjs
 
 Migration is explicit; start only checks the migration ledger and acquires the single-writer lock. `/health/live` reports the HTTP process, while readiness requires the configured Store, worker, Feishu and Codex components. The storage command creates and removes a temporary MySQL container. These checks do not contact Feishu or Codex.
 
-Reply/reaction membership, client conversation scope, body/byte limits and unknown-write recovery remain enforced for the communication APIs. Hook delivery still requires a durable consumer acknowledgement before it returns 204. The connected media and outbox components retain their current constraints in [input media](media.md) and [outbound media](outbound-media.md). [Catchup](catchup.md) describes the earlier generation implementation and is historical for the 0.2.0 forward execution path.
+Reply/reaction membership, client conversation scope, body/byte limits and unknown-write recovery remain enforced for the communication APIs. Hook delivery still requires a durable consumer acknowledgement before it returns 204. The connected media and outbox components retain their current constraints in [input media](media.md) and [outbound media](outbound-media.md). [Catchup](catchup.md) describes the earlier generation implementation and is historical for the current forward execution path.
