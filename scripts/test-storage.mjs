@@ -2,6 +2,15 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
+import { existsSync } from 'node:fs';
+
+// Every integration suite owns a pristine schema and the single writer lock.
+const files = process.argv.slice(2);
+if (files.length > 1 || files.some(file => !/^test\/[a-z0-9_.-]+\.test\.mjs$/i.test(file)
+    || !existsSync(new URL(`../${file}`, import.meta.url)))) {
+  process.stderr.write('Pass at most one existing test/*.test.mjs path per isolated database.\n');
+  process.exit(2);
+}
 
 // Never use a remote Docker endpoint or inherited database credentials.
 const context = spawnSync('docker', ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], {encoding:'utf8',timeout:5000});
@@ -36,8 +45,6 @@ try {
     await new Promise(r=>setTimeout(r,1000));
   }
   if(!ready)throw new Error('mysql_startup_deadline');
-  const files=process.argv.slice(2);
-  if(files.some(file=>!/^test\/[a-z0-9_.-]+\.test\.mjs$/i.test(file)))throw new Error('invalid_test_path');
   const run=spawnSync(process.execPath,['--test',...(files.length?files:['test/storage.integration.test.mjs'])],{
     cwd:fileURLToPath(new URL('..',import.meta.url)),stdio:'inherit',timeout:60000,killSignal:'SIGKILL',
     env:{...process.env,BRIDGE_TEST_HOST:'127.0.0.1',BRIDGE_TEST_PORT:port,BRIDGE_TEST_USER:'root',BRIDGE_TEST_PASSWORD:password,BRIDGE_TEST_DATABASE:'bridge_test'},
