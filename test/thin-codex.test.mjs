@@ -17,6 +17,52 @@ class FakeStream extends EventEmitter {
   setEncoding() {}
 }
 
+test('requestUserInput resolved before turn admission never opens a card', async t => {
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-codex-input-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+  mkdirSync(join(cwd,'home'));const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[{id:0}],resolveServerRequestBeforeResponse:true});let opens=0;
+  const executor=createCodexExecutor({config:{...config(cwd),requestUserInput:true},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:'default_mode_request_user_input under_development false\n'}),onUserInput:async()=>{opens++;}});
+  const running=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'message',prompt:'work'});running.catch(()=>{});
+  await new Promise(resolve=>setTimeout(resolve,20));assert.equal(opens,0);
+  await executor.close();await assert.rejects(running,{code:'CODEX_OBSERVATION_LOST'});
+});
+
+test('concurrent requestUserInput requests are ordered and the superseded request is answered only with an error', async t => {
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-codex-input-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+  mkdirSync(join(cwd,'home'));const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[{id:'first'},{id:'second'}]});const opens=[];const closed=[];
+  const executor=createCodexExecutor({config:{...config(cwd),requestUserInput:true},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:'default_mode_request_user_input under_development false\n'}),onUserInput:async request=>opens.push(request.itemId),onUserInputClosed:async request=>closed.push(request.itemId)});
+  const running=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'message',prompt:'work'});running.catch(()=>{});
+  while(opens.length<2)await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(opens,['item-0','item-1']);assert.deepEqual(closed,['item-0']);
+  assert(runtime.calls.some(message=>message.id==='first'&&message.error));
+  await executor.close();await assert.rejects(running,{code:'CODEX_OBSERVATION_LOST'});
+});
+
+test('active requestUserInput writes exactly one nested qid answer for numeric request id zero', async t => {
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-codex-input-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));mkdirSync(join(cwd,'home'));
+  const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[{id:0}]});let opened;
+  const executor=createCodexExecutor({config:{...config(cwd),requestUserInput:true},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:'default_mode_request_user_input under_development false\n'}),onUserInput:async request=>{opened=request;}});
+  const running=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'message',prompt:'work'});running.catch(()=>{});
+  while(!opened)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal((await executor.answerUserInput({threadId:opened.threadId,turnId:opened.turnId,requestId:0,itemId:opened.itemId,messageId:'message',answers:{q:{answers:['A']}}})).status,'submitted');
+  assert(runtime.calls.some(message=>message.id===0&&message.result?.answers?.q?.answers?.[0]==='A'));
+  assert.equal((await executor.answerUserInput({threadId:opened.threadId,turnId:opened.turnId,requestId:0,itemId:opened.itemId,messageId:'message',answers:{q:{answers:['A']}}})).status,'expired');
+  await executor.close();await assert.rejects(running,{code:'CODEX_OBSERVATION_LOST'});
+});
+
+test('secret requestUserInput is rejected without exposing questions to the card sink', async t => {
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-codex-input-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));mkdirSync(join(cwd,'home'));
+  const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[{id:'secret',params:{questions:[{id:'secret',header:'Secret',question:'Sensitive',isSecret:true}]}}]});let opens=0;
+  const executor=createCodexExecutor({config:{...config(cwd),requestUserInput:true},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:'default_mode_request_user_input under_development false\n'}),onUserInput:async()=>{opens++;}});
+  const running=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'message',prompt:'work'});running.catch(()=>{});
+  while(!runtime.calls.some(message=>message.id==='secret'&&message.error))await new Promise(resolve=>setImmediate(resolve));assert.equal(opens,0);
+  while(executor.status().activeTurns!==1)await new Promise(resolve=>setImmediate(resolve));
+  await executor.close();await assert.rejects(running,{code:'CODEX_OBSERVATION_LOST'});
+});
+
 class FakeChild extends EventEmitter {
   constructor(handler) {
     super(); this.exitCode = null; this.signalCode = null;
@@ -44,7 +90,7 @@ function memoryStore(initial = []) {
   };
 }
 
-function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set() } = {}) {
+function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false } = {}) {
   let threadNumber = 0; let turnNumber = 0;
   const children = []; const calls = []; const envs = []; const args = [];
   const spawnImpl = (_bin, childArgs, options) => {
@@ -80,6 +126,8 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkTh
         if (archiveTurnStartOnce) { archiveTurnStartOnce = false; setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: `session ${message.params.threadId} is archived` } })); return; }
         if (rejectTurnStart) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: 'synthetic transport uncertainty' } })); return; }
         const id = `turn-${++turnNumber}`;
+        for (const [index,request] of serverRequestsOnStart.entries()) instance.send({id:request.id,method:'item/tool/requestUserInput',params:{threadId:message.params.threadId,turnId:id,itemId:`item-${index}`,questions:[{id:'q',header:'Choice',question:'Pick',options:[{label:'A',description:'a'}]}],isBlocking:true,...request.params}});
+        if(resolveServerRequestBeforeResponse&&serverRequestsOnStart[0])instance.send({method:'serverRequest/resolved',params:{threadId:message.params.threadId,requestId:serverRequestsOnStart[0].id}});
         const completed = { method: 'turn/completed', params: { threadId: message.params.threadId, turnId: id, turn: { id, status: 'completed', items: [{ id: `answer-${id}`, type: 'agentMessage', phase: 'final_answer', text: `answer ${id}` }] } } };
         if (completeStarts && raceCompletionBeforeResponse) instance.send(completed);
         respond({ turn: { id } });

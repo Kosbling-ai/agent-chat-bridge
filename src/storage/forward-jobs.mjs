@@ -385,6 +385,86 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         return { outcome: result.fork.status, fork: result.fork };
       });
     },
+    beginUserInput(input) {
+      const id = required(input.id,36);
+      const messageId = required(input.messageId,191);
+      const threadId = required(input.threadId,255);
+      const turnId = required(input.turnId,255);
+      const itemId = required(input.itemId,255);
+      const requestKey = required(input.requestKey,600);
+      const cardUuid = required(input.cardUuid,64);
+      if (!Array.isArray(input.questions) || !input.questions.length) throw new StoreError('invalid_store_input');
+      return write(async connection => {
+        const [[found]] = await connection.execute(`SELECT status,message_id,chat_id,sender_open_id,result_json FROM assistant_codex_forward_jobs
+          WHERE connection_id=? AND public_run_id=? FOR UPDATE`, [connectionId,id]);
+        if (!found) return { outcome:'not_found' };
+        const result=parse(found.result_json); const execution=result.execution||{};
+        if (found.status!=='running'||found.message_id!==messageId||execution.threadId!==threadId||execution.turnId!==turnId) return {outcome:'stale'};
+        if (result.userInput?.requestKey===requestKey&&result.userInput?.itemId===itemId) return {outcome:'replay',userInput:result.userInput};
+        if(result.userInput?.threadId===threadId&&result.userInput?.turnId===turnId
+          &&(['submitting','unknown'].includes(result.userInput.status)||result.userInput.card?.status==='unknown'))return {outcome:'blocked',userInput:result.userInput};
+        result.userInput={requestKey,itemId,threadId,turnId,messageId,actor:found.sender_open_id,chatId:found.chat_id,
+          questions:input.questions,status:'pending',card:{uuid:cardUuid,status:'intent'},createdAt:now()};
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=? WHERE connection_id=? AND public_run_id=?`,[safeJson(result),now(),connectionId,id]);
+        return {outcome:'new',userInput:result.userInput};
+      });
+    },
+    finishUserInputCard(input) {
+      const id=required(input.id,36); const requestKey=required(input.requestKey,600);
+      if(!['confirmed','failed','unknown'].includes(input.status)) throw new StoreError('invalid_store_input');
+      return write(async connection=>{
+        const [[found]]=await connection.execute(`SELECT result_json FROM assistant_codex_forward_jobs WHERE connection_id=? AND public_run_id=? FOR UPDATE`,[connectionId,id]);
+        if(!found)return {outcome:'not_found'}; const result=parse(found.result_json); const userInput=result.userInput;
+        if(!userInput||userInput.requestKey!==requestKey)return {outcome:'stale'};
+        if(userInput.card?.status!=='intent')return {outcome:'replay',userInput};
+        userInput.card={...userInput.card,status:input.status,...(input.cardMessageId?{messageId:required(input.cardMessageId,191)}:{}),finishedAt:now()};
+        if(input.status==='failed')userInput.status='expired';
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=? WHERE connection_id=? AND public_run_id=?`,[safeJson(result),now(),connectionId,id]);
+        return {outcome:input.status,userInput};
+      });
+    },
+    beginUserInputAnswer(input) {
+      const id=required(input.id,36); const requestKey=required(input.requestKey,600); const itemId=required(input.itemId,255);
+      const actor=required(input.actor,191); const chatId=required(input.chatId,191); const cardMessageId=required(input.cardMessageId,191);
+      if(!input.answers||typeof input.answers!=='object'||Array.isArray(input.answers))throw new StoreError('invalid_store_input');
+      return write(async connection=>{
+        const [[found]]=await connection.execute(`SELECT status,message_id,chat_id,sender_open_id,result_json FROM assistant_codex_forward_jobs WHERE connection_id=? AND public_run_id=? FOR UPDATE`,[connectionId,id]);
+        if(!found)return {outcome:'not_found'}; const result=parse(found.result_json); const userInput=result.userInput;
+        if(found.status!=='running'||found.chat_id!==chatId||found.sender_open_id!==actor||!userInput||userInput.status!=='pending'
+          ||userInput.requestKey!==requestKey||userInput.itemId!==itemId||userInput.card?.status!=='confirmed'||userInput.card?.messageId!==cardMessageId){
+          if(userInput?.requestKey===requestKey&&['submitting','submitted','unknown'].includes(userInput.status))return {outcome:'replay',userInput};
+          return {outcome:'stale'};
+        }
+        userInput.status='submitting'; userInput.answers=input.answers; userInput.operationId=required(input.operationId,36); userInput.submittedAt=now();
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=? WHERE connection_id=? AND public_run_id=?`,[safeJson(result),now(),connectionId,id]);
+        return {outcome:'new',userInput};
+      });
+    },
+    finishUserInput(input) {
+      const id=required(input.id,36); const requestKey=required(input.requestKey,600); const operationId=required(input.operationId,36);
+      if(!['submitted','unknown','expired'].includes(input.status))throw new StoreError('invalid_store_input');
+      return write(async connection=>{
+        const [[found]]=await connection.execute(`SELECT result_json FROM assistant_codex_forward_jobs WHERE connection_id=? AND public_run_id=? FOR UPDATE`,[connectionId,id]);
+        if(!found)return {outcome:'not_found'}; const result=parse(found.result_json); const userInput=result.userInput;
+        if(!userInput||userInput.requestKey!==requestKey||userInput.operationId!==operationId)return {outcome:'stale'};
+        if(userInput.status!=='submitting')return {outcome:'replay',userInput};
+        userInput.status=input.status; userInput.finishedAt=now();
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=? WHERE connection_id=? AND public_run_id=?`,[safeJson(result),now(),connectionId,id]);
+        return {outcome:input.status,userInput};
+      });
+    },
+    expireUserInput(input) {
+      const id=required(input.id,36); const requestKey=required(input.requestKey,600);
+      return write(async connection=>{
+        const [[found]]=await connection.execute(`SELECT result_json FROM assistant_codex_forward_jobs WHERE connection_id=? AND public_run_id=? FOR UPDATE`,[connectionId,id]);
+        if(!found)return {outcome:'not_found'}; const result=parse(found.result_json); const userInput=result.userInput;
+        if(!userInput||userInput.requestKey!==requestKey)return {outcome:'stale'};
+        if(['submitted','unknown','expired'].includes(userInput.status))return {outcome:'replay',userInput};
+        userInput.status='expired'; userInput.finishedAt=now();
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=? WHERE connection_id=? AND public_run_id=?`,[safeJson(result),now(),connectionId,id]);
+        return {outcome:'expired',userInput};
+      });
+    },
     beginStop(input) {
       const id = required(input.id, 36);
       const threadId = required(input.threadId, 255);

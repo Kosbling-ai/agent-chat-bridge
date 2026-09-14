@@ -7,6 +7,7 @@ import { collectOutboxAttachments } from './outbound-files.mjs';
 import { codexThreadCreatedAtMs, shouldRolloverForRules } from './codex-rules-rollover.mjs';
 import { exactTurnSnapshot, inProgressTurnIds, interruptTurnAndPredecessors, isNoActiveTurnError, steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from './codex-turn-recovery.mjs';
 import { createPublicProgressProjector } from '../../shared/public-progress.mjs';
+import { normalizeUserInputAnswers, normalizeUserInputRequest, typedRequestKey } from './user-input-request.mjs';
 
 const textInput = (text) => ({ type: 'text', text, text_elements: [] });
 const trim = (value) => String(value || '').trim();
@@ -111,20 +112,24 @@ function formatDurationShort(durationMs) {
   return `${Math.round(value / 1000)} 秒`;
 }
 
-export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, now = Date.now, onRestartRequired = async () => {}, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval } = {}) {
+export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, spawnSyncImpl, now = Date.now, onRestartRequired = async () => {}, onUserInput = async () => {}, onUserInputClosed = async () => {}, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval } = {}) {
   if (!config || !sessionStore) throw new Error('config and sessionStore are required');
   const locks = new Map();
   const activeByBinding = new Map();
   const activeByTurn = new Map();
+  const startingByThread = new Map();
+  const resolvedUserInputs = new Set();
   const loadedThreads = new Set();
   let memoryTimer;
   let closing = false;
   let restartPending = '';
   let restartNotified = false;
+  const rememberResolvedUserInput=key=>{resolvedUserInputs.add(key);if(resolvedUserInputs.size>100)resolvedUserInputs.delete(resolvedUserInputs.values().next().value);};
 
   const client = new CodexAppServerClient({
-    config, childEnv, spawnImpl, log, now,
+    config, childEnv, spawnImpl, spawnSyncImpl, log, now,
     eventSink: (event) => handleNotification(event),
+    serverRequestSink: (request) => handleServerRequest(request),
     onDisconnect: (error) => handleDisconnect(error),
     onIdle: () => { maybeNotifyRestart().catch(() => {}); },
   });
@@ -365,6 +370,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       binding, threadId: binding.codexSessionId, turnId, messageId: input.messageId,
       startedAt, outboxScanFromMs: startedAt, itemText: new Map(), publicProgress: createPublicProgressProjector(),
       lastAgentMessage: '', pendingSteerId: null, settled: false, stopRequested: false,
+      userInput: null,
+      userInputQueue: Promise.resolve(),
       steerQueue: Promise.resolve(), waiters: new Set(),
       finalized: null,
       completed: new Promise((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; }),
@@ -386,7 +393,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function registerState(state) {
-    state.finalized = finalizeTurn(state);
+    state.finalized = finalizeTurn(state).finally(() => expireUserInput(state, 'turn_finished'));
     activeByBinding.set(bindingKey(state.binding), state);
     activeByTurn.set(state.turnId, state);
     const releaseActivity = client.lifecycle.hold();
@@ -398,9 +405,84 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }).catch(() => {});
   }
 
+  function startAdmission(threadId, messageId) {
+    let resolveAdmission; let rejectAdmission;
+    const promise = new Promise((resolvePromise, rejectPromise) => { resolveAdmission = resolvePromise; rejectAdmission = rejectPromise; });
+    promise.catch(() => {});
+    const admission = { threadId, messageId, promise, resolve: resolveAdmission, reject: rejectAdmission };
+    startingByThread.set(threadId, admission);
+    return admission;
+  }
+
+  async function expireUserInput(state, reason, { resolved = false } = {}) {
+    const pending = state?.userInput;
+    if (!pending || pending.settled) return;
+    pending.settled = true; state.userInput = null;
+    try {
+      if (resolved) pending.request.abandon();
+      else await pending.request.respondError(-32002, 'User input request expired');
+    } catch { /* a disconnected child is already expired */ }
+    await onUserInputClosed({ ...pending.public, reason }).catch(() => {});
+  }
+
+  async function handleServerRequest(request) {
+    let normalized;
+    try { normalized = normalizeUserInputRequest(request); }
+    catch (error) {
+      await request.respondError(-32602, error.code === 'CODEX_USER_INPUT_SECRET_UNSUPPORTED' ? 'Secret questions are unsupported' : 'Invalid user input request').catch(() => {});
+      return;
+    }
+    if (closing || config.requestUserInput === false) {
+      await request.respondError(-32002, 'User input request unavailable').catch(() => {}); return;
+    }
+    const resolvedKey = `${normalized.threadId}:${typedRequestKey(normalized.requestId)}`;
+    if (resolvedUserInputs.delete(resolvedKey)) { request.abandon(); return; }
+    let state = activeByTurn.get(normalized.turnId);
+    if (!state) {
+      const admission = startingByThread.get(normalized.threadId);
+      if (!admission) { await request.respondError(-32002, 'User input request has no active turn').catch(() => {}); return; }
+      try { state = await admission.promise; } catch { await request.respondError(-32002, 'User input request expired before turn admission').catch(() => {}); return; }
+    }
+    const operation=state.userInputQueue.then(async()=>{
+      if(resolvedUserInputs.delete(resolvedKey)){request.abandon();return;}
+      if (state.threadId !== normalized.threadId || state.turnId !== normalized.turnId || state.settled || closing) {
+        await request.respondError(-32002, 'User input request does not match the active turn').catch(() => {}); return;
+      }
+      await expireUserInput(state, 'superseded');
+      if(resolvedUserInputs.delete(resolvedKey)){request.abandon();return;}
+      const controller=new AbortController();
+      const publicRequest = {
+        ...normalized, messageId: state.messageId, binding: state.binding, signal:controller.signal,
+        requestKey: typedRequestKey(normalized.requestId),
+      };
+      state.userInput = { request, public: publicRequest, controller, settled: false };
+      try { await onUserInput(publicRequest); }
+      catch {
+        if(state.userInput?.request===request)await expireUserInput(state, 'delivery_failed');
+        log('error', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'user_input_card', status: 'failed', threadId: state.threadId, turnId: state.turnId });
+      }
+    });
+    state.userInputQueue=operation.catch(()=>{});
+    await operation;
+  }
+
+  async function answerUserInput({ threadId, turnId, requestId, itemId, messageId, answers }) {
+    const state = activeByTurn.get(turnId);
+    const pending = state?.userInput;
+    if (!state || state.threadId !== threadId || state.messageId !== messageId || !pending || pending.settled
+      || typedRequestKey(pending.public.requestId) !== typedRequestKey(requestId) || pending.public.itemId !== itemId) return { status: 'expired' };
+    let result;
+    try { result = normalizeUserInputAnswers(pending.public.questions, answers); }
+    catch (error) { return { status: 'invalid', code: error.code }; }
+    pending.settled = true; pending.controller?.abort(); state.userInput = null;
+    try { await pending.request.respondResult(result); return { status: 'submitted' }; }
+    catch { return { status: 'unknown' }; }
+  }
+
   function handleDisconnect(error) {
     loadedThreads.clear();
     for (const state of activeByTurn.values()) {
+      expireUserInput(state, 'disconnected', { resolved: true }).catch(() => {});
       const lost = coded('Codex app-server connection was lost; native turn status is unknown', 'CODEX_OBSERVATION_LOST', { retryable: true, outcome: 'unknown' });
       Object.assign(lost, { cause: error, threadId: state.threadId, turnId: state.turnId, startedAt: state.startedAt });
       state.reject(lost);
@@ -502,6 +584,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       const startedAt = now();
       await options.onStartIntent?.({ binding, threadId: binding.codexSessionId, messageId: normalized.messageId, startedAt });
       let response;
+      let admission = startAdmission(binding.codexSessionId, normalized.messageId);
       try {
         response = await client.request('turn/start', {
           threadId: binding.codexSessionId, input: [textInput(prompt)], cwd: config.cwd,
@@ -510,32 +593,41 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         });
       } catch (error) {
         if (error?.code === 'CODEX_THREAD_ARCHIVED') {
+          startingByThread.delete(admission.threadId); admission.reject(error);
           loadedThreads.delete(binding.codexSessionId);
           binding = await rolloverArchivedBinding(binding, normalized.messageId, error);
           await ensureThreadReady(binding);
           prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
           await persistUser(binding, normalized, 'user', prompt);
+          admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
             threadId: binding.codexSessionId, input: [textInput(prompt)], cwd: config.cwd,
             approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy), approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
             ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
-          });
+          }).catch((failure) => { startingByThread.delete(admission.threadId); admission.reject(failure); throw failure; });
         } else {
+          startingByThread.delete(admission.threadId); admission.reject(error);
           error.code ||= 'CODEX_TURN_START_UNCONFIRMED'; error.outcome ||= 'unknown'; error.phase ||= 'turn_start'; throw error;
         }
       }
       const turnId = trim(response?.turn?.id);
-      if (!turnId) throw coded('Codex did not return a turn id', 'CODEX_TURN_START_UNCONFIRMED', { outcome: 'unknown' });
+      if (!turnId) {
+        const error = coded('Codex did not return a turn id', 'CODEX_TURN_START_UNCONFIRMED', { outcome: 'unknown' });
+        startingByThread.delete(admission.threadId); admission.reject(error); throw error;
+      }
       const state = createTurnState(binding, normalized, turnId, startedAt);
-      await registerState(state);
+      try { await registerState(state); }
+      catch (error) { startingByThread.delete(admission.threadId); admission.reject(error); throw error; }
       try { await options.onBound?.({ threadId: state.threadId, turnId, startedAt }); }
       catch {
+        startingByThread.delete(admission.threadId); admission.reject(coded('durable binding failed', 'CODEX_BINDING_UNCERTAIN'));
         state.bindingUncertain = true;
         waitForTurn(state, normalized.messageId, { created: binding.created }).catch(() => {});
         const error = coded('native turn started but durable binding failed', 'CODEX_BINDING_UNCERTAIN', { outcome: 'unknown' });
         Object.assign(error, { threadId: state.threadId, turnId, startedAt });
         throw error;
       }
+      startingByThread.delete(admission.threadId); admission.resolve(state);
       await sessionStore.saveCodexRealtimeEvent(binding, { messageId: normalized.messageId, eventKey: `public:${turnId}:started`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: startedAt, detail: { kind: 'started', id: turnId, turnId, at: startedAt } })
         .catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_started', status: 'failed', threadId: binding.codexSessionId, turnId }));
       return { completion: waitForTurn(state, normalized.messageId, { created: binding.created, signal: options.signal }) };
@@ -701,6 +793,17 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function handleNotification(event) {
+    if (event.method === 'serverRequest/resolved') {
+      const threadId = trim(event.params?.threadId);
+      const requestId = event.params?.requestId;
+      if (!threadId || !((typeof requestId === 'string' && requestId) || (typeof requestId === 'number' && Number.isSafeInteger(requestId)))) return;
+      const key = `${threadId}:${typedRequestKey(requestId)}`;
+      const state = [...activeByTurn.values()].find(candidate => candidate.threadId === threadId
+        && candidate.userInput && typedRequestKey(candidate.userInput.public.requestId) === typedRequestKey(requestId));
+      if (state) await expireUserInput(state, 'native_resolved', { resolved: true });
+      else if (startingByThread.has(threadId)||[...activeByTurn.values()].some(candidate=>candidate.threadId===threadId)) rememberResolvedUserInput(key);
+      return;
+    }
     const turnId = trim(event.params?.turnId || event.params?.turn?.id);
     const state = activeByTurn.get(turnId);
     if (!state) return;
@@ -759,11 +862,14 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   return Object.freeze({
-    execute, inspect, interrupt, forkBinding,
+    execute, inspect, interrupt, forkBinding, answerUserInput,
     status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), fault: client.fault || null, activeTurns: activeByTurn.size, activeTurnResponseWaiters: [...activeByBinding.values()].filter(hasOpenWaiter).length, restartPending: restartPending || null }),
     async close() {
       closing = true;
       clearIntervalImpl(memoryTimer);
+      for (const admission of startingByThread.values()) admission.reject(coded('executor is closing', 'CODEX_EXECUTOR_CLOSING'));
+      startingByThread.clear();
+      await Promise.allSettled([...activeByTurn.values()].map(state => expireUserInput(state, 'shutdown', { resolved:true })));
       client.lifecycle.stop();
       await client.close('shutdown');
       await Promise.allSettled([...activeByTurn.values()].map((state) => state.finalized));

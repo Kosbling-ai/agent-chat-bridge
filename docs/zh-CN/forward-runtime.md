@@ -4,6 +4,12 @@
 
 `codex.idleCloseMs` 只控制 bridge 活动归零后是否自动关闭其 app-server 子进程。原业务缺省值为 `60000` 毫秒；显式写 `0` 仍可关闭该定时器，其他值最大为 86400000。正常 shutdown 仍会关闭子进程，异常退出仍走既有故障处理。这不改变会话空闲两天、规则更新或归档时的 rollover。Codex 状态缺省使用启动用户共享的 `~/.codex`；可选 `codex.sharedHome` 与启动环境 `CODEX_HOME` 同时存在时必须解析到同一目录。app-server shell 继承策略只基于 bridge 传给子进程的受控环境。
 
+`codex.requestUserInput` 缺省为 `true`。bridge 启动时先检查当前 Codex 可执行文件是否提供 Default 模式的用户提问功能，只在确认支持时启用；功能不可用不会阻断其他执行，但 Codex 不能打开飞书提问卡。显式设为 `false` 会保持关闭。
+
+受支持的提问会为当前 active turn 创建一张独立飞书表单，可以一次包含多道题；每题接受一个已有选项、允许的“其他”输入或自由填空。只有原消息发送者能在原聊天中提交，bridge 会重新核对当前 job、卡片、授权、thread 和 turn。只要一批请求中包含 secret 提问，整批就会在展示和收集内容前被拒绝；普通飞书表单不是秘密输入通道。
+
+提交只接受一次。“已提交”表示 bridge 已接受表单并尝试交给仍存活的 native 请求，不表示 Codex 已经消费答案。native 已解决、停止执行、turn 完成或失败、app-server 断线、服务关闭都会让旧卡失效。bridge 不伪造超时答案，不在重启后恢复旧 RPC，也不重放 prompt 或答案。
+
 群授权必须显式出现在 `routing.groups`。`capabilities` 只允许 `bridge`、`hook`，缺省两者都开，`[]` 表示两者都关。`bridge` 仍继续检查 @/all trigger 和可选 `userIds`；`hook` 只按自己的群授权与订阅过滤，不参加 Agent 路由、执行或回复。旧配置中只写在 `hooks[].conversationIds` 的群，需要补入 `routing.groups`，纯 hook 群可写 `capabilities:["hook"]`。
 
 hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lark-cli 等自身查询接口为数据真源，并保留业务轮询兜底及双入口 messageId 去重；bridge 不迁入业务回补、历史同步、缓存或 cron，也不让业务另建飞书 WebSocket。

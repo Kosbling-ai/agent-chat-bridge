@@ -1,25 +1,41 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { DEFAULT_IDLE_CLOSE_MS, IdleLifecycle, closeOwnedChild, classifyCodexRpcError } from './idle-lifecycle.mjs';
 
 function emitLog(log, level, operation, status, detail = {}) {
   try { log?.(level, { module: 'agent-chat-bridge', component: 'codex-app-server', operation, status, ...detail }); } catch { /* logging is observational */ }
 }
 
-export function codexAppServerArgs(config = {}) {
+export function codexAppServerArgs(config = {}, { requestUserInputFeature = false } = {}) {
   return [
     'app-server', '--listen', 'stdio://',
     '-c', `sandbox_workspace_write.network_access=${config.networkAccess === false ? 'false' : 'true'}`,
     '-c', 'shell_environment_policy.inherit=all',
+    ...(requestUserInputFeature ? ['-c', `features.default_mode_request_user_input=${config.requestUserInput === false ? 'false' : 'true'}`] : []),
   ];
 }
 
+export function hasRequestUserInputFeature(config, childEnv, spawnSyncImpl = spawnSync) {
+  try {
+    const result = spawnSyncImpl(config.bin, ['features', 'list'], {
+      cwd: config.cwd, env: { ...childEnv }, shell: false, encoding: 'utf8', timeout: 5_000,
+      maxBuffer: 256 * 1024,
+    });
+    return result?.status === 0 && /^default_mode_request_user_input\s+/m.test(String(result.stdout || ''));
+  } catch { return false; }
+}
+
+const requestKey = id => `${typeof id}:${JSON.stringify(id)}`;
+const validRequestId = id => (typeof id === 'string' && id.length > 0 && id.length <= 512)
+  || (typeof id === 'number' && Number.isSafeInteger(id));
+
 export class CodexAppServerClient {
-  constructor({ config, childEnv = {}, spawnImpl = spawn, eventSink = async () => {}, onDisconnect = () => {}, onIdle = () => {}, log = () => {}, now = Date.now } = {}) {
+  constructor({ config, childEnv = {}, spawnImpl = spawn, spawnSyncImpl = spawnSync, eventSink = async () => {}, serverRequestSink = async () => {}, onDisconnect = () => {}, onIdle = () => {}, log = () => {}, now = Date.now } = {}) {
     if (!config?.bin || !config?.cwd || !config?.sharedHome) throw new Error('Codex app-server requires bin, cwd and sharedHome');
     if (!childEnv || typeof childEnv !== 'object' || Array.isArray(childEnv)) throw new Error('childEnv must be an object');
     this.config = config;
     this.spawnImpl = spawnImpl;
     this.eventSink = eventSink;
+    this.serverRequestSink = serverRequestSink;
     this.onDisconnect = onDisconnect;
     this.log = log;
     this.now = now;
@@ -33,6 +49,9 @@ export class CodexAppServerClient {
     this.stdoutBuffer = '';
     this.fault = null;
     this.disconnectedChildren = new WeakSet();
+    this.inbound = new Map();
+    this.requestUserInputFeature = hasRequestUserInputFeature(config, this.childEnv, spawnSyncImpl);
+    if (config.requestUserInput !== false && !this.requestUserInputFeature) emitLog(this.log, 'warning', 'request_user_input_feature', 'unavailable');
     this.lifecycle = new IdleLifecycle({
       idleMs: config.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS,
       close: () => this.close('idle'),
@@ -55,7 +74,7 @@ export class CodexAppServerClient {
 
   async start() {
     this.lifecycle.assertRunning();
-    const child = this.spawnImpl(this.config.bin, codexAppServerArgs(this.config), {
+    const child = this.spawnImpl(this.config.bin, codexAppServerArgs(this.config, { requestUserInputFeature: this.requestUserInputFeature }), {
       cwd: this.config.cwd,
       env: { ...this.childEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -125,7 +144,7 @@ export class CodexAppServerClient {
       catch { emitLog(this.log, 'warning', 'rpc_frame', 'invalid'); continue; }
       if (Object.hasOwn(message, 'id') && !message.method) this.handleResponse(message, child);
       else if (message.method && Object.hasOwn(message, 'id')) {
-        child.stdin.write(`${JSON.stringify({ id: message.id, error: { code: -32601, message: 'Unsupported server request' } })}\n`);
+        this.handleServerRequest(message, child);
       } else if (message.method) {
         const release = this.lifecycle.hold();
         Promise.resolve().then(() => (this.child === child
@@ -135,6 +154,48 @@ export class CodexAppServerClient {
           .finally(release);
       }
     }
+  }
+
+  handleServerRequest(message, child) {
+    if (!validRequestId(message.id) || message.method !== 'item/tool/requestUserInput') {
+      try { child.stdin.write(`${JSON.stringify({ id: message.id ?? null, error: { code: -32601, message: 'Unsupported server request' } })}\n`); } catch { /* disconnect path settles the child */ }
+      return;
+    }
+    const key = requestKey(message.id);
+    if (this.inbound.has(key)) return;
+    const release = this.lifecycle.hold();
+    const entry = { child, settled: false, release };
+    this.inbound.set(key, entry);
+    const respond = async (payload) => {
+      if (entry.settled || this.child !== child || !child.stdin?.writable) throw Object.assign(new Error('server request is no longer live'), { code: 'CODEX_USER_INPUT_EXPIRED' });
+      entry.settled = true;
+      this.inbound.delete(key);
+      try {
+        await new Promise((resolve, reject) => {
+          let callbackCalled = false;
+          const timer=setTimeout(()=>reject(Object.assign(new Error('server response write unconfirmed'),{code:'CODEX_USER_INPUT_WRITE_UNKNOWN',outcome:'unknown'})),
+            Math.min(1_000,Number(this.config.rpcTimeoutMs||1_000)));
+          timer.unref?.();
+          const settle=callback=>value=>{clearTimeout(timer);callback(value);};
+          const accepted = child.stdin.write(`${JSON.stringify({ id: message.id, ...payload })}\n`, error => {
+            callbackCalled = true;
+            if (error) settle(reject)(error); else settle(resolve)();
+          });
+          // Several test streams are synchronous and do not implement callbacks.
+          if (accepted !== false && child.stdin.write.length < 2 && !callbackCalled) settle(resolve)();
+        });
+      } finally { release(); }
+    };
+    const abandon = () => {
+      if (entry.settled) return false;
+      entry.settled = true; this.inbound.delete(key); release(); return true;
+    };
+    Promise.resolve().then(() => this.serverRequestSink({
+      method: message.method, requestId: message.id, params: message.params || {}, receivedAt: this.now(),
+      respondResult: result => respond({ result }),
+      respondError: (code, text) => respond({ error: { code, message: text } }),
+      abandon,
+    })).catch(() => respond({ error: { code: -32001, message: 'User input request unavailable' } }).catch(() => {}));
   }
 
   handleResponse(message, child) {
@@ -190,6 +251,10 @@ export class CodexAppServerClient {
   notifyDisconnect(error, child) {
     if (!child || this.disconnectedChildren.has(child)) return;
     this.disconnectedChildren.add(child);
+    for (const [key, request] of this.inbound) {
+      if (request.child !== child) continue;
+      this.inbound.delete(key); request.settled = true; request.release();
+    }
     try { this.onDisconnect(error instanceof Error ? error : new Error(String(error || 'codex app-server exited')), child); }
     catch { emitLog(this.log, 'error', 'disconnect_callback', 'failed'); }
   }
