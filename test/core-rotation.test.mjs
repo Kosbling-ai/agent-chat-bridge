@@ -19,6 +19,21 @@ test('idle rotation preserves activity CAS and refuses active native work', asyn
   thread.turns = []; session.activeRunId = 'other-run';
   await inspect({ id: 'other', conversationId: 'chat' }); assert.equal(calls.length, 1);
 });
+test('idle rotation defaults to five days', async () => {
+  const day = 24 * 60 * 60 * 1000;
+  let clock = 4 * day;
+  let reads = 0;
+  const calls = [];
+  const inspect = createSessionRotation({ connectionId: 'fixture', workspace: '/workspace', config: { rolloverOnRulesUpdate: false }, now: () => clock,
+    store: { getAgentAttempt: async () => null, getSession: async () => ({ generation: 1, nativeThreadId: 'thread', lastMessageAt: 1, activeRunId: null }), rotateIdleSession: async value => calls.push(value) },
+    codex: { readThread: async () => { reads++; return { thread: { id: 'thread', cwd: '/workspace', createdAt: 0, turns: [] } }; } } });
+  await inspect({ id: 'before', conversationId: 'chat' });
+  assert.equal(reads, 0);
+  clock = 5 * day + 1;
+  await inspect({ id: 'at-threshold', conversationId: 'chat' });
+  assert.equal(reads, 1);
+  assert.equal(calls[0].reason, 'session_idle');
+});
 test('rules rotation retains production timestamp margin and ignores absent rules', async () => {
   const workspace = await mkdtemp(join(tmpdir(), 'bridge-rules-'));
   try {

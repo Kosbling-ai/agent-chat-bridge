@@ -2,7 +2,7 @@
 
 尚未发布的 0.2.4 开发版用一条带租约的 Codex forward worker 替换 0.1.1 的 generation worker；communication worker 只负责 hook 和已登记的消息 outbox。进程只持有一个飞书 bot/WebSocket 和一个 Codex app-server/executor。线程新建、恢复和 turn 启动使用协议定义的 `auto_review` 审批 reviewer。当前仅完成公开 bridge 代码与合成验证，Kosbling 业务 producer 的实际切换属于后续独立工作。
 
-`codex.idleCloseMs` 只控制 bridge 活动归零后是否自动关闭其 app-server 子进程。原业务缺省值为 `60000` 毫秒；显式写 `0` 仍可关闭该定时器，其他值最大为 86400000。正常 shutdown 仍会关闭子进程，异常退出仍走既有故障处理。这不改变会话空闲两天、规则更新或归档时的 rollover。Codex 状态缺省使用启动用户共享的 `~/.codex`；可选 `codex.sharedHome` 与启动环境 `CODEX_HOME` 同时存在时必须解析到同一目录。app-server shell 继承策略只基于 bridge 传给子进程的受控环境。
+`codex.idleCloseMs` 只控制 bridge 活动归零后是否自动关闭其 app-server 子进程。原业务缺省值为 `60000` 毫秒；显式写 `0` 仍可关闭该定时器，其他值最大为 86400000。正常 shutdown 仍会关闭子进程，异常退出仍走既有故障处理。这不改变独立的会话 rollover；后者的闲置缺省值为五天（`432000000` 毫秒），规则更新或归档触发也保持原样。Codex 状态缺省使用启动用户共享的 `~/.codex`；可选 `codex.sharedHome` 与启动环境 `CODEX_HOME` 同时存在时必须解析到同一目录。app-server shell 继承策略只基于 bridge 传给子进程的受控环境。
 
 `codex.requestUserInput` 缺省为 `false`。bridge 启动时检查当前 Codex 可执行文件是否提供 Default 模式用户提问功能；若存在，会显式传入 `features.default_mode_request_user_input=false`，覆盖共享 Codex home 继承的设置，并防御性拒绝意外收到的请求。显式设为 `true` 才选择启用，同一探测只在确认支持时打开该功能。功能不可用不会阻断其他执行，但 Codex 不能打开飞书提问卡。此配置控制 bridge 当前使用的 Default 模式功能；bridge 不会启动 Plan 模式工作流。
 

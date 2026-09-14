@@ -123,7 +123,7 @@ function validateRuntime(raw) {
   if (!Number.isFinite(codex.groupContextHours) || codex.groupContextHours < 0 || codex.groupContextHours > 168) throw new ConfigError('invalid_group_context_hours');
   codex.idleCloseMs = raw.codex.idleCloseMs ?? 60_000;
   if (!Number.isSafeInteger(codex.idleCloseMs) || codex.idleCloseMs < 0 || codex.idleCloseMs > 24 * 60 * 60 * 1000) throw new ConfigError('invalid_codex_idle_close');
-  codex.rolloverIdleMs = raw.codex.rolloverIdleMs ?? 2 * 24 * 60 * 60 * 1000;
+  codex.rolloverIdleMs = raw.codex.rolloverIdleMs ?? 5 * 24 * 60 * 60 * 1000;
   if (!Number.isSafeInteger(codex.rolloverIdleMs) || codex.rolloverIdleMs < 0 || codex.rolloverIdleMs > 365 * 24 * 60 * 60 * 1000) throw new ConfigError('invalid_idle_rollover');
   codex.rolloverOnRulesUpdate = raw.codex.rolloverOnRulesUpdate ?? true;
   if (typeof codex.rolloverOnRulesUpdate !== 'boolean') throw new ConfigError('invalid_rules_rollover');
