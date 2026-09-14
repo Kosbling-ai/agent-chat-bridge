@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
+import { createProcessingTyping } from '../src/channels/feishu/typing.mjs';
 
 function jobFixture() {
   return {
@@ -45,6 +46,36 @@ test('live feedback awaits production Typing before starting the execution card'
   const state = await started;
   assert.equal(state.typing.reactionId, 'reaction-1');
   state.card.stop();
+});
+
+test('normal completion removes the confirmed Typing reaction before audit and list recovery', async () => {
+  const job = jobFixture();
+  delete job.result.executionCard;
+  const removed = [];
+  const typing = createProcessingTyping({
+    chat: {
+      async addReaction() { return { reaction_id: 'known-reaction' }; },
+      async removeReaction({ reactionId }) { removed.push(reactionId); },
+      async listReactions() { throw new Error('synthetic list failure'); },
+    },
+    inbound: {
+      async recordEvent() { throw new Error('synthetic audit failure'); },
+      async loadOpenProcessingReactionIds() { return new Set(); },
+    },
+  });
+  const feedback = createExecutionFeedback({
+    jobs: { async patchFeedback() {} }, sessions: {}, chat: {}, typing, executor: {},
+    cardClient: { im: { v1: { message: {
+      async create() { return { code: 0, data: { message_id: 'card-message' } }; },
+    } } } },
+  });
+
+  const state = await feedback.start(job);
+  const result = { ...job.result, answer: 'done' };
+  await feedback.prepare(job, result, state);
+  assert.deepEqual(result.processingReaction, { reactionId: 'known-reaction' });
+  await feedback.cleanup({ ...job, result });
+  assert.deepEqual(removed, ['known-reaction']);
 });
 
 test('busy waiting reuses one card and does not repeat Typing until admission succeeds', async () => {

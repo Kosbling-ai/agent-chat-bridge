@@ -40,9 +40,15 @@ export function stringifyPostContent(value) {
 }
 export function extractMessageText(event) {
   if (!['text', 'post'].includes(event.message?.kind)) return '';
-  const content = safeJson(event.message.content);
-  if (typeof content.text === 'string') return content.text;
-  const text = stringifyPostContent(content.post || content.content); return [content.title, text].filter(Boolean).join('\n');
+  try {
+    const content = JSON.parse(event.message.content || '{}');
+    if (typeof content.text === 'string') return content.text;
+    const postText = stringifyPostContent(content.post || content.content);
+    if (postText) return [content.title, postText].filter(Boolean).join('\n');
+  } catch {
+    return event.message.content || '';
+  }
+  return '';
 }
 export function unsupportedReply(type, template) {
   return String(template || '暂不支持处理「{{type}}」类型的附件，请改用文字、图片或飞书云文档链接。').replaceAll('{{type}}', labels[type] || '该');

@@ -104,6 +104,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
 
   async function prepare(job, result, state) {
     if (job.deliveryMode === 'caller' || !state) return;
+    if (state.typing?.reactionId) result.processingReaction = { reactionId: state.typing.reactionId };
     if (state.observer) result.executionCard = await state.observer.stop();
     else if (state.card) {
       state.card.stop();
@@ -184,7 +185,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
   async function cleanup(job, control = {}) {
     if (job.deliveryMode === 'caller' || !job.sourceMessageId) return;
     control.assertOwned?.();
-    await typing?.cleanup?.(job);
+    await typing?.cleanup?.(job, job.result?.processingReaction || null);
     control.assertOwned?.();
   }
 

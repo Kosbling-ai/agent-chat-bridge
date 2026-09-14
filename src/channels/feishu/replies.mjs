@@ -3,7 +3,6 @@ import { unlink } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import { canDeliverOutboxAttachments } from '../../agents/codex/outbox-policy.mjs';
 
-const stable = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 32);
 const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const imageTypes = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 
@@ -59,8 +58,7 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
     const kind = replyAsPost ? 'post' : 'text';
     const chunkSize = replyAsPost ? 3000 : 1900;
     const chunks = chunkText(limitText(String(result.answer || 'Codex 没有返回可用结论。'), maxOutputChars), chunkSize);
-    const prefix = stableEventKey(['codex-reply', job.messageId || '', result.turnId || result.execution?.turnId || '',
-      result.threadId || result.sessionId || result.execution?.threadId || ''].join(':'));
+    const prefix = codexReplyUuidPrefix(job, result);
     const sent = [];
     for (const [index, chunk] of chunks.entries()) {
       control.assertLease();
@@ -73,22 +71,23 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
   }
 
   async function sendAttachments(job, result, control) {
+    const legacy = job.result?.delivery?.attachments || result.delivery?.attachments || [];
+    if (legacy.some(item => ['upload_intent', 'send_intent', 'unknown'].includes(item.status))) {
+      return legacy.map((item, index) => ({ ...item, index, status: 'unknown' }));
+    }
     const paths = Array.isArray(result.attachments) ? result.attachments.filter(value => typeof value === 'string' && value) : [];
     if (!paths.length || !sendAttachment) return [];
     if (!canDeliverOutboxAttachments({ chatType: job.chatType, chatId: job.chatId, allowedGroupChatIds })) {
       log('warning', 'forward_attachment', 'skipped', { code: 'attachment_conversation_not_allowed', attachments: paths.length });
       return [];
     }
-    const legacy = job.result?.delivery?.attachments || result.delivery?.attachments || [];
-    if (legacy.some(item => ['upload_intent', 'send_intent', 'unknown'].includes(item.status))) {
-      return legacy.map((item, index) => ({ ...item, index }));
-    }
+    const prefix = codexReplyUuidPrefix(job, result);
     const facts = [];
     for (const [index, filePath] of paths.entries()) {
       try {
         control.assertLease();
         const response = await sendAttachment({ chatId: job.chatId, filePath,
-          uuid: stable(`run:${job.id}:attachment:${index}`), maxBytes: 28 * 1024 * 1024 });
+          uuid: stableEventKey(`${prefix}:file:${index}`), maxBytes: 28 * 1024 * 1024 });
         await unlink(filePath).catch(() => log('warning', 'forward_attachment', 'cleanup_failed', { code: 'attachment_cleanup_failed' }));
         facts.push({ index, fileName: basename(filePath), messageId: response?.messageId || '', status: 'sent' });
       } catch (error) {
@@ -108,7 +107,8 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
       const text = skipText ? { sent: 0, status: 'sent' } : await sendText(job, result, control);
       const attachments = await sendAttachments(job, result, control);
       const statuses = [text.status, ...attachments.map(item => item.status)];
-      const status = statuses.some(value => value === 'unknown') ? 'unknown' : 'sent';
+      const status = statuses.some(value => value === 'unknown') ? 'unknown'
+        : text.status === 'failed' ? 'failed' : 'sent';
       log(status === 'sent' ? 'info' : 'warning', 'forward_reply', status === 'sent' ? 'succeeded' : status,
         { attachments: attachments.filter(item => ['sent', 'cleaned'].includes(item.status)).length });
       return { messages: text.sent, attachments, status };
@@ -120,6 +120,15 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
     },
     publicAttachments,
   });
+}
+
+function codexReplyUuidPrefix(job, result = {}) {
+  return stableEventKey([
+    'codex-reply',
+    job.messageId || '',
+    result.turnId || result.execution?.turnId || '',
+    result.threadId || result.sessionId || result.execution?.threadId || '',
+  ].join(':'));
 }
 
 export function markdownToFeishuPost(markdown) {

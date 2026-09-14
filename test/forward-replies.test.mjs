@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -12,14 +13,16 @@ test('bridge attachments use executor paths, delete successes and retain failure
   const calls = [];
   const chat = { async sendMessage(){calls.push('text');return{message_id:'text'};} };
   const first=join(root,'first.txt'),second=join(root,'second.txt');await writeFile(first,'first');await writeFile(second,'second');
-  const job = { id: 'run', leaseOwner: 'worker', chatId: 'chat', chatType: 'group', sourceMessageId: 'source', startedAt: 1000,
-    result: { execution: { bindingOpenId: 'group:binding', startedAt: 1000 }, answer: 'done', attachments:[first,second] } };
+  const job = { id: 'run', leaseOwner: 'worker', chatId: 'chat', chatType: 'group', messageId: 'source', sourceMessageId: 'source', startedAt: 1000,
+    result: { execution: { bindingOpenId: 'group:binding', threadId: 'thread', turnId: 'turn', startedAt: 1000 }, answer: 'done', attachments:[first,second] } };
   const replies = createFeishuReplies({ chat, jobs:{}, connectionId:'fixture', allowedGroupChatIds:new Set(['chat']),
-    async sendAttachment({filePath}){calls.push(`attachment:${filePath}`);if(filePath===second)throw new Error('synthetic');return{messageId:'sent'};} });
+    async sendAttachment({filePath,uuid}){calls.push(`attachment:${filePath}:${uuid}`);if(filePath===second)throw new Error('synthetic');return{messageId:'sent'};} });
   const delivered=await replies.deliver(job,job.result,{assertLease(){}});
   assert.equal(delivered.status,'sent');assert.deepEqual(delivered.attachments.map(item=>item.status),['sent','failed']);
   await assert.rejects(stat(first),{code:'ENOENT'});assert.equal((await stat(second)).isFile(),true);
-  assert.deepEqual(calls,['text',`attachment:${first}`,`attachment:${second}`]);
+  const sha1 = value => createHash('sha1').update(value).digest('hex').slice(0,24);
+  const prefix = sha1('codex-reply:source:turn:thread');
+  assert.deepEqual(calls,['text',`attachment:${first}:${sha1(`${prefix}:file:0`)}`,`attachment:${second}:${sha1(`${prefix}:file:1`)}`]);
 });
 
 test('API run without a source message creates the original post in the conversation', async () => {
@@ -68,6 +71,37 @@ test('legacy unconfirmed ordinary reply is held without another create', async (
   assert.equal(delivered.status, 'unknown');
   assert.equal(creates, 0);
   assert.deepEqual(markdownToFeishuPost(''), { zh_cn:{ title:'', content:[[{ tag:'text', text:' ' }]] } });
+});
+
+test('legacy unconfirmed attachments are held before old artifact objects are filtered', async () => {
+  for (const legacyStatus of ['upload_intent', 'send_intent', 'unknown']) {
+    let writes = 0;
+    const job = {
+      id: 'run', leaseOwner: 'worker', chatId: 'chat', messageId: 'source',
+      result: {
+        attachments: [{ ref: { artifactId: 'artifact' }, fileName: 'old.txt' }],
+        delivery: { attachments: [{ artifactId: 'artifact', status: legacyStatus }] },
+      },
+    };
+    const replies = createFeishuReplies({
+      chat: { async sendMessage() { writes += 1; } }, jobs: {}, connectionId: 'fixture',
+      async sendAttachment() { writes += 1; },
+    });
+    const delivered = await replies.deliver(job, job.result, { skipText: true, assertLease() {} });
+    assert.equal(delivered.status, 'unknown');
+    assert.deepEqual(delivered.attachments.map(item => item.status), ['unknown']);
+    assert.equal(writes, 0);
+  }
+});
+
+test('a failed existing text delivery remains failed when attachments are best effort', async () => {
+  const job = {
+    id: 'run', leaseOwner: 'worker', chatId: 'chat', messageId: 'source',
+    result: { delivery: { text: { items: [{ index: 0, status: 'failed' }] } } },
+  };
+  const replies = createFeishuReplies({ chat: {}, jobs: {}, connectionId: 'fixture' });
+  const delivered = await replies.deliver(job, job.result, { assertLease() {} });
+  assert.equal(delivered.status, 'failed');
 });
 
 test('final card rejection flows through the controller into the original post fallback', async () => {

@@ -20,6 +20,13 @@ test('production post extraction keeps text, links and unique image keys', () =>
   assert.deepEqual(extractPostImageKeys(source),['image']);
 });
 
+test('production text extraction keeps raw malformed content and ignores a title without a post body', () => {
+  const malformed = event('text', {});
+  malformed.message.content = 'plain text from an invalid JSON envelope';
+  assert.equal(extractMessageText(malformed), 'plain text from an invalid JSON envelope');
+  assert.equal(extractMessageText(event('post', { title: 'title only' })), '');
+});
+
 test('private image and every private post image download to the configured inbox', async () => {
   const f=await fixture();
   try {
