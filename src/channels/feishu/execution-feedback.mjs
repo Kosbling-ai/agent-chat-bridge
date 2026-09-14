@@ -1,9 +1,10 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { ExecutionCard, observeExecutionCard } from './execution-card.mjs';
 import { codexBindingOpenId } from '../../agents/codex/thread-scope.mjs';
 
 const stable = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const toast = (content, type = 'info') => ({ toast: { type, content } });
+const safeCode = error => String(error?.code || 'fork_failed').replace(/[^A-Za-z0-9_-]/g, '').slice(0,64) || 'fork_failed';
 const unconfirmedCard = saved => saved?.delivery === 'unknown'
   || ['intent', 'unknown'].includes(saved?.deliveryState?.status);
 const productionCardState = saved => {
@@ -13,7 +14,7 @@ const productionCardState = saved => {
 };
 
 export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClient, authorize = async () => true,
-  executor, config = {}, log = () => {}, now = Date.now } = {}) {
+  executor, runAsync = operation => { Promise.resolve().then(operation).catch(() => {}); }, config = {}, log = () => {}, now = Date.now } = {}) {
   const bindingOpenId = (job, result = job.result || {}) => result.execution?.bindingOpenId
     || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType });
 
@@ -28,13 +29,13 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     state.result = { ...state.result, [key]: structuredClone(value) };
   }
 
-  function cardFor(job, state, saved) {
+  function cardFor(job, state, saved, persistCard = true) {
     if (unconfirmedCard(saved)) return null;
     return new ExecutionCard({
       client: cardClient, chatId: job.chatId, jobId: job.id, messageId: job.messageId,
       displayName: config.displayName, uuid: stable(`execution-card:${job.messageId}`),
       intervalMs: config.executionCardIntervalMs || 1000,
-      persist: value => persist(job, state, 'executionCard', value),
+      persist: persistCard ? value => persist(job, state, 'executionCard', value) : async () => {},
       audit: event => sessions?.saveCodexRealtimeEvent?.({
         feishuOpenId: bindingOpenId(job, state.result), chatId: job.chatId, chatType: job.chatType,
         codexSessionId: state.result.execution?.threadId || event.threadId || '',
@@ -113,6 +114,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
 
   async function prepare(job, result, state) {
     if (job.deliveryMode === 'caller' || !state) return;
+    if (result.busyFork?.sourceThreadId) state.card?.setForkSource?.(result.busyFork.sourceThreadId);
     if (state.typing?.reactionId) result.processingReaction = { reactionId: state.typing.reactionId };
     if (state.observer) result.executionCard = await state.observer.stop();
     else if (state.card) {
@@ -149,6 +151,54 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
 
   async function handleCardAction(data) {
     const value = data?.action?.value || {};
+    if (value.action === 'fork_busy_session') {
+      const operator = data?.operator?.open_id || '';
+      const job = await jobs.getRun({ id: String(value.jobId || '') });
+      const candidate = job?.result?.busyFork;
+      const cardMessageId = data?.context?.open_message_id || '';
+      if (!job || !operator || job.chatId !== data?.context?.open_chat_id || job.senderOpenId !== operator
+        || job.result?.executionCard?.messageId !== cardMessageId || job.status !== 'failed'
+        || job.last_error !== 'CODEX_THREAD_BUSY' || candidate?.sourceThreadId !== value.expectedSourceThreadId) return toast('该卡片已失效');
+      if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator }, conversationId: job.chatId, operation: 'fork' }))) {
+        return toast('没有切换该会话的权限', 'error');
+      }
+      const begun = await jobs.beginFork({ id: job.id, sourceThreadId: candidate.sourceThreadId,
+        bindingOpenId: candidate.bindingOpenId, chatId: job.chatId, messageId: job.messageId,
+        cardMessageId, actor: operator, operationId: randomUUID() });
+      if (['not_found','stale'].includes(begun.outcome)) return toast('该卡片已失效');
+      if (begun.fork?.status === 'succeeded') return toast('已保留历史并切换到新会话，请继续发送消息');
+      if (begun.fork?.status === 'failed') return toast('未能创建新会话，原会话绑定保持不变', 'error');
+      if (['unknown','superseded'].includes(begun.fork?.status)) return toast('新会话状态未确认，原会话绑定保持不变', 'error');
+      if (begun.outcome === 'replay') return toast('正在创建保留历史的新会话');
+      runAsync(async () => {
+        try {
+          const completed = await executor.forkBinding({
+            binding: { feishuOpenId: candidate.bindingOpenId, chatId: job.chatId, chatType: job.chatType },
+            expectedSourceThreadId: candidate.sourceThreadId,
+            onForked: ({ targetThreadId }) => jobs.finishFork({ id: job.id, operationId: begun.fork.operationId,
+              status: 'succeeded', targetThreadId }),
+          });
+          if (completed.committed?.outcome === 'succeeded') {
+            const state = stateFor(job);
+            const card = cardFor(job, state, job.result.executionCard, false);
+            await card?.finish?.('已保留历史并切换到新会话，请继续发送消息。', 'completed');
+          }
+          log('info', 'busy_session_fork', completed.committed?.outcome || 'succeeded', { code: 'fork_completed', runId: job.id, operationId: begun.fork.operationId });
+        } catch (error) {
+          const status = error?.outcome === 'unknown' ? 'unknown' : 'failed';
+          await jobs.finishFork({ id: job.id, operationId: begun.fork.operationId, status,
+            errorCode: safeCode(error), targetThreadId: error?.forkTargetThreadId }).catch(() => {});
+          const state = stateFor(job);
+          const card = cardFor(job, state, job.result.executionCard, false);
+          const message = status === 'unknown' ? '新会话状态未确认，原会话绑定保持不变。' : '未能创建新会话，原会话绑定保持不变。';
+          await card?.finish?.(message, 'failed').catch(() => {});
+          log(status === 'failed' ? 'warning' : 'error', 'busy_session_fork', status, {
+            code: safeCode(error), runId: job.id, operationId: begun.fork.operationId,
+          });
+        }
+      });
+      return toast('正在创建保留历史的新会话');
+    }
     if (value.action !== 'stop_execution') return {};
     const operator = data?.operator?.open_id || '';
     const job = await jobs.getRun({ id: String(value.jobId || '') });

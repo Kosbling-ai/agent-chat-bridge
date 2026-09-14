@@ -322,6 +322,69 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         return { status };
       });
     },
+    beginFork(input) {
+      const id = required(input.id, 36);
+      const sourceThreadId = required(input.sourceThreadId, 255);
+      const bindingOpenId = required(input.bindingOpenId, 191);
+      const chatId = required(input.chatId, 191);
+      const messageId = required(input.messageId, 191);
+      const cardMessageId = required(input.cardMessageId, 191);
+      return write(async connection => {
+        const [[found]] = await connection.execute(`SELECT status,last_error,message_id,chat_id,result_json FROM assistant_codex_forward_jobs
+          WHERE connection_id=? AND public_run_id=? FOR UPDATE`, [connectionId,id]);
+        if (!found) return { outcome: 'not_found' };
+        const result = parse(found.result_json);
+        const candidate = result.busyFork;
+        if (found.status !== 'failed' || found.last_error !== 'CODEX_THREAD_BUSY' || found.message_id !== messageId
+          || found.chat_id !== chatId || result.executionCard?.messageId !== cardMessageId
+          || candidate?.sourceThreadId !== sourceThreadId || candidate?.bindingOpenId !== bindingOpenId) return { outcome: 'stale' };
+        if (result.fork) return { outcome: 'replay', fork: result.fork };
+        const [[binding]] = await connection.execute(`SELECT codex_session_id FROM assistant_codex_sessions
+          WHERE connection_id=? AND feishu_open_id=? AND chat_id=? FOR UPDATE`, [connectionId,bindingOpenId,chatId]);
+        if (binding?.codex_session_id !== sourceThreadId) return { outcome: 'stale' };
+        const fork = { sourceThreadId, actor: required(input.actor,191), operationId: required(input.operationId,36), status: 'pending', intentAt: now() };
+        result.fork = fork;
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=?
+          WHERE connection_id=? AND public_run_id=?`, [safeJson(result),now(),connectionId,id]);
+        return { outcome: 'new', fork };
+      });
+    },
+    finishFork(input) {
+      const id = required(input.id,36);
+      const operationId = required(input.operationId,36);
+      const status = input.status;
+      if (!['succeeded','failed','unknown'].includes(status)) throw new StoreError('invalid_store_input');
+      const targetThreadId = input.targetThreadId ? required(input.targetThreadId,255) : '';
+      return write(async connection => {
+        const [[found]] = await connection.execute(`SELECT result_json FROM assistant_codex_forward_jobs
+          WHERE connection_id=? AND public_run_id=? FOR UPDATE`, [connectionId,id]);
+        if (!found) return { outcome: 'not_found' };
+        const result = parse(found.result_json);
+        const fork = result.fork;
+        if (!fork || fork.operationId !== operationId) return { outcome: 'stale' };
+        if (fork.status !== 'pending') return { outcome: 'replay', fork };
+        if (status === 'succeeded') {
+          if (!targetThreadId || targetThreadId === fork.sourceThreadId) throw new StoreError('invalid_store_input');
+          const candidate = result.busyFork || {};
+          const [[binding]] = await connection.execute(`SELECT codex_session_id FROM assistant_codex_sessions
+            WHERE connection_id=? AND feishu_open_id=? AND chat_id=? FOR UPDATE`, [connectionId,candidate.bindingOpenId,candidate.chatId]);
+          if (binding?.codex_session_id !== fork.sourceThreadId) {
+            result.fork = { ...fork, status: 'superseded', targetThreadId, finishedAt: now() };
+          } else {
+            await connection.execute(`UPDATE assistant_codex_sessions SET codex_session_id=?,updated_at=?,last_error=''
+              WHERE connection_id=? AND feishu_open_id=? AND chat_id=? AND codex_session_id=?`,
+            [targetThreadId,now(),connectionId,candidate.bindingOpenId,candidate.chatId,fork.sourceThreadId]);
+            result.fork = { ...fork, status: 'succeeded', targetThreadId, finishedAt: now() };
+          }
+        } else {
+          result.fork = { ...fork, status, errorCode: required(input.errorCode || 'fork_failed',64),
+            ...(targetThreadId ? { targetThreadId } : {}), finishedAt: now() };
+        }
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=?
+          WHERE connection_id=? AND public_run_id=?`, [safeJson(result),now(),connectionId,id]);
+        return { outcome: result.fork.status, fork: result.fork };
+      });
+    },
     beginStop(input) {
       const id = required(input.id, 36);
       const threadId = required(input.threadId, 255);

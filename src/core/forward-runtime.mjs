@@ -250,9 +250,18 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         return;
       }
       execution = { ...execution, terminal: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', finishedAt: now() };
+      let busyFork;
+      if (isBusy(error) && job.deliveryMode === 'bridge' && job.sourceMessageId
+        && !job.senderOpenId.startsWith('system:') && !job.senderOpenId.startsWith('group:')) {
+        const scopedBindingOpenId = execution.bindingOpenId || codexBindingOpenId({
+          feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType,
+        });
+        const current = await sessions.loadBinding({ feishuOpenId: scopedBindingOpenId, chatId: job.chatId, chatType: job.chatType }).catch(() => null);
+        if (current?.codexSessionId) busyFork = { sourceThreadId: current.codexSessionId, bindingOpenId: scopedBindingOpenId, chatId: job.chatId };
+      }
       const failed = { failed: true, turnStatus: execution.terminal,
         answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : isBusy(error) ? '会话被其他客户端占用，请释放后重试。原会话绑定保持不变。' : '执行未完成，请稍后重试。',
-        rawAnswer: '', attachments: [], execution };
+        rawAnswer: '', attachments: [], execution, ...(busyFork ? { busyFork } : {}) };
       await feedback?.prepare?.(job, failed, state);
       await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: error.code || 'forward_execution_failed' });
       needsDelivery = true;

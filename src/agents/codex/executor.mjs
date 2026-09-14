@@ -660,6 +660,46 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     catch (error) { return isNoActiveTurnError(error) ? { status: 'already_finished' } : { status: 'unconfirmed' }; }
   }
 
+  async function forkBinding({ binding, expectedSourceThreadId, onForked }) {
+    if (closing) throw coded('executor is closing', 'CODEX_EXECUTOR_CLOSING', { retryable: true });
+    const actor = identity({ bindingOpenId: binding.bindingOpenId || binding.feishuOpenId, chatId: binding.chatId, chatType: binding.chatType });
+    const sourceThreadId = trim(expectedSourceThreadId);
+    if (!sourceThreadId || typeof onForked !== 'function') throw coded('invalid fork request', 'CODEX_INVALID_INPUT');
+    return client.lifecycle.run(() => withKeyLock(bindingKey(actor), async () => {
+      if (activeByBinding.has(bindingKey(actor))) throw coded('binding has an active turn', 'CODEX_THREAD_BUSY', {
+        outcome: 'rejected', phase: 'pre_admission', busyOrigin: 'local',
+      });
+      const current = await sessionStore.loadBinding(actor);
+      if (!current || current.codexSessionId !== sourceThreadId) throw coded('fork source binding changed', 'CODEX_FORK_SOURCE_CHANGED', { outcome: 'rejected' });
+      let response;
+      try {
+        response = await client.request('thread/fork', threadDefaults({
+          threadId: sourceThreadId, ephemeral: false, deferGoalContinuation: true,
+          ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}),
+        }));
+      } catch (error) {
+        error.code ||= 'CODEX_FORK_UNCONFIRMED';
+        error.outcome ||= 'unknown';
+        throw error;
+      }
+      const thread = response?.thread;
+      const targetThreadId = trim(thread?.id);
+      if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(config.cwd)
+        || thread?.ephemeral === true || (thread?.forkedFromId && thread.forkedFromId !== sourceThreadId)) {
+        throw coded('fork response could not be verified', 'CODEX_FORK_UNCONFIRMED', { outcome: 'unknown' });
+      }
+      let committed;
+      try { committed = await onForked({ sourceThreadId, targetThreadId }); }
+      catch (error) {
+        error.outcome = 'unknown';
+        error.forkTargetThreadId = targetThreadId;
+        throw error;
+      }
+      loadedThreads.add(targetThreadId);
+      return { sourceThreadId, targetThreadId, committed };
+    }));
+  }
+
   async function handleNotification(event) {
     const turnId = trim(event.params?.turnId || event.params?.turn?.id);
     const state = activeByTurn.get(turnId);
@@ -719,7 +759,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   return Object.freeze({
-    execute, inspect, interrupt,
+    execute, inspect, interrupt, forkBinding,
     status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), fault: client.fault || null, activeTurns: activeByTurn.size, activeTurnResponseWaiters: [...activeByBinding.values()].filter(hasOpenWaiter).length, restartPending: restartPending || null }),
     async close() {
       closing = true;

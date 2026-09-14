@@ -5,6 +5,7 @@ import { validateConfig } from '../src/config.mjs';
 import { createForwardRuntime, publicRun } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
+import { renderExecutionCard } from '../src/channels/feishu/execution-card.mjs';
 import { createApi } from '../src/core/api.mjs';
 import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
 
@@ -298,12 +299,13 @@ test('ordinary live and API busy failures deliver on the first attempt without r
     ['live', { outcome: 'unknown', phase: 'turn_start', rpcMethod: 'turn/start' }],
     ['api', {}],
   ]) {
-    const jobs = memoryJobs({ status: 'pending', attempts: 0, callerId, executionNamespace: null, deliveryMode: 'bridge', result: {} });
+    const jobs = memoryJobs({ status: 'pending', attempts: 0, callerId, executionNamespace: null, deliveryMode: 'bridge',
+      sourceMessageId: 'message', senderOpenId: 'human', chatType: 'p2p', result: {} });
     let admissions = 0;
     let deliveries = 0;
     const error = Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, ...facts });
     const runtime = createForwardRuntime({
-      config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+      config: { owner: 'owner', pollMs: 1 }, jobs, sessions: { async loadBinding() { return { codexSessionId: 'source-thread' }; } },
       executor: { async execute() { admissions += 1; throw error; } },
       feedback: { async start() { return {}; }, async prepare() {}, async finish() { return false; } },
       replies: { async prepare(_job, result) { return result; }, async deliver() { deliveries += 1; return { status: 'sent' }; } }, authorize: async () => true,
@@ -317,9 +319,54 @@ test('ordinary live and API busy failures deliver on the first attempt without r
     assert.equal(jobs.job.status, 'failed');
     assert.equal(jobs.job.result.failed, true);
     assert.match(jobs.job.result.answer, /会话被其他客户端占用/);
+    assert.deepEqual(jobs.job.result.busyFork, { sourceThreadId: 'source-thread', bindingOpenId: 'human', chatId: 'chat' });
     assert.equal(jobs.job.result.execution.terminal, 'failed');
     assert.equal(error.outcome, facts.outcome);
   }
+});
+
+test('only a failed busy card with a frozen source thread renders the explicit fork button', () => {
+  const baseState = { status: 'failed', jobId: 'run', entries: [] };
+  const busy = renderExecutionCard({ ...baseState, forkSourceThreadId: 'source-thread' }, 'busy');
+  const value = busy.body.elements.flatMap(element => element.behaviors || []).find(item => item.value?.action === 'fork_busy_session')?.value;
+  assert.deepEqual(value, { action: 'fork_busy_session', jobId: 'run', expectedSourceThreadId: 'source-thread' });
+  assert.equal(JSON.stringify(renderExecutionCard(baseState, 'failed')).includes('fork_busy_session'), false);
+  assert.equal(JSON.stringify(renderExecutionCard({ ...baseState, status: 'completed', forkSourceThreadId: 'source-thread' }, 'done')).includes('fork_busy_session'), false);
+});
+
+test('busy fork callback validates the original sender and runs one durable fork intent', async () => {
+  const job = {
+    id: '00000000-0000-0000-0000-000000000001', callerId: 'live', chatId: 'chat', chatType: 'p2p',
+    messageId: 'message', senderOpenId: 'human', status: 'failed', last_error: 'CODEX_THREAD_BUSY',
+    result: { busyFork: { sourceThreadId: 'source-thread', bindingOpenId: 'human', chatId: 'chat' },
+      executionCard: { messageId: 'card-message', status: 'failed', entries: [], forkSourceThreadId: 'source-thread' } },
+  };
+  let intent;
+  let forks = 0;
+  let pending;
+  const jobs = {
+    async getRun() { return job; },
+    async beginFork(input) { intent = input; return { outcome: 'new', fork: { operationId: input.operationId, status: 'pending' } }; },
+    async finishFork(input) { return { outcome: input.status, fork: input }; },
+    async patchFeedback() {},
+  };
+  const feedback = createExecutionFeedback({
+    jobs, sessions: {}, typing: {}, authorize: async ({ operation }) => operation === 'fork',
+    executor: { async forkBinding(input) { forks += 1; return { committed: await input.onForked({ targetThreadId: 'target-thread' }) }; } },
+    runAsync(operation) { pending = Promise.resolve().then(operation); return pending; },
+    cardClient: { im: { v1: { message: { async patch() { return { code: 0 }; } } } } },
+  });
+  const stale = await feedback.handleCardAction({ action: { value: { action: 'fork_busy_session', jobId: job.id, expectedSourceThreadId: 'source-thread' } },
+    operator: { open_id: 'other' }, context: { open_chat_id: 'chat', open_message_id: 'card-message' } });
+  assert.match(stale.toast.content, /失效/);
+  assert.equal(forks, 0);
+  const accepted = await feedback.handleCardAction({ action: { value: { action: 'fork_busy_session', jobId: job.id, expectedSourceThreadId: 'source-thread' } },
+    operator: { open_id: 'human' }, context: { open_chat_id: 'chat', open_message_id: 'card-message' } });
+  assert.match(accepted.toast.content, /正在创建/);
+  await pending;
+  assert.equal(forks, 1);
+  assert.equal(intent.bindingOpenId, 'human');
+  assert.equal(intent.cardMessageId, 'card-message');
 });
 
 test('ordinary busy finishes the real feedback card and stops its observer and lease timer', async () => {

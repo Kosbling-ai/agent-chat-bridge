@@ -23,6 +23,7 @@ export function renderExecutionCard(state, answer = '', displayName = 'agent-cha
   if (!elements.length) elements.push(md('已收到，正在处理你的请求。'));
   elements.push(md(`**${statuses[state.status] || '执行中'}**${state.delivery === 'fallback' ? ' · 结果将通过普通消息送达' : ''}`));
   if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: '停止执行' }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
+  if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: '保留历史并新建会话' }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
   let card = { schema: '2.0', config: { update_multi: true, summary: { content: `${displayName} · ${statuses[state.status] || '执行中'}` } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: displayName } }, body: { elements } };
   // IM cards are limited to 30 KB, including UTF-8 and JSON scaffolding.
   while (Buffer.byteLength(JSON.stringify(card)) > 28000 && card.body.elements.length > (answer ? 2 : 1)) card.body.elements.shift();
@@ -45,6 +46,7 @@ export class ExecutionCard {
     });
   }
   snapshot() { return structuredClone(this.state); }
+  setForkSource(threadId) { this.state.forkSourceThreadId = String(threadId || ''); }
   push(event) {
     if (this.closed || this.state.delivery === 'fallback' || !event) return;
     if (event.kind === 'started') { this.state.status = 'running'; if (event.turnId) this.state.turnId = event.turnId; }

@@ -82,6 +82,13 @@ export async function startService({ config, configPath, env = process.env, log,
   const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
   const pool = factories.pool(config.storage, env);
   let store, executor, feishu, communication, forward, catchup, http;
+  const cardOperations = new Set();
+  const runCardOperation = operation => {
+    const pending = Promise.resolve().then(operation).finally(() => cardOperations.delete(pending));
+    cardOperations.add(pending);
+    pending.catch(() => {});
+    return pending;
+  };
   let writerHealthy = true;
   let closing;
   let rejectCancelled;
@@ -101,10 +108,12 @@ export async function startService({ config, configPath, env = process.env, log,
       try { await operation(); } catch { failures.push(true); }
     }
     forward?.beginStop?.();
-    const executorClosing = Promise.resolve().then(() => executor?.close());
     for (const operation of [() => catchup?.stop(), () => communication?.stop()]) {
       try { await operation(); } catch { failures.push(true); }
     }
+    const cardResults = await Promise.allSettled([...cardOperations]);
+    if (cardResults.some(result => result.status === 'rejected')) failures.push(true);
+    const executorClosing = Promise.resolve().then(() => executor?.close());
     try { await forward?.stop(); } catch { failures.push(true); }
     try { await executorClosing; } catch { failures.push(true); }
     for (const operation of [() => store ? store.close() : pool.end(), () => reporter?.close()]) {
@@ -183,7 +192,8 @@ export async function startService({ config, configPath, env = process.env, log,
     const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
       emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
-    const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
+    const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,
+      runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
     forward=factories.forward({config:{
       steering:config.codex.steering,
       pollMs:config.codex.jobPollMs,

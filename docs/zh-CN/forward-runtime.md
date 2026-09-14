@@ -12,6 +12,8 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 普通任务收到 `CODEX_THREAD_BUSY` 后第一次即走失败投递，即使 turn/start 的原生接收结果仍未知，也不等待下一次 claim；原卡片/回复链提示“会话被其他客户端占用，请释放后重试。原会话绑定保持不变。”其他可重试入场失败默认最多 3 次、每次相隔 60 秒；`codex.jobRetryMs` 允许 10 秒到 30 分钟，`codex.jobMaxAttempts` 允许 1 到 10。bridge 不自动新建会话或更换原 binding。
 
+真实飞书用户已有 binding 时，busy 失败卡片提供“保留历史并新建会话”。只有原消息发送者可点击，回调会重新核对当前 bot 范围内的 job、卡片、聊天、授权和冻结的源线程；它只执行一次显式 `thread/fork`，使用当前 bridge 的工作目录与权限默认值，并在同一 binding admission 锁内完成持久化与旧线程 CAS 切换。该操作不 resume/interrupt 源线程、不启动 turn，也不重放失败消息。原生明确拒绝或 binding 已变化时保留当前 binding；原生结果或数据库提交结果未知时会记录为未确认，不会自动重试，需管理员核查持久状态。跨进程 writer 占用时 native 是否支持 fork 取决于 Codex 实现，bridge 会将拒绝作为可见失败处理，不假定一定成功。
+
 忙碌排队例外只授予配置中显式启用 `queueIfBusy` 的认证客户端：已持久化且非空的 `executionNamespace` 必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。请求 payload、sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭；恢复流程不再添加 Typing。
 
 执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。

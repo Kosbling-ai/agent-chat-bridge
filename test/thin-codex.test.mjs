@@ -44,7 +44,7 @@ function memoryStore(initial = []) {
   };
 }
 
-function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set() } = {}) {
+function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set() } = {}) {
   let threadNumber = 0; let turnNumber = 0;
   const children = []; const calls = []; const envs = []; const args = [];
   const spawnImpl = (_bin, childArgs, options) => {
@@ -71,6 +71,10 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, comple
         loaded.add(message.params.threadId); respond({ thread: { id: message.params.threadId, turns: resumeTurns } }, resumeDelayMs);
       }
       else if (message.method === 'thread/read') respond({ thread: { ...readThread, id: message.params.threadId, turns: readTurns } });
+      else if (message.method === 'thread/fork') {
+        const id = `fork-${++threadNumber}`; loaded.add(id);
+        respond({ thread: forkThread === undefined ? { id, cwd: message.params.cwd, ephemeral: message.params.ephemeral, forkedFromId: message.params.threadId, turns: [] } : forkThread });
+      }
       else if (message.method === 'turn/start') {
         if (strictThreadLoading && !loaded.has(message.params.threadId)) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: 'thread was not loaded by this child' } })); return; }
         if (archiveTurnStartOnce) { archiveTurnStartOnce = false; setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: `session ${message.params.threadId} is archived` } })); return; }
@@ -245,6 +249,93 @@ test('executor binds and completes from the production notification order', asyn
     assert.equal(turnStart.params.model, 'gpt-test');
     assert.equal(turnStart.params.effort, 'medium');
     assert.ok(store.events.some((event) => event.event_key === 'assistant-final:m1'));
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('explicit busy fork copies history without starting or interrupting a turn', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-fork-'));
+  try {
+    const binding = { feishuOpenId: 'human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'source-thread', created: false };
+    const runtime = fakeRuntime();
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore([binding]), spawnImpl: runtime.spawnImpl });
+    let committed;
+    const result = await executor.forkBinding({ binding, expectedSourceThreadId: 'source-thread',
+      onForked: async value => { committed = value; return { outcome: 'succeeded' }; } });
+    assert.equal(result.targetThreadId, 'fork-1');
+    assert.deepEqual(committed, { sourceThreadId: 'source-thread', targetThreadId: 'fork-1' });
+    const fork = runtime.calls.find(call => call.method === 'thread/fork');
+    assert.deepEqual(fork.params, { cwd, approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', sandbox: 'workspace-write',
+      model: 'gpt-test', threadId: 'source-thread', ephemeral: false, deferGoalContinuation: true,
+      config: { model_reasoning_effort: 'medium' } });
+    assert.equal(runtime.calls.some(call => ['thread/resume','turn/start','turn/interrupt'].includes(call.method)), false);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('fork keeps the binding admission lock through durable CAS and prevents a second native fork', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-fork-lock-'));
+  try {
+    const binding = { feishuOpenId: 'human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'source-thread', created: false };
+    const store = memoryStore([binding]);
+    const runtime = fakeRuntime();
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    let release;
+    const durable = new Promise(resolve => { release = resolve; });
+    const first = executor.forkBinding({ binding, expectedSourceThreadId: 'source-thread', onForked: async ({ targetThreadId }) => {
+      await durable;
+      await store.saveCodexBinding({ ...binding, codexSessionId: targetThreadId });
+      return { outcome: 'succeeded' };
+    } });
+    while (!runtime.calls.some(call => call.method === 'thread/fork')) await new Promise(resolve => setImmediate(resolve));
+    const second = executor.forkBinding({ binding, expectedSourceThreadId: 'source-thread', onForked: async () => {
+      throw new Error('second fork must not commit');
+    } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(runtime.calls.filter(call => call.method === 'thread/fork').length, 1);
+    release();
+    await first;
+    await assert.rejects(second, { code: 'CODEX_FORK_SOURCE_CHANGED', outcome: 'rejected' });
+    assert.equal(runtime.calls.filter(call => call.method === 'thread/fork').length, 1);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('unverified native fork responses never switch the durable binding', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-fork-invalid-'));
+  try {
+    const binding = { feishuOpenId: 'human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'source-thread', created: false };
+    for (const forkThread of [
+      { cwd, ephemeral: false, forkedFromId: 'source-thread' },
+      { id: 'source-thread', cwd, ephemeral: false, forkedFromId: 'source-thread' },
+      { id: 'new-thread', cwd: join(cwd, 'other'), ephemeral: false, forkedFromId: 'source-thread' },
+      { id: 'new-thread', cwd, ephemeral: true, forkedFromId: 'source-thread' },
+      { id: 'new-thread', cwd, ephemeral: false, forkedFromId: 'other-thread' },
+    ]) {
+      const runtime = fakeRuntime({ forkThread });
+      const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore([binding]), spawnImpl: runtime.spawnImpl });
+      let commits = 0;
+      await assert.rejects(executor.forkBinding({ binding, expectedSourceThreadId: 'source-thread', onForked: async () => { commits += 1; } }),
+        { code: 'CODEX_FORK_UNCONFIRMED', outcome: 'unknown' });
+      assert.equal(commits, 0);
+      await executor.close();
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('fork refuses a binding with an active local turn without interrupting it', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-fork-active-'));
+  try {
+    const binding = { feishuOpenId: 'human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'source-thread', created: false };
+    const runtime = fakeRuntime({ completeStarts: false });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore([binding]), spawnImpl: runtime.spawnImpl });
+    const active = executor.execute({ bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'active-message', prompt: 'work', busyPolicy: 'reject' });
+    while (!runtime.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(executor.forkBinding({ binding, expectedSourceThreadId: 'source-thread', onForked: async () => {} }),
+      { code: 'CODEX_THREAD_BUSY', outcome: 'rejected' });
+    assert.equal(runtime.calls.some(call => call.method === 'thread/fork'), false);
+    assert.equal(runtime.calls.some(call => call.method === 'turn/interrupt'), false);
+    active.catch(() => {});
     await executor.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
