@@ -66,7 +66,7 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
       if (input.deliveryMode !== undefined && !['bridge','caller'].includes(input.deliveryMode)) throw new ApiError('invalid_delivery_mode');
       authorize(client, input.conversationId);
       const idempotencyKey = identifier(input.idempotencyKey, 255);
-      const result = await forwardRuntime.submit({source:'api',callerId:client.id,idempotencyKey,executionNamespace:input.executionNamespace,message:{conversationId:input.conversationId,conversationType:'group',text:input.text},actor:{type:'service',id:client.id},prompt:input.text,deliveryMode:input.deliveryMode||'bridge'});
+      const result = await forwardRuntime.submit({source:'api',callerId:client.id,idempotencyKey,executionNamespace:input.executionNamespace,message:{conversationId:input.conversationId,conversationType:'group',text:input.text},actor:{type:'service',id:client.id},prompt:input.text,deliveryMode:input.deliveryMode||'bridge',queueIfBusy:client.queueIfBusy===true});
       return { status: 202, body: { id: result.id, duplicate: result.duplicate } };
     }
     const resource = /^\/v1\/runs\/([\w-]+)\/resources\/(\d+)$/.exec(path);

@@ -24,7 +24,7 @@ test('group mention can register forward and hook branches without either consum
   await runtime.ingest(event);await runtime.ingest(event);
   await new Promise(setImmediate);
   assert(accepted.every(item=>item.forwardJob===undefined&&item.hooks.length===1));
-  assert.equal(forwarded.length,1);
+  assert.equal(forwarded.length,2,'forward upsert owns Agent terminal deduplication after an inbox replay');
   assert.equal(forwarded[0].prompt,'【提到你的消息 来自 Human（open_id=human）】\nhello');
 });
 
@@ -54,14 +54,56 @@ test('stale group input is skipped while private history catchup keeps the origi
   assert.equal(forwarded[0].message.messageId,'stale-private');
 });
 
-function memoryJobs(initial){let job={id:'run',internalId:'1',callerId:'caller',chatId:'chat',chatType:'group',messageId:'message',senderOpenId:'system:scope',senderName:'Caller',deliveryMode:'caller',executionNamespace:'daily',prompt:'work',attempts:1,result:{},createdAt:1,leaseOwner:'owner',...initial};const calls=[];const finish=async({status,result})=>{calls.push(['finished',status]);job={...job,status,result,replySentAt:null};};return{calls,get job(){return job;},upsert:async()=>({...job,duplicate:false}),claimReplyPending:async()=>job.status==='reply_pending'?[job]:[],claim:async()=>job.status==='pending'?[job={...job,status:'running',leaseOwner:'owner'}]:[],renew:async()=>({renewed:true}),patchExecution:async({execution})=>{calls.push(['execution',execution]);job={...job,result:{...job.result,execution}};},patchFeedback:async()=>{},markReplyPending:async({result})=>{calls.push(['reply_pending']);job={...job,status:'reply_pending',result};},markFinished:finish,markFinishedWithoutReply:finish,markRetry:async input=>{calls.push(['retry',input]);job={...job,status:input.held?'held':input.terminal?'failed':'pending',last_error:input.errorCode};},getRun:async()=>job,readEvents:async()=>[]};}
+test('private image-only post reaches media preparation and empty group mention can use prior context',async()=>{
+  const forwarded=[];
+  const config=validateConfig({...base,routing:{...base.routing,privateUserIds:['human']}});
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async()=>({duplicate:false})},
+    inbound:{async loadRecentGroupContext(){return[{messageId:'prior',prompt:'prior context',senderOpenId:'other',senderName:'Other',createdAt:1}];}},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{execution:{terminal:'completed'}};}},chat:{}});
+  await runtime.ingest({connectionId:'test',source:'live',eventKey:'private-post',type:'message.received',conversationId:'private',conversationType:'p2p',messageId:'private-post',occurredAt:Date.now(),actor:{type:'user',openId:'human',name:'Human'},message:{kind:'post',content:'{"content":[[{"tag":"img","image_key":"image"}]]}',mentions:[]}});
+  await runtime.ingest({connectionId:'test',source:'live',eventKey:'group-empty',type:'message.received',conversationId:'chat',conversationType:'group',messageId:'group-empty',occurredAt:Date.now(),actor:{type:'user',openId:'human',name:'Human'},message:{kind:'text',content:'{"text":"<at>bot</at>"}',mentions:[{openId:'bot',key:'<at>bot</at>'}]}});
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,2);
+  assert.equal(forwarded[0].message.type,'post');
+  assert.match(forwarded[1].prompt,/prior context/);
+});
 
-test('forward runtime persists start/bound, caller result and known-turn inspect-only resume',async()=>{
-  const jobs=memoryJobs({status:'pending'});const options=[];const executor={execute:async(_input,value)=>{options.push(value);await value.onStartIntent({binding:{feishuOpenId:'group:binding'},threadId:'thread',messageId:'message',startedAt:2});await value.onBound({threadId:'thread',turnId:'turn',startedAt:2});return{threadId:'thread',turnId:'turn',answer:'shown',rawAnswer:'full machine answer',attachments:[]};}};
+test('failed forward keeps recent group context until a later accepted execution',async()=>{
+  const prompts=[];let attempt=0;
+  const config=validateConfig(base);
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async()=>({duplicate:false})},
+    forward:{handleMessage:async input=>{prompts.push(input.prompt);attempt+=1;return attempt===1?{failed:true}:{execution:{terminal:'completed'}};}},chat:{}});
+  const event=(id,text,mentioned=false)=>({connectionId:'test',source:'live',eventKey:id,type:'message.received',conversationId:'chat',conversationType:'group',messageId:id,occurredAt:Date.now(),actor:{type:'user',openId:'human',name:'Human'},message:{kind:'text',content:JSON.stringify({text:mentioned?`<at>bot</at> ${text}`:text}),mentions:mentioned?[{openId:'bot',key:'<at>bot</at>'}]:[]}});
+  await runtime.ingest(event('context','keep me'));
+  await runtime.ingest(event('first','first',true));await new Promise(setImmediate);
+  await runtime.ingest(event('second','second',true));await new Promise(setImmediate);
+  assert.match(prompts[0],/keep me/);
+  assert.match(prompts[1],/keep me/);
+});
+
+function memoryJobs(initial){
+  let job={id:'run',internalId:'1',callerId:'caller',chatId:'chat',chatType:'group',messageId:'message',senderOpenId:'system:scope',senderName:'Caller',deliveryMode:'caller',executionNamespace:'daily',prompt:'work',attempts:1,result:{},createdAt:1,leaseOwner:'',...initial};
+  const calls=[];
+  const unsafe=()=>{const execution=job.result?.execution||{};return execution.unconfirmed===true||['start_intent','bound','unknown'].includes(execution.status)||execution.intent||execution.threadId||execution.turnId;};
+  const finish=async({status,result})=>{calls.push(['finished',status]);job={...job,status,result,replySentAt:null};};
+  const due=()=>job.nextAttemptAt==null||job.nextAttemptAt<=Date.now();
+  const claim=async({owner})=>{if(job.status!=='pending'||!due()||unsafe())return null;job={...job,status:'running',leaseOwner:owner,attempts:job.attempts+1};return job;};
+  return{calls,get job(){return job;},upsert:async()=>({...job,duplicate:false}),getByMessageId:async()=>null,
+    loadRecoverable:async()=>job.status==='pending'&&due()&&!unsafe()?[job]:[],claimById:claim,claimReplyById:async({owner})=>job.status==='reply_pending'?(job={...job,leaseOwner:owner}):null,
+    claimReplyPending:async({owner})=>job.status==='reply_pending'?[(job={...job,leaseOwner:owner})]:[],claim:async input=>{const value=await claim(input);return value?[value]:[];},
+    renew:async()=>({renewed:true}),patchPreparedInput:async({execution})=>{calls.push(['prepared',execution]);job={...job,result:{...job.result,execution}};return job;},
+    patchExecution:async({execution})=>{calls.push(['execution',execution]);job={...job,result:{...job.result,execution}};},patchFeedback:async()=>{},
+    markReplyPending:async({result})=>{calls.push(['reply_pending']);job={...job,status:'reply_pending',result};},markFinished:finish,markFinishedWithoutReply:finish,
+    markRetry:async input=>{calls.push(['retry',input]);job={...job,status:input.held?'held':input.terminal?'failed':'pending',last_error:input.errorCode,nextAttemptAt:input.nextAttemptAt,leaseOwner:''};},
+    getRun:async()=>job,readEvents:async()=>[]};
+}
+
+test('forward runtime uses only its response waiter signal and persists caller result',async()=>{
+  const jobs=memoryJobs({status:'pending'});const options=[];const executor={execute:async(_input,value)=>{options.push(value);return{threadId:'thread',turnId:'turn',answer:'shown',rawAnswer:'full machine answer',attachments:[]};}};
   const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1,leaseMs:10000},jobs,sessions:{},executor,replies:{readResource:async()=>null},feedback:null,authorize:async()=>true});runtime.start();await flush();await runtime.stop();
-  assert.deepEqual(jobs.calls.map(x=>x[0]),['execution','execution','reply_pending','finished']);
-  assert.equal(jobs.job.result.rawAnswer,'full machine answer');assert.equal(jobs.job.status,'completed');assert.equal(options[0].resume,undefined);
-  const recovered=memoryJobs({status:'pending',result:{execution:{threadId:'thread',turnId:'turn',startedAt:2}}});const resumes=[];const again=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs:recovered,sessions:{},executor:{execute:async(_input,value)=>{resumes.push(value.resume);return{threadId:'thread',turnId:'turn',answer:'done',rawAnswer:'done',attachments:[]};}},replies:{readResource:async()=>null},authorize:async()=>true});again.start();await flush();await again.stop();assert.deepEqual(resumes,[{threadId:'thread',turnId:'turn',startedAt:2}]);
+  assert.deepEqual(jobs.calls.map(x=>x[0]),['reply_pending','finished']);
+  assert.equal(jobs.job.result.rawAnswer,'full machine answer');assert.equal(jobs.job.status,'completed');
+  assert.deepEqual(Object.keys(options[0]),['signal']);
 });
 
 test('unknown native outcome becomes held and is not submitted again',async()=>{
@@ -147,7 +189,7 @@ test('unknown reply stays pending and a failed reply never records a successful 
   assert.equal(finished.errorCode, 'reply_delivery_failed');
 });
 
-test('persisted start intent without a turn is held without a new executor call', async () => {
+test('persisted start intent stays isolated without a new executor call', async () => {
   const jobs = memoryJobs({ status: 'pending', result: { execution: { threadId: 'thread', startedAt: 2, status: 'start_intent', unconfirmed: true } } });
   let executions = 0;
   const runtime = createForwardRuntime({
@@ -157,16 +199,16 @@ test('persisted start intent without a turn is held without a new executor call'
   });
   runtime.start(); await flush(); await runtime.stop();
   assert.equal(executions, 0);
-  assert.equal(jobs.job.status, 'held');
-  assert.equal(jobs.calls.at(-1)[1].errorCode, 'native_start_unconfirmed');
+  assert.equal(jobs.job.status, 'pending');
+  assert.deepEqual(jobs.calls, []);
 });
 
-test('known recovery restores and observes feedback before inspect-only execution', async () => {
+test('persisted known native identity stays isolated without restore or resume', async () => {
   const jobs = memoryJobs({ status: 'pending', deliveryMode: 'bridge', result: { execution: { bindingOpenId: 'group:binding', threadId: 'thread', turnId: 'turn', startedAt: 2 } } });
   const calls = [];
   const runtime = createForwardRuntime({
     config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
-    executor: { async execute(_input, options) { calls.push(['execute', options.resume]); return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
+    executor: { async execute() { calls.push(['execute']); } },
     feedback: {
       async restore() { calls.push(['restore']); return { card: {} }; },
       observe(_job, _state, execution) { calls.push(['observe', execution.turnId]); },
@@ -175,12 +217,15 @@ test('known recovery restores and observes feedback before inspect-only executio
     replies: { readResource: async () => null }, authorize: async () => true,
   });
   runtime.start(); await flush(); await runtime.stop();
-  assert.deepEqual(calls.slice(0, 3), [['restore'], ['observe', 'turn'], ['execute', { threadId: 'thread', turnId: 'turn', startedAt: 2 }]]);
+  assert.deepEqual(calls, []);
+  assert.equal(jobs.job.status,'pending');
 });
 
 test('media preparation feeds a durable image addendum to executor input', async () => {
   const jobs = memoryJobs({ status: 'pending', prompt: 'User：', result: { inputEvent: { messageId: 'message', message: { kind: 'image' } } } });
-  let prompt;
+  let prompt;const order=[];
+  const patchPreparedInput=jobs.patchPreparedInput.bind(jobs);jobs.patchPreparedInput=async input=>{order.push('prepare');return patchPreparedInput(input);};
+  const claimById=jobs.claimById.bind(jobs);jobs.claimById=async input=>{order.push('claim');return claimById(input);};
   const runtime = createForwardRuntime({
     config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
     media: { async prepare() { return { status: 'ready', text: '', addendum: '（图片路径：safe/image.png）' }; } },
@@ -189,7 +234,27 @@ test('media preparation feeds a durable image addendum to executor input', async
   });
   runtime.start(); await flush(); await runtime.stop();
   assert.match(prompt, /safe\/image\.png/);
-  assert.equal(jobs.calls.filter(([name]) => name === 'execution')[0][1].inputStatus, 'ready');
+  assert.deepEqual(order.slice(0,2),['prepare','claim']);
+  assert.equal(jobs.calls.filter(([name]) => name === 'prepared')[0][1].inputStatus, 'ready');
+});
+
+test('API registration returns before its internal execute waiter completes',async()=>{
+  const jobs=memoryJobs({status:'pending'});let release;
+  const runtime=createForwardRuntime({config:{owner:'owner',pollMs:30_000},jobs,sessions:{},
+    executor:{execute:async()=>new Promise(resolve=>{release=()=>resolve({threadId:'thread',turnId:'turn',answer:'done',rawAnswer:'done',attachments:[]});})},
+    replies:{},authorize:async()=>true});
+  const registered=await runtime.submit({source:'api',callerId:'caller',idempotencyKey:'one',conversationId:'chat',executionNamespace:'daily',deliveryMode:'caller',prompt:'work'});
+  assert.equal(registered.id,'run');
+  await new Promise(setImmediate);assert.equal(typeof release,'function');
+  release();await flush();await runtime.stop();
+});
+
+test('live replay lets the existing forward row decide terminal duplication',async()=>{
+  const existing={id:'existing',status:'completed',messageId:'same',chatId:'chat',chatType:'p2p',deliveryMode:'bridge',result:{answer:'done',execution:{terminal:'completed'}}};
+  let upserts=0;let claims=0;
+  const runtime=createForwardRuntime({jobs:{async getByMessageId(){return existing;},async upsert(){upserts+=1;},async getRun(){return existing;},async claimById(){claims+=1;},async claimReplyById(){return null;},async readEvents(){return[];}},sessions:{},executor:{},replies:{},authorize:async()=>true});
+  const result=await runtime.handleMessage({source:'live',callerId:'live',idempotencyKey:'same',message:{messageId:'same',conversationId:'chat',conversationType:'p2p',type:'text'},actor:{openId:'human'},prompt:'changed context'});
+  assert.equal(result.answer,'done');assert.equal(upserts,0);assert.equal(claims,1);
 });
 
 test('prepared media prompt is reused without downloading again', async () => {
@@ -207,7 +272,7 @@ test('prepared media prompt is reused without downloading again', async () => {
   assert.match(prompt, /safe\/image\.png/);
 });
 
-test('manual pre-admission busy fails once with an explicit reply and no retry', async () => {
+test('manual pre-admission busy follows the ordinary bounded retry policy', async () => {
   const jobs = memoryJobs({ status: 'pending', callerId: 'live', executionNamespace: null, deliveryMode: 'bridge', result: {} });
   let admissions = 0;
   const runtime = createForwardRuntime({
@@ -218,11 +283,10 @@ test('manual pre-admission busy fails once with an explicit reply and no retry',
   });
   runtime.start(); await flush(); await runtime.stop();
   assert.equal(admissions, 1);
-  assert.equal(jobs.calls.some(([name]) => name === 'retry'), false);
-  assert.equal(jobs.calls.filter(([name]) => name === 'reply_pending').length, 1);
-  assert.equal(jobs.job.status, 'failed');
-  assert.match(jobs.job.result.answer, /其他客户端占用/);
-  assert.equal(jobs.job.result.execution.notStarted, true);
+  assert.equal(jobs.calls.filter(([name]) => name === 'retry').length,1);
+  assert.equal(jobs.calls.filter(([name]) => name === 'reply_pending').length,0);
+  assert.equal(jobs.job.status,'pending');
+  assert.equal(jobs.calls.find(([name])=>name==='retry')[1].preserveAttempt,false);
 });
 
 test('only a persisted caller-derived system binding gets the 60-second wait policy', async () => {
@@ -231,7 +295,7 @@ test('only a persisted caller-derived system binding gets the 60-second wait pol
   const job = {
     id: 'run', callerId: 'caller', chatId: 'chat', chatType: 'group', messageId: 'message',
     senderOpenId: bindingOpenId, senderName: 'Caller', deliveryMode: 'caller', executionNamespace: 'daily',
-    prompt: 'work', attempts: 0, status: 'pending', result: { execution: { bindingOpenId } },
+    prompt: 'work', attempts: 0, status: 'pending', result: { execution: { bindingOpenId }, policy: { queueIfBusy: true } },
     createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
   };
   const calls = [];
@@ -241,11 +305,14 @@ test('only a persisted caller-derived system binding gets the 60-second wait pol
       Object.assign(job, { leaseOwner: owner });
       return [{ ...job, result: structuredClone(job.result) }];
     },
-    async claim({ owner }) {
-      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+    async loadRecoverable() { return job.status==='pending'&&job.nextAttemptAt<=clock?[{...job,result:structuredClone(job.result)}]:[]; },
+    async claimById({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return null;
       Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
-      return [{ ...job, result: structuredClone(job.result) }];
+      return { ...job, result: structuredClone(job.result) };
     },
+    async claim({owner}) { const value=await this.claimById({owner});return value?[value]:[]; },
+    async claimReplyById(){return null;},async getRun(){return job;},
     async renew() {},
     async patchExecution({ execution }) {
       job.result = { ...job.result, execution };
@@ -265,11 +332,9 @@ test('only a persisted caller-derived system binding gets the 60-second wait pol
   const executor = { async execute(_input, options) {
     admissions += 1;
     if (admissions < 3) throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' });
-    await options.onStartIntent({ binding: { feishuOpenId: bindingOpenId }, threadId: 'thread', messageId: 'message', startedAt: clock });
-    await options.onBound({ threadId: 'thread', turnId: 'turn', startedAt: clock });
     return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] };
   } };
-  const runtime = createForwardRuntime({ config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000 }, jobs, sessions: {}, executor, feedback: { async prepare() {} }, replies: {}, now: () => clock });
+  const runtime = createForwardRuntime({ config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000 }, jobs, sessions: {}, executor, feedback: { async prepare() {} }, replies: {}, allowBusyQueue:async()=>true,now: () => clock });
   const settled = async () => {
     for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
   };
@@ -284,14 +349,14 @@ test('only a persisted caller-derived system binding gets the 60-second wait pol
   assert(calls.filter(([name]) => name === 'retry').every(([, input]) => input.preserveAttempt === true));
 
   for(const spoof of [
-    { executionNamespace: '', senderOpenId: 'system:pretend', result: { execution: { bindingOpenId: 'system:pretend' } } },
-    { executionNamespace: 'daily', senderOpenId: bindingOpenId, result: { execution: { bindingOpenId: 'system:mismatch' } } },
+    { executionNamespace: '', senderOpenId: 'system:pretend', result: { execution: { bindingOpenId: 'system:pretend' },policy:{queueIfBusy:true} } },
+    { executionNamespace: 'daily', senderOpenId: bindingOpenId, result: { execution: { bindingOpenId: 'system:mismatch' },policy:{queueIfBusy:true} } },
   ]) {
     const spoofJobs = memoryJobs({ status: 'pending', deliveryMode: 'caller', ...spoof });
-    const one = createForwardRuntime({ config: { owner: 'owner', pollMs: 1 }, jobs: spoofJobs, sessions: {}, executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission' }); } }, replies: {} });
+    const one = createForwardRuntime({ config: { owner: 'owner', pollMs: 1 }, jobs: spoofJobs, sessions: {}, executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission' }); } }, replies: {},allowBusyQueue:async()=>true });
     one.start(); await flush(); await one.stop();
-    assert.equal(spoofJobs.calls.some(([name]) => name === 'retry'), false);
-    assert.equal(spoofJobs.job.status, 'failed');
+    assert.equal(spoofJobs.calls.find(([name]) => name === 'retry')[1].preserveAttempt, false);
+    assert.equal(spoofJobs.job.status, 'pending');
   }
 });
 
@@ -360,13 +425,12 @@ test('claim failure marks the only worker unhealthy', async () => {
   await runtime.stop();
 });
 
-test('one forward worker admits another human job while the first turn is active', async () => {
+test('recovery executes claimed jobs serially', async () => {
   const baseJob = { internalId: '1', callerId: 'live', chatId: 'chat', chatType: 'group', senderOpenId: 'human', senderName: 'Human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work', attempts: 1, result: {}, createdAt: 1, leaseOwner: 'owner' };
   const queued = [{ ...baseJob, id: 'run-1', messageId: 'message-1' }, { ...baseJob, id: 'run-2', internalId: '2', messageId: 'message-2' }];
   let claimed = false;
   let releaseFirst;
-  let secondEntered;
-  const second = new Promise(resolve => { secondEntered = resolve; });
+  let secondEntered = false;
   const jobs = {
     async claimReplyPending() { return []; },
     async claim() { if (claimed) return []; claimed = true; return queued; },
@@ -380,16 +444,18 @@ test('one forward worker admits another human job while the first turn is active
     async readEvents() { return []; },
   };
   const executor = { async execute(input) {
-    if (input.messageId === 'message-2') { secondEntered(); return { threadId: 'thread', turnId: 'turn-2', answer: 'steered', rawAnswer: 'steered', attachments: [], deferred: true }; }
+    if (input.messageId === 'message-2') { secondEntered = true; return { threadId: 'thread', turnId: 'turn-2', answer: 'steered', rawAnswer: 'steered', attachments: [], deferred: true }; }
     return new Promise(resolve => { releaseFirst = () => resolve({ threadId: 'thread', turnId: 'turn-1', answer: 'done', rawAnswer: 'done', attachments: [] }); });
   } };
   const runtime = createForwardRuntime({ config: { owner: 'owner', pollMs: 1, maxActive: 5 }, jobs, sessions: {}, executor, replies: {}, authorize: async () => true });
   runtime.start();
-  await second;
+  await flush();
   assert.equal(typeof releaseFirst, 'function');
+  assert.equal(secondEntered, false);
   releaseFirst();
   await flush();
   await runtime.stop();
+  assert.equal(secondEntered, true);
 });
 
 test('lease loss after binding aborts observation without a terminal write', async () => {
@@ -404,8 +470,6 @@ test('lease loss after binding aborts observation without a terminal write', asy
   const runtime = createForwardRuntime({
     config: { owner: 'owner', pollMs: 1, leaseMs: 100, heartbeatMs: 5 }, jobs, sessions: {},
     executor: { async execute(_input, options) {
-      await options.onStartIntent({ binding: { feishuOpenId: 'group:binding' }, threadId: 'thread', messageId: 'message', startedAt: 2 });
-      await options.onBound({ threadId: 'thread', turnId: 'turn', startedAt: 2 });
       return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(new Error('stopped'), { code: 'CODEX_WAIT_ABORTED', outcome: 'unknown' })), { once: true }));
     } },
     feedback: {
@@ -417,7 +481,7 @@ test('lease loss after binding aborts observation without a terminal write', asy
   });
   runtime.start(); await flush(); await runtime.stop();
   assert.ok(renewals > 1);
-  assert.deepEqual(jobs.calls.map(([name]) => name), ['execution', 'execution']);
+  assert.deepEqual(jobs.calls.map(([name]) => name), []);
   assert.equal(jobs.job.status, 'running');
   assert.equal(abandoned, 1);
 });

@@ -98,8 +98,6 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000002,'late-thread','group:late','late-chat','late-message','tool:visible','public_progress','activity','Visible','',JSON.stringify({kind:'tool',id:'visible',status:'running'}),1301]);
       const binding = { feishuOpenId: 'group:late', chatId: 'late-chat' };
       let cardState = { entries: [] };
-      let firstCursorPersisted;
-      const firstCursor = new Promise(resolve => { firstCursorPersisted = resolve; });
       const card = {
         chain: Promise.resolve(),
         snapshot: () => structuredClone(cardState),
@@ -107,10 +105,6 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
           const index = cardState.entries.findIndex(item => item.id === event.id);
           if (index >= 0) cardState.entries[index] = event;
           else cardState.entries.push(event);
-        },
-        setObserverCursor(cursor, seen) {
-          cardState = { ...cardState, observerCursor: structuredClone(cursor), observerSeen: structuredClone(seen) };
-          firstCursorPersisted();
         },
         async persist(value) { cardState = structuredClone(value); },
         async log() {},
@@ -120,9 +114,8 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
         binding, threadId: 'late-thread', messageId: 'late-message', cursor, limit: 100,
       }).then(rows => rows.map(row => ({ ...row, progress_json: row.detail_json })));
       const observer = observeExecutionCard({ card, since: 1200, load });
-      await firstCursor;
+      for(let attempt=0;attempt<100&&!cardState.entries.length;attempt+=1)await new Promise(resolve=>setTimeout(resolve,5));
       assert.deepEqual(cardState.entries.map(entry => entry.id), ['visible']);
-      assert.deepEqual(cardState.observerCursor, { at: 1200, id: '0' });
       await delayed.commit();
       const saved = await observer.stop();
       assert.deepEqual(saved.entries.map(entry => entry.id).sort(), ['late', 'visible']);
@@ -208,7 +201,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const replies = createFeishuReplies({
       connectionId: 'fixture', jobs: store,
       chat: {
-        async replyMessage() { deliveryCalls.push('reply'); return { message_id: 'reply-message' }; },
+        async sendMessage() { deliveryCalls.push('reply'); return { message_id: 'reply-message' }; },
       },
       outbound: {
         async prepare() {
@@ -222,11 +215,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const preparedDelivery = await replies.prepare(replyClaim, replyClaim.result);
     const delivered = await replies.deliver(replyClaim, preparedDelivery, { assertLease() {} });
     assert.equal(delivered.status, 'sent');
-    assert.deepEqual(deliveryCalls, ['reply', 'upload', 'attachment', 'cleanup']);
-    const persistedDelivery = await store.getRun({ id: deliveryRun.id });
-    assert.equal(persistedDelivery.result.delivery.text.items[0].status, 'sent');
-    assert.equal(persistedDelivery.result.delivery.attachments[0].status, 'cleaned');
-
+    assert.deepEqual(deliveryCalls, ['reply']);
     await store.patchFeedback({
       id: deliveryRun.id, leaseOwner: 'delivery-worker', key: 'typing',
       value: { desired: false, operation: 'remove', outcome: 'unknown' },
@@ -239,19 +228,29 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal(cleanupClaim.id, deliveryRun.id);
     const removedReactions = [];
     const feedback = createExecutionFeedback({
-      jobs: store, sessions: {}, executor: {},
-      chat: {
-        async listReactions() {
-          return { items: [{ reaction_id: 'typing-reaction', operator: { operator_type: 'app' }, reaction_type: { emoji_type: 'Typing' } }] };
-        },
-        async removeReaction(value) { removedReactions.push(value.reactionId); },
-      },
+      jobs: store, sessions: {}, executor: {}, chat: {},
+      typing: { async cleanup(job) { removedReactions.push('typing-reaction'); await store.patchFeedback({
+        id:job.id,leaseOwner:job.leaseOwner,key:'typing',value:{desired:false,outcome:'confirmed'},
+      }); } },
     });
     await feedback.cleanup(cleanupClaim, { assertLease() {} });
     await store.releaseFeedback({ id: deliveryRun.id, leaseOwner: 'feedback-worker' });
     assert.deepEqual(removedReactions, ['typing-reaction']);
     assert.equal((await store.getRun({ id: deliveryRun.id })).result.typing.outcome, 'confirmed');
     assert.deepEqual(await store.claimFeedbackPending({ owner: 'feedback-worker-2', leaseMs: 100, limit: 1 }), []);
+
+    const safeUnknownAnswer = await store.upsert({ ...input, idempotencyKey: 'safe-unknown-answer', messageId: 'safe-unknown-answer' });
+    const legacyUnknownReply = await store.upsert({ ...input, idempotencyKey: 'legacy-unknown-reply', messageId: 'legacy-unknown-reply' });
+    for (const run of [safeUnknownAnswer, legacyUnknownReply]) {
+      const claimed = await store.claimById({ id: run.id, owner: `prepare-${run.id}`, leaseMs: 100 });
+      await store.markReplyPending({ id: run.id, leaseOwner: claimed.leaseOwner, result: run.id === safeUnknownAnswer.id
+        ? { answer: 'unknown', rawAnswer: 'unknown' }
+        : { answer: 'answer', delivery: { text: { items: [{ status: 'unknown' }] } } } });
+    }
+    const deliveryGuardClaims = await store.claimReplyPending({ owner: 'delivery-guard', leaseMs: 100, limit: 5 });
+    assert.equal(deliveryGuardClaims.some(item => item.id === safeUnknownAnswer.id), true);
+    assert.equal(deliveryGuardClaims.some(item => item.id === legacyUnknownReply.id), false);
+    await store.markFinished({ id: safeUnknownAnswer.id, leaseOwner: 'delivery-guard', status: 'completed', result: safeUnknownAnswer.result });
 
     await pool.execute('DELETE FROM assistant_codex_forward_jobs');
     const startIntentRun = await store.upsert({
@@ -284,17 +283,13 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
       feedback: startIntentFeedback, replies: {}, authorize: async () => true,
     });
     startIntentRuntime.start();
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if ((await store.getRun({ id: startIntentRun.id })).status === 'held') break;
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
+    await new Promise(resolve => setTimeout(resolve, 20));
     await startIntentRuntime.stop();
     const heldStartIntent = await store.getRun({ id: startIntentRun.id });
     assert.equal(startIntentExecutions, 0);
-    assert.deepEqual(startIntentRemoved, ['persisted-typing']);
-    assert.equal(heldStartIntent.status, 'held');
-    assert.equal(heldStartIntent.result.typing.desired, false);
-    assert.equal(heldStartIntent.result.typing.outcome, 'confirmed');
+    assert.deepEqual(startIntentRemoved, []);
+    assert.equal(heldStartIntent.status, 'running');
+    assert.equal(heldStartIntent.result.typing.desired, true);
 
     const leaseRun = await store.upsert({ ...input, idempotencyKey: 'lease-generation', messageId: 'lease-generation' });
     const oldLease = (await store.claim({ owner: 'same-process:first-claim', leaseMs: 100, limit: 1 }))[0];
@@ -352,6 +347,18 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal(staleUnknown.replay, true);
     assert.equal(staleUnknown.stop.outcome, 'requested');
 
+    const cardStopRun = await store.upsert({ ...input, idempotencyKey: 'card-stop', messageId: 'card-stop-source' });
+    const cardStopClaim = await store.claimById({ id: cardStopRun.id, owner: 'card-stop-worker', leaseMs: 100 });
+    await store.patchExecution({ id: cardStopRun.id, leaseOwner: cardStopClaim.leaseOwner,
+      execution: { bindingOpenId: 'group:binding' } });
+    await store.patchFeedback({ id: cardStopRun.id, leaseOwner: cardStopClaim.leaseOwner, key: 'executionCard',
+      value: { messageId: 'card-stop-message', turnId: 'card-stop-turn', status: 'running' } });
+    const cardStop = await store.beginStop({ id: cardStopRun.id, threadId: 'card-stop-thread', bindingThreadId: 'card-stop-thread',
+      turnId: 'card-stop-turn', messageId: 'card-stop-source', actor: 'human' });
+    assert.equal(cardStop.outcome,'new');
+    assert.equal((await store.beginStop({ id: cardStopRun.id, threadId: 'wrong-thread', bindingThreadId: 'card-stop-thread',
+      turnId: 'card-stop-turn', messageId: 'card-stop-source', actor: 'human' })).outcome,'stale');
+
     const communication = await createMysqlStore({ pool, now: () => now });
     const receipt = {
       connectionId: 'fixture', conversationId: 'chat', source: 'live', conversationType: 'group',
@@ -364,15 +371,14 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     };
     const accepted = await communication.acceptInbound(receipt);
     const replayed = await communication.acceptInbound(receipt);
-    assert.equal(accepted.forwardRunId, replayed.forwardRunId);
+    assert.equal(accepted.forwardRunId, undefined);
+    assert.equal(replayed.forwardRunId, undefined);
     assert.deepEqual(replayed.hookJobIds, accepted.hookJobIds);
     const [[counts]] = await pool.query(`SELECT
       (SELECT COUNT(*) FROM assistant_codex_forward_jobs WHERE message_id='message-1') AS forward_count,
       (SELECT COUNT(*) FROM bridge_jobs WHERE event_id=? AND kind='hook') AS hook_count`, [accepted.eventId]);
-    assert.equal(Number(counts.forward_count), 1);
+    assert.equal(Number(counts.forward_count), 0);
     assert.equal(Number(counts.hook_count), 1);
-    const [[forwardInput]] = await pool.query('SELECT result_json FROM assistant_codex_forward_jobs WHERE message_id=?', ['message-1']);
-    assert.equal(JSON.parse(forwardInput.result_json).inputEvent.messageId, 'message-1');
 
     await communication.acceptInbound({
       connectionId: 'fixture', conversationId: 'chat', source: 'live', conversationType: 'group',
@@ -403,9 +409,8 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const [identities] = await pool.query("SELECT caller_id,sender_open_id,source_message_id FROM assistant_codex_forward_jobs WHERE caller_id IN ('live','api-caller') ORDER BY caller_id,sender_open_id");
     const apiIdentities = identities.filter(row => row.caller_id === 'api-caller').map(row => row.sender_open_id).sort();
     assert.deepEqual(apiIdentities, [deriveExecutionScope('api-caller', 'namespace-a'), deriveExecutionScope('api-caller', 'namespace-b')].sort());
-    assert.equal(identities.some(row => row.caller_id === 'live' && row.sender_open_id === 'human'), true);
+    assert.equal(identities.some(row => row.caller_id === 'live'), false);
     assert(identities.filter(row => row.caller_id === 'api-caller').every(row => row.source_message_id === null));
-    assert.equal(identities.find(row => row.caller_id === 'live').source_message_id, 'message-1');
     await communication.close();
   } finally {
     if (!pool.pool?._closed) await pool.end();

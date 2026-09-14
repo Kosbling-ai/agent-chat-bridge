@@ -86,14 +86,17 @@ test('public chat read proxies are absent while send-scope checks remain interna
 });
 test('group defaults allow all human members; explicit member filter does not limit hooks', async () => {
   const observed = [];
+  const forwarded = [];
   const groupConfig = validateConfig({ ...config, routing: { ...config.routing, groups: [{ conversationId: 'chat', trigger: 'all', passiveContext: true }] }, hooks: [{ id: 'h', url: 'http://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: ['chat'] }] });
-  const runtime = createCommunicationRuntime({ config: groupConfig, store: { acceptInbound: async value => { observed.push(value); return {}; } }, chat: {} });
-  const event = { connectionId: 'test', eventKey: 'synthetic', type: 'message.received', conversationId: 'chat', conversationType: 'group', messageId: 'm', actor: { type: 'user', openId: 'not-enumerated' }, message: { kind: 'text', parsedContent: { text: 'synthetic' } } };
+  const runtime = createCommunicationRuntime({ config: groupConfig, store: { acceptInbound: async value => { observed.push(value); return {}; } }, forward:{handleMessage:async value=>{forwarded.push(value);return{execution:{terminal:'completed'}};}},chat: {} });
+  const event = { connectionId: 'test', eventKey: 'synthetic', type: 'message.received', conversationId: 'chat', conversationType: 'group', messageId: 'm', actor: { type: 'user', openId: 'not-enumerated' }, message: { kind: 'text', content: '{"text":"synthetic"}', parsedContent: { text: 'synthetic' } } };
   await runtime.ingest(event);
-  assert(observed[0].forwardJob); assert.equal(observed[0].hooks.length, 1);
-  const restricted = createCommunicationRuntime({ config: { ...groupConfig, routing: { ...groupConfig.routing, groups: [{ ...groupConfig.routing.groups[0], userIds: [] }] } }, store: { acceptInbound: async value => { observed.push(value); return {}; } }, chat: {} });
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,1);assert.equal(observed[0].forwardJob,undefined); assert.equal(observed[0].hooks.length, 1);
+  const restricted = createCommunicationRuntime({ config: { ...groupConfig, routing: { ...groupConfig.routing, groups: [{ ...groupConfig.routing.groups[0], userIds: [] }] } }, store: { acceptInbound: async value => { observed.push(value); return {}; } }, forward:{handleMessage:async value=>{forwarded.push(value);}},chat: {} });
   await restricted.ingest(event);
-  assert.equal(observed[1].forwardJob, undefined); assert.equal(observed[1].hooks.length, 1);
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,1);assert.equal(observed[1].forwardJob, undefined); assert.equal(observed[1].hooks.length, 1);
 });
 test('run API accepts existing long cron prompts and caps UTF-8 bytes including JSON escape allowance', async () => {
   const accepted = [];

@@ -186,10 +186,13 @@ export async function startService({ config, configPath, env = process.env, log,
     const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
     forward=factories.forward({config:{
       steering:config.codex.steering,
+      pollMs:config.codex.jobPollMs,
       retryDelayMs:config.codex.jobRetryMs,
       maxAttempts:config.codex.jobMaxAttempts,
-    },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
-    communication=factories.communication({config,store,inbound,chat,outbound,hookTokens,log});
+      executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
+    },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,
+    allowBusyQueue:async({callerId,conversationId})=>Boolean(config.auth.clients.some(client=>client.id===callerId&&client.queueIfBusy===true&&client.conversationIds.includes(conversationId))),log});
+    communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest, onCardAction: feedback.handleCardAction, log });
     const api = createApi({ config, store, forwardRuntime:forward, chat, tokens });
     await Promise.race([feishu.start(), cancelled]);

@@ -4,7 +4,7 @@
 
 英文文档和实际代码是主契约；API、配置字段、命令和结构化日志保持英文。
 
-版本：`0.2.4`，当前为未发布开发版；0.1.1 是此前实现版本。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。人工会话被其他客户端占用时仍只向飞书返回一次明确失败。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
+版本：`0.2.4`，当前为未发布开发版；0.1.1 是此前实现版本。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。普通可重试入场失败按 60 秒间隔最多尝试 3 次；只有认证客户端显式配置 `queueIfBusy`，并通过 caller/namespace system scope 校验，才能使用忙碌排队例外。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
 
 这是独立的飞书 + Codex bridge。一个进程持有一套飞书 bot/WebSocket 和一个 Codex app-server/executor；MySQL 使用 bridge 自己的 schema。communication worker 负责 hook 和已登记消息 outbox，唯一的 forward worker 负责 Codex 执行、恢复、卡片、Typing、停止和答案/附件投递。
 

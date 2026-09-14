@@ -27,18 +27,21 @@ function sessionStore() {
 test('service launches the real executor child with mapped config and closes an active turn', { timeout: 5000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-service-executor-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
+  let service;
+  t.after(async()=>service?.close());
   const child = join(directory, 'codex-fixture.mjs');
   const observed = join(directory, 'observed.json');
   await writeFile(child, `#!/usr/bin/env node
 import readline from 'node:readline';
 import { writeFileSync } from 'node:fs';
 const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
+let turnStarts=0;
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const message=JSON.parse(line);
  if(message.method==='initialize') { writeFileSync(process.env.OBSERVED_FILE,JSON.stringify(process.env)); send({id:message.id,result:{}}); }
  else if(message.method==='thread/start') send({id:message.id,result:{thread:{id:'thread-1'}}});
  else if(message.method==='thread/resume'&&message.params.threadId==='log-reject') send({id:message.id,error:{code:-32000,message:'active writer SYNTHETIC_SECRET'}});
- else if(message.method==='turn/start') { writeFileSync(process.env.OBSERVED_FILE+'.turn','started'); send({id:message.id,result:{turn:{id:'turn-1'}}}); }
+ else if(message.method==='turn/start') { turnStarts+=1; const turnId='turn-'+turnStarts; writeFileSync(process.env.OBSERVED_FILE+'.turn','started'); send({id:message.id,result:{turn:{id:turnId}}}); if(turnStarts===1)setImmediate(()=>send({method:'turn/completed',params:{threadId:'thread-1',turnId,turn:{id:turnId,status:'completed',items:[{id:'answer',type:'agentMessage',phase:'final_answer',text:'done'}]}}})); }
  else if(message.method==='thread/read') send({id:message.id,result:{thread:{id:'thread-1',turns:[{id:'turn-1',status:'inProgress',items:[]}]}}});
  else if(message.method==='turn/steer') { writeFileSync(process.env.OBSERVED_FILE+'.steer','steered'); send({id:message.id,result:{}}); }
  else send({id:message.id,result:{}});
@@ -64,51 +67,50 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   let executorConfig;
   let executorInstance;
   let forwardConfig;
+  let forwardInstance;
   let repliesConfig;
   let mediaConfig;
   let typingConfig;
   let sessions;
   const logEvents = [];
-  const forwardJobs = [
-    { id: 'run-1', callerId: 'live', chatId: 'chat', chatType: 'group', messageId: 'message-1', senderOpenId: 'human', senderName: 'Human', deliveryMode: 'caller', executionNamespace: null, prompt: 'first', attempts: 1, result: {}, createdAt: 1, leaseOwner: '' },
-    { id: 'run-2', callerId: 'live', chatId: 'chat', chatType: 'group', messageId: 'message-2', senderOpenId: 'human', senderName: 'Human', deliveryMode: 'caller', executionNamespace: null, prompt: 'second', attempts: 1, result: {}, createdAt: 2, leaseOwner: '' },
-  ];
-  let claimed = false;
+  const forwardJob={id:'run-1',callerId:'live',chatId:'chat',chatType:'group',messageId:'message-1',senderOpenId:'human',senderName:'Human',deliveryMode:'caller',executionNamespace:null,prompt:'first',attempts:0,status:'pending',result:{},createdAt:1,leaseOwner:''};
   const jobStore = {
     async claimReplyPending() { return []; },
-    async claim({ owner }) { if (claimed) return []; claimed = true; return forwardJobs.map(job => Object.assign(job, { status: 'running', leaseOwner: owner })); },
-    async renew() { return { renewed: true }; },
-    async patchExecution({ id, execution }) { const job = forwardJobs.find(item => item.id === id); job.result = { ...job.result, execution }; },
-    async markReplyPending({ id, result }) { const job = forwardJobs.find(item => item.id === id); Object.assign(job, { status: 'reply_pending', result }); },
-    async markFinished({ id, status, result }) { const job = forwardJobs.find(item => item.id === id); Object.assign(job, { status, result }); },
-    async markFinishedWithoutReply({ id, status, result }) { const job = forwardJobs.find(item => item.id === id); Object.assign(job, { status, result }); },
-    async markRetry({ id, held }) { const job = forwardJobs.find(item => item.id === id); job.status = held ? 'held' : 'pending'; },
-    async getRun() { return null; }, async readEvents() { return []; },
+    async loadRecoverable() { return forwardJob.status==='pending'?[structuredClone(forwardJob)]:[]; },
+    async claimById({owner}) { if(forwardJob.status!=='pending')return null;Object.assign(forwardJob,{status:'running',leaseOwner:owner,attempts:forwardJob.attempts+1});return structuredClone(forwardJob); },
+    async claimReplyById({owner}) { if(forwardJob.status!=='reply_pending')return null;forwardJob.leaseOwner=owner;return structuredClone(forwardJob); },
+    async renew() {},async markReplyPending({result,errorCode}){Object.assign(forwardJob,{status:'reply_pending',result,lastError:errorCode});},
+    async markFinished({status,result}){Object.assign(forwardJob,{status,result});},async markFinishedWithoutReply({status,result}){Object.assign(forwardJob,{status,result});},
+    async markRetry(){forwardJob.status='pending';},async getRun(){return structuredClone(forwardJob);},async readEvents(){return[];},
   };
   const inertWorker = { start() {}, beginStop() {}, async stop() {}, status: () => ({ running: true }) };
-  const service = await startService({ config: validateConfig(raw), configPath: join(directory, 'bridge.json'), env,
+  service = await startService({ config: validateConfig(raw), configPath: join(directory, 'bridge.json'), env,
     log: createLogger({ write(value) { logEvents.push(JSON.parse(value)); } }), dependencies: {
     pool: () => ({ async query() {}, async end() {} }),
     store: async () => ({ async assertCurrent() {}, async close() {} }),
     sessions: () => (sessions = sessionStore()),
-    jobs: () => jobStore, inbound: () => ({}), feedback: () => ({}), replies: input => (repliesConfig = input, {}),
+    jobs: () => jobStore, inbound: () => ({async markForwarded(){}}), feedback: () => ({}), replies: input => (repliesConfig = input, {}),
     communication: () => inertWorker,
     executor: input => {
       executorConfig = input.config;
       executorInstance = createCodexExecutor(input);
       return executorInstance;
     },
-    forward: input => { forwardConfig = input.config; return createForwardRuntime(input); },
+    forward: input => { forwardConfig = input.config; forwardInstance=createForwardRuntime(input);return forwardInstance; },
     media: async input => (mediaConfig=input,{}), typing: input => (typingConfig=input,{}),
     outbound: async () => ({}), chat: () => ({}),
     sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} },
     feishu: () => ({ async start() {}, async stop() {}, status: () => ({ connected: true }) }),
   } });
+  await forwardInstance.recover();
+  assert.equal(forwardJob.status,'completed');
+  assert.equal(forwardJob.result.rawAnswer,'done');
+  const active = executorInstance.execute({bindingOpenId:'other-human',chatId:'chat',chatType:'group',messageId:'active',prompt:'work',busyPolicy:'steer'}).catch(error=>error);
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    try { await access(`${observed}.steer`); break; }
+    try { await access(`${observed}.turn`); break; }
     catch { await new Promise(resolve => setTimeout(resolve, 5)); }
   }
-  await access(`${observed}.steer`);
+  await access(`${observed}.turn`);
   const childEnv = JSON.parse(await readFile(observed, 'utf8'));
   assert.equal(childEnv.UNSELECTED_SECRET, undefined);
   assert.equal(childEnv.HOME, undefined);
@@ -141,7 +143,6 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const rpcLog = logEvents.find(event => event.operation === 'rpc_request');
   assert.deepEqual({code:rpcLog.code,rpcMethod:rpcLog.rpc_method}, {code:'CODEX_THREAD_BUSY',rpcMethod:'thread/resume'});
   assert.equal(JSON.stringify(logEvents).includes('SYNTHETIC_SECRET'), false);
-  assert.equal(forwardJobs[1].status, 'deferred');
   await service.close();
-  assert.equal(forwardJobs[0].status, 'running');
+  assert.equal((await active).code,'CODEX_OBSERVATION_LOST');
 });

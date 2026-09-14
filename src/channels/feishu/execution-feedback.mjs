@@ -61,9 +61,14 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       card: state.card, since: Number(job.createdAt || now()),
       load: async next => {
         state.control.assertOwned?.();
+        const bound = execution.threadId ? null : await sessions.loadBinding({
+          feishuOpenId: execution.bindingOpenId || bindingOpenId(job, state.result), chatId: job.chatId, chatType: job.chatType,
+        });
+        const threadId = execution.threadId || bound?.codexSessionId;
+        if (!threadId) return [];
         const rows = await sessions.readPublicProgress({
           binding: { feishuOpenId: bindingOpenId(job, state.result), chatId: job.chatId },
-          threadId: execution.threadId, messageId: job.messageId, cursor: next, limit: 100,
+          threadId, messageId: job.messageId, cursor: next, limit: 100,
         });
         state.control.assertOwned?.();
         return rows.map(row => ({ ...row, progress_json: row.detail_json }));
@@ -153,22 +158,25 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       return toast('没有停止该任务的权限', 'error');
     }
     const execution = job.result?.execution || {};
-    if (!execution.turnId || execution.turnId !== value.expectedTurnId) return toast('该卡片已失效');
-    const begun = await jobs.beginStop({ id: job.id, threadId: execution.threadId, turnId: execution.turnId,
+    const turnId = execution.turnId || job.result?.executionCard?.turnId || '';
+    if (!turnId || turnId !== value.expectedTurnId) return toast('该卡片已失效');
+    const binding = await sessions.loadBinding({ feishuOpenId: bindingOpenId(job), chatId: job.chatId, chatType: job.chatType });
+    const threadId = execution.threadId || binding?.codexSessionId || '';
+    if (!threadId) return toast('该卡片已失效');
+    const begun = await jobs.beginStop({ id: job.id, threadId, turnId, bindingThreadId: binding.codexSessionId,
       messageId: job.messageId, actor: operator });
     if (begun.outcome === 'already_finished') return toast('该任务已结束');
     if (['not_found', 'stale'].includes(begun.outcome)) return toast('该卡片已失效');
     if (begun.stop?.outcome === 'requested') return toast('已请求停止执行');
     if (begun.stop?.outcome === 'already_finished') return toast('该执行已结束，不会影响新的任务');
 
-    const binding = await sessions.loadBinding({ feishuOpenId: bindingOpenId(job), chatId: job.chatId, chatType: job.chatType });
     let response;
     if (begun.outcome === 'replay') {
-      const snapshot = await executor.inspect({ binding, threadId: execution.threadId, turnId: execution.turnId });
+      const snapshot = await executor.inspect({ binding, threadId, turnId });
       response = snapshot.status === 'inProgress' || snapshot.status === 'unknown'
         ? { status: 'unconfirmed' } : { status: 'already_finished' };
     } else {
-      response = await executor.interrupt({ binding, threadId: execution.threadId, turnId: execution.turnId, messageId: job.messageId });
+      response = await executor.interrupt({ binding, threadId, turnId, messageId: job.messageId });
     }
     const stop = { ...begun.stop, outcome: response.status, confirmedAt: now() };
     await jobs.finishStop({ id: job.id, stop });
@@ -185,7 +193,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
   async function cleanup(job, control = {}) {
     if (job.deliveryMode === 'caller' || !job.sourceMessageId) return;
     control.assertOwned?.();
-    await typing?.cleanup?.(job, job.result?.processingReaction || null);
+    await typing?.cleanup?.(job, control.reaction || job.result?.processingReaction || null);
     control.assertOwned?.();
   }
 

@@ -550,7 +550,7 @@ test('forward lease loss abandons feedback through the real executor abort path'
       async markRetry() { throw new Error('aborted execution must not be retried by the stale owner'); },
     };
     const feedback = {
-      async start() { return { observer: { active: true }, card: { active: true } }; },
+      async restore() { return { observer: { active: true }, card: { active: true } }; },
       observe() { observerStarted = true; },
       abandon(state) {
         abandoned += 1;

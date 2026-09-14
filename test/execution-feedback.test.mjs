@@ -196,12 +196,16 @@ test('legacy unconfirmed card state is held without another platform write', asy
 
 test('stop callback is fenced to the original sender/card/turn and replay does not interrupt twice', async () => {
   const job = jobFixture();
+  job.result.execution = { bindingOpenId: 'group:binding' };
+  job.result.executionCard.turnId = 'turn-1';
   let interrupts = 0;
+  let stoppedIdentity;
   let authorized = true;
   const feedback = createExecutionFeedback({
     jobs: {
       async getRun() { return job; },
-      async beginStop() {
+      async beginStop(input) {
+        stoppedIdentity = { threadId:input.threadId,turnId:input.turnId };
         if (job.result.stop) return { outcome:'replay',stop:job.result.stop };
         const stop = { threadId:'thread-1',turnId:'turn-1',messageId:'source-message',actor:'sender-1',outcome:'pending' };
         job.result.stop = stop;
@@ -209,7 +213,7 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
       },
       async finishStop({ stop }) { job.result.stop = stop; },
     },
-    sessions: { async loadBinding() { return { threadId: 'thread-1' }; } },
+    sessions: { async loadBinding() { return { codexSessionId: 'thread-1' }; } },
     chat: {},
     cardClient: {},
     executor: { async interrupt() { interrupts += 1; return { status: 'requested' }; }, async inspect() { return { status:'inProgress' }; } },
@@ -222,6 +226,7 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
   };
 
   assert.equal((await feedback.handleCardAction(action)).toast.content, '已请求停止执行');
+  assert.deepEqual(stoppedIdentity,{threadId:'thread-1',turnId:'turn-1'});
   assert.equal((await feedback.handleCardAction(action)).toast.content, '已请求停止执行');
   assert.equal(interrupts, 1);
 

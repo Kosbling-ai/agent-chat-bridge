@@ -52,26 +52,29 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       hooks});
     if(contextCandidate&&!receipt.duplicate)recent.remember({chatId:normalized.chatId,messageId:normalized.messageId,prompt:normalized.rawText,
       senderOpenId:normalized.senderOpenId,senderName:normalized.senderName});
-    const hasResolvablePayload=event.conversationType==='p2p'&&!['text','post'].includes(normalized.messageType);
-    if(!triggered||receipt.duplicate||(!normalized.text&&!hasResolvablePayload)||!forward)return receipt;
-    const memoryEntries=event.conversationType==='group'?recent.take(normalized.chatId):[];
-    const persistedEntries=event.conversationType==='group'&&group?.passiveContext&&inbound
-      ? await inbound.loadRecentGroupContext({connectionId,chatId:normalized.chatId,beforeMs:normalized.createdAt,windowMs:contextWindowMs,
-        limit:contextLimit,excludeMessageIds:[normalized.messageId,...memoryEntries.map(entry=>entry.messageId)]}) : [];
-    const contextEntries=mergeGroupContextPrompts(persistedEntries,memoryEntries);
-    const mergedPrompt=mergeMentionPrompts(contextEntries,normalized.text);
-    const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
-      mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId});
-    launchForward(Promise.resolve().then(()=>forward.handleMessage({
-      source:'live',callerId:'live',idempotencyKey:`live:${connectionId}:${normalized.chatId}:${normalized.messageId}`,
-      message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,type:normalized.messageType,event},
-      actor:{openId:normalized.senderOpenId,name:normalized.senderName},prompt,context:contextEntries,
-      groupChatContext:normalized.chatType==='group'?{chatId:normalized.chatId,name:group?.name||'',description:group?.description||''}:null,
-      deliveryMode:'bridge',
-    })).then(result=>{
-      if(result?.deferred&&result.accepted===false)return;
-      recent.consume(contextEntries);
-    }));
+    if(!triggered||!forward)return receipt;
+    launchForward((async()=>{
+      const memoryEntries=event.conversationType==='group'?recent.take(normalized.chatId):[];
+      const persistedEntries=event.conversationType==='group'&&group?.passiveContext&&inbound
+        ? await inbound.loadRecentGroupContext({connectionId,chatId:normalized.chatId,beforeMs:normalized.createdAt,windowMs:contextWindowMs,
+          limit:contextLimit,excludeMessageIds:[normalized.messageId,...memoryEntries.map(entry=>entry.messageId)]}) : [];
+      const contextEntries=mergeGroupContextPrompts(persistedEntries,memoryEntries);
+      const mediaResolvable=normalized.chatType==='p2p'&&normalized.messageType!=='text';
+      if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;
+      const mergedPrompt=normalized.chatType==='p2p'?normalized.text:mergeMentionPrompts(contextEntries,normalized.text);
+      const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
+        mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId});
+      const result=await forward.handleMessage({
+        source:'live',callerId:'live',idempotencyKey:`live:${connectionId}:${normalized.chatId}:${normalized.messageId}`,
+        message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,type:normalized.messageType,event},
+        actor:{openId:normalized.senderOpenId,name:normalized.senderName},prompt,context:contextEntries,
+        groupChatContext:normalized.chatType==='group'?{chatId:normalized.chatId,name:group?.name||'',description:group?.description||''}:null,
+        deliveryMode:'bridge',
+      });
+      const accepted=result?.deferred===true?result.accepted!==false
+        : result?.failed!==true&&result?.execution?.terminal==='completed';
+      if(accepted)recent.consume(contextEntries);
+    })());
     return receipt;
     } finally { processing.delete(event.messageId); }
   }

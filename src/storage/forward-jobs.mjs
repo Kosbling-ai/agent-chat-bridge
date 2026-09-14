@@ -11,9 +11,14 @@ const SAFE_EXECUTION_SQL = `
   AND JSON_EXTRACT(result_json,'$.execution.threadId') IS NULL
   AND JSON_EXTRACT(result_json,'$.execution.turnId') IS NULL`;
 const SAFE_DELIVERY_SQL = `
-  JSON_SEARCH(result_json,'one','unknown') IS NULL
-  AND JSON_SEARCH(result_json,'one','send_intent') IS NULL
-  AND JSON_SEARCH(result_json,'one','upload_intent') IS NULL`;
+  COALESCE(JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.executionCard.delivery')),'')!='unknown'
+  AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.executionCard.deliveryState.status')),'') NOT IN ('intent','unknown')
+  AND JSON_SEARCH(JSON_EXTRACT(result_json,'$.delivery.text.items'),'one','unknown',NULL,'$[*].status') IS NULL
+  AND JSON_SEARCH(JSON_EXTRACT(result_json,'$.delivery.text.items'),'one','intent',NULL,'$[*].status') IS NULL
+  AND JSON_SEARCH(JSON_EXTRACT(result_json,'$.delivery.text.items'),'one','pending',NULL,'$[*].status') IS NULL
+  AND JSON_SEARCH(JSON_EXTRACT(result_json,'$.delivery.attachments'),'one','unknown',NULL,'$[*].status') IS NULL
+  AND JSON_SEARCH(JSON_EXTRACT(result_json,'$.delivery.attachments'),'one','send_intent',NULL,'$[*].status') IS NULL
+  AND JSON_SEARCH(JSON_EXTRACT(result_json,'$.delivery.attachments'),'one','upload_intent',NULL,'$[*].status') IS NULL`;
 
 const hash = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 const parse = value => { try { return value ? JSON.parse(value) : {}; } catch { return {}; } };
@@ -83,7 +88,10 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       return write(async connection => {
         const publicRunId = randomUUID();
         const createdAt = now();
-        const initialResult = input.bindingOpenId ? { execution: { bindingOpenId: input.bindingOpenId } } : {};
+        const supplied = input.initialResult && typeof input.initialResult === 'object' ? input.initialResult : {};
+        const initialResult = { ...supplied, ...(input.bindingOpenId ? {
+          execution: { ...(supplied.execution || {}), bindingOpenId: input.bindingOpenId },
+        } : {}) };
         await connection.execute(`INSERT IGNORE INTO assistant_codex_forward_jobs
           (public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,source_message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,context_entries_json,status,next_attempt_at,result_json,last_error,created_at,updated_at)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),input.sourceMessageId || null,required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,safeJson(initialResult),'',createdAt,createdAt]);
@@ -94,6 +102,36 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
     },
     getRun: ({ id }) => getBy('public_run_id', required(id,36)),
     getByMessageId: ({ messageId }) => getBy('message_id', required(messageId,191)),
+    loadRecoverable(input = {}) {
+      const take = Math.max(1, Math.min(5, Number(input.limit || 1)));
+      return read(async connection => {
+        const at = now();
+        const [rows] = await connection.execute(`SELECT id AS internal_id,assistant_codex_forward_jobs.*
+          FROM assistant_codex_forward_jobs
+          WHERE ((status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+            OR (status='running' AND lease_expires_at<=?))
+            AND ${SAFE_EXECUTION_SQL}
+          ORDER BY created_at,id LIMIT ${take}`, [at,at]);
+        return rows.map(row);
+      });
+    },
+    patchPreparedInput(input) {
+      const id = required(input.id,36);
+      return write(async connection => {
+        const at = now();
+        const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
+          SET result_json=JSON_SET(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
+            '$.execution',CAST(? AS JSON)),updated_at=?
+          WHERE public_run_id=?
+            AND ((status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+              OR (status='running' AND lease_expires_at<=?))
+            AND ${SAFE_EXECUTION_SQL}`,
+        [safeJson(input.execution || {}),at,id,at,at]);
+        const [[updated]] = await connection.execute(`SELECT id AS internal_id,assistant_codex_forward_jobs.*
+          FROM assistant_codex_forward_jobs WHERE public_run_id=?`, [id]);
+        return row(updated);
+      });
+    },
     claim(input) {
       const owner = required(input.owner,191); const leaseMs = Number(input.leaseMs || 60000); const take = Math.max(1,Math.min(5,Number(input.limit || 1)));
       return write(async connection => {
@@ -148,6 +186,25 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const [rows] = await connection.execute(`SELECT id AS internal_id, assistant_codex_forward_jobs.*
           FROM assistant_codex_forward_jobs WHERE id IN (${slots}) ORDER BY updated_at,id`, ids);
         return rows.map(row);
+      });
+    },
+    claimReplyById(input) {
+      const owner = required(input.owner,191); const leaseMs = Number(input.leaseMs || 60000);
+      const id = required(input.id,36);
+      return write(async connection => {
+        const at = now();
+        const [[candidate]] = await connection.execute(`SELECT id FROM assistant_codex_forward_jobs
+          WHERE public_run_id=? AND status='reply_pending'
+            AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+            AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+            AND ${SAFE_DELIVERY_SQL}
+          FOR UPDATE`, [id,at,at]);
+        if (!candidate) return null;
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET reply_attempts=reply_attempts+1,
+          lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?`, [owner,at+leaseMs,at,candidate.id]);
+        const [[claimed]] = await connection.execute(`SELECT id AS internal_id,assistant_codex_forward_jobs.*
+          FROM assistant_codex_forward_jobs WHERE id=?`, [candidate.id]);
+        return row(claimed);
       });
     },
     renew(input) {
@@ -268,6 +325,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
       const id = required(input.id, 36);
       const threadId = required(input.threadId, 255);
       const turnId = required(input.turnId, 255);
+      const bindingThreadId = input.bindingThreadId ? required(input.bindingThreadId,255) : '';
       const messageId = required(input.messageId, 191);
       return write(async connection => {
         const [[found]] = await connection.execute(`SELECT status,message_id,result_json FROM assistant_codex_forward_jobs
@@ -275,7 +333,10 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         if (!found) return { outcome: 'not_found' };
         const result = parse(found.result_json);
         const execution = result.execution || {};
-        if (execution.threadId !== threadId || execution.turnId !== turnId || found.message_id !== messageId) return { outcome: 'stale' };
+        const nativeIdentityMatches = execution.threadId === threadId && execution.turnId === turnId;
+        const cardIdentityMatches = !execution.threadId && !execution.turnId
+          && result.executionCard?.turnId === turnId && bindingThreadId === threadId;
+        if ((!nativeIdentityMatches && !cardIdentityMatches) || found.message_id !== messageId) return { outcome: 'stale' };
         if (found.status !== 'running') return { outcome: 'already_finished' };
         const previous = result.stop;
         if (previous?.threadId === threadId && previous?.turnId === turnId && previous?.messageId === messageId) {
