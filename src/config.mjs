@@ -81,7 +81,7 @@ function validateRuntime(raw) {
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
   object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
-  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'idleCloseMs', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'steering', 'proxyEnv', 'jobRetryMs', 'jobMaxAttempts'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobRetryMs', 'jobMaxAttempts'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
   if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
   if (raw.codex.proxyEnv !== undefined) {
@@ -89,6 +89,22 @@ function validateRuntime(raw) {
     codex.proxyEnv = Object.fromEntries(Object.entries(raw.codex.proxyEnv).map(([name, source]) => [name, reference(source)]));
   }
   if (raw.codex.model !== undefined) codex.model = string(raw.codex.model);
+  if (raw.codex.reasoningEffort !== undefined) {
+    codex.reasoningEffort = string(raw.codex.reasoningEffort).toLowerCase();
+    if (!['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(codex.reasoningEffort)) throw new ConfigError('invalid_codex_reasoning_effort');
+  }
+  codex.closeGraceMs = raw.codex.closeGraceMs ?? 5_000;
+  codex.rpcTimeoutMs = raw.codex.rpcTimeoutMs ?? 2 * 60 * 1000;
+  codex.turnTimeoutMs = raw.codex.turnTimeoutMs ?? 3 * 60 * 60 * 1000;
+  for (const field of ['closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs']) {
+    if (!Number.isSafeInteger(codex[field]) || codex[field] <= 0) throw new ConfigError(`invalid_codex_${field.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`)}`);
+  }
+  codex.sandbox = raw.codex.sandbox === undefined ? 'workspace-write' : string(raw.codex.sandbox);
+  codex.approvalPolicy = raw.codex.approvalPolicy === undefined || raw.codex.approvalPolicy === 'auto' ? 'on-request' : string(raw.codex.approvalPolicy);
+  codex.approvalsReviewer = raw.codex.approvalsReviewer === undefined || raw.codex.approvalsReviewer === 'auto' ? 'auto_review' : string(raw.codex.approvalsReviewer);
+  codex.networkAccess = raw.codex.networkAccess ?? true;
+  if (typeof codex.networkAccess !== 'boolean') throw new ConfigError('invalid_codex_network_access');
+  codex.threadNamePrefix = raw.codex.threadNamePrefix === undefined ? 'bridge' : string(raw.codex.threadNamePrefix);
   codex.steering = raw.codex.steering ?? true;
   if (typeof codex.steering !== 'boolean') throw new ConfigError('invalid_steering_flag');
   codex.jobRetryMs = raw.codex.jobRetryMs ?? 60_000;
@@ -103,6 +119,15 @@ function validateRuntime(raw) {
   if (typeof codex.rolloverOnRulesUpdate !== 'boolean') throw new ConfigError('invalid_rules_rollover');
   codex.rulesFiles = strings(raw.codex.rulesFiles ?? ['AGENTS.md']);
   if (codex.rulesFiles.length > 20 || codex.rulesFiles.some(path => path.startsWith('/') || path.split(/[\\/]/).includes('..'))) throw new ConfigError('invalid_rules_files');
+  codex.rolloverCheckTimeoutMs = raw.codex.rolloverCheckTimeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(codex.rolloverCheckTimeoutMs) || codex.rolloverCheckTimeoutMs <= 0) throw new ConfigError('invalid_codex_rollover_check_timeout');
+  codex.memoryCheckIntervalMs = raw.codex.memoryCheckIntervalMs ?? 60_000;
+  if (!Number.isSafeInteger(codex.memoryCheckIntervalMs) || codex.memoryCheckIntervalMs < 0) throw new ConfigError('invalid_codex_memory_check_interval');
+  const memoryMaxRssMb = raw.codex.memoryMaxRssMb ?? 1536;
+  const memoryMaxHeapUsedMb = raw.codex.memoryMaxHeapUsedMb ?? 1024;
+  if (![memoryMaxRssMb, memoryMaxHeapUsedMb].every(value => Number.isFinite(value) && value >= 0)) throw new ConfigError('invalid_codex_memory_limit');
+  codex.memoryMaxRssBytes = Math.round(memoryMaxRssMb * 1024 * 1024);
+  codex.memoryMaxHeapUsedBytes = Math.round(memoryMaxHeapUsedMb * 1024 * 1024);
   object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaUnsupportedReply'], 'invalid_feishu_fields');
   if (raw.feishu.catchup !== undefined && typeof raw.feishu.catchup !== 'boolean') throw new ConfigError('invalid_catchup_flag');
   const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };

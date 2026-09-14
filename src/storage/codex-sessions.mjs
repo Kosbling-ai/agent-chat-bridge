@@ -22,7 +22,7 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
     if (!row) return null;
     return {
       feishuOpenId: bindingOpenId, chatId: identity.chatId,
-      chatType: row.chat_type || identity.chatType || '', codexSessionId: row.codex_session_id,
+      chatType: identity.chatType || '', codexSessionId: row.codex_session_id,
       threadName: row.thread_name || '', lastMessageAt: Number(row.last_message_at || row.updated_at || 0),
       created: false,
     };
@@ -44,7 +44,7 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
 
   async function saveCodexRealtimeEvent(binding, event) {
     const threadId = String(event.codexSessionId || binding.codexSessionId || '').trim();
-    if (!threadId) throw new Error('codex event requires a thread id');
+    if (!threadId) return;
     const eventKey = limit(event.eventKey || stableKey(JSON.stringify(event)), 180);
     await rows(`INSERT INTO ${table('assistant_codex_events')} (
       codex_session_id, feishu_open_id, chat_id, message_id, event_key,

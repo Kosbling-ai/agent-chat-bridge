@@ -5,7 +5,7 @@ import { CodexAppServerClient } from './app-server-client.mjs';
 import { buildInitialPrompt } from './prompt.mjs';
 import { collectOutboxAttachments } from './outbound-files.mjs';
 import { codexThreadCreatedAtMs, shouldRolloverForRules } from './codex-rules-rollover.mjs';
-import { exactTurnSnapshot, inProgressTurnIds, isNoActiveTurnError, steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from './codex-turn-recovery.mjs';
+import { exactTurnSnapshot, inProgressTurnIds, interruptTurnAndPredecessors, isNoActiveTurnError, steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from './codex-turn-recovery.mjs';
 import { createPublicProgressProjector } from '../../shared/public-progress.mjs';
 
 const textInput = (text) => ({ type: 'text', text, text_elements: [] });
@@ -13,6 +13,8 @@ const trim = (value) => String(value || '').trim();
 const limitText = (value, max) => String(value || '').slice(0, max || undefined);
 const stableKey = (value) => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const bindingKey = ({ feishuOpenId, chatId }) => `${feishuOpenId || 'unknown'}:${chatId || 'unknown'}`;
+const normalizeApprovalPolicy = (value) => !trim(value) || trim(value) === 'auto' ? 'on-request' : trim(value);
+const normalizeApprovalsReviewer = (value) => !trim(value) || trim(value) === 'auto' ? 'auto_review' : trim(value);
 
 function coded(message, code, { retryable = false, outcome, phase, busyOrigin } = {}) {
   const error = new Error(message); error.code = code; error.retryable = retryable;
@@ -36,6 +38,11 @@ function uncertainObservation(error, { threadId, turnId, startedAt, phase, inten
 
 function parseDetail(row) {
   try { return JSON.parse(row?.detail_json || '{}'); } catch { return {}; }
+}
+
+function publicResult(result) {
+  if (!result || typeof result !== 'object' || !result.threadId || result.sessionId) return result;
+  return { ...result, sessionId: result.threadId };
 }
 
 function finalAnswer(turn) {
@@ -104,14 +111,11 @@ function formatDurationShort(durationMs) {
   return `${Math.round(value / 1000)} 秒`;
 }
 
-export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, now = Date.now, onRestartRequired = async () => {} } = {}) {
+export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, now = Date.now, onRestartRequired = async () => {}, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval } = {}) {
   if (!config || !sessionStore) throw new Error('config and sessionStore are required');
   const locks = new Map();
   const activeByBinding = new Map();
   const activeByTurn = new Map();
-  const earlyNotifications = new Map();
-  const pendingStartThreads = new Set();
-  const pendingKnownTurns = new Set();
   const loadedThreads = new Set();
   let memoryTimer;
   let closing = false;
@@ -122,6 +126,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     config, childEnv, spawnImpl, log, now,
     eventSink: (event) => handleNotification(event),
     onDisconnect: (error) => handleDisconnect(error),
+    onIdle: () => { maybeNotifyRestart().catch(() => {}); },
   });
 
   async function withKeyLock(key, operation) {
@@ -146,8 +151,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   function threadDefaults(extra = {}) {
     return {
       cwd: config.cwd,
-      approvalPolicy: config.approvalPolicy || 'auto',
-      approvalsReviewer: config.approvalsReviewer || 'auto_review',
+      approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy),
+      approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
       sandbox: config.sandbox || 'workspace-write',
       ...(config.model ? { model: config.model } : {}),
       ...extra,
@@ -174,7 +179,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   async function ensureBinding(actor, messageId) {
     const existing = await sessionStore.loadBinding(actor);
-    if (existing?.codexSessionId) return existing;
+    if (existing?.codexSessionId) return { ...existing, threadName: existing.threadName || buildThreadName(actor) };
     const started = await startThread(actor);
     const binding = { ...actor, codexSessionId: started.threadId, threadName: started.threadName, created: true };
     await sessionStore.saveCodexBinding(binding, { messageId, lastError: '' });
@@ -194,8 +199,17 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       throw error;
     }
-    const activeIds = inProgressTurnIds(response?.thread);
-    if (activeIds.length) throw coded(`Codex thread contains an unbound active turn: ${activeIds.join(',')}`, 'CODEX_THREAD_HELD', { retryable: true, outcome: 'unknown' });
+    for (const turnId of inProgressTurnIds(response?.thread)) {
+      await interruptTurnAndPredecessors({
+        request: (...args) => client.request(...args),
+        threadId: binding.codexSessionId,
+        expectedTurnId: turnId,
+        onRecovery: ({ attempt, expectedTurnId, actualTurnId }) => log('warning', {
+          module: 'agent-chat-bridge', component: 'codex-executor', operation: 'resume_cleanup', status: 'recovering',
+          attempt, threadId: binding.codexSessionId, expectedTurnId, actualTurnId,
+        }),
+      });
+    }
     loadedThreads.add(binding.codexSessionId);
   }
 
@@ -296,7 +310,17 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function steer(active, input) {
-    if (input.messageId && input.messageId === active.messageId) return waitForTurn(active, input.messageId, { takeover: true });
+    const operation = active.steerQueue.then(() => steerLocked(active, input));
+    active.steerQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  async function steerLocked(active, input) {
+    if (active.settled) return { restart: true, input };
+    if (input.messageId && input.messageId === active.messageId) {
+      if (hasOpenWaiter(active)) return { deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId };
+      return waitForTurn(active, input.messageId, { takeover: true });
+    }
     if (active.pendingSteerId && active.pendingSteerId !== input.messageId) throw coded('previous steer delivery unconfirmed', 'CODEX_STEER_UNCONFIRMED', { outcome: 'unknown' });
     const duplicate = await sessionStore.findAcceptedMessageEvent(active.binding, input.messageId, { includeInFlight: true });
     if (duplicate) return duplicateResult(active.binding, duplicate, active.turnId);
@@ -328,6 +352,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }
     await persistUser(active.binding, input, 'user-steer-confirmed', input.prompt, { attemptId });
     active.pendingSteerId = null;
+    if (!hasOpenWaiter(active)) return waitForTurn(active, input.messageId, { takeover: true });
     return { deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId };
   }
 
@@ -338,19 +363,21 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       binding, threadId: binding.codexSessionId, turnId, messageId: input.messageId,
       startedAt, outboxScanFromMs: startedAt, itemText: new Map(), publicProgress: createPublicProgressProjector(),
       lastAgentMessage: '', pendingSteerId: null, settled: false, stopRequested: false,
+      steerQueue: Promise.resolve(), waiters: new Set(),
       finalized: null,
       completed: new Promise((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; }),
       resolve(value) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); resolveCompletion(value); },
       reject(error) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); rejectCompletion(error); },
     };
-    if (Number(config.turnTimeoutMs) > 0) {
+    const turnTimeoutMs = Number(config.turnTimeoutMs ?? 3 * 60 * 60 * 1000);
+    if (turnTimeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
-        state.reject(coded(`Codex turn timed out after ${config.turnTimeoutMs}ms`, 'CODEX_TURN_TIMEOUT'));
+        state.reject(coded(`Codex turn timed out after ${turnTimeoutMs}ms`, 'CODEX_TURN_TIMEOUT'));
         const release = client.lifecycle.hold();
-        client.request('turn/interrupt', { threadId: state.threadId, turnId: state.turnId })
-          .catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'timeout_interrupt', status: 'unconfirmed', threadId: state.threadId, turnId: state.turnId }))
+        interruptTurnAndPredecessors({ request: (...args) => client.request(...args), threadId: state.threadId, expectedTurnId: state.turnId })
+          .catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'timeout_cleanup', status: 'unconfirmed', threadId: state.threadId, turnId: state.turnId }))
           .finally(release);
-      }, Number(config.turnTimeoutMs));
+      }, turnTimeoutMs);
       timeoutTimer.unref?.();
     }
     return state;
@@ -367,9 +394,6 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (activeByBinding.get(bindingKey(state.binding)) === state) activeByBinding.delete(bindingKey(state.binding));
       maybeNotifyRestart();
     }).catch(() => {});
-    const early = earlyNotifications.get(state.turnId) || [];
-    earlyNotifications.delete(state.turnId);
-    for (const event of early) await handleNotification(event);
   }
 
   function handleDisconnect(error) {
@@ -395,24 +419,18 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         attachments: collectOutboxAttachments(state.binding, state.outboxScanFromMs, { workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, log }),
       };
     }, async (error) => {
-      const observationUnknown = error?.outcome === 'unknown';
       const observationEvent = {
         messageId: state.messageId,
-        eventKey: `${observationUnknown ? 'observation-error' : 'error'}:${state.messageId || state.turnId}`,
+        eventKey: `error:${state.messageId || state.turnId}`,
         eventType: 'error', role: 'activity',
-        title: observationUnknown ? 'Codex 状态待核对' : 'Codex 会话失败',
+        title: '执行失败',
         text: error.message, createdAt: now(),
-        detail: { turnId: state.turnId, turnStatus: observationUnknown ? 'unknown' : (error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed') },
+        detail: { turnId: state.turnId, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
       };
-      if (observationUnknown) {
-        try { await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent); }
-        catch { logObservationPersistenceFailure(state, 'event'); }
-        try { await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: error.message }); }
-        catch { logObservationPersistenceFailure(state, 'touch'); }
-        throw error;
-      }
-      await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent);
-      await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: error.message });
+      try { await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent); }
+      catch { logObservationPersistenceFailure(state, 'event'); }
+      try { await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: error.message }); }
+      catch { logObservationPersistenceFailure(state, 'touch'); }
       throw error;
     });
   }
@@ -429,7 +447,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   async function execute(input, options = {}) {
     if (closing) throw coded('executor is closing', 'CODEX_EXECUTOR_CLOSING', { retryable: true });
     const actor = identity(input);
-    const normalized = { ...input, prompt: String(input.prompt || ''), messageId: trim(input.messageId), busyPolicy: input.busyPolicy || 'steer' };
+    const normalized = { ...input, prompt: String(input.prompt || ''), messageId: trim(input.messageId), busyPolicy: input.busyPolicy || (input.queueIfBusy === false ? 'reject' : 'steer') };
     if (!normalized.prompt.trim()) throw coded('empty prompt', 'CODEX_INVALID_INPUT');
     if (!['steer', 'reject'].includes(normalized.busyPolicy)) throw coded('invalid busy policy', 'CODEX_INVALID_INPUT');
     return client.lifecycle.run(async () => {
@@ -461,14 +479,14 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           throw error;
         }
         if (normalized.messageId && normalized.messageId === active.messageId) {
+          if (hasOpenWaiter(active)) return { completion: Promise.resolve({ deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId }) };
           return { completion: waitForTurn(active, normalized.messageId, { takeover: true, signal: options.signal }) };
         }
         if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', {
           retryable: true, outcome: 'rejected', phase: 'pre_admission', busyOrigin: 'local',
         });
         if (active.settled) return { afterFinal: active.finalized, restart: { input: normalized } };
-        const result = await steer(active, normalized);
-        return result?.restart ? { restart: result } : { completion: Promise.resolve(result) };
+        return { completion: steer(active, normalized).then((result) => result?.restart ? execute(result.input, options) : result) };
       }
       let binding = await ensureBinding(actor, normalized.messageId);
       const duplicate = await sessionStore.findAcceptedMessageEvent(binding, normalized.messageId);
@@ -476,36 +494,33 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       const reconciled = await reconcileSteer(binding, normalized.messageId, normalized.prompt);
       if (reconciled) return { completion: Promise.resolve(reconciled) };
       binding = await maybeRollover(binding, normalized.messageId);
-      try { await ensureThreadReady(binding); }
-      catch (error) {
-        if (error?.code !== 'CODEX_THREAD_ARCHIVED') throw error;
-        const archivedSessionId = binding.codexSessionId;
-        binding = await rollover(binding, normalized.messageId, 'codex_session_archived', {
-          outText: 'Codex 原会话已归档，后续飞书消息承接到新 Codex 会话。',
-          inText: '因原 Codex 会话已归档，本会话开始承接后续飞书消息。',
-          detail: { archivedCodexSessionId: archivedSessionId, error: limitText(error.message, 1000) },
-        });
-      }
-      const prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
+      binding = await ensureBindingThreadReadyWithArchiveRecovery(binding, normalized.messageId);
+      let prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
       await persistUser(binding, normalized, 'user', prompt);
       const startedAt = now();
       await options.onStartIntent?.({ binding, threadId: binding.codexSessionId, messageId: normalized.messageId, startedAt });
       let response;
-      pendingStartThreads.add(binding.codexSessionId);
       try {
         response = await client.request('turn/start', {
           threadId: binding.codexSessionId, input: [textInput(prompt)], cwd: config.cwd,
-          approvalPolicy: config.approvalPolicy || 'auto', approvalsReviewer: config.approvalsReviewer || 'auto_review',
+          approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy), approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
           ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
         });
       } catch (error) {
         if (error?.code === 'CODEX_THREAD_ARCHIVED') {
           loadedThreads.delete(binding.codexSessionId);
-          throw coded('Codex thread was archived before turn start', 'CODEX_THREAD_ARCHIVED', { retryable: true, outcome: 'rejected' });
+          binding = await rolloverArchivedBinding(binding, normalized.messageId, error);
+          await ensureThreadReady(binding);
+          prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
+          await persistUser(binding, normalized, 'user', prompt);
+          response = await client.request('turn/start', {
+            threadId: binding.codexSessionId, input: [textInput(prompt)], cwd: config.cwd,
+            approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy), approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
+            ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
+          });
+        } else {
+          error.code ||= 'CODEX_TURN_START_UNCONFIRMED'; error.outcome ||= 'unknown'; error.phase ||= 'turn_start'; throw error;
         }
-        error.code ||= 'CODEX_TURN_START_UNCONFIRMED'; error.outcome ||= 'unknown'; error.phase ||= 'turn_start'; throw error;
-      } finally {
-        pendingStartThreads.delete(binding.codexSessionId);
       }
       const turnId = trim(response?.turn?.id);
       if (!turnId) throw coded('Codex did not return a turn id', 'CODEX_TURN_START_UNCONFIRMED', { outcome: 'unknown' });
@@ -526,8 +541,28 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         if (routed.afterFinal) await routed.afterFinal.catch(() => {});
         return execute(routed.restart.input, options);
       }
-      if (routed.state) return waitForTurn(routed.state, normalized.messageId, { created: false, signal: options.signal });
-      return routed.completion;
+      if (routed.state) return publicResult(await waitForTurn(routed.state, normalized.messageId, { created: false, signal: options.signal }));
+      return publicResult(await routed.completion);
+    });
+  }
+
+  async function ensureBindingThreadReadyWithArchiveRecovery(binding, messageId) {
+    try { await ensureThreadReady(binding); return binding; }
+    catch (error) {
+      if (error?.code !== 'CODEX_THREAD_ARCHIVED') throw error;
+      const next = await rolloverArchivedBinding(binding, messageId, error);
+      await ensureThreadReady(next);
+      return next;
+    }
+  }
+
+  function rolloverArchivedBinding(binding, messageId, error) {
+    const archivedSessionId = error?.reason?.kind === 'thread_archived' ? error.reason.threadId : binding.codexSessionId;
+    if (archivedSessionId !== binding.codexSessionId) throw error;
+    return rollover(binding, messageId, 'codex_session_archived', {
+      outText: 'Codex 原会话已归档，后续飞书消息承接到新 Codex 会话。',
+      inText: '因原 Codex 会话已归档，本会话开始承接后续飞书消息。',
+      detail: { archivedCodexSessionId: archivedSessionId, error: limitText(error.message, 1000) },
     });
   }
 
@@ -540,7 +575,6 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   async function prepareKnownResume(binding, input, resume) {
     loadedThreads.delete(resume.threadId);
-    pendingKnownTurns.add(resume.turnId);
     let snapshot;
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
@@ -550,7 +584,6 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (snapshot.status !== 'unknown' && otherActiveIds.length === 0) loadedThreads.add(resume.threadId);
     }
     catch (error) {
-      pendingKnownTurns.delete(resume.turnId);
       throw uncertainObservation(error, {
         threadId: resume.threadId,
         turnId: resume.turnId,
@@ -559,27 +592,51 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         intent: { kind: 'observe', messageId: input.messageId },
       });
     }
-    if (snapshot.status === 'unknown') { pendingKnownTurns.delete(resume.turnId); throw coded('persisted turn could not be confirmed', 'CODEX_TURN_UNKNOWN', { retryable: true, outcome: 'unknown' }); }
+    if (snapshot.status === 'unknown') throw coded('persisted turn could not be confirmed', 'CODEX_TURN_UNKNOWN', { retryable: true, outcome: 'unknown' });
     const state = createTurnState(binding, input, resume.turnId, Number(resume.startedAt));
     await registerState(state);
-    pendingKnownTurns.delete(resume.turnId);
     if (snapshot.status === 'completed') state.resolve({ turn: snapshot.turn });
     else if (snapshot.status !== 'inProgress') state.reject(coded(snapshot.turn?.error?.message || `Codex turn ${snapshot.status}`, snapshot.status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED'));
     return state;
   }
 
   async function waitForTurn(state, messageId, { created = false, takeover = false, signal } = {}) {
-    const completion = state.finalized.then((result) => ({ ...result, created, takeover }));
-    if (!signal) return completion;
-    if (signal.aborted) throw coded('caller stopped waiting', 'CODEX_WAIT_ABORTED', { outcome: 'unknown' });
+    const waiter = {};
+    state.waiters.add(waiter);
+    const completion = state.finalized.then(async (result) => {
+      if (takeover && messageId && messageId !== state.messageId) {
+        const answer = result.rawAnswer || result.answer || '';
+        if (answer) await sessionStore.saveCodexRealtimeEvent(state.binding, {
+          messageId, eventKey: `assistant-final:${messageId}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复',
+          text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId, takeover: true },
+        });
+        await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: '' });
+      }
+      return { ...result, created, takeover };
+    }, async (error) => {
+      if (takeover && messageId && messageId !== state.messageId) {
+        await sessionStore.saveCodexRealtimeEvent(state.binding, {
+          messageId, eventKey: `error:${messageId}`, eventType: 'error', role: 'activity', title: '执行失败',
+          text: error.message, createdAt: now(), detail: { turnId: state.turnId, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
+        }).catch(() => {});
+        await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: error.message }).catch(() => {});
+      }
+      throw error;
+    });
+    if (!signal) {
+      try { return await completion; } finally { state.waiters.delete(waiter); }
+    }
+    if (signal.aborted) { state.waiters.delete(waiter); throw coded('caller stopped waiting', 'CODEX_WAIT_ABORTED', { outcome: 'unknown' }); }
     let abort;
     const aborted = new Promise((_, reject) => {
       abort = () => reject(coded('caller stopped waiting', 'CODEX_WAIT_ABORTED', { outcome: 'unknown' }));
       signal.addEventListener('abort', abort, { once: true });
     });
     try { return await Promise.race([completion, aborted]); }
-    finally { signal.removeEventListener('abort', abort); }
+    finally { signal.removeEventListener('abort', abort); state.waiters.delete(waiter); }
   }
+
+  function hasOpenWaiter(state) { return Boolean(state?.waiters?.size); }
 
   async function inspect({ binding, threadId, turnId }) {
     if (!binding || binding.codexSessionId !== threadId) throw coded('inspection identity does not match binding', 'CODEX_INSPECT_MISMATCH');
@@ -603,15 +660,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   async function handleNotification(event) {
     const turnId = trim(event.params?.turnId || event.params?.turn?.id);
     const state = activeByTurn.get(turnId);
-    if (!state) {
-      const threadId = trim(event.params?.threadId || event.params?.thread?.id);
-      if (turnId && (pendingKnownTurns.has(turnId) || pendingStartThreads.has(threadId)) && earlyNotifications.size < 32) {
-        const queued = earlyNotifications.get(turnId) || [];
-        if (queued.length < 100) queued.push(event);
-        earlyNotifications.set(turnId, queued);
-      }
-      return;
-    }
+    if (!state) return;
     const { method, params } = event;
     const progress = state.publicProgress(method, params);
     if (progress) sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `public:${turnId}:${progress.id}:${method}`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: progress.at, detail: progress }).catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_progress', status: 'failed' }));
@@ -648,7 +697,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function maybeNotifyRestart() {
-    if (!restartPending || restartNotified || activeByTurn.size) return;
+    if (!restartPending || restartNotified || activeByBinding.size || client.lifecycle.active) return;
     restartNotified = true;
     try { await onRestartRequired(restartPending); }
     catch { log('error', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'restart_required', status: 'failed' }); }
@@ -656,21 +705,22 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   function checkMemory() {
     const usage = config.memoryUsage?.() || process.memoryUsage();
-    const over = (config.memoryMaxRssBytes && usage.rss >= config.memoryMaxRssBytes) || (config.memoryMaxHeapUsedBytes && usage.heapUsed >= config.memoryMaxHeapUsedBytes);
-    if (!over || restartPending) return;
-    restartPending = 'memory_limit';
+    const overRss = config.memoryMaxRssBytes && usage.rss >= config.memoryMaxRssBytes;
+    const overHeap = config.memoryMaxHeapUsedBytes && usage.heapUsed >= config.memoryMaxHeapUsedBytes;
+    if ((!overRss && !overHeap) || restartPending) return;
+    restartPending = [overRss ? `rss ${usage.rss} >= ${config.memoryMaxRssBytes}` : '', overHeap ? `heapUsed ${usage.heapUsed} >= ${config.memoryMaxHeapUsedBytes}` : ''].filter(Boolean).join('; ');
     maybeNotifyRestart();
   }
   if (Number(config.memoryCheckIntervalMs) >= 1000 && (config.memoryMaxRssBytes || config.memoryMaxHeapUsedBytes)) {
-    memoryTimer = setInterval(checkMemory, Number(config.memoryCheckIntervalMs)); memoryTimer.unref?.();
+    memoryTimer = setIntervalImpl(checkMemory, Number(config.memoryCheckIntervalMs)); memoryTimer?.unref?.();
   }
 
   return Object.freeze({
     execute, inspect, interrupt,
-    status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), fault: client.fault || null, activeTurns: activeByTurn.size, heldNotifications: [...earlyNotifications.values()].reduce((n, list) => n + list.length, 0), restartPending: restartPending || null }),
+    status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), fault: client.fault || null, activeTurns: activeByTurn.size, activeTurnResponseWaiters: [...activeByBinding.values()].filter(hasOpenWaiter).length, restartPending: restartPending || null }),
     async close() {
       closing = true;
-      clearInterval(memoryTimer);
+      clearIntervalImpl(memoryTimer);
       client.lifecycle.stop();
       await client.close('shutdown');
       await Promise.allSettled([...activeByTurn.values()].map((state) => state.finalized));

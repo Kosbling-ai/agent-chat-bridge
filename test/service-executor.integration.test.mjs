@@ -115,6 +115,17 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(childEnv.CODEX_HOME, join(directory, '.codex'));
   assert.deepEqual(executorConfig.rulesPaths, ['AGENTS.md']);
   assert.equal(executorConfig.idleCloseMs, 60_000);
+  assert.equal(executorConfig.closeGraceMs, 5_000);
+  assert.equal(executorConfig.rpcTimeoutMs, 120_000);
+  assert.equal(executorConfig.turnTimeoutMs, 3 * 60 * 60 * 1000);
+  assert.equal(executorConfig.approvalPolicy, 'on-request');
+  assert.equal(executorConfig.approvalsReviewer, 'auto_review');
+  assert.equal(executorConfig.sandbox, 'workspace-write');
+  assert.equal(executorConfig.networkAccess, true);
+  assert.equal(executorConfig.rolloverCheckTimeoutMs, 30_000);
+  assert.equal(executorConfig.memoryCheckIntervalMs, 60_000);
+  assert.equal(executorConfig.memoryMaxRssBytes, 1536 * 1024 * 1024);
+  assert.equal(executorConfig.memoryMaxHeapUsedBytes, 1024 * 1024 * 1024);
   assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['api-chat', 'chat']);
   assert.equal(forwardConfig.retryDelayMs, 60_000);
   assert.equal(forwardConfig.maxAttempts, 3);

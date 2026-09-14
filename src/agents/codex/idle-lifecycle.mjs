@@ -23,14 +23,17 @@ export function resolveSharedHome({ configuredHome = '', inheritedHome = process
 export function classifyCodexRpcError(value, request = {}) {
   const providerText = typeof value === 'string' ? value : value?.message || value?.description || '';
   const reason = classifyProtocolError(value, request);
-  const error = new Error('Codex RPC was rejected');
+  // Keep the provider classification available to the executor as production
+  // did. Structured logging intentionally records only code/method, never this
+  // message or the original response object.
+  const error = new Error(providerText || 'Codex RPC failed');
   error.code = reason?.kind === 'thread_archived' ? 'CODEX_THREAD_ARCHIVED'
     : request.method === 'turn/start' ? 'CODEX_TURN_START_UNCONFIRMED' : 'CODEX_RPC_REJECTED';
   error.outcome = request.method === 'turn/start' && !reason ? 'unknown' : 'rejected';
   error.rpcMethod = /^[a-z][a-z0-9_-]*\/[a-z][a-z0-9_-]*$/i.test(request.method || '') ? request.method : 'unknown';
   if (reason) error.reason = reason;
   if (/\bactive writer\b/i.test(providerText)) {
-    error.message = 'Codex thread is active in another client';
+    error.message = '该 Codex 会话正在其他客户端执行，请等待释放后重试；原会话绑定保持不变。';
     error.code = 'CODEX_THREAD_BUSY';
     error.retryable = true;
   }

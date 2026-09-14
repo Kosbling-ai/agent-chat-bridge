@@ -62,6 +62,38 @@ export class TurnRecoverySupersededError extends Error {
   }
 }
 
+// Production cleanup retries the requested turn after removing only native
+// predecessors explicitly named by the app-server mismatch response.
+export async function interruptTurnAndPredecessors({
+  request, threadId, expectedTurnId, maxAttempts = 12, retryDelayMs = 100,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), onRecovery = () => {},
+} = {}) {
+  const interruptedTurnIds = [];
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await request('turn/interrupt', { threadId, turnId: expectedTurnId });
+      interruptedTurnIds.push(expectedTurnId);
+      return { interruptedTurnIds, noActiveTurn: false };
+    } catch (error) {
+      lastError = error;
+      if (isNoActiveTurnError(error)) return { interruptedTurnIds, noActiveTurn: true };
+      const mismatch = parseActiveTurnMismatch(error, expectedTurnId);
+      if (!mismatch || mismatch.actualTurnId === expectedTurnId || !isCodexTurnPredecessor(mismatch.actualTurnId, expectedTurnId)) throw error;
+      onRecovery({ phase: 'interrupt', attempt, expectedTurnId, actualTurnId: mismatch.actualTurnId });
+      try {
+        await request('turn/interrupt', { threadId, turnId: mismatch.actualTurnId });
+        interruptedTurnIds.push(mismatch.actualTurnId);
+      } catch (interruptError) {
+        lastError = interruptError;
+        if (!isNoActiveTurnError(interruptError) && !parseActiveTurnMismatch(interruptError, mismatch.actualTurnId)) throw interruptError;
+      }
+      if (attempt < maxAttempts) await wait(retryDelayMs);
+    }
+  }
+  throw lastError || new Error(`failed to interrupt Codex turn ${expectedTurnId}`);
+}
+
 // Mismatch recovery is allowed only after native evidence names an older turn
 // in the same thread. Generic orphan/predecessor cleanup is intentionally absent.
 export async function steerTurnWithMismatchRecovery({

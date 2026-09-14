@@ -14,7 +14,7 @@ export function codexAppServerArgs(config = {}) {
 }
 
 export class CodexAppServerClient {
-  constructor({ config, childEnv = {}, spawnImpl = spawn, eventSink = async () => {}, onDisconnect = () => {}, log = () => {}, now = Date.now } = {}) {
+  constructor({ config, childEnv = {}, spawnImpl = spawn, eventSink = async () => {}, onDisconnect = () => {}, onIdle = () => {}, log = () => {}, now = Date.now } = {}) {
     if (!config?.bin || !config?.cwd || !config?.sharedHome) throw new Error('Codex app-server requires bin, cwd and sharedHome');
     if (!childEnv || typeof childEnv !== 'object' || Array.isArray(childEnv)) throw new Error('childEnv must be an object');
     this.config = config;
@@ -31,12 +31,12 @@ export class CodexAppServerClient {
     this.nextId = 1;
     this.pending = new Map();
     this.stdoutBuffer = '';
-    this.notificationChain = Promise.resolve();
     this.fault = null;
     this.disconnectedChildren = new WeakSet();
     this.lifecycle = new IdleLifecycle({
       idleMs: config.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS,
       close: () => this.close('idle'),
+      onIdle,
       onError: () => emitLog(this.log, 'error', 'app_server_close', 'failed'),
     });
   }
@@ -128,10 +128,9 @@ export class CodexAppServerClient {
         child.stdin.write(`${JSON.stringify({ id: message.id, error: { code: -32601, message: 'Unsupported server request' } })}\n`);
       } else if (message.method) {
         const release = this.lifecycle.hold();
-        this.notificationChain = this.notificationChain
-          .then(() => (this.child === child
-            ? this.eventSink({ method: message.method, params: message.params || {}, receivedAt: this.now() })
-            : undefined))
+        Promise.resolve().then(() => (this.child === child
+          ? this.eventSink({ method: message.method, params: message.params || {}, receivedAt: this.now() })
+          : undefined))
           .catch(() => emitLog(this.log, 'warning', 'notification', 'failed'))
           .finally(release);
       }
@@ -159,8 +158,7 @@ export class CodexAppServerClient {
     this.closing = closeOwnedChild(child, {
       graceMs: this.config.closeGraceMs ?? 5_000,
       onEscalate: (signal) => emitLog(this.log, 'warning', 'app_server_close', 'escalating', { reason, signal }),
-    }).then(async () => {
-      await this.notificationChain;
+    }).then(() => {
       if (this.child === child) this.handleExit(new Error('codex app-server closed'), child);
       this.closing = null;
       emitLog(this.log, 'info', 'app_server_close', 'succeeded', { reason, durationMs: this.now() - startedAt });

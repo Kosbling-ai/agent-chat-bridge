@@ -135,19 +135,31 @@ export async function startService({ config, configPath, env = process.env, log,
       cwd,
       sharedHome,
       serviceName: config.feishu.displayName || 'Agent Chat Bridge',
-      approvalPolicy: 'never',
-      sandbox: 'workspace-write',
+      approvalPolicy: config.codex.approvalPolicy,
+      approvalsReviewer: config.codex.approvalsReviewer,
+      sandbox: config.codex.sandbox,
       model: config.codex.model,
+      reasoningEffort: config.codex.reasoningEffort,
+      networkAccess: config.codex.networkAccess,
+      threadNamePrefix: config.codex.threadNamePrefix,
       idleCloseMs: config.codex.idleCloseMs,
+      closeGraceMs: config.codex.closeGraceMs,
+      rpcTimeoutMs: config.codex.rpcTimeoutMs,
+      turnTimeoutMs: config.codex.turnTimeoutMs,
       rolloverIdleMs: config.codex.rolloverIdleMs,
+      rolloverCheckTimeoutMs: config.codex.rolloverCheckTimeoutMs,
       rolloverOnRulesUpdate: config.codex.rolloverOnRulesUpdate,
       rulesPaths: config.codex.rulesFiles,
+      memoryCheckIntervalMs: config.codex.memoryCheckIntervalMs,
+      memoryMaxRssBytes: config.codex.memoryMaxRssBytes,
+      memoryMaxHeapUsedBytes: config.codex.memoryMaxHeapUsedBytes,
+      maxOutputChars: config.feishu.maxOutputChars,
+      outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
     };
     executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,onRestartRequired:async reason=>{
       log('warning','codex_executor','restart_required',{code:reason});
-      forward?.beginStop?.();
-      await feishu?.stop?.();
+      await close();
     }});
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };

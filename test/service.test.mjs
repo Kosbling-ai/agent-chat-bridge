@@ -32,10 +32,18 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
   assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
   assert.equal(validateConfig(config).codex.idleCloseMs, 60_000);
+  assert.equal(validateConfig(config).codex.closeGraceMs, 5_000);
+  assert.equal(validateConfig(config).codex.rpcTimeoutMs, 2 * 60 * 1000);
+  assert.equal(validateConfig(config).codex.turnTimeoutMs, 3 * 60 * 60 * 1000);
+  assert.equal(validateConfig(config).codex.approvalPolicy, 'on-request');
+  assert.equal(validateConfig(config).codex.approvalsReviewer, 'auto_review');
+  assert.equal(validateConfig(config).codex.memoryMaxRssBytes, 1536 * 1024 * 1024);
+  assert.equal(validateConfig(config).codex.memoryMaxHeapUsedBytes, 1024 * 1024 * 1024);
+  assert.equal(validateConfig({ ...config, codex: { ...config.codex, memoryCheckIntervalMs: 0, memoryMaxRssMb: 0, memoryMaxHeapUsedMb: 0 } }).codex.memoryMaxRssBytes, 0);
   assert.equal(validateConfig({ ...config, codex: { ...config.codex, idleCloseMs: 0 } }).codex.idleCloseMs, 0);
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, catchup: false } }).feishu.catchup, false);
   for (const invalid of [
-    { ...config, codex: { ...config.codex, approvalPolicy: 'never' } },
+    { ...config, codex: { ...config.codex, networkAccess: 'yes' } },
     { ...config, codex: { ...config.codex, jobRetryMs: 9_999 } },
     { ...config, codex: { ...config.codex, jobMaxAttempts: 0 } },
     { ...config, codex: { ...config.codex, idleCloseMs: -1 } },
