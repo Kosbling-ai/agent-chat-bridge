@@ -269,3 +269,43 @@ test('memory restart callback runs only after the service has completed ordered 
   assert.ok(events.indexOf('store-close') < events.indexOf('exit:rss threshold'));
   await service.close();
 });
+
+test('service close drains an accepted busy fork callback before closing its dependencies', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-fork-close-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events = []; let callback, enterBegin, releaseBegin; let executorClosed = false, storeClosed = false;
+  const entered = new Promise(resolve => { enterBegin = resolve; });
+  const beginGate = new Promise(resolve => { releaseBegin = resolve; });
+  const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 },
+    codex: { bin: process.execPath, cwd: directory, envNames: [] }, feishu: { ...config.feishu, catchup: false } });
+  const job = { id: '00000000-0000-0000-0000-000000000001', callerId: 'live', chatId: 'chat', chatType: 'p2p',
+    messageId: 'message', senderOpenId: 'human', status: 'failed', last_error: 'CODEX_THREAD_BUSY',
+    result: { busyFork: { sourceThreadId: 'source', bindingOpenId: 'human', chatId: 'chat' },
+      executionCard: { messageId: 'card', status: 'failed', entries: [], forkSourceThreadId: 'source' } } };
+  const worker = { start() {}, beginStop() {}, async stop() {}, status: () => ({ running: true }) };
+  const service = await startService({ config: runtimeConfig, configPath: join(directory, 'config.json'),
+    env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, dependencies: {
+      pool: () => ({}), store: async () => ({ async assertCurrent() {}, async close() { storeClosed = true; events.push('store-close'); } }),
+      sessions: () => ({}), inbound: () => ({}), jobs: () => ({
+        async getRun() { events.push('get-run'); return job; },
+        async beginFork(input) { enterBegin(); await beginGate; events.push('begin-return'); return { outcome: 'new', fork: { operationId: input.operationId, status: 'pending' } }; },
+        async finishFork(input) { assert.equal(storeClosed, false); events.push('finish-fork'); return { outcome: 'succeeded', fork: { status: 'succeeded', targetThreadId: input.targetThreadId } }; },
+      }),
+      executor: () => ({ status: () => ({}), async close() { executorClosed = true; events.push('executor-close'); },
+        async forkBinding(input) { assert.equal(executorClosed, false); events.push('native-fork'); return { targetThreadId: 'target', committed: await input.onForked({ targetThreadId: 'target' }) }; } }),
+      replies: () => ({}), communication: () => worker, forward: () => worker, media: async () => ({}), outbound: async () => ({}), chat: () => ({}), typing: () => ({}),
+      sdk: { Client: class { constructor() { this.im = { v1: { message: { async patch() { events.push('card-patch'); return { code: 0 }; } } } }; } }, WSClient: class {}, defaultHttpInstance: {} },
+      feishu: ({ onCardAction }) => { callback = onCardAction; return { async start() {}, async stop() { events.push('feishu-stop'); }, status: () => ({ connected: true }) }; },
+    } });
+  const payload = { action: { value: { action: 'fork_busy_session', jobId: job.id, expectedSourceThreadId: 'source' } },
+    operator: { open_id: 'human' }, context: { open_chat_id: 'chat', open_message_id: 'card' } };
+  const cardReply = callback(payload); await entered;
+  const closing = service.close(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(executorClosed, false); assert.equal(storeClosed, false);
+  releaseBegin(); await cardReply; await closing;
+  assert(events.indexOf('finish-fork') < events.indexOf('executor-close'));
+  assert(events.indexOf('card-patch') < events.indexOf('store-close'));
+  const rejected = await callback(payload);
+  assert.match(rejected.toast.content, /服务正在关闭/);
+  assert.equal(events.filter(event => event === 'get-run').length, 1);
+});

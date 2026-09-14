@@ -83,11 +83,16 @@ export async function startService({ config, configPath, env = process.env, log,
   const pool = factories.pool(config.storage, env);
   let store, executor, feishu, communication, forward, catchup, http;
   const cardOperations = new Set();
+  let acceptCardOperations = true;
   const runCardOperation = operation => {
     const pending = Promise.resolve().then(operation).finally(() => cardOperations.delete(pending));
     cardOperations.add(pending);
     pending.catch(() => {});
     return pending;
+  };
+  const handleCardOperation = operation => {
+    if (!acceptCardOperations) return Promise.resolve({ toast: { type: 'error', content: '服务正在关闭，请稍后重试' } });
+    return runCardOperation(operation);
   };
   let writerHealthy = true;
   let closing;
@@ -103,6 +108,7 @@ export async function startService({ config, configPath, env = process.env, log,
   signal?.addEventListener('abort', abort, { once: true });
   const close = () => closing ??= (async () => {
     signal?.removeEventListener('abort', abort);
+    acceptCardOperations = false;
     const failures = [];
     for (const operation of [() => http?.close(), () => feishu?.stop()]) {
       try { await operation(); } catch { failures.push(true); }
@@ -111,8 +117,10 @@ export async function startService({ config, configPath, env = process.env, log,
     for (const operation of [() => catchup?.stop(), () => communication?.stop()]) {
       try { await operation(); } catch { failures.push(true); }
     }
-    const cardResults = await Promise.allSettled([...cardOperations]);
-    if (cardResults.some(result => result.status === 'rejected')) failures.push(true);
+    while (cardOperations.size) {
+      const cardResults = await Promise.allSettled([...cardOperations]);
+      if (cardResults.some(result => result.status === 'rejected')) failures.push(true);
+    }
     const executorClosing = Promise.resolve().then(() => executor?.close());
     try { await forward?.stop(); } catch { failures.push(true); }
     try { await executorClosing; } catch { failures.push(true); }
@@ -203,7 +211,8 @@ export async function startService({ config, configPath, env = process.env, log,
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,
     allowBusyQueue:async({callerId,conversationId})=>Boolean(config.auth.clients.some(client=>client.id===callerId&&client.queueIfBusy===true&&client.conversationIds.includes(conversationId))),log});
     communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
-    feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest, onCardAction: feedback.handleCardAction, log });
+    feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest,
+      onCardAction: payload => handleCardOperation(() => feedback.handleCardAction(payload)), log });
     const api = createApi({ config, store, forwardRuntime:forward, chat, tokens });
     await Promise.race([feishu.start(), cancelled]);
     checkCancelled();

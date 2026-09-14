@@ -47,6 +47,35 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     });
   }
 
+  async function publishForkOutcome(job, fork, operationId) {
+    const presentations = {
+      succeeded: { status: 'completed', message: '已保留历史并切换到新会话，请继续发送消息。', level: 'info' },
+      failed: { status: 'failed', message: '未能创建新会话，原会话绑定保持不变。', level: 'warning' },
+      unknown: { status: 'failed', message: '新会话状态未确认，请联系管理员核查后再继续。', level: 'error' },
+      superseded: { status: 'failed', message: '当前会话绑定已变化，新建会话未自动绑定，请联系管理员核查。', level: 'warning' },
+    };
+    const presentation = presentations[fork?.status] || presentations.unknown;
+    let delivered = false;
+    try {
+      const state = stateFor(job);
+      const card = cardFor(job, state, job.result.executionCard, false);
+      if (card) {
+        card.state.status = presentation.status;
+        delete card.state.delivery;
+        await card.update(presentation.message);
+        delivered = true;
+      }
+    } catch { /* the durable fork result remains authoritative */ }
+    if (!delivered) {
+      log('error', 'busy_session_fork_delivery', 'failed', {
+        code: 'card_delivery_failed', runId: job.id, operationId,
+      });
+    }
+    log(presentation.level, 'busy_session_fork', fork?.status || 'unknown', {
+      code: `fork_${fork?.status || 'unknown'}`, runId: job.id, operationId,
+    });
+  }
+
   async function start(job, control = {}) {
     if (job.deliveryMode === 'caller') return null;
     const state = stateFor(job, control);
@@ -168,7 +197,8 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       if (['not_found','stale'].includes(begun.outcome)) return toast('该卡片已失效');
       if (begun.fork?.status === 'succeeded') return toast('已保留历史并切换到新会话，请继续发送消息');
       if (begun.fork?.status === 'failed') return toast('未能创建新会话，原会话绑定保持不变', 'error');
-      if (['unknown','superseded'].includes(begun.fork?.status)) return toast('新会话状态未确认，原会话绑定保持不变', 'error');
+      if (begun.fork?.status === 'unknown') return toast('新会话状态未确认，请联系管理员核查后再继续', 'error');
+      if (begun.fork?.status === 'superseded') return toast('当前会话绑定已变化，新建会话未自动绑定', 'error');
       if (begun.outcome === 'replay') return toast('正在创建保留历史的新会话');
       runAsync(async () => {
         try {
@@ -178,23 +208,17 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
             onForked: ({ targetThreadId }) => jobs.finishFork({ id: job.id, operationId: begun.fork.operationId,
               status: 'succeeded', targetThreadId }),
           });
-          if (completed.committed?.outcome === 'succeeded') {
-            const state = stateFor(job);
-            const card = cardFor(job, state, job.result.executionCard, false);
-            await card?.finish?.('已保留历史并切换到新会话，请继续发送消息。', 'completed');
-          }
-          log('info', 'busy_session_fork', completed.committed?.outcome || 'succeeded', { code: 'fork_completed', runId: job.id, operationId: begun.fork.operationId });
+          const fork = completed.committed?.fork || { status: completed.committed?.outcome || 'unknown', targetThreadId: completed.targetThreadId };
+          await publishForkOutcome(job, fork, begun.fork.operationId);
         } catch (error) {
           const status = error?.outcome === 'unknown' ? 'unknown' : 'failed';
-          await jobs.finishFork({ id: job.id, operationId: begun.fork.operationId, status,
-            errorCode: safeCode(error), targetThreadId: error?.forkTargetThreadId }).catch(() => {});
-          const state = stateFor(job);
-          const card = cardFor(job, state, job.result.executionCard, false);
-          const message = status === 'unknown' ? '新会话状态未确认，原会话绑定保持不变。' : '未能创建新会话，原会话绑定保持不变。';
-          await card?.finish?.(message, 'failed').catch(() => {});
-          log(status === 'failed' ? 'warning' : 'error', 'busy_session_fork', status, {
-            code: safeCode(error), runId: job.id, operationId: begun.fork.operationId,
-          });
+          let reconciled;
+          try {
+            reconciled = await jobs.finishFork({ id: job.id, operationId: begun.fork.operationId, status,
+              errorCode: safeCode(error), targetThreadId: error?.forkTargetThreadId });
+          } catch { /* a second storage failure leaves the result unconfirmed */ }
+          const fork = reconciled?.fork || { status, ...(error?.forkTargetThreadId ? { targetThreadId: error.forkTargetThreadId } : {}) };
+          await publishForkOutcome(job, fork, begun.fork.operationId);
         }
       });
       return toast('正在创建保留历史的新会话');

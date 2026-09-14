@@ -369,6 +369,56 @@ test('busy fork callback validates the original sender and runs one durable fork
   assert.equal(intent.cardMessageId, 'card-message');
 });
 
+test('busy fork reconciles durable outcomes and reports an undelivered terminal card', async () => {
+  const original = {
+    id: '00000000-0000-0000-0000-000000000001', callerId: 'live', chatId: 'chat', chatType: 'p2p',
+    messageId: 'message', senderOpenId: 'human', status: 'failed', last_error: 'CODEX_THREAD_BUSY',
+    result: { busyFork: { sourceThreadId: 'source', bindingOpenId: 'human', chatId: 'chat' },
+      executionCard: { messageId: 'card', status: 'failed', delivery: 'fallback', entries: [], forkSourceThreadId: 'source' } },
+  };
+  const payload = { action: { value: { action: 'fork_busy_session', jobId: original.id, expectedSourceThreadId: 'source' } },
+    operator: { open_id: 'human' }, context: { open_chat_id: 'chat', open_message_id: 'card' } };
+  for (const mode of ['commit_ack_lost','reconcile_failed','card_rejected','superseded']) {
+    let pending; let forks = 0; let durable = { operationId: '', status: 'pending' }; const cards = []; const logs = [];
+    const jobs = {
+      async getRun() { return structuredClone(original); },
+      async beginFork(input) { durable.operationId = input.operationId; return { outcome: 'new', fork: { ...durable } }; },
+      async finishFork(input) {
+        if (mode === 'reconcile_failed') throw Object.assign(new Error('storage unavailable'), { code: 'store_unavailable' });
+        if (durable.status !== 'pending') return { outcome: 'replay', fork: { ...durable } };
+        durable = { ...durable, status: mode === 'superseded' ? 'superseded' : 'succeeded', targetThreadId: 'target' };
+        if (mode === 'commit_ack_lost') throw Object.assign(new Error('commit unknown'), { code: 'commit_unknown' });
+        return { outcome: durable.status, fork: { ...durable } };
+      },
+    };
+    const feedback = createExecutionFeedback({ jobs, sessions: {}, authorize: async () => true,
+      log: (...event) => logs.push(event), runAsync(operation) { pending = Promise.resolve().then(operation); },
+      executor: { async forkBinding(input) {
+        forks += 1;
+        try { return { targetThreadId: 'target', committed: await input.onForked({ targetThreadId: 'target' }) }; }
+        catch (error) { error.outcome = 'unknown'; error.forkTargetThreadId = 'target'; throw error; }
+      } },
+      cardClient: { im: { v1: { message: { async patch(input) {
+        cards.push(JSON.parse(input.data.content)); return { code: mode === 'card_rejected' ? 999 : 0 };
+      } } } } },
+    });
+    await feedback.handleCardAction(payload); await pending;
+    assert.equal(forks, 1, mode);
+    if (cards.length) assert.doesNotMatch(JSON.stringify(cards.at(-1)), /结果将通过普通消息送达/);
+    if (mode === 'commit_ack_lost') assert.match(JSON.stringify(cards.at(-1)), /已保留历史并切换/);
+    if (mode === 'reconcile_failed') {
+      assert.match(JSON.stringify(cards.at(-1)), /状态未确认/);
+      assert.doesNotMatch(JSON.stringify(cards.at(-1)), /原会话绑定保持不变/);
+    }
+    if (mode === 'card_rejected') {
+      assert.equal(durable.status, 'succeeded');
+      assert.equal(cards.length, 1);
+      assert(logs.some(([level,operation,status]) => level === 'error' && operation === 'busy_session_fork_delivery' && status === 'failed'));
+    }
+    if (mode === 'superseded') assert.match(JSON.stringify(cards.at(-1)), /当前会话绑定已变化/);
+  }
+});
+
 test('ordinary busy finishes the real feedback card and stops its observer and lease timer', async () => {
   const originalSetInterval=globalThis.setInterval;const originalClearInterval=globalThis.clearInterval;
   const timers=new Map();let sequence=0;let reads=0;const cards=[];
