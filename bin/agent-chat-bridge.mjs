@@ -2,6 +2,9 @@
 import { ConfigError, loadConfig } from '../src/config.mjs';
 import { createLogger } from '../src/logger.mjs';
 import { readFile } from 'node:fs/promises';
+import { StoreError } from '../src/storage/errors.mjs';
+
+const SAFE_MIGRATION_CODES = new Set(['legacy_connection_id_required', 'legacy_connection_id_mismatch', 'invalid_legacy_connection_id', 'writer_busy', 'migration_busy', 'schema_version_mismatch']);
 
 const HELP = `agent-chat-bridge
 
@@ -63,8 +66,9 @@ try {
     }
   }
 } catch (error) {
-  log(error instanceof ConfigError ? 'warning' : 'error', 'startup', 'failed', {
-    code: error instanceof ConfigError ? error.code : 'startup_failed',
+  const safeMigrationCode = command === 'migrate' && error instanceof StoreError && SAFE_MIGRATION_CODES.has(error.code);
+  log(error instanceof ConfigError || safeMigrationCode ? 'warning' : 'error', 'startup', 'failed', {
+    code: error instanceof ConfigError || safeMigrationCode ? error.code : 'startup_failed',
   });
   process.exitCode = 1;
   // Locked SDK owns a cache interval even after WS close. All service cleanup

@@ -28,7 +28,7 @@ const ASSISTANT_TABLES = [
 function statements(sql) { return sql.split(';').map((part) => part.trim()).filter(Boolean); }
 
 async function column(connection, table) {
-  const [rows] = await connection.execute(`SELECT DATA_TYPE AS type, CHARACTER_MAXIMUM_LENGTH AS size, IS_NULLABLE AS nullable
+  const [rows] = await connection.execute(`SELECT DATA_TYPE AS type, CHARACTER_MAXIMUM_LENGTH AS size, IS_NULLABLE AS nullable, COLLATION_NAME AS collation
     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'connection_id'`, [table]);
   return rows[0];
 }
@@ -64,7 +64,7 @@ async function run004Step(connection, statement, desiredIndexes) {
     if (!await column(connection, addColumn[1])) await connection.query(statement);
   } else if (modifyColumn) {
     const current = await column(connection, modifyColumn[1]);
-    if (!current || current.nullable === 'YES') await connection.query(statement);
+    if (!current || current.nullable === 'YES' || current.collation !== 'utf8mb4_bin') await connection.query(statement);
   } else if (dropIndex) {
     const actual = await index(connection, dropIndex[1], dropIndex[2]);
     const desired = desiredIndexes.get(`${dropIndex[1]}.${dropIndex[2]}`);
@@ -107,7 +107,7 @@ async function migrate004(connection, legacyConnectionId, database) {
   for (const statement of sql.slice(firstModify)) await run004Step(connection, statement, desiredIndexes);
   for (const table of ASSISTANT_TABLES) {
     const definition = await column(connection, table);
-    if (definition?.type !== 'varchar' || Number(definition.size) !== 128 || definition.nullable !== 'NO') throw new StoreError('schema_version_mismatch');
+    if (definition?.type !== 'varchar' || Number(definition.size) !== 128 || definition.nullable !== 'NO' || definition.collation !== 'utf8mb4_bin') throw new StoreError('schema_version_mismatch');
     const [[row]] = await connection.query(`SELECT EXISTS(SELECT 1 FROM ${table} WHERE connection_id IS NULL LIMIT 1) AS present`);
     if (Number(row.present) !== 0) throw new StoreError('schema_version_mismatch');
   }

@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createPoolFromEnvironment } from '../src/storage/connection.mjs';
 import { assertSchemaCurrent, migrate } from '../src/storage/migrations.mjs';
@@ -8,6 +12,16 @@ import { assertSchemaCurrent, migrate } from '../src/storage/migrations.mjs';
 const enabled = Boolean(process.env.BRIDGE_TEST_PASSWORD);
 const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map((key) => [`${key}Env`, `BRIDGE_TEST_${key.toUpperCase()}`]));
 const assistantTables = ['assistant_codex_sessions', 'assistant_codex_events', 'assistant_codex_forward_jobs', 'assistant_inbound_messages', 'assistant_message_events'];
+const storageCli = fileURLToPath(new URL('../src/storage/migrate-cli.mjs', import.meta.url));
+const publicCli = fileURLToPath(new URL('../bin/agent-chat-bridge.mjs', import.meta.url));
+
+function cliCode(script, args) {
+  const result = spawnSync(process.execPath, [script, ...args], { env: process.env, encoding: 'utf8', timeout: 10_000 });
+  assert.equal(result.status, 1);
+  const lines = (result.stdout + result.stderr).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(lines.length, 1);
+  return lines[0].code;
+}
 
 async function install003(pool) {
   for (let version = 1; version <= 3; version++) {
@@ -26,7 +40,17 @@ async function hasColumn(pool, table) {
 
 test('004 preserves 003 rows, rejects missing or changed legacy ownership, and resumes partial DDL', { skip: !enabled, timeout: 90_000 }, async () => {
   const pool = createPoolFromEnvironment(refs);
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-migration-004-cli-'));
   try {
+    const storageConfig = join(dir, 'storage.json');
+    const publicConfig = join(dir, 'config.json');
+    await writeFile(storageConfig, JSON.stringify(refs));
+    await writeFile(publicConfig, JSON.stringify({
+      schemaVersion: 1, storage: refs, codex: { bin: './codex', cwd: './workspace', envNames: [] },
+      feishu: { connectionId: 'original-bot', appIdEnv: 'TEST_APP', appSecretEnv: 'TEST_SECRET', botOpenId: 'bot' },
+      routing: { version: '1', privateUserIds: [], groups: [] },
+      auth: { clients: [{ id: 'caller', tokenEnv: 'TEST_TOKEN', conversationIds: [], admin: true }] }, hooks: [],
+    }));
     await install003(pool);
     await pool.execute("INSERT INTO assistant_codex_sessions (id,feishu_open_id,chat_id,chat_type,codex_session_id,thread_name,created_at,updated_at,last_message_id,last_message_at,last_error) VALUES (91,'actor','chat','group','thread-91','original',101,202,'message-91',203,'') ");
     await pool.execute("INSERT INTO assistant_codex_events (id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at) VALUES (92,'thread-91','actor','chat','message-91','progress','progress','activity','title','original history','{}',204)");
@@ -39,6 +63,8 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
       before[table] = row;
     }
     await assert.rejects(migrate(pool), { code: 'legacy_connection_id_required' });
+    assert.equal(cliCode(storageCli, ['--config', storageConfig]), 'legacy_connection_id_required');
+    assert.equal(cliCode(publicCli, ['migrate', '--config', publicConfig]), 'legacy_connection_id_required');
     for (const table of assistantTables) assert.equal(await hasColumn(pool, table), false);
     const [[scopeAbsent]] = await pool.query("SELECT COUNT(*) AS count FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bridge_migration_004_scope'");
     assert.equal(Number(scopeAbsent.count), 0);
@@ -49,6 +75,8 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
     try {
       await oldWriter.query('SELECT GET_LOCK(?, 0)', [oldWriterLock]);
       await assert.rejects(migrate(pool, { legacyConnectionId: 'original-bot' }), { code: 'writer_busy' });
+      assert.equal(cliCode(storageCli, ['--config', storageConfig, '--legacy-connection-id', 'original-bot']), 'writer_busy');
+      assert.equal(cliCode(publicCli, ['migrate', '--config', publicConfig, '--legacy-connection-id', 'original-bot']), 'writer_busy');
       assert.equal(await hasColumn(pool, assistantTables[0]), false);
     } finally {
       await oldWriter.query('SELECT RELEASE_LOCK(?)', [oldWriterLock]);
@@ -77,20 +105,31 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
     assert.equal(failed, true);
     assert.equal(await hasColumn(pool, assistantTables[0]), true);
     assert.equal(await hasColumn(pool, assistantTables[1]), false);
+    await pool.execute("UPDATE assistant_codex_sessions SET connection_id = 'original-bot' WHERE connection_id IS NULL");
+    await pool.query('ALTER TABLE assistant_codex_sessions MODIFY COLUMN connection_id VARCHAR(128) NOT NULL');
     await assert.rejects(migrate(pool, { legacyConnectionId: 'other-bot' }), { code: 'legacy_connection_id_mismatch' });
+    assert.equal(cliCode(storageCli, ['--config', storageConfig, '--legacy-connection-id', 'other-bot']), 'legacy_connection_id_mismatch');
     assert.deepEqual(await migrate(pool, { legacyConnectionId: 'original-bot' }), { version: 4, applied: true });
     assert.deepEqual(await assertSchemaCurrent(pool), { version: 4 });
     for (const table of assistantTables) {
       const [[row]] = await pool.query(`SELECT * FROM ${table} LIMIT 1`);
       assert.equal(row.connection_id, 'original-bot');
+      const [[definition]] = await pool.execute("SELECT COLLATION_NAME AS collation FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'connection_id'", [table]);
+      assert.equal(definition.collation, 'utf8mb4_bin');
       delete row.connection_id;
       assert.deepEqual(row, before[table], table);
     }
     assert.deepEqual(await migrate(pool), { version: 4, applied: false });
+    await pool.execute("INSERT INTO assistant_codex_sessions (connection_id,feishu_open_id,chat_id,chat_type,codex_session_id,thread_name,created_at,updated_at,last_message_id,last_error) VALUES ('ORIGINAL-BOT','actor','chat','group','other-thread','other',301,302,'','')");
+    const [lowerRows] = await pool.execute("SELECT id FROM assistant_codex_sessions WHERE connection_id = 'original-bot' AND feishu_open_id = 'actor' AND chat_id = 'chat'");
+    const [upperRows] = await pool.execute("SELECT id FROM assistant_codex_sessions WHERE connection_id = 'ORIGINAL-BOT' AND feishu_open_id = 'actor' AND chat_id = 'chat'");
+    assert.deepEqual(lowerRows.map((row) => Number(row.id)), [91]);
+    assert.equal(upperRows.length, 1);
+    assert.notEqual(Number(upperRows[0].id), 91);
     const [bridges] = await pool.query("SELECT INDEX_NAME AS name, COLUMN_NAME AS columnName FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('bridge_jobs','bridge_outbox','bridge_recoveries') AND INDEX_NAME IN ('jobs_claim','jobs_lease','outbox_claim','outbox_lease','outbox_cleanup','recovery_claim','recovery_idempotency') AND SEQ_IN_INDEX = 1");
     assert.equal(bridges.length, 7);
     assert.ok(bridges.every((row) => row.columnName === 'connection_id'));
-  } finally { await pool.end(); }
+  } finally { await pool.end(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test('004 initializes an empty disposable schema without a legacy owner', { skip: !enabled, timeout: 90_000 }, async () => {
