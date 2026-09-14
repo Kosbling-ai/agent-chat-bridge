@@ -35,7 +35,7 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).codex.rolloverIdleMs, 5 * 24 * 60 * 60 * 1000);
   assert.equal(validateConfig(config).codex.closeGraceMs, 5_000);
   assert.equal(validateConfig(config).codex.rpcTimeoutMs, 2 * 60 * 1000);
-  assert.equal(validateConfig(config).codex.turnTimeoutMs, 3 * 60 * 60 * 1000);
+  assert.equal(validateConfig(config).codex.turnTimeoutMs, 12 * 60 * 60 * 1000);
   assert.equal(validateConfig(config).codex.approvalPolicy, 'on-request');
   assert.equal(validateConfig(config).codex.approvalsReviewer, 'auto_review');
   assert.equal(validateConfig(config).codex.requestUserInput, false);

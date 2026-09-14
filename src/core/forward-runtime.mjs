@@ -65,7 +65,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   const pollMs = Number(config.pollMs || 30_000);
   const maxAttempts = Number(config.maxAttempts ?? 3);
   const retryDelayMs = Number(config.retryDelayMs ?? 60_000);
-  const executeTimeoutMs = Number(config.executeTimeoutMs ?? 3 * 60 * 60 * 1000 + 10_000);
+  const executeTimeoutMs = Number(config.executeTimeoutMs ?? 12 * 60 * 60 * 1000 + 10_000);
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) throw new Error('invalid_forward_max_attempts');
   if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 10_000 || retryDelayMs > 1_800_000) throw new Error('invalid_forward_retry_delay');
   if (!Number.isSafeInteger(pollMs) || pollMs < 1 || pollMs > 600_000) throw new Error('invalid_forward_poll');

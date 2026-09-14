@@ -378,7 +378,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       resolve(value) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); resolveCompletion(value); },
       reject(error) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); rejectCompletion(error); },
     };
-    const turnTimeoutMs = Number(config.turnTimeoutMs ?? 3 * 60 * 60 * 1000);
+    const turnTimeoutMs = Number(config.turnTimeoutMs ?? 12 * 60 * 60 * 1000);
     if (turnTimeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
         state.reject(coded(`Codex turn timed out after ${turnTimeoutMs}ms`, 'CODEX_TURN_TIMEOUT'));

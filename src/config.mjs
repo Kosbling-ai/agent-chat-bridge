@@ -95,7 +95,7 @@ function validateRuntime(raw) {
   }
   codex.closeGraceMs = raw.codex.closeGraceMs ?? 5_000;
   codex.rpcTimeoutMs = raw.codex.rpcTimeoutMs ?? 2 * 60 * 1000;
-  codex.turnTimeoutMs = raw.codex.turnTimeoutMs ?? 3 * 60 * 60 * 1000;
+  codex.turnTimeoutMs = raw.codex.turnTimeoutMs ?? 12 * 60 * 60 * 1000;
   for (const field of ['closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs']) {
     if (!Number.isSafeInteger(codex[field]) || codex[field] <= 0) throw new ConfigError(`invalid_codex_${field.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`)}`);
   }

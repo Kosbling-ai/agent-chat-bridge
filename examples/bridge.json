@@ -7,7 +7,7 @@
   },
   "codex": {
     "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"],
-    "idleCloseMs": 60000, "closeGraceMs": 5000, "rpcTimeoutMs": 120000, "turnTimeoutMs": 10800000,
+    "idleCloseMs": 60000, "closeGraceMs": 5000, "rpcTimeoutMs": 120000, "turnTimeoutMs": 43200000,
     "sandbox": "workspace-write", "approvalPolicy": "on-request", "approvalsReviewer": "auto_review", "networkAccess": true,
     "requestUserInput": false,
     "rolloverIdleMs": 432000000, "rolloverCheckTimeoutMs": 30000,
