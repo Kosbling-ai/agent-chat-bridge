@@ -49,6 +49,8 @@ export class CodexAppServerClient {
     this.stdoutBuffer = '';
     this.fault = null;
     this.disconnectedChildren = new WeakSet();
+    this.childGeneration = 0;
+    this.childGenerations = new WeakMap();
     this.inbound = new Map();
     this.requestUserInputFeature = hasRequestUserInputFeature(config, this.childEnv, spawnSyncImpl);
     if (config.requestUserInput !== false && !this.requestUserInputFeature) emitLog(this.log, 'warning', 'request_user_input_feature', 'unavailable');
@@ -80,6 +82,8 @@ export class CodexAppServerClient {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
     });
+    const generation=++this.childGeneration;
+    this.childGenerations.set(child,generation);
     this.child = child;
     this.ready = false;
     this.stdoutBuffer = '';
@@ -133,6 +137,7 @@ export class CodexAppServerClient {
 
   handleStdout(chunk, child) {
     if (this.child !== child) return;
+    const generation=this.childGenerations.get(child);
     this.stdoutBuffer += String(chunk || '');
     let newline;
     while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
@@ -148,7 +153,7 @@ export class CodexAppServerClient {
       } else if (message.method) {
         const release = this.lifecycle.hold();
         Promise.resolve().then(() => (this.child === child
-          ? this.eventSink({ method: message.method, params: message.params || {}, receivedAt: this.now() })
+          ? this.eventSink({ method: message.method, params: message.params || {}, receivedAt: this.now(), generation })
           : undefined))
           .catch(() => emitLog(this.log, 'warning', 'notification', 'failed'))
           .finally(release);
@@ -157,6 +162,7 @@ export class CodexAppServerClient {
   }
 
   handleServerRequest(message, child) {
+    const generation=this.childGenerations.get(child);
     if (!validRequestId(message.id) || message.method !== 'item/tool/requestUserInput') {
       try { child.stdin.write(`${JSON.stringify({ id: message.id ?? null, error: { code: -32601, message: 'Unsupported server request' } })}\n`); } catch { /* disconnect path settles the child */ }
       return;
@@ -191,7 +197,7 @@ export class CodexAppServerClient {
       entry.settled = true; this.inbound.delete(key); release(); return true;
     };
     Promise.resolve().then(() => this.serverRequestSink({
-      method: message.method, requestId: message.id, params: message.params || {}, receivedAt: this.now(),
+      method: message.method, requestId: message.id, params: message.params || {}, receivedAt: this.now(), generation,
       respondResult: result => respond({ result }),
       respondError: (code, text) => respond({ error: { code, message: text } }),
       abandon,

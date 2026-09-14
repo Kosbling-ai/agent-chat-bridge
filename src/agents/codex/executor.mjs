@@ -417,7 +417,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   async function expireUserInput(state, reason, { resolved = false } = {}) {
     const pending = state?.userInput;
     if (!pending || pending.settled) return;
-    pending.settled = true; state.userInput = null;
+    pending.settled = true; pending.controller?.abort(); state.userInput = null;
     try {
       if (resolved) pending.request.abandon();
       else await pending.request.respondError(-32002, 'User input request expired');
@@ -435,7 +435,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     if (closing || config.requestUserInput === false) {
       await request.respondError(-32002, 'User input request unavailable').catch(() => {}); return;
     }
-    const resolvedKey = `${normalized.threadId}:${typedRequestKey(normalized.requestId)}`;
+    const resolvedKey = `${request.generation}:${normalized.threadId}:${typedRequestKey(normalized.requestId)}`;
     if (resolvedUserInputs.delete(resolvedKey)) { request.abandon(); return; }
     let state = activeByTurn.get(normalized.turnId);
     if (!state) {
@@ -481,6 +481,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   function handleDisconnect(error) {
     loadedThreads.clear();
+    resolvedUserInputs.clear();
     for (const state of activeByTurn.values()) {
       expireUserInput(state, 'disconnected', { resolved: true }).catch(() => {});
       const lost = coded('Codex app-server connection was lost; native turn status is unknown', 'CODEX_OBSERVATION_LOST', { retryable: true, outcome: 'unknown' });
@@ -797,7 +798,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       const threadId = trim(event.params?.threadId);
       const requestId = event.params?.requestId;
       if (!threadId || !((typeof requestId === 'string' && requestId) || (typeof requestId === 'number' && Number.isSafeInteger(requestId)))) return;
-      const key = `${threadId}:${typedRequestKey(requestId)}`;
+      const key = `${event.generation}:${threadId}:${typedRequestKey(requestId)}`;
       const state = [...activeByTurn.values()].find(candidate => candidate.threadId === threadId
         && candidate.userInput && typedRequestKey(candidate.userInput.public.requestId) === typedRequestKey(requestId));
       if (state) await expireUserInput(state, 'native_resolved', { resolved: true });

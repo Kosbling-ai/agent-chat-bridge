@@ -8,6 +8,8 @@
 
 受支持的提问会为当前 active turn 创建一张独立飞书表单，可以一次包含多道题；每题接受一个已有选项、允许的“其他”输入或自由填空。只有原消息发送者能在原聊天中提交，bridge 会重新核对当前 job、卡片、授权、thread 和 turn。只要一批请求中包含 secret 提问，整批就会在展示和收集内容前被拒绝；普通飞书表单不是秘密输入通道。
 
+首版 bridge 最多接受 3 道题、每题 20 个选项、每个自由填写答案 1000 字符，并把渲染后的卡片限制在 28 KB。它们是 bridge 与飞书投递限制，不是 Codex 协议上限；超限请求会被明确拒绝，不会截断问题或答案。
+
 提交只接受一次。“已提交”表示 bridge 已接受表单并尝试交给仍存活的 native 请求，不表示 Codex 已经消费答案。native 已解决、停止执行、turn 完成或失败、app-server 断线、服务关闭都会让旧卡失效。bridge 不伪造超时答案，不在重启后恢复旧 RPC，也不重放 prompt 或答案。
 
 群授权必须显式出现在 `routing.groups`。`capabilities` 只允许 `bridge`、`hook`，缺省两者都开，`[]` 表示两者都关。`bridge` 仍继续检查 @/all trigger 和可选 `userIds`；`hook` 只按自己的群授权与订阅过滤，不参加 Agent 路由、执行或回复。旧配置中只写在 `hooks[].conversationIds` 的群，需要补入 `routing.groups`，纯 hook 群可写 `capabilities:["hook"]`。

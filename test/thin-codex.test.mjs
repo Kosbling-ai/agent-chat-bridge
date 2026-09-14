@@ -63,6 +63,21 @@ test('secret requestUserInput is rejected without exposing questions to the card
   await executor.close();await assert.rejects(running,{code:'CODEX_OBSERVATION_LOST'});
 });
 
+test('resolved request ids from an idle child cannot expire a reused id in its replacement',async t=>{
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-codex-input-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));mkdirSync(join(cwd,'home'));
+  const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[{id:7}]});const opened=[];
+  const executor=createCodexExecutor({config:{...config(cwd),requestUserInput:true,idleCloseMs:10},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:'default_mode_request_user_input under_development false\n'}),onUserInput:async request=>opened.push(request)});
+  const first=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'first',prompt:'work'});while(opened.length<1)await new Promise(resolve=>setImmediate(resolve));
+  await executor.answerUserInput({threadId:'thread-1',turnId:'turn-1',requestId:7,itemId:'item-0',messageId:'first',answers:{q:{answers:['A']}}});
+  runtime.children[0].send({method:'serverRequest/resolved',params:{threadId:'thread-1',requestId:7}});
+  runtime.children[0].send({method:'turn/completed',params:{threadId:'thread-1',turnId:'turn-1',turn:{id:'turn-1',status:'completed',items:[]}}});await first;
+  while(runtime.children[0].stdin.writable)await new Promise(resolve=>setTimeout(resolve,2));
+  const second=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'second',prompt:'more'});second.catch(()=>{});
+  while(opened.length<2)await new Promise(resolve=>setImmediate(resolve));assert.equal(opened[1].requestId,7);assert.equal(opened[1].turnId,'turn-2');
+  await executor.close();await assert.rejects(second,{code:'CODEX_OBSERVATION_LOST'});
+});
+
 class FakeChild extends EventEmitter {
   constructor(handler) {
     super(); this.exitCode = null; this.signalCode = null;

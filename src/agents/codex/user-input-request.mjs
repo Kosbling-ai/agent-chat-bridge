@@ -28,7 +28,8 @@ export function normalizeUserInputRequest(request) {
       const label = text(option?.label, 200, 'option label');
       if (values.has(label)) throw Object.assign(new Error('duplicate option label'), { code: 'CODEX_USER_INPUT_INVALID' });
       values.add(label);
-      return { label, description: typeof option.description === 'string' && option.description.length <= 500 ? option.description : '' };
+      if(option?.description!==undefined&&(typeof option.description!=='string'||option.description.length>500))throw Object.assign(new Error('invalid option description'),{code:'CODEX_USER_INPUT_INVALID'});
+      return { label, description: option.description || '' };
     });
     if (question.isOther !== undefined && typeof question.isOther !== 'boolean') throw Object.assign(new Error('invalid other flag'), { code: 'CODEX_USER_INPUT_INVALID' });
     return { id, header, question: prompt, options, isOther: question.isOther === true };
@@ -42,7 +43,7 @@ export function normalizeUserInputAnswers(questions, answers) {
   for (const question of questions) {
     const answer = answers[question.id];
     if (!answer || !Array.isArray(answer.answers) || answer.answers.length !== 1) throw Object.assign(new Error('one answer is required'), { code: 'CODEX_USER_INPUT_INVALID' });
-    const value = text(answer.answers[0], 1_000, 'answer');
+    const value = text(answer.answers[0], 1_011, 'answer');
     if (question.options.length && !question.options.some(option => option.label === value) && !(question.isOther && value.startsWith('user_note: '))) {
       throw Object.assign(new Error('answer is not an offered option'), { code: 'CODEX_USER_INPUT_INVALID' });
     }

@@ -32,11 +32,14 @@ export function answersFromForm(userInput, formValue) {
   if(!formValue||typeof formValue!=='object'||Array.isArray(formValue))throw Object.assign(new Error('invalid form'),{code:'invalid_user_input'});
   const allowed=new Set(); const answers=Object.create(null);
   userInput.questions.forEach((question,index)=>{
-    const choiceName=`q_${index}_choice`; const otherName=`q_${index}_other`; allowed.add(choiceName); allowed.add(otherName);
+    const choiceName=`q_${index}_choice`; const otherName=`q_${index}_other`;
+    if(question.options.length)allowed.add(choiceName);
+    if(!question.options.length||question.isOther)allowed.add(otherName);
     const choice=formValue[choiceName]; const other=formValue[otherName];
     if(choice!=null&&typeof choice!=='string')throw Object.assign(new Error('invalid choice'),{code:'invalid_user_input'});
     if(other!=null&&typeof other!=='string')throw Object.assign(new Error('invalid text'),{code:'invalid_user_input'});
     const note=String(other||'').trim();
+    if(note&&question.options.length&&!question.isOther)throw Object.assign(new Error('other is unavailable'),{code:'invalid_user_input'});
     if(note&&choice)throw Object.assign(new Error('choose an option or fill other'),{code:'invalid_user_input'});
     let answer;
     if(note)answer=`user_note: ${note}`;

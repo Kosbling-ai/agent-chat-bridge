@@ -257,7 +257,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         const at = now();
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
-            JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),updated_at=?
+            JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop','$.userInput')),updated_at=?
           WHERE connection_id=? AND public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='reply_pending'`, [safeJson(input.result || {}), at, connectionId,id, owner, at]);
         await assertLease(connection, result);
         return { updated: true };
@@ -271,7 +271,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET status='reply_pending',
             result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
-              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
+              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop','$.userInput')),
             last_error=?,lease_expires_at=?,updated_at=?
           WHERE connection_id=? AND public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='running'`, [safeJson(value), input.errorCode || '', at, at, connectionId,id, owner, at]);
         await assertLease(connection, result);
@@ -286,7 +286,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET status=?,
             result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
-              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop','$.delivery')),
+              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop','$.delivery','$.userInput')),
             last_error=CASE WHEN ?='' THEN last_error ELSE ? END,finished_at=?,reply_sent_at=?,lease_owner='',lease_expires_at=NULL,updated_at=?
           WHERE connection_id=? AND public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='reply_pending'`, [input.status, safeJson(input.result || {}), input.errorCode || '', input.errorCode || '', at, input.replySent === false ? null : at, at, connectionId,id, owner, at]);
         await assertLease(connection, result);
@@ -301,7 +301,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         const [result] = await connection.execute(`UPDATE assistant_codex_forward_jobs
           SET status=?,
             result_json=JSON_MERGE_PATCH(CASE WHEN JSON_VALID(result_json) THEN result_json ELSE JSON_OBJECT() END,
-              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop')),
+              JSON_REMOVE(CAST(? AS JSON),'$.executionCard','$.typing','$.stop','$.userInput')),
             last_error=CASE WHEN ?='' THEN last_error ELSE ? END,finished_at=?,reply_sent_at=NULL,lease_owner='',lease_expires_at=NULL,updated_at=?
           WHERE connection_id=? AND public_run_id=? AND lease_owner=? AND lease_expires_at>? AND status='running'`, [input.status, safeJson(input.result || {}), input.errorCode || '', input.errorCode || '', at, at, connectionId,id, owner, at]);
         await assertLease(connection, result);
@@ -463,6 +463,19 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         userInput.status='expired'; userInput.finishedAt=now();
         await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=? WHERE connection_id=? AND public_run_id=?`,[safeJson(result),now(),connectionId,id]);
         return {outcome:'expired',userInput};
+      });
+    },
+    markUserInputUnknown(input) {
+      const id=required(input.id,36);const requestKey=required(input.requestKey,600);const operationId=required(input.operationId,36);
+      return write(async connection=>{
+        const [[found]]=await connection.execute(`SELECT result_json FROM assistant_codex_forward_jobs WHERE connection_id=? AND public_run_id=? FOR UPDATE`,[connectionId,id]);
+        if(!found)return{outcome:'not_found'};const result=parse(found.result_json);const userInput=result.userInput;
+        if(!userInput||userInput.requestKey!==requestKey)return{outcome:'stale'};
+        if(userInput.status==='submitted'||userInput.status==='unknown')return{outcome:'replay',userInput};
+        if(userInput.status!=='pending'&&(userInput.status!=='submitting'||userInput.operationId!==operationId))return{outcome:'stale'};
+        userInput.status='unknown';userInput.operationId=operationId;userInput.finishedAt=now();
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET result_json=?,updated_at=? WHERE connection_id=? AND public_run_id=?`,[safeJson(result),now(),connectionId,id]);
+        return{outcome:'unknown',userInput};
       });
     },
     beginStop(input) {

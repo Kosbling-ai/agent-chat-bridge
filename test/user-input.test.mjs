@@ -49,6 +49,10 @@ test('card maps protocol choices and free text to one answer per qid without pro
   assert.deepEqual(normalized.answers.choice.answers,['A']);
   assert.deepEqual(Object.getOwnPropertyDescriptor(normalized.answers,'__proto__').value.answers,['user_note: hello']);
   assert.throws(()=>answersFromForm(userInput,{q_0_choice:'o_0',q_0_other:'also',q_1_other:'hello'}));
+  const free={...userInput,questions:[{id:'free',header:'Fill',question:'Fill',options:[],isOther:false}]};
+  const longAnswer=answersFromForm(free,{q_0_other:'x'.repeat(1000)});
+  assert.equal(longAnswer.free.answers[0].length,1011);assert.equal(normalizeUserInputAnswers(free.questions,longAnswer).answers.free.answers[0].length,1011);
+  assert.throws(()=>answersFromForm({...userInput,questions:[{id:'choice',header:'Choose',question:'Choose',options:[{label:'A',description:''}],isOther:false}]},{q_0_choice:'o_0',q_0_other:'forged'}));
 });
 
 function fixture(){
@@ -62,6 +66,7 @@ function fixture(){
     async finishUserInputCard(input){job.result.userInput.card={...job.result.userInput.card,status:input.status,messageId:input.cardMessageId};return{outcome:input.status,userInput:job.result.userInput};},
     async beginUserInputAnswer(input){if(job.result.userInput.status!=='pending')return{outcome:'replay',userInput:job.result.userInput};job.result.userInput={...job.result.userInput,status:'submitting',answers:input.answers,operationId:input.operationId};return{outcome:'new',userInput:job.result.userInput};},
     async finishUserInput(input){job.result.userInput={...job.result.userInput,status:input.status};return{outcome:input.status,userInput:job.result.userInput};},
+    async markUserInputUnknown(input){if(['submitted','unknown'].includes(job.result.userInput.status))return{outcome:'replay',userInput:job.result.userInput};job.result.userInput={...job.result.userInput,status:'unknown',operationId:input.operationId};return{outcome:'unknown',userInput:job.result.userInput};},
     async expireUserInput(){job.result.userInput.status='expired';return{outcome:'expired',userInput:job.result.userInput};},
   };
   const runtime=createUserInputRuntime({jobs,executor,authorize:async()=>true,cardClient,
@@ -73,9 +78,9 @@ test('user-input runtime authenticates exact card identity and submits once asyn
   const f=fixture();const request={messageId:'source',threadId:'thread',turnId:'turn',itemId:'item',requestId:0,requestKey:'number:0',
     questions:[{id:'q',header:'选择',question:'选一个',options:[{label:'A',description:''}],isOther:false}]};
   await f.runtime.open(request);assert.equal(f.creates.length,1);
-  const payload={operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'number:0',itemId:'item'},form_value:{q_0_choice:'o_0',q_0_other:''}}};
+  const payload={operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'number:0',itemId:'item'},form_value:{q_0_choice:'o_0'}}};
   assert.equal((await f.runtime.handleCardAction({...payload,operator:{open_id:'other'}})).toast.content,'该提问已失效');
-  assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答已提交');
+  assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答正在提交');
   await Promise.allSettled(f.asyncOps);assert.equal(f.nativeCalls,1);assert.equal(f.job.result.userInput.status,'submitted');assert.equal(f.patches.length,1);
   assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答已提交');assert.equal(f.nativeCalls,1);
   await f.runtime.close();
@@ -89,4 +94,31 @@ test('a durable card from an earlier process cannot submit into a new executor',
     action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'string:"old"',itemId:'item'},form_value:{q_0_other:'answer'}}});
   assert.equal(response.toast.content,'该提问已失效');assert.equal(f.nativeCalls,0);assert.equal(f.job.result.userInput.status,'pending');
   await restarted.close();await f.runtime.close();
+});
+
+test('a card create that returns after native expiry is persisted and patched only as expired',async()=>{
+  const f=fixture();let releaseCreate;f.cardClient.im.v1.message.create=()=>new Promise(resolve=>{releaseCreate=resolve;});
+  const controller=new AbortController();const opening=f.runtime.open({messageId:'source',threadId:'thread',turnId:'turn',itemId:'item',requestId:'late',requestKey:'string:"late"',signal:controller.signal,
+    questions:[{id:'q',header:'填写',question:'内容',options:[],isOther:false}]});
+  while(!releaseCreate)await new Promise(resolve=>setImmediate(resolve));controller.abort();releaseCreate({code:0,data:{message_id:'card'}});
+  await assert.rejects(opening,{code:'user_input_expired'});assert.equal(f.job.result.userInput.status,'expired');assert.equal(f.runtime.status().pending,0);assert.equal(f.patches.length,1);
+  assert.match(f.patches[0].data.content,/该提问已失效/);await f.runtime.close();
+});
+
+test('lost begin and finish acknowledgements reconcile one native submission without a retry',async()=>{
+  const f=fixture();const request={messageId:'source',threadId:'thread',turnId:'turn',itemId:'item',requestId:'rpc',requestKey:'string:"rpc"',
+    questions:[{id:'q',header:'选择',question:'选一个',options:[{label:'A',description:''}],isOther:false}]};await f.runtime.open(request);
+  const originalBegin=f.jobs.beginUserInputAnswer;f.jobs.beginUserInputAnswer=async input=>{await originalBegin(input);throw Object.assign(new Error('lost'),{code:'commit_unknown'});};
+  const originalFinish=f.jobs.finishUserInput;f.jobs.finishUserInput=async input=>{await originalFinish(input);throw Object.assign(new Error('lost'),{code:'commit_unknown'});};
+  const payload={operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'string:"rpc"',itemId:'item'},form_value:{q_0_choice:'o_0'}}};
+  assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答正在提交');await Promise.allSettled(f.asyncOps);
+  assert.equal(f.nativeCalls,1);assert.equal(f.job.result.userInput.status,'submitted');assert.match(f.patches.at(-1).data.content,/回答已提交/);await f.runtime.close();
+});
+
+test('unconfirmed answer admission becomes durable unknown and never calls native',async()=>{
+  const f=fixture();const request={messageId:'source',threadId:'thread',turnId:'turn',itemId:'item',requestId:'rpc',requestKey:'string:"rpc"',
+    questions:[{id:'q',header:'选择',question:'选一个',options:[{label:'A',description:''}],isOther:false}]};await f.runtime.open(request);
+  f.jobs.beginUserInputAnswer=async()=>{throw Object.assign(new Error('lost'),{code:'commit_unknown'});};
+  const response=await f.runtime.handleCardAction({operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'string:"rpc"',itemId:'item'},form_value:{q_0_choice:'o_0'}}});
+  assert.equal(response.toast.content,'提交状态未确认，请勿重复提交');assert.equal(f.nativeCalls,0);assert.equal(f.job.result.userInput.status,'unknown');assert.match(f.patches.at(-1).data.content,/提交状态未确认/);await f.runtime.close();
 });
