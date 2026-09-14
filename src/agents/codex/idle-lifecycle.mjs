@@ -61,8 +61,10 @@ export class IdleLifecycle {
       released = true;
       if (--this.active === 0 && !this.stopped) {
         this.onIdle();
-        this.timer = this.setTimer(() => this.closeIfIdle().catch(this.onError), this.idleMs);
-        this.timer?.unref?.();
+        if (this.idleMs > 0) {
+          this.timer = this.setTimer(() => this.closeIfIdle().catch(this.onError), this.idleMs);
+          this.timer?.unref?.();
+        }
       }
     };
   }

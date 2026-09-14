@@ -1,6 +1,6 @@
 # Forward runtime and API
 
-The unreleased 0.2.2 development version replaces the 0.1.1 generation worker with one leased Codex forward worker. It keeps the communication worker for hook delivery and registered chat outbox effects. One Feishu bot and WebSocket client feed both routes; one Codex app-server and forward worker start or observe Codex work. Thread start, resume and turn start use the protocol-defined `auto_review` approval reviewer.
+The unreleased 0.2.3 development version replaces the 0.1.1 generation worker with one leased Codex forward worker. It keeps the communication worker for hook delivery and registered chat outbox effects. One Feishu bot and WebSocket client feed both routes; one Codex app-server and forward worker start or observe Codex work. Thread start, resume and turn start use the protocol-defined `auto_review` approval reviewer.
 
 The implementation is validated with synthetic providers and disposable MySQL. It has not been connected to a real bot or model, deployed, or wired into the Kosbling business producer. The producer migration is separate work.
 
@@ -19,6 +19,8 @@ Hook delivery remains `{deliveryId,event}` with stable event, chat, and message 
 Live messages preserve the sender name. A bot mention is removed only when it identifies the configured bot. Group passive context reads at most the ten messages strictly before the current message and no more than two hours old. Context and the current speaker are formatted into the prompt; business parsers, role SQL, lark-cli queries, and cron scheduling stay outside the bridge.
 
 Every forward job is committed before native work. A bounded forward worker may hold several claimed jobs so authorized messages can reach the executor's existing steering path; every claim has its own fenced lease identity. The single Codex app-server/executor owns native lifecycle decisions and records thread start intent and the confirmed turn before waiting for completion. Recovery with a known thread and turn only reads that turn. Unknown admission or observation becomes `held` and is never submitted again automatically.
+
+`codex.idleCloseMs` controls only automatic app-server child cleanup after bridge activity reaches zero. It defaults to `0`, so the owned child stays open while the bridge service is running; this does not send keepalive RPCs or promise ownership across service shutdown, crashes, or child exits. A positive value up to 86400000 restores a bounded idle-close timer. Explicit bridge shutdown still closes the child, and an unexpected exit still follows the existing fault/restart path. This setting does not change the separate two-day conversation rollover or rules/archived rollover policy.
 
 If another client holds the native writer before a manual Feishu request is admitted, the request ends on its first confirmed `CODEX_THREAD_BUSY` rejection. Its existing card/reply path reports “会话被其他客户端占用，请释放后重试或新建会话。” once; the bridge keeps the binding and does not create a replacement thread or replay the request. Other explicitly retryable pre-admission failures use at most `codex.jobMaxAttempts` claims (default 3), spaced by `codex.jobRetryMs` (default 60 seconds; valid range 10 seconds to 30 minutes).
 
@@ -55,7 +57,7 @@ Bridge delivery status is `waiting`, `pending`, `sent`, `failed`, or `unknown`; 
 
 ## Configuration and validation
 
-Use `examples/bridge.json` for the current shape. Secrets are read only from explicit environment-variable names. `codex.bin` and `codex.cwd` are explicit; only `codex.envNames` plus configured proxy mappings enter the child. Optional `codex.jobRetryMs` and `codex.jobMaxAttempts` use the limits above. The process uses one Feishu HTTP client and one WebSocket client.
+Use `examples/bridge.json` for the current shape. Secrets are read only from explicit environment-variable names. `codex.bin` and `codex.cwd` are explicit; only `codex.envNames` plus configured proxy mappings enter the child. Optional `codex.idleCloseMs` uses the lifecycle semantics above; `codex.jobRetryMs` and `codex.jobMaxAttempts` use the retry limits above. The process uses one Feishu HTTP client and one WebSocket client.
 
 Paths are resolved from the config file. The executable and workspace must satisfy the ownership checks. If only `HOME` is selected for the child, Codex state resolves under its `.codex` directory; an explicit `CODEX_HOME` remains authoritative. `approvalPolicy=never`, `sandbox=workspace-write`, cwd and execution identity cannot be overridden by HTTP callers.
 

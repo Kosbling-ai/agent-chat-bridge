@@ -23,11 +23,13 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).feishu.catchup, true);
   assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
   assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
+  assert.equal(validateConfig(config).codex.idleCloseMs, 0);
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, catchup: false } }).feishu.catchup, false);
   for (const invalid of [
     { ...config, codex: { ...config.codex, approvalPolicy: 'never' } },
     { ...config, codex: { ...config.codex, jobRetryMs: 9_999 } },
     { ...config, codex: { ...config.codex, jobMaxAttempts: 0 } },
+    { ...config, codex: { ...config.codex, idleCloseMs: -1 } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
     { ...config, feishu: { ...config.feishu, appSecret: 'synthetic' } },
     { ...config, hooks: [{ id: 'h', url: 'https://user:synthetic@example.invalid', tokenEnv: 'TEST_HOOK', conversationIds: [] }] },

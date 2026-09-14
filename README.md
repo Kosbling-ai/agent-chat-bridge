@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.2` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
+Version: `0.2.3` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
-The runtime assembles an independent MySQL schema, one Codex app-server/executor, one Feishu bot and WebSocket owner, scoped hooks and authenticated run/chat APIs. Version 0.2.2 includes the production-derived forward lease, reply-pending delivery, native recovery, bounded group context, execution card, Typing, stop callback and replies in the bridge. It reports an externally occupied manual chat once instead of repeatedly retrying it, while a validated caller/namespace system scope retains its explicit waiting policy. It also uses the Codex app-server's `auto_review` approval-reviewer enum for new and resumed threads. Business parsing, polling, cron scheduling, lark-cli queries and document/table/contact tools remain outside it. See the [forward runtime contract](docs/runtime.md) and [Chinese supplement](docs/zh-CN/forward-runtime.md).
+The runtime assembles an independent MySQL schema, one Codex app-server/executor, one Feishu bot and WebSocket owner, scoped hooks and authenticated run/chat APIs. Version 0.2.3 keeps the owned app-server open while the bridge service is running, avoiding the previous 60-second idle close without keepalive RPCs. It includes the production-derived forward lease, reply-pending delivery, native recovery, bounded group context, execution card, Typing, stop callback and replies in the bridge. It reports an externally occupied manual chat once instead of repeatedly retrying it, while a validated caller/namespace system scope retains its explicit waiting policy. It also uses the Codex app-server's `auto_review` approval-reviewer enum for new and resumed threads. Business parsing, polling, cron scheduling, lark-cli queries and document/table/contact tools remain outside it. See the [forward runtime contract](docs/runtime.md) and [Chinese supplement](docs/zh-CN/forward-runtime.md).
 
 Synthetic tests, a disposable MySQL container, and offline implementation review cover the new runtime and storage paths. No real bot/model acceptance, deployment, business-producer adaptation, or production replacement has been completed.
 
