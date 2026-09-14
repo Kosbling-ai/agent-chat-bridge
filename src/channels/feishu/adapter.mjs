@@ -14,8 +14,9 @@ export function probeFeishuConnection(wsClient) {
   } catch { return { connected: false, supported: false }; }
 }
 
-// onEvent must commit inbox + routing atomically, enforce signal/deadline in
-// its storage operations, and deduplicate late/uncertain commits on redelivery.
+// Feishu requires the SDK handler to acknowledge promptly. The ingress task is
+// tracked for shutdown, but the platform's short ACK budget never owns a model
+// waiter or interrupts a Codex turn.
 export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '', onEvent, onCardAction,
   deadlineMs = 2000, log = () => {}, reportError = () => {} }) {
   if (!sdk?.EventDispatcher || !wsClient || typeof onEvent !== 'function' || !connectionId) {
@@ -42,34 +43,34 @@ export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '
       } catch { reportingFailed(); }
     }
   }
-  async function receive(type, payload) {
+  async function runEvent(type, payload) {
     const started = Date.now();
     const controller = new AbortController();
     let timer;
-    let rejectDeadline;
-    const cancellation = new Promise((_, reject) => { rejectDeadline = reject; });
-    const cancel = (code) => { controller.abort(); rejectDeadline(new FeishuIngressError(code)); };
+    const cancellation = new Promise((_, reject) => controller.signal.addEventListener('abort', () => {
+      reject(new FeishuIngressError(state === 'stopped' ? 'feishu_stopped' : 'feishu_ingress_timeout'));
+    }, { once: true }));
+    const cancel = () => controller.abort();
     active.add(cancel);
     try {
       if (state === 'stopped') throw new FeishuIngressError('feishu_stopped');
       const event = normalizeFeishuEvent(type, payload, { connectionId, botOpenId, receivedAt: started });
-      timer = setTimeout(() => cancel('feishu_ingress_timeout'), deadlineMs);
+      timer = setTimeout(() => controller.abort(), deadlineMs);
       await Promise.race([cancellation, Promise.resolve().then(() => onEvent(event, {
         signal: controller.signal, deadlineAt: started + deadlineMs,
       }))]);
-      // Guard event-loop stalls and a commit that resolves after the budget.
-      if (Date.now() - started >= deadlineMs || controller.signal.aborted) throw new FeishuIngressError('feishu_ingress_timeout');
-      return undefined;
+      if (controller.signal.aborted) throw new FeishuIngressError('feishu_ingress_timeout');
     } catch (error) {
       const code = error instanceof FeishuIngressError ? error.code : 'feishu_ingress_failed';
-      // A rejected ingress remains eligible for platform redelivery; terminal
-      // retry exhaustion is owned by core, not this per-attempt adapter.
       observe('warning', 'retryable_failure', code, Date.now() - started);
-      throw new FeishuIngressError(code);
     } finally {
       clearTimeout(timer);
       active.delete(cancel);
     }
+  }
+  function receive(type, payload) {
+    void runEvent(type, payload);
+    return Promise.resolve({});
   }
   async function receiveCardAction(payload) {
     if (state === 'stopped') throw new FeishuIngressError('feishu_stopped');
@@ -97,9 +98,9 @@ export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '
       try { await wsClient.start({ eventDispatcher: dispatcher }); if (state !== 'stopped') state = 'started'; }
       catch { state = 'stopped'; wsClient.close({ force: true }); throw new Error('feishu_start_failed'); }
     },
-    stop() {
+    async stop() {
       state = 'stopped';
-      for (const cancel of active) cancel('feishu_stopped');
+      for (const cancel of active) cancel();
       wsClient.close({ force: true });
     },
     status() {

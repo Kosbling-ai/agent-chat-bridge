@@ -17,12 +17,41 @@ test('group capabilities default to both and allow either side or neither',()=>{
 });
 
 test('group mention can register forward and hook branches without either consuming the other',async()=>{
-  const accepted=[];const config=validateConfig({...base,hooks:[{id:'h',url:'https://example.invalid/h',tokenEnv:'TEST_HOOK',conversationIds:['chat']}]});
-  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async input=>{accepted.push(input);return{forwardRunId:'run',hookJobIds:['hook']};}},chat:{}});
-  const event={connectionId:'test',source:'live',eventKey:'event',type:'message.received',conversationId:'chat',conversationType:'group',messageId:'message',occurredAt:10,actor:{type:'user',openId:'human',name:'Human'},message:{kind:'text',parsedContent:{text:'<at>bot</at> hello'},mentions:[{openId:'bot',key:'<at>bot</at>'}]}};
+  const accepted=[];const forwarded=[];let receipts=0;const config=validateConfig({...base,hooks:[{id:'h',url:'https://example.invalid/h',tokenEnv:'TEST_HOOK',conversationIds:['chat']}]});
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async input=>{accepted.push(input);receipts++;return{duplicate:receipts>1,hookJobIds:['hook']};}},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{accepted:true};}},chat:{}});
+  const event={connectionId:'test',source:'live',eventKey:'event',type:'message.received',conversationId:'chat',conversationType:'group',messageId:'message',occurredAt:Date.now(),actor:{type:'user',openId:'human',name:'Human'},message:{kind:'text',content:'{"text":"<at>bot</at> hello"}',parsedContent:{text:'<at>bot</at> hello'},mentions:[{openId:'bot',key:'<at>bot</at>'}]}};
   await runtime.ingest(event);await runtime.ingest(event);
-  assert(accepted.every(item=>item.forwardJob&&item.hooks.length===1));
-  assert.equal(accepted[0].forwardJob.prompt,'Human：hello');
+  await new Promise(setImmediate);
+  assert(accepted.every(item=>item.forwardJob===undefined&&item.hooks.length===1));
+  assert.equal(forwarded.length,1);
+  assert.equal(forwarded[0].prompt,'【提到你的消息 来自 Human（open_id=human）】\nhello');
+});
+
+test('hook-only, bridge-only and both capabilities keep independent routing',async()=>{
+  for(const [capabilities,expectedHooks,expectedForwards] of [[['hook'],1,0],[['bridge'],0,1],[['bridge','hook'],1,1]]) {
+    const accepted=[];const forwarded=[];
+    const config=validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],capabilities}]},
+      hooks:[{id:'h',url:'https://example.invalid/h',tokenEnv:'TEST_HOOK',conversationIds:['chat']}]});
+    const runtime=createCommunicationRuntime({config,store:{acceptInbound:async input=>{accepted.push(input);return{duplicate:false};}},
+      forward:{handleMessage:async input=>{forwarded.push(input);return{accepted:true};}},chat:{}});
+    await runtime.ingest({connectionId:'test',source:'live',eventKey:`event-${capabilities.join('-')}`,type:'message.received',conversationId:'chat',conversationType:'group',messageId:`message-${capabilities.join('-')}`,occurredAt:Date.now(),actor:{type:'user',openId:'human',name:'Human'},message:{kind:'text',content:'{"text":"<at>bot</at> hello"}',mentions:[{openId:'bot',key:'<at>bot</at>'}]}});
+    await new Promise(setImmediate);
+    assert.equal(accepted[0].hooks.length,expectedHooks);
+    assert.equal(forwarded.length,expectedForwards);
+  }
+});
+
+test('stale group input is skipped while private history catchup keeps the original exception',async()=>{
+  const forwarded=[];const config=validateConfig({...base,routing:{...base.routing,privateUserIds:['human'],groups:[{...base.routing.groups[0],trigger:'all',capabilities:['bridge']}]}});
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async()=>({duplicate:false})},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{accepted:true};}},chat:{},now:()=>1_000_000});
+  const message={kind:'text',content:'{"text":"old"}',mentions:[]};
+  await runtime.ingest({connectionId:'test',source:'live',eventKey:'stale-group',type:'message.received',conversationId:'chat',conversationType:'group',messageId:'stale-group',occurredAt:1,actor:{type:'user',openId:'human',name:'Human'},message});
+  await runtime.ingest({connectionId:'test',source:'history_catchup',eventKey:'stale-private',type:'message.received',conversationId:'private',conversationType:'p2p',messageId:'stale-private',occurredAt:1,actor:{type:'user',openId:'human',name:'Human'},message});
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,1);
+  assert.equal(forwarded[0].message.messageId,'stale-private');
 });
 
 function memoryJobs(initial){let job={id:'run',internalId:'1',callerId:'caller',chatId:'chat',chatType:'group',messageId:'message',senderOpenId:'system:scope',senderName:'Caller',deliveryMode:'caller',executionNamespace:'daily',prompt:'work',attempts:1,result:{},createdAt:1,leaseOwner:'owner',...initial};const calls=[];const finish=async({status,result})=>{calls.push(['finished',status]);job={...job,status,result,replySentAt:null};};return{calls,get job(){return job;},upsert:async()=>({...job,duplicate:false}),claimReplyPending:async()=>job.status==='reply_pending'?[job]:[],claim:async()=>job.status==='pending'?[job={...job,status:'running',leaseOwner:'owner'}]:[],renew:async()=>({renewed:true}),patchExecution:async({execution})=>{calls.push(['execution',execution]);job={...job,result:{...job.result,execution}};},patchFeedback:async()=>{},markReplyPending:async({result})=>{calls.push(['reply_pending']);job={...job,status:'reply_pending',result};},markFinished:finish,markFinishedWithoutReply:finish,markRetry:async input=>{calls.push(['retry',input]);job={...job,status:input.held?'held':input.terminal?'failed':'pending',last_error:input.errorCode};},getRun:async()=>job,readEvents:async()=>[]};}

@@ -2,6 +2,19 @@ import { createHash, randomUUID } from 'node:crypto';
 import { withConnection } from './connection.mjs';
 import { StoreError } from './errors.mjs';
 
+// Trial rows that may already have caused a native or delivery side effect stay
+// isolated. A fresh binding or prepared input alone is safe to claim.
+const SAFE_EXECUTION_SQL = `
+  COALESCE(JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.execution.unconfirmed')),'false')!='true'
+  AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.execution.status')),'') NOT IN ('start_intent','bound','unknown')
+  AND JSON_EXTRACT(result_json,'$.execution.intent') IS NULL
+  AND JSON_EXTRACT(result_json,'$.execution.threadId') IS NULL
+  AND JSON_EXTRACT(result_json,'$.execution.turnId') IS NULL`;
+const SAFE_DELIVERY_SQL = `
+  JSON_SEARCH(result_json,'one','unknown') IS NULL
+  AND JSON_SEARCH(result_json,'one','send_intent') IS NULL
+  AND JSON_SEARCH(result_json,'one','upload_intent') IS NULL`;
+
 const hash = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 const parse = value => { try { return value ? JSON.parse(value) : {}; } catch { return {}; } };
 const required = (value, max = 255) => {
@@ -87,12 +100,32 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const at = now();
         const [candidates] = await connection.execute(`SELECT id FROM assistant_codex_forward_jobs
           WHERE ((status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)) OR (status='running' AND lease_expires_at<=?))
+            AND ${SAFE_EXECUTION_SQL}
           ORDER BY created_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [at,at]);
         if (!candidates.length) return [];
         const ids = candidates.map(item => String(item.id));
         await connection.execute(`UPDATE assistant_codex_forward_jobs SET status='running',attempts=attempts+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id IN (${ids.map(()=>'?').join(',')})`, [owner,at+leaseMs,at,at,...ids]);
         const [rows] = await connection.execute(`SELECT id AS internal_id, assistant_codex_forward_jobs.* FROM assistant_codex_forward_jobs WHERE id IN (${ids.map(()=>'?').join(',')}) ORDER BY created_at,id`,ids);
         return rows.map(row);
+      });
+    },
+    claimById(input) {
+      const owner = required(input.owner,191); const leaseMs = Number(input.leaseMs || 60000);
+      const id = required(input.id,36);
+      return write(async connection => {
+        const at = now();
+        const [[candidate]] = await connection.execute(`SELECT id FROM assistant_codex_forward_jobs
+          WHERE public_run_id=?
+            AND ((status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)) OR (status='running' AND lease_expires_at<=?))
+            AND ${SAFE_EXECUTION_SQL}
+          FOR UPDATE`, [id,at,at]);
+        if (!candidate) return null;
+        await connection.execute(`UPDATE assistant_codex_forward_jobs SET status='running',attempts=attempts+1,
+          lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?`,
+        [owner,at+leaseMs,at,at,candidate.id]);
+        const [[claimed]] = await connection.execute(`SELECT id AS internal_id,assistant_codex_forward_jobs.*
+          FROM assistant_codex_forward_jobs WHERE id=?`, [candidate.id]);
+        return row(claimed);
       });
     },
     claimReplyPending(input) {
@@ -104,6 +137,7 @@ export function createForwardJobStore({ pool, now = Date.now, operationTimeoutMs
         const [candidates] = await connection.execute(`SELECT id FROM assistant_codex_forward_jobs
           WHERE status='reply_pending' AND (lease_expires_at IS NULL OR lease_expires_at<=?)
             AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+            AND ${SAFE_DELIVERY_SQL}
           ORDER BY updated_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [at, at]);
         if (!candidates.length) return [];
         const ids = candidates.map(item => String(item.id));
