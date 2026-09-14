@@ -81,8 +81,9 @@ function validateRuntime(raw) {
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
   object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
-  object(raw.codex, ['bin', 'cwd', 'envNames', 'model', 'idleCloseMs', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'steering', 'proxyEnv', 'jobRetryMs', 'jobMaxAttempts'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'idleCloseMs', 'rolloverIdleMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'steering', 'proxyEnv', 'jobRetryMs', 'jobMaxAttempts'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
+  if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
   if (raw.codex.proxyEnv !== undefined) {
     object(raw.codex.proxyEnv, ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'], 'invalid_codex_proxy_fields');
     codex.proxyEnv = Object.fromEntries(Object.entries(raw.codex.proxyEnv).map(([name, source]) => [name, reference(source)]));
@@ -94,7 +95,7 @@ function validateRuntime(raw) {
   if (!Number.isSafeInteger(codex.jobRetryMs) || codex.jobRetryMs < 10_000 || codex.jobRetryMs > 1_800_000) throw new ConfigError('invalid_codex_job_retry');
   codex.jobMaxAttempts = raw.codex.jobMaxAttempts ?? 3;
   if (!Number.isInteger(codex.jobMaxAttempts) || codex.jobMaxAttempts < 1 || codex.jobMaxAttempts > 10) throw new ConfigError('invalid_codex_job_attempts');
-  codex.idleCloseMs = raw.codex.idleCloseMs ?? 0;
+  codex.idleCloseMs = raw.codex.idleCloseMs ?? 60_000;
   if (!Number.isSafeInteger(codex.idleCloseMs) || codex.idleCloseMs < 0 || codex.idleCloseMs > 24 * 60 * 60 * 1000) throw new ConfigError('invalid_codex_idle_close');
   codex.rolloverIdleMs = raw.codex.rolloverIdleMs ?? 2 * 24 * 60 * 60 * 1000;
   if (!Number.isSafeInteger(codex.rolloverIdleMs) || codex.rolloverIdleMs < 0 || codex.rolloverIdleMs > 365 * 24 * 60 * 60 * 1000) throw new ConfigError('invalid_idle_rollover');

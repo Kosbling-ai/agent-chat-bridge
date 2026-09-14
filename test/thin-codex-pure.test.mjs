@@ -95,6 +95,8 @@ test('shared home rejects conflicting inherited state and owned close escalates 
   try {
     mkdirSync(join(root, '.codex'));
     assert.equal(resolveSharedHome({ home: root, inheritedHome: '' }), realpathSync(join(root, '.codex')));
+    mkdirSync(join(root, 'shared'));
+    assert.equal(resolveSharedHome({ configuredHome: '~/shared', inheritedHome: join(root, 'shared'), home: root }), realpathSync(join(root, 'shared')));
     assert.throws(() => resolveSharedHome({ home: root, inheritedHome: join(root, 'other') }), { code: 'CODEX_HOME_CONFLICT' });
     const child = new EventEmitter(); child.exitCode = null; child.signalCode = null; child.signals = [];
     child.stdin = { end() {} };

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4] — Unreleased
+
+- Restore the frozen production runtime defaults: the launching user's shared Codex home, a 60-second idle child close, and `shell_environment_policy.inherit=all` within the explicitly constructed child environment.
+- Add optional `codex.sharedHome`. A configured value and inherited `CODEX_HOME` must resolve to the same directory; explicit `codex.idleCloseMs: 0` remains supported.
+
+No database migration is added. Validation uses offline configuration, lifecycle and synthetic child-process fixtures; no real message or model acceptance was run.
+
 ## [0.2.3] — Unreleased
 
 - Keep the owned Codex app-server open while the bridge service remains running by default. This removes the 60-second idle child close without adding keepalive traffic or changing native writer-lock behavior.

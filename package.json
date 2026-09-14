@@ -1,6 +1,6 @@
 {
   "name": "agent-chat-bridge",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "type": "module",
   "description": "Independent Feishu and Codex client with durable hooks and message delivery",

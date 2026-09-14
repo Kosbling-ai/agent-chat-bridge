@@ -23,7 +23,8 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).feishu.catchup, true);
   assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
   assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
-  assert.equal(validateConfig(config).codex.idleCloseMs, 0);
+  assert.equal(validateConfig(config).codex.idleCloseMs, 60_000);
+  assert.equal(validateConfig({ ...config, codex: { ...config.codex, idleCloseMs: 0 } }).codex.idleCloseMs, 0);
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, catchup: false } }).feishu.catchup, false);
   for (const invalid of [
     { ...config, codex: { ...config.codex, approvalPolicy: 'never' } },
@@ -141,6 +142,53 @@ test('SDK request wrapper enforces time, redirects and size without retries', as
   const client = boundedFeishuHttp({ request: async options => { calls++; assert.equal(options.timeout, 10000); assert.equal(options.maxRedirects, 0); return {}; } });
   await client.request({ timeout: 0, maxRedirects: 5 });
   assert.equal(calls, 1);
+});
+test('service rejects configured and inherited Codex homes that differ', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-home-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const runtimeConfig = validateConfig({
+    ...config,
+    codex: { bin: process.execPath, cwd: directory, sharedHome: join(directory, 'configured'), envNames: [] },
+  });
+  await assert.rejects(startService({
+    config: runtimeConfig,
+    configPath: join(directory, 'config.json'),
+    env: {
+      HOME: directory,
+      CODEX_HOME: join(directory, 'inherited'),
+      TEST_TOKEN: 'synthetic-token-for-service-only',
+      TEST_APP: 'synthetic',
+      TEST_SECRET: 'synthetic',
+    },
+  }), { code: 'CODEX_HOME_CONFLICT' });
+});
+test('explicit service env does not fall back to ambient CODEX_HOME', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-ambient-home-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const previous = process.env.CODEX_HOME;
+  const hadPrevious = Object.hasOwn(process.env, 'CODEX_HOME');
+  process.env.CODEX_HOME = '/synthetic/ambient-codex-home';
+  const reachedPool = new Error('synthetic_pool_boundary');
+  try {
+    const runtimeConfig = validateConfig({
+      ...config,
+      codex: { bin: process.execPath, cwd: directory, sharedHome: join(directory, '.codex'), envNames: [] },
+    });
+    await assert.rejects(startService({
+      config: runtimeConfig,
+      configPath: join(directory, 'config.json'),
+      env: {
+        HOME: directory,
+        TEST_TOKEN: 'synthetic-token-for-service-only',
+        TEST_APP: 'synthetic',
+        TEST_SECRET: 'synthetic',
+      },
+      dependencies: { pool() { throw reachedPool; } },
+    }), error => error === reachedPool);
+  } finally {
+    if (hadPrevious) process.env.CODEX_HOME = previous;
+    else delete process.env.CODEX_HOME;
+  }
 });
 test('failed async warning sinks never become unhandled rejections', async () => {
   const reporter = createErrorReporter({ url: 'http://synthetic.invalid', token: 'synthetic', warn: async () => { throw new Error('synthetic warning failure'); }, fetchImpl: async () => { throw new Error('synthetic HTTP failure'); } });

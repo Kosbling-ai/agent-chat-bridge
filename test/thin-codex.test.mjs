@@ -104,12 +104,13 @@ test('app-server starts lazily with a controlled environment and explicit policy
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
     const runtime = fakeRuntime();
-    const client = new CodexAppServerClient({ config: config(cwd), childEnv: { PATH: '/safe/bin', HTTPS_PROXY: 'http://proxy.invalid' }, spawnImpl: runtime.spawnImpl });
+    const client = new CodexAppServerClient({ config: { ...config(cwd), idleCloseMs: undefined }, childEnv: { PATH: '/safe/bin', HTTPS_PROXY: 'http://proxy.invalid' }, spawnImpl: runtime.spawnImpl });
     assert.equal(runtime.children.length, 0);
+    assert.equal(client.lifecycle.idleMs, 60_000);
     await client.request('thread/start', {});
     assert.deepEqual(runtime.envs[0], { PATH: '/safe/bin', HTTPS_PROXY: 'http://proxy.invalid', CODEX_HOME: join(cwd, 'home') });
     assert.ok(runtime.args[0].includes('sandbox_workspace_write.network_access=false'));
-    assert.ok(runtime.args[0].includes('shell_environment_policy.inherit=none'));
+    assert.ok(runtime.args[0].includes('shell_environment_policy.inherit=all'));
     await client.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
