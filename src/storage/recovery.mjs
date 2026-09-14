@@ -57,13 +57,19 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       if (input.action === 'adopt_turn' && (!threadId || !turnId)) throw new StoreError('invalid_recovery');
       const digest = hash({ runId, action: input.action, generation: String(input.expectedGeneration), evidence, threadId, turnId });
       return write(async (c) => {
-        // Completed requests remain replayable even when the target is no longer unknown.
-        const [[existing]] = await c.execute(`SELECT id,payload_hash FROM bridge_recoveries
-          WHERE connection_id=? AND caller_id=? AND idempotency_key=?`, [connectionId,callerId,key]);
-        if (existing) {
-          if (existing.payload_hash !== digest) throw new StoreError('recovery_conflict');
-          return { id: existing.id, duplicate: true };
-        }
+        // The scoped unique key serializes retries before validating a target
+        // that may already have been settled by a completed recovery.
+        const id = randomUUID();
+        await c.execute(`INSERT INTO bridge_recoveries
+          (id,run_id,connection_id,caller_id,idempotency_key,payload_hash,action,expected_generation,
+           native_thread_id,native_turn_id,evidence,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [
+          id, runId, connectionId,callerId, key, digest, input.action, input.expectedGeneration, threadId, turnId, evidence, now(), now(),
+        ]);
+        const [[row]] = await c.execute(`SELECT id,payload_hash FROM bridge_recoveries
+          WHERE connection_id=? AND caller_id=? AND idempotency_key=? FOR UPDATE`, [connectionId,callerId, key]);
+        if (row.payload_hash !== digest) throw new StoreError('recovery_conflict');
+        if (row.id !== id) return { id: row.id, duplicate: true };
         const { attempt } = await target(c, runId, input.expectedGeneration, input.action);
         if (attempt.connection_id !== connectionId) throw new StoreError('recovery_conflict');
         if (input.action === 'adopt_turn') {
@@ -71,17 +77,9 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
             WHERE connection_id=? AND native_thread_id=? FOR UPDATE`, [connectionId,threadId]);
           if (owner?.resource_retired_at != null) throw new StoreError('resource_retired');
         }
-        const id = randomUUID();
-        await c.execute(`INSERT INTO bridge_recoveries
-          (id,run_id,connection_id,conversation_id,caller_id,idempotency_key,payload_hash,action,expected_generation,
-           native_thread_id,native_turn_id,evidence,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [
-          id, runId, connectionId,attempt.conversation_id,callerId, key, digest, input.action, input.expectedGeneration, threadId, turnId, evidence, now(), now(),
-        ]);
-        const [[row]] = await c.execute(`SELECT id,payload_hash FROM bridge_recoveries
-          WHERE connection_id=? AND caller_id=? AND idempotency_key=?`, [connectionId,callerId, key]);
-        if (row.payload_hash !== digest) throw new StoreError('recovery_conflict');
-        return { id: row.id, duplicate: row.id !== id };
+        await c.execute('UPDATE bridge_recoveries SET conversation_id=? WHERE id=? AND connection_id=?',
+          [attempt.conversation_id,id,connectionId]);
+        return { id, duplicate: false };
       });
     },
     claimRecoveries(input) {

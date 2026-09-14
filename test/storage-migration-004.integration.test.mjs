@@ -109,6 +109,7 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
     await pool.query('ALTER TABLE assistant_codex_sessions MODIFY COLUMN connection_id VARCHAR(128) NOT NULL');
     await assert.rejects(migrate(pool, { legacyConnectionId: 'other-bot' }), { code: 'legacy_connection_id_mismatch' });
     assert.equal(cliCode(storageCli, ['--config', storageConfig, '--legacy-connection-id', 'other-bot']), 'legacy_connection_id_mismatch');
+    assert.equal(cliCode(publicCli, ['migrate', '--config', publicConfig, '--legacy-connection-id', 'other-bot']), 'legacy_connection_id_mismatch');
     assert.deepEqual(await migrate(pool, { legacyConnectionId: 'original-bot' }), { version: 4, applied: true });
     assert.deepEqual(await assertSchemaCurrent(pool), { version: 4 });
     for (const table of assistantTables) {

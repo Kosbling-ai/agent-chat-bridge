@@ -95,6 +95,11 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
             || hash(predecessor.payload.ref) !== hash(ref)) throw new StoreError('invalid_artifact_effect');
       }
     }
+    if (input.predecessorId) {
+      const [[predecessor]] = await c.execute(`SELECT id FROM bridge_outbox
+        WHERE id=? AND connection_id=? AND conversation_id=?`, [text(input.predecessorId,36),connectionId,conversationId]);
+      if (!predecessor) throw new StoreError('invalid_outbox_predecessor');
+    }
     if (input.jobId) {
         const [[job]] = await c.execute('SELECT output_resource_state FROM bridge_jobs WHERE id=? AND connection_id=? FOR UPDATE',[input.jobId,connectionId]);
         if (!job) throw new StoreError('invalid_artifact_effect');
@@ -153,7 +158,8 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
         condition = `j.connection_id=? AND ((j.status='pending' AND j.next_attempt_at<=?) OR
           (j.status='unknown' AND j.kind IN ('create','reply','artifact_send') AND j.first_attempt_at>? AND j.next_attempt_at<=?))
           AND (j.predecessor_id IS NULL OR EXISTS (
-            SELECT 1 FROM bridge_outbox predecessor WHERE predecessor.id=j.predecessor_id AND predecessor.status='sent'
+            SELECT 1 FROM bridge_outbox predecessor WHERE predecessor.id=j.predecessor_id
+              AND predecessor.connection_id=j.connection_id AND predecessor.status='sent'
           ))`;
         params = [connectionId,now(), now()-55*60*1000, now()];
       }
@@ -423,7 +429,7 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
     getOutbox: (input) => read(async (c) => {
       const [[row]] = await c.execute(`SELECT effect.*, predecessor.status AS predecessor_status, predecessor.result AS predecessor_result,
         (effect.predecessor_id IS NOT NULL AND (predecessor.id IS NULL OR predecessor.status<>'sent')) AS blocked
-        FROM bridge_outbox effect LEFT JOIN bridge_outbox predecessor ON predecessor.id=effect.predecessor_id
+        FROM bridge_outbox effect LEFT JOIN bridge_outbox predecessor ON predecessor.id=effect.predecessor_id AND predecessor.connection_id=effect.connection_id
         WHERE effect.id=? AND effect.connection_id=?`, [text(input.id, 36),connectionId]);
       return row ? { ...decode(row), blocked: Boolean(row.blocked), predecessorResult: row.predecessor_status === 'sent' ? row.predecessor_result : null } : null;
     }),

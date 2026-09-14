@@ -28,11 +28,11 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
      return c;
    };
    const register=(key)=>mode==='enqueue'
-     ? store.enqueueJob({kind:'hook',connectionId:'c',conversationId:mode,hookId:'h',idempotencyKey:key,payload:{}})
-     : store.acceptInbound({connectionId:'c',conversationId:mode,eventKey:key,eventType:'message',payload:{},policyVersion:'v',hooks:[{hookId:'h'}]});
+     ? store.enqueueJob({kind:'hook',connectionId:'c',conversationId:mode,hookId:'h',idempotencyKey:`${mode}:${key}`,payload:{}})
+     : store.acceptInbound({connectionId:'c',conversationId:mode,eventKey:`${mode}:${key}`,eventType:'message',payload:{},policyVersion:'v',hooks:[{hookId:'h'}]});
    let first,second;
    try {
-     first=register('first');await entered;
+     first=register('first');await Promise.race([entered,first.then(()=>{throw new Error('commit_not_intercepted');})]);
      let secondDone=false;
      second=register('second').then(value=>{secondDone=true;return value;});
      await new Promise(resolve=>setTimeout(resolve,50));
@@ -50,6 +50,7 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  const event=await store.acceptInbound(input);assert.equal(event.duplicate,false);
  const repeated=await store.acceptInbound({...input,policyVersion:'v2'});assert.equal(repeated.duplicate,true);assert.equal(repeated.agentJobId,event.agentJobId);
  await assert.rejects(store.acceptInbound({...input,payload:{text:'changed'}}),{code:'inbound_conflict'});
+ await store.enqueueJob({kind:'agent',connectionId:'c',conversationId:'chat',idempotencyKey:'agent:first',payload:{prompt:'synthetic'}});
  const [job]=await store.claimJobs({kind:'agent',owner:'one',limit:1,leaseMs:1000});
  clock+=1100;const [replacement]=await store.claimJobs({kind:'agent',owner:'two',limit:1,leaseMs:1000});
  await assert.rejects(store.finishJobWithOutbox({id:job.id,leaseToken:job.leaseToken}),{code:'stale_lease'});
@@ -65,6 +66,7 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  const hookEvent=await store.acceptInbound({...input,eventKey:'event2'});
  const [hook1]=await store.claimJobs({kind:'hook',owner:'one',leaseMs:1000});assert.equal(hook1.id,event.hookJobIds[0]);assert.deepEqual(await store.claimJobs({kind:'hook',owner:'two',leaseMs:1000}),[]);
  await store.finishJobWithOutbox({id:hook1.id,leaseToken:hook1.leaseToken});const [hook2]=await store.claimJobs({kind:'hook',owner:'one',leaseMs:1000});assert.equal(hook2.id,hookEvent.hookJobIds[0]);
+ await store.enqueueJob({kind:'agent',connectionId:'c',conversationId:'chat',idempotencyKey:'agent:second',payload:{prompt:'synthetic'}});
  const [agent2]=await store.claimJobs({kind:'agent',owner:'one',leaseMs:1000});const attempt=await store.beginAgentAttempt({id:agent2.id,leaseToken:agent2.leaseToken,agentId:'codex'});assert.equal(attempt.recoveryRequired,false);
  assert.equal((await store.beginAgentAttempt({id:agent2.id,leaseToken:agent2.leaseToken,agentId:'codex'})).recoveryRequired,true);
  await assert.rejects(store.resetSession({...key,expectedGeneration:2}),{code:'session_busy_or_conflict'});
@@ -75,7 +77,7 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  // Actual COMMIT succeeds in MySQL; response is deliberately lost at driver boundary.
  const lostCommitPool={async getConnection(){const c=await pool.getConnection();const original=c.commit.bind(c);c.commit=async()=>{await original();throw new Error('synthetic lost response');};return c;}};
  await assert.rejects(withConnection(lostCommitPool,c=>c.execute('INSERT INTO bridge_cursors (connection_id,cursor_key,version,value,updated_at) VALUES (?,?,1,?,?)',['fault','commit',JSON.stringify({ok:true}),clock]),{transaction:true}),{code:'commit_unknown'});
- const [[faultCursor]]=await pool.query('SELECT value FROM bridge_cursors WHERE connection_id=? AND cursor_key=?',['fault','commit']);assert.deepEqual(JSON.parse(faultCursor.value),{ok:true});
+ const [[faultCursor]]=await pool.query('SELECT value FROM bridge_cursors WHERE connection_id=? AND cursor_key=?',['fault','commit']);assert.deepEqual(faultCursor.value,{ok:true});
  await store.excludeMessage({connectionId:'c',messageId:'future'});await store.acceptInbound({...input,eventKey:'future',messageId:'future',agentJob:null,hooks:[]});assert.equal((await store.readPassiveContext(input)).some(row=>row.messageId==='future'),false);
  const unknownJob=await store.enqueueJob({kind:'agent',connectionId:'c',conversationId:'unknown',idempotencyKey:'unknown',payload:{}});const [unknownClaim]=await store.claimJobs({kind:'agent',owner:'one',leaseMs:1000});assert.equal(unknownClaim.id,unknownJob.id);await store.beginAgentAttempt({id:unknownClaim.id,leaseToken:unknownClaim.leaseToken,agentId:'codex'});await store.holdAgentAttempt({id:unknownClaim.id,leaseToken:unknownClaim.leaseToken,errorCode:'rpc_timeout'});assert.equal((await store.getJob({id:unknownClaim.id})).status,'unknown');assert.deepEqual(await store.claimJobs({kind:'agent',owner:'other',leaseMs:1000}),[]);
  const start=Date.now();await assert.rejects(withConnection(pool,c=>c.query('SELECT SLEEP(5)'),{timeoutMs:50}),{code:'store_timeout'});assert.ok(Date.now()-start<1000);await assertSchemaCurrent(pool);
