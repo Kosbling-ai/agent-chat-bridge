@@ -34,11 +34,11 @@ export function buildInitialPrompt({ binding, prompt, groupChatContext, outboxRe
     }
     return lines.length ? `${lines.join('\n')}\n\n${prompt}` : prompt;
   }
-  if (!binding.created) return prompt;
-  const lines = ['【飞书私聊会话】'];
-  if (clean(binding.chatId)) lines.push(`chat_id：${clean(binding.chatId)}`);
-  if (clean(binding.feishuOpenId)) lines.push(`对方 open_id：${clean(binding.feishuOpenId)}`);
+  const lines = [binding.created ? '【飞书私聊会话】' : '【飞书私聊文件回传】'];
+  if (binding.created && clean(binding.chatId)) lines.push(`chat_id：${clean(binding.chatId)}`);
+  if (binding.created && clean(binding.feishuOpenId)) lines.push(`对方 open_id：${clean(binding.feishuOpenId)}`);
   lines.push(`回发文件目录：${outbox}`);
+  lines.push('说明：需要回发本机图片或文件时，必须复制或写入该目录；只在 Markdown 中引用本机路径不会上传。');
   return `${lines.join('\n')}\n\n${prompt}`;
 }
 

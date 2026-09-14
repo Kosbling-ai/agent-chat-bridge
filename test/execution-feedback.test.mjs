@@ -306,3 +306,15 @@ test('terminal cards derive completed failed and interrupted from persisted resu
     assert(JSON.stringify(content).includes(expected));
   }
 });
+
+test('terminal card removes local image paths with the same collected attachment boundary as ordinary replies', async () => {
+  const job=jobFixture();job.sourceMessageId=null;
+  job.result={...job.result,answer:'Before ![sent](image.png) ![missing](/tmp/missing.png) after',attachments:['/workspace/image.png']};
+  let content;
+  const feedback=createExecutionFeedback({jobs:{async patchFeedback(){}},sessions:{},chat:{},executor:{},workspace:'/workspace',
+    cardClient:{im:{v1:{message:{async patch(input){content=JSON.parse(input.data.content);return{code:0};}}}}}});
+  assert.equal(await feedback.finish(job,job.result),true);
+  const encoded=JSON.stringify(content);
+  assert.match(encoded,/Before sent 图片.*missing.*未能发送。 after/);
+  assert.doesNotMatch(encoded,/\/workspace|\/tmp\/missing/);
+});

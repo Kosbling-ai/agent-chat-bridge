@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { ExecutionCard, observeExecutionCard } from './execution-card.mjs';
 import { codexBindingOpenId } from '../../agents/codex/thread-scope.mjs';
+import { adaptLocalMarkdownImages } from './markdown-images.mjs';
 
 const stable = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const toast = (content, type = 'info') => ({ toast: { type, content } });
@@ -14,7 +15,7 @@ const productionCardState = saved => {
 };
 
 export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClient, authorize = async () => true,
-  executor, runAsync = operation => { Promise.resolve().then(operation).catch(() => {}); }, config = {}, log = () => {}, now = Date.now } = {}) {
+  executor, workspace, runAsync = operation => { Promise.resolve().then(operation).catch(() => {}); }, config = {}, log = () => {}, now = Date.now } = {}) {
   const bindingOpenId = (job, result = job.result || {}) => result.execution?.bindingOpenId
     || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType });
 
@@ -173,7 +174,8 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
         const status = terminal === 'interrupted' ? 'interrupted' : result.failed || terminal === 'failed' ? 'failed'
           : result.deferred ? 'deferred' : 'completed';
         try {
-          delivered = await card.finish(result.answer || 'Codex 没有返回可用结论。', status);
+          const answer = adaptLocalMarkdownImages(result.answer, result.attachments, { workspace });
+          delivered = await card.finish(answer || 'Codex 没有返回可用结论。', status);
           result.executionCard = card.snapshot();
         } catch (error) { cardError = error; }
       }

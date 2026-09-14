@@ -198,7 +198,7 @@ export async function startService({ config, configPath, env = process.env, log,
       spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'),
       allowedGroupChatIds, maxTotalBytes: config.feishu.outputBudgetBytes, log });
     checkCancelled();
-    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,allowedGroupChatIds,
+    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,
       sendAttachment: input => sendOutboundAttachment({ client, ...input }),
       replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
     const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
@@ -206,7 +206,7 @@ export async function startService({ config, configPath, env = process.env, log,
       runAsync:runCardOperation,config:{displayName:config.feishu.displayName},log});
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
       emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
-    const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,
+    const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,workspace:cwd,
       runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
     forward=factories.forward({config:{
       steering:config.codex.steering,

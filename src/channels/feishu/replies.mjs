@@ -2,10 +2,10 @@ import { createHash } from 'node:crypto';
 import { unlink } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import { canDeliverOutboxAttachments } from '../../agents/codex/outbox-policy.mjs';
+import { adaptLocalMarkdownImages, referencedCollectedLocalImages } from './markdown-images.mjs';
 
 const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const imageTypes = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
-
 export function publicAttachments(attachments = []) {
   return attachments.map((value, index) => {
     const path = typeof value === 'string' ? value : value?.filePath;
@@ -18,7 +18,7 @@ export function publicAttachments(attachments = []) {
   });
 }
 
-export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, connectionId, allowedGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
+export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, connectionId, workspace, allowedGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
   function artifactScope(job, result = job.result || {}) {
     const execution = result.execution || job.result?.execution || {};
     return {
@@ -57,7 +57,8 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
     }
     const kind = replyAsPost ? 'post' : 'text';
     const chunkSize = replyAsPost ? 3000 : 1900;
-    const chunks = chunkText(limitText(String(result.answer || 'Codex 没有返回可用结论。'), maxOutputChars), chunkSize);
+    const answer = adaptLocalMarkdownImages(result.answer, result.attachments, { workspace });
+    const chunks = chunkText(limitText(answer || 'Codex 没有返回可用结论。', maxOutputChars), chunkSize);
     const prefix = codexReplyUuidPrefix(job, result);
     const sent = [];
     for (const [index, chunk] of chunks.entries()) {
@@ -99,6 +100,26 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
     return facts;
   }
 
+  async function reportAttachmentFailures(job, result, attachments, control) {
+    const paths = Array.isArray(result.attachments) ? result.attachments : [];
+    const referenced = referencedCollectedLocalImages(result.answer, paths, { workspace });
+    const failed = attachments.filter(item => item.status === 'failed' && referenced.has(paths[item.index]));
+    if (!failed.length) return 0;
+    const lines = failed.map(() => '图片未能发送。');
+    try {
+      control.assertLease();
+      const kind = replyAsPost ? 'post' : 'text';
+      const content = replyAsPost ? markdownToFeishuPost(lines.join('\n')) : { text: lines.join('\n') };
+      await chat.sendMessage({ conversationId: job.chatId, kind, content,
+        uuid: stableEventKey(`${codexReplyUuidPrefix(job, result)}:attachment-failures`) });
+      return 1;
+    } catch (error) {
+      if (error?.code === 'forward_lease_lost') throw error;
+      log('warning', 'forward_attachment', 'failed', { code: 'attachment_failure_notice_failed' });
+      return 0;
+    }
+  }
+
   return Object.freeze({
     prepare,
     async deliver(job, result, { skipText = false, signal, assertLease = () => {} } = {}) {
@@ -106,12 +127,13 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
       const control = { signal, assertLease };
       const text = skipText ? { sent: 0, status: 'sent' } : await sendText(job, result, control);
       const attachments = await sendAttachments(job, result, control);
+      const failureMessages = await reportAttachmentFailures(job, result, attachments, control);
       const statuses = [text.status, ...attachments.map(item => item.status)];
       const status = statuses.some(value => value === 'unknown') ? 'unknown'
         : text.status === 'failed' ? 'failed' : 'sent';
       log(status === 'sent' ? 'info' : 'warning', 'forward_reply', status === 'sent' ? 'succeeded' : status,
         { attachments: attachments.filter(item => ['sent', 'cleaned'].includes(item.status)).length });
-      return { messages: text.sent, attachments, status };
+      return { messages: text.sent + failureMessages, attachments, status };
     },
     async readResource(job, index) {
       const artifact = (job.result?.attachments || [])[index];

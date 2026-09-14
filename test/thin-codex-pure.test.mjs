@@ -75,6 +75,14 @@ test('outbox policy remains p2p-on and group allowlist-only', () => {
   assert.equal(canDeliverOutboxAttachments({ chatType: 'group', chatId: 'denied', allowedGroupChatIds: groups }), false);
 });
 
+test('continued p2p turns repeat the current outbox without repeating identity', () => {
+  const prompt = buildInitialPrompt({ binding: { feishuOpenId: 'human', chatId: 'private', chatType: 'p2p', created: false }, prompt: 'work' });
+  assert.match(prompt, /【飞书私聊文件回传】/);
+  assert.match(prompt, /回发文件目录：data\/feishu-outbox\/private/);
+  assert.match(prompt, /Markdown 中引用本机路径不会上传/);
+  assert.doesNotMatch(prompt, /chat_id：|对方 open_id：/);
+});
+
 test('prompt and attachment scan isolate system directories and enforce file/byte budgets', () => {
   const root = mkdtempSync(join(tmpdir(), 'bridge-outbox-'));
   try {

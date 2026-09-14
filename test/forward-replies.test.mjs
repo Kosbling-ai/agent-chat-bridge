@@ -5,6 +5,7 @@ import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createFeishuReplies, markdownToFeishuPost } from '../src/channels/feishu/replies.mjs';
+import { adaptLocalMarkdownImages } from '../src/channels/feishu/markdown-images.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 
 test('bridge attachments use executor paths, delete successes and retain failures without blocking text', async t => {
@@ -23,6 +24,49 @@ test('bridge attachments use executor paths, delete successes and retain failure
   const sha1 = value => createHash('sha1').update(value).digest('hex').slice(0,24);
   const prefix = sha1('codex-reply:source:turn:thread');
   assert.deepEqual(calls,['text',`attachment:${first}:${sha1(`${prefix}:file:0`)}`,`attachment:${second}:${sha1(`${prefix}:file:1`)}`]);
+});
+
+test('local markdown images are paired only with collected attachments without leaking paths', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'bridge-image-replies-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const collected=join(root,'sent.png'),missing=join(root,'missing.png');await writeFile(collected,'image');
+  const answer=`Before ![sent alt](sent.png) middle ![missing alt](<${missing.replace('missing.png','pics (final)/missing.png')}>) after ![remote](//example.invalid/a.png)`;
+  const adapted=adaptLocalMarkdownImages(answer,[collected],{workspace:root});
+  assert.equal(adapted,'Before sent alt middle 图片“missing alt”未能发送。 after ![remote](//example.invalid/a.png)');
+  assert.doesNotMatch(adapted,new RegExp(root));
+  const calls=[];const job={id:'run',leaseOwner:'worker',chatId:'chat',chatType:'p2p',messageId:'source',result:{answer,attachments:[collected]}};
+  const replies=createFeishuReplies({chat:{async sendMessage(input){calls.push(input);return{message_id:'text'};}},jobs:{},connectionId:'fixture',workspace:root,
+    async sendAttachment(){return{messageId:'image'};}});
+  const delivered=await replies.deliver(job,job.result,{assertLease(){}});
+  assert.equal(delivered.attachments[0].status,'sent');
+  const encoded=JSON.stringify(calls[0].content);
+  assert.match(encoded,/sent alt/);assert.match(encoded,/missing alt/);assert.match(encoded,/example.invalid/);assert.doesNotMatch(encoded,new RegExp(root));
+});
+
+test('local markdown image parsing consumes parenthesized and angle-bracket paths completely', () => {
+  const first='/tmp/pics(final)/private.png',second='/tmp/pics (final)/private.png';
+  assert.equal(adaptLocalMarkdownImages(`A ![one](${first}) Z`,[]),'A 图片“one”未能发送。 Z');
+  assert.equal(adaptLocalMarkdownImages(`A ![two](<${second}>) Z`,[]),'A 图片“two”未能发送。 Z');
+  assert.equal(adaptLocalMarkdownImages('A ![remote](//example.invalid/a.png) Z',[]),'A ![remote](//example.invalid/a.png) Z');
+});
+
+test('standard markdown titles and escapes use parsed image URLs while code remains literal', () => {
+  const path='/tmp/pics(final)/private.png';
+  assert.equal(adaptLocalMarkdownImages('A ![one](/tmp/pics\\(final\\)/private.png "caption") Z',[path]),'A one Z');
+  assert.equal(adaptLocalMarkdownImages('A ![two](</tmp/missing.png> "caption") Z',[]),'A 图片“two”未能发送。 Z');
+  const code='`![inline](/tmp/private.png)`\n```md\n![block](/tmp/private.png)\n```';
+  assert.equal(adaptLocalMarkdownImages(code,[]),code);
+});
+
+test('failed image upload gets one stable path-free user notice', async t => {
+  const root=await mkdtemp(join(tmpdir(),'bridge-image-failure-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const image=join(root,'failed.png');await writeFile(image,'image');const calls=[];
+  const job={id:'run',leaseOwner:'worker',chatId:'chat',chatType:'p2p',messageId:'source',result:{execution:{threadId:'thread',turnId:'turn'},answer:`![preview](${image})`,attachments:[image]}};
+  const replies=createFeishuReplies({chat:{async sendMessage(input){calls.push(input);return{message_id:'text'};}},jobs:{},connectionId:'fixture',async sendAttachment(){throw new Error('synthetic');}});
+  const delivered=await replies.deliver(job,job.result,{assertLease(){}});
+  assert.equal(delivered.messages,2);assert.equal(delivered.attachments[0].status,'failed');assert.equal(calls.length,2);
+  assert.match(JSON.stringify(calls[1].content),/图片未能发送/);assert.doesNotMatch(JSON.stringify(calls[1].content),new RegExp(root));
+  assert.equal(typeof calls[1].uuid,'string');assert.equal(calls[1].uuid.length,24);
 });
 
 test('API run without a source message creates the original post in the conversation', async () => {
