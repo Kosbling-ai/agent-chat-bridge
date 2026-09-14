@@ -6,6 +6,12 @@ Application version: `0.2.3`
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
 
+## Branch promotion
+
+Development changes are integrated and tested on `staging` before a `staging` to `main` promotion pull request. `main` remains the default branch. Moving source to either branch does not automatically run a migration, deploy an instance, publish npm, create or move a tag, or declare a release. See the [staging workflow](docs/staging-workflow.md).
+
+A schema change must reach `staging` with its immutable forward migration and rollback plan. Apply it only to a dedicated staging database through the explicit migrate command after an authorized backup and writer stop. Promotion to `main` preserves that reviewed migration history; production migration remains a separate, authorized operation.
+
 ## 0.2.3 app-server idle lifecycle
 
 Version 0.2.3 adds no database migration. Optional `codex.idleCloseMs` defaults to `0`, which disables automatic idle child close. A nonnegative integer up to 86400000 ms is accepted; explicit service shutdown and crash handling remain active.
