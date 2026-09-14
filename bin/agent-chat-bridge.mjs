@@ -9,7 +9,8 @@ const SAFE_IMPORT_CODES = new Set(['invalid_binding_snapshot', 'unsupported_bind
   'binding_import_connection_mismatch', 'binding_import_source_not_drained', 'binding_import_mapping_missing',
   'binding_import_mapping_unused', 'binding_import_identity_mismatch', 'binding_import_duplicate_identity',
   'binding_import_duplicate_thread', 'binding_import_target_jobs', 'binding_import_conflict',
-  'binding_import_thread_conflict', 'binding_import_rules_rollover_enabled', 'writer_busy', 'schema_version_mismatch']);
+  'binding_import_thread_conflict', 'binding_import_rules_rollover_enabled', 'writer_busy', 'schema_version_mismatch',
+  'commit_unknown']);
 
 const HELP = `agent-chat-bridge
 

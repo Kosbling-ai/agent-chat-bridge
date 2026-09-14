@@ -146,19 +146,24 @@ async function inspect(connection, snapshot, { lock = false } = {}) {
 }
 
 export async function importBindingSnapshot({ pool, connectionId, rolloverOnRulesUpdate, snapshot, apply = false,
-  operationTimeoutMs = 5000 } = {}) {
+  operationTimeoutMs = 5000, dependencies = {} } = {}) {
+  const assertCurrent = dependencies.assertSchemaCurrent || assertSchemaCurrent;
+  const lockWriter = dependencies.acquireWriter || acquireWriter;
+  const runWithConnection = dependencies.withConnection || withConnection;
   if (!pool || typeof connectionId !== 'string' || !connectionId) invalid('invalid_store_input');
   if (rolloverOnRulesUpdate !== false) invalid('binding_import_rules_rollover_enabled');
   const normalized = normalizeBindingSnapshot(snapshot, connectionId);
-  await assertSchemaCurrent(pool);
+  await assertCurrent(pool);
   if (!apply) {
-    const result = await withConnection(pool, connection => inspect(connection, normalized), { timeoutMs: operationTimeoutMs });
+    const result = await runWithConnection(pool, connection => inspect(connection, normalized), { timeoutMs: operationTimeoutMs });
     return { applied: false, ...result.summary, total: normalized.bindings.length, sourceQueue: normalized.sourceQueue,
       mappings: normalized.bindings.filter(row => row.mapping).map(row => row.mapping) };
   }
-  const writer = await acquireWriter(pool, () => {}, { timeoutMs: operationTimeoutMs, connectionId });
+  let transactionConnection;
+  const writer = await lockWriter(pool, () => transactionConnection?.destroy(), { timeoutMs: operationTimeoutMs, connectionId });
   try {
-    const result = await withConnection(pool, async connection => {
+    const result = await runWithConnection(pool, async connection => {
+      transactionConnection = connection;
       await writer.verify();
       const plan = await inspect(connection, normalized, { lock: true });
       for (const row of normalized.bindings) {
@@ -178,7 +183,10 @@ export async function importBindingSnapshot({ pool, connectionId, rolloverOnRule
     }, { timeoutMs: operationTimeoutMs, transaction: true });
     return { applied: true, ...result, total: normalized.bindings.length, sourceQueue: normalized.sourceQueue,
       mappings: normalized.bindings.filter(row => row.mapping).map(row => row.mapping) };
-  } finally { await writer.close(); }
+  } finally {
+    transactionConnection = undefined;
+    await writer.close();
+  }
 }
 
 export function bindingSnapshotHash(bytes) {
