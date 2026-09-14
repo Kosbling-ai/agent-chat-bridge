@@ -103,10 +103,14 @@ function validateRuntime(raw) {
   if (typeof codex.rolloverOnRulesUpdate !== 'boolean') throw new ConfigError('invalid_rules_rollover');
   codex.rulesFiles = strings(raw.codex.rulesFiles ?? ['AGENTS.md']);
   if (codex.rulesFiles.length > 20 || codex.rulesFiles.some(path => path.startsWith('/') || path.split(/[\\/]/).includes('..'))) throw new ConfigError('invalid_rules_files');
-  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv'], 'invalid_feishu_fields');
+  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars'], 'invalid_feishu_fields');
   if (raw.feishu.catchup !== undefined && typeof raw.feishu.catchup !== 'boolean') throw new ConfigError('invalid_catchup_flag');
   const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };
   feishu.displayName = raw.feishu.displayName === undefined ? 'agent-chat-bridge' : identifier(raw.feishu.displayName, 80);
+  feishu.replyAsPost = raw.feishu.replyAsPost ?? true;
+  if (typeof feishu.replyAsPost !== 'boolean') throw new ConfigError('invalid_feishu_reply_mode');
+  feishu.maxOutputChars = raw.feishu.maxOutputChars ?? 3500;
+  if (!Number.isSafeInteger(feishu.maxOutputChars) || feishu.maxOutputChars < 1 || feishu.maxOutputChars > 1_000_000) throw new ConfigError('invalid_feishu_output_chars');
   if (raw.feishu.httpProxyEnv !== undefined) feishu.httpProxyEnv = reference(raw.feishu.httpProxyEnv);
   feishu.catchup = raw.feishu.catchup ?? true;
   if (raw.feishu.mediaBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.mediaBudgetBytes) || raw.feishu.mediaBudgetBytes < 20 * 1024 * 1024 || raw.feishu.mediaBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_media_budget');

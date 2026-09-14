@@ -4,7 +4,7 @@
 
 ## Integrate and test
 
-Start each change from the latest `staging`. Keep its commits reviewable, then place the reviewed change on `staging` for integration testing. Fixes found there return to `staging` so the tested branch contains the complete candidate.
+Start each change from the latest `staging` in a topic worktree and keep its commits reviewable. After review, push the approved commit directly to `staging`; do not open a pull request merely to enter `staging`. Fixes found there follow the same reviewed direct-to-`staging` path so the tested branch contains the complete candidate. Pull requests are reserved for promotion from `staging` to `main`.
 
 Run the checks appropriate to the change. The repository currently has no hosted CI workflow, so record the actual command results instead of treating a branch update as a passing check:
 

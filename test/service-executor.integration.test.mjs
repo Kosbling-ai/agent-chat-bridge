@@ -64,6 +64,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   let executorConfig;
   let executorInstance;
   let forwardConfig;
+  let repliesConfig;
   let sessions;
   const logEvents = [];
   const forwardJobs = [
@@ -88,7 +89,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     pool: () => ({ async query() {}, async end() {} }),
     store: async () => ({ async assertCurrent() {}, async close() {} }),
     sessions: () => (sessions = sessionStore()),
-    jobs: () => jobStore, inbound: () => ({}), feedback: () => ({}), replies: () => ({}),
+    jobs: () => jobStore, inbound: () => ({}), feedback: () => ({}), replies: input => (repliesConfig = input, {}),
     communication: () => inertWorker,
     executor: input => {
       executorConfig = input.config;
@@ -114,6 +115,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['api-chat', 'chat']);
   assert.equal(forwardConfig.retryDelayMs, 60_000);
   assert.equal(forwardConfig.maxAttempts, 3);
+  assert.equal(repliesConfig.replyAsPost, true);
+  assert.equal(repliesConfig.maxOutputChars, 3500);
   await sessions.saveCodexBinding({feishuOpenId:'system:log',chatId:'log-chat',chatType:'group',codexSessionId:'log-reject',threadName:'log',created:false});
   await assert.rejects(executorInstance.execute({bindingOpenId:'system:log',chatId:'log-chat',chatType:'group',messageId:'log-message',prompt:'work',busyPolicy:'reject'}), {code:'CODEX_THREAD_BUSY'});
   const rpcLog = logEvents.find(event => event.operation === 'rpc_request');

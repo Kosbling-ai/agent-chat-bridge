@@ -14,7 +14,7 @@ A schema change must reach `staging` with its immutable forward migration and ro
 
 ## 0.2.4 production runtime defaults
 
-Version 0.2.4 adds no database migration. It restores the 60000 ms app-server idle-close default and controlled `inherit=all` shell policy. Optional `codex.sharedHome` selects the shared Codex directory and must match an inherited `CODEX_HOME`; configurations may still set `codex.idleCloseMs` to `0` explicitly.
+Version 0.2.4 adds no database migration. It restores the 60000 ms app-server idle-close default, controlled `inherit=all` shell policy, production execution-card controller and ordinary post/text replies. Optional `codex.sharedHome` selects the shared Codex directory and must match an inherited `CODEX_HOME`; configurations may still set `codex.idleCloseMs` to `0` explicitly. Optional `feishu.replyAsPost` defaults to `true`, and `feishu.maxOutputChars` defaults to `3500`.
 
 ## 0.2.3 app-server idle lifecycle
 

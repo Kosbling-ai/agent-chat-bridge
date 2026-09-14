@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { basename, extname } from 'node:path';
-import { splitReplyCards } from './reply-card.mjs';
 
 const stable = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 32);
+const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const imageTypes = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 const effectUnknown = code => Object.assign(new Error(code), { code, outcome: 'unknown' });
 
@@ -18,7 +18,7 @@ export function publicAttachments(attachments = []) {
   });
 }
 
-export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = () => {} } = {}) {
+export function createFeishuReplies({ chat, outbound, jobs, connectionId, replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
   function artifactScope(job, result = job.result || {}) {
     const execution = result.execution || job.result?.execution || {};
     return {
@@ -54,37 +54,26 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = 
   }
 
   async function sendText(job, result, control) {
-    const cards = splitReplyCards(String(result.answer || 'Codex 没有返回可用结论。'));
-    const delivery = structuredClone(job.result?.delivery || result.delivery || {});
-    delivery.text ||= { items: cards.map((_, index) => ({ index, status: 'pending' })) };
-    for (const [index, content] of cards.entries()) {
-      const item = delivery.text.items[index] ||= { index, status: 'pending' };
-      if (item.status === 'intent') {
-        item.status = 'unknown';
-        item.errorCode ||= 'reply_delivery_unknown';
-        await persist(job, delivery);
-      }
-      if (['sent', 'failed'].includes(item.status)) continue;
-      if (item.status === 'unknown') return { sent: 0, status: 'unknown' };
-      item.status = 'intent';
-      await persist(job, delivery);
-      control.assertLease();
-      const args = { kind: 'interactive', content, uuid: stable(`run:${job.id}:answer:${index}`) };
-      try {
-        const response = job.sourceMessageId
-          ? await chat.replyMessage({ ...args, messageId: job.sourceMessageId })
-          : await chat.sendMessage({ ...args, conversationId: job.chatId });
-        item.status = 'sent';
-        item.messageId = response?.message_id || response?.messageId || '';
-      } catch (error) {
-        item.status = error?.outcome === 'failed' ? 'failed' : 'unknown';
-        item.errorCode = error?.code || 'reply_delivery_unknown';
-      }
-      await persist(job, delivery);
-      if (item.status === 'unknown') return { sent: 0, status: 'unknown' };
+    const previous = job.result?.delivery?.text?.items || result.delivery?.text?.items;
+    if (previous?.length) {
+      if (previous.some(item => ['intent', 'unknown', 'pending'].includes(item.status))) return { sent: 0, status: 'unknown' };
+      return { sent: previous.filter(item => item.status === 'sent').length,
+        status: previous.some(item => item.status === 'failed') ? 'failed' : 'sent' };
     }
-    const failed = delivery.text.items.some(item => item.status === 'failed');
-    return { sent: delivery.text.items.filter(item => item.status === 'sent').length, status: failed ? 'failed' : 'sent' };
+    const kind = replyAsPost ? 'post' : 'text';
+    const chunkSize = replyAsPost ? 3000 : 1900;
+    const chunks = chunkText(limitText(String(result.answer || 'Codex 没有返回可用结论。'), maxOutputChars), chunkSize);
+    const prefix = stableEventKey(['codex-reply', job.messageId || '', result.turnId || result.execution?.turnId || '',
+      result.threadId || result.sessionId || result.execution?.threadId || ''].join(':'));
+    const sent = [];
+    for (const [index, chunk] of chunks.entries()) {
+      control.assertLease();
+      const content = replyAsPost ? markdownToFeishuPost(chunk) : { text: chunk };
+      const response = await chat.sendMessage({ conversationId: job.chatId, kind, content,
+        uuid: stableEventKey(`${prefix}:${kind}:${index}`) });
+      sent.push({ messageId: response?.message_id || response?.messageId || '', msgType: kind, text: chunk, content: JSON.stringify(content) });
+    }
+    return { sent: sent.length, status: 'sent', items: sent };
   }
 
   async function sendAttachments(job, result, control) {
@@ -175,4 +164,57 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, log = 
     },
     publicAttachments,
   });
+}
+
+export function markdownToFeishuPost(markdown) {
+  const content = [];
+  let inCodeBlock = false;
+  for (const rawLine of String(markdown || '').split(/\r?\n/)) {
+    if (/^\s*```/.test(rawLine)) {
+      inCodeBlock = !inCodeBlock;
+      content.push([{ tag: 'text', text: rawLine || '```' }]);
+      continue;
+    }
+    const line = inCodeBlock ? rawLine : normalizeMarkdownLine(rawLine);
+    if (!line.trim()) {
+      content.push([{ tag: 'text', text: ' ' }]);
+      continue;
+    }
+    content.push(markdownInlineToFeishuElements(line));
+  }
+  return { zh_cn: { title: '', content: content.length ? content : [[{ tag: 'text', text: '' }]] } };
+}
+
+function normalizeMarkdownLine(line) {
+  return String(line || '')
+    .replace(/^\s{0,3}#{1,6}\s+/, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/`([^`]+)`/g, '$1');
+}
+
+function markdownInlineToFeishuElements(line) {
+  const elements = [];
+  const pattern = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  let index = 0;
+  let match;
+  while ((match = pattern.exec(line))) {
+    if (match.index > index) elements.push({ tag: 'text', text: line.slice(index, match.index) });
+    elements.push({ tag: 'a', text: match[1], href: match[2] });
+    index = pattern.lastIndex;
+  }
+  if (index < line.length) elements.push({ tag: 'text', text: line.slice(index) });
+  return elements.length ? elements : [{ tag: 'text', text: line }];
+}
+
+function chunkText(text, size) {
+  const chunks = [];
+  for (let index = 0; index < text.length; index += size) chunks.push(text.slice(index, index + size));
+  return chunks.length ? chunks : [''];
+}
+
+function limitText(text, max = 12000) {
+  const value = String(text || '');
+  if (value.length <= max) return value;
+  return `${value.slice(0, max)}\n\n[已截断 ${value.length - max} 字符]`;
 }

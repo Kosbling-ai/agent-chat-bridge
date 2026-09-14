@@ -8,7 +8,7 @@
 
 涉及 schema 的改动必须连同不可变的向前迁移和回滚方案先进入 `staging`。只有在已授权备份并停止唯一 writer 后，才可对独立 staging 数据库显式执行 migrate；提升到 `main` 只保留这段已审迁移历史，生产迁移仍是单独授权的操作。
 
-0.2.4 不增加数据库迁移；它恢复 app-server 空闲 60000 毫秒关闭、受控环境中的 `inherit=all` 及共享 Codex HOME 默认值。可选 `codex.sharedHome` 必须与继承的 `CODEX_HOME` 指向同一目录，显式 `codex.idleCloseMs: 0` 仍可关闭定时器。0.2.3、0.2.2 和 0.2.1 同样不增加数据库迁移。
+0.2.4 不增加数据库迁移；它恢复 app-server 空闲 60000 毫秒关闭、受控环境中的 `inherit=all`、共享 Codex HOME 默认值、原执行卡控制器及普通 post/text 回复。可选 `codex.sharedHome` 必须与继承的 `CODEX_HOME` 指向同一目录，显式 `codex.idleCloseMs: 0` 仍可关闭定时器；`feishu.replyAsPost` 缺省为 `true`，`feishu.maxOutputChars` 缺省为 `3500`。0.2.3、0.2.2 和 0.2.1 同样不增加数据库迁移。
 
 迁移 002–003 只用于 bridge 自己的 MySQL schema：002 增加 Codex binding/event 表，003 增加 forward job、入站消息和消息事件表及所需索引/收据字段。表结构虽来源于冻结生产实现，但这不是 Kosbling 生产/P 原库的原地转换，也不是透明升级。
 

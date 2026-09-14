@@ -4,7 +4,7 @@
 
 ## 集成与测试
 
-每项改动从最新 `staging` 开始，保持提交便于审阅；审阅后的改动进入 `staging` 做集成测试。在 staging 发现的修复仍先落回 `staging`，确保被测试的分支包含完整候选代码。
+每项改动从最新 `staging` 建 topic worktree，保持提交便于审阅；审阅通过后直接把获准提交推到 `staging`，不为“进入 staging”单独开 PR。在 staging 发现的修复也按相同的受审直推流程返回 `staging`，确保被测试的分支包含完整候选代码。PR 只用于从 `staging` 提升到 `main`。
 
 按改动范围运行检查。仓库当前没有托管 CI workflow，因此要记录实际命令结果，不能把分支更新本身当成检查通过：
 

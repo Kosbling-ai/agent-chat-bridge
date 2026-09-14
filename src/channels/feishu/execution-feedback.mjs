@@ -2,8 +2,15 @@ import { createHash } from 'node:crypto';
 import { ExecutionCard, observeExecutionCard } from './execution-card.mjs';
 import { codexBindingOpenId } from '../../agents/codex/thread-scope.mjs';
 
-const stable = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 32);
+const stable = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const toast = (content, type = 'info') => ({ toast: { type, content } });
+const unconfirmedCard = saved => saved?.delivery === 'unknown'
+  || ['intent', 'unknown'].includes(saved?.deliveryState?.status);
+const productionCardState = saved => {
+  if (!saved) return saved;
+  const { desiredRevision, ackedRevision, deliveryState, observerCursor, observerSeen, ...state } = saved;
+  return state;
+};
 
 export function createExecutionFeedback({ jobs, sessions, chat, cardClient, authorize = async () => true,
   executor, config = {}, log = () => {}, now = Date.now } = {}) {
@@ -81,9 +88,10 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
   }
 
   function cardFor(job, state, saved) {
+    if (unconfirmedCard(saved)) return null;
     return new ExecutionCard({
       client: cardClient, chatId: job.chatId, jobId: job.id, messageId: job.messageId,
-      displayName: config.displayName, uuid: stable(`execution-card:${job.messageId}`), saved,
+      displayName: config.displayName, uuid: stable(`execution-card:${job.messageId}`),
       intervalMs: config.executionCardIntervalMs || 1000,
       persist: value => persist(job, state, 'executionCard', value),
       audit: event => sessions?.saveCodexRealtimeEvent?.({
@@ -93,6 +101,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
         messageId: job.messageId, eventKey: `feedback:${job.id}:${event.status}:${now()}`,
         eventType: 'execution_card', role: 'activity', title: '执行卡片', text: '', createdAt: now(), detail: event,
       }),
+      saved: productionCardState(saved),
     });
   }
 
@@ -104,15 +113,14 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
       log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
       return null;
     });
-    state.card.push({ kind: 'started' });
+    state.card?.push({ kind: 'started' });
     return state;
   }
 
   function observe(job, state, execution) {
     if (!state?.card || state.observer) return state?.observer || null;
-    const cursor = state.result.executionCard?.observerCursor;
     state.observer = observeExecutionCard({
-      card: state.card, since: Number(job.createdAt || now()), cursor,
+      card: state.card, since: Number(job.createdAt || now()),
       load: async next => {
         state.control.assertOwned?.();
         const rows = await sessions.readPublicProgress({
@@ -134,7 +142,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     });
     state.card = cardFor(job, state, state.result.executionCard);
     state.typing = typingDesired(job, state, true).catch(() => null);
-    state.card.push({ kind: 'started', turnId: state.result.execution?.turnId });
+    state.card?.push({ kind: 'started', turnId: state.result.execution?.turnId });
     return state;
   }
 
@@ -157,11 +165,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
 
   async function wait(job, state) {
     if (job.deliveryMode === 'caller' || !state) return;
-    const savedCard = state.result.executionCard;
-    const waitingConfirmed = savedCard?.status === 'retrying'
-      && savedCard.deliveryState?.status === 'confirmed'
-      && Number(savedCard.ackedRevision || 0) >= Number(savedCard.desiredRevision || 0);
-    if (!waitingConfirmed && state.card) {
+    if (state.result.executionCard?.status !== 'retrying' && state.card) {
       state.result.executionCard = await state.card.pause();
     }
     await ensureTypingStopped(job, state).catch(error => {
@@ -190,13 +194,18 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     let cardError;
     if (snapshot) {
       const card = cardFor(job, state, snapshot);
-      const terminal = result.turnStatus || result.execution?.terminal;
-      const status = terminal === 'interrupted' ? 'interrupted' : result.failed || terminal === 'failed' ? 'failed'
-        : result.deferred ? 'deferred' : 'completed';
-      try {
-        delivered = await card.finish(result.answer || 'Codex 没有返回可用结论。', status);
-        result.executionCard = card.snapshot();
-      } catch (error) { cardError = error; }
+      if (!card) cardError = Object.assign(new Error('existing card delivery is unconfirmed'), {
+        code: 'execution_card_delivery_unknown', outcome: 'unknown',
+      });
+      else {
+        const terminal = result.turnStatus || result.execution?.terminal;
+        const status = terminal === 'interrupted' ? 'interrupted' : result.failed || terminal === 'failed' ? 'failed'
+          : result.deferred ? 'deferred' : 'completed';
+        try {
+          delivered = await card.finish(result.answer || 'Codex 没有返回可用结论。', status);
+          result.executionCard = card.snapshot();
+        } catch (error) { cardError = error; }
+      }
     }
     await typingDesired(job, state, false);
     if (cardError) throw cardError;

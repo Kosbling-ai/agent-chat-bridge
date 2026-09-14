@@ -21,6 +21,9 @@ const config = {
 test('runtime configuration is explicit and rejects scope/secret overrides', () => {
   assert.equal(validateConfig(config).feishu.connectionId, 'test');
   assert.equal(validateConfig(config).feishu.catchup, true);
+  assert.equal(validateConfig(config).feishu.replyAsPost, true);
+  assert.equal(validateConfig(config).feishu.maxOutputChars, 3500);
+  assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, replyAsPost: false, maxOutputChars: 7000 } }).feishu.replyAsPost, false);
   assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
   assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
   assert.equal(validateConfig(config).codex.idleCloseMs, 60_000);
@@ -31,6 +34,8 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, codex: { ...config.codex, jobRetryMs: 9_999 } },
     { ...config, codex: { ...config.codex, jobMaxAttempts: 0 } },
     { ...config, codex: { ...config.codex, idleCloseMs: -1 } },
+    { ...config, feishu: { ...config.feishu, replyAsPost: 'yes' } },
+    { ...config, feishu: { ...config.feishu, maxOutputChars: 0 } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
     { ...config, feishu: { ...config.feishu, appSecret: 'synthetic' } },
     { ...config, hooks: [{ id: 'h', url: 'https://user:synthetic@example.invalid', tokenEnv: 'TEST_HOOK', conversationIds: [] }] },

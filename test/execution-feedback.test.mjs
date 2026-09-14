@@ -97,7 +97,7 @@ test('busy waiting reuses one card and does not repeat Typing until admission su
   assert.deepEqual(effects.filter(value => value.startsWith('typing:remove')), ['typing:remove:reaction-1']);
 });
 
-test('busy waiting retries an unconfirmed card patch once and then stays quiet', async () => {
+test('busy waiting follows the original single pause patch and then stays quiet', async () => {
   const job = jobFixture();
   job.sourceMessageId = null;
   job.result.executionCard = {
@@ -128,23 +128,14 @@ test('busy waiting retries an unconfirmed card patch once and then stays quiet',
   await feedback.wait(job, feedback.restoreWaiting(job));
   assert.equal(patches, 1);
   assert.equal(job.result.executionCard.status, 'retrying');
-  assert.equal(job.result.executionCard.deliveryState.status, 'unknown');
-  assert.equal(job.result.executionCard.desiredRevision, 2);
-  assert.equal(job.result.executionCard.ackedRevision, 1);
-
   await feedback.wait(job, feedback.restoreWaiting(job));
-  assert.equal(patches, 2);
-  assert.equal(job.result.executionCard.deliveryState.status, 'confirmed');
-  assert.equal(job.result.executionCard.desiredRevision, 3);
-  assert.equal(job.result.executionCard.ackedRevision, 3);
-
-  await feedback.wait(job, feedback.restoreWaiting(job));
-  assert.equal(patches, 2);
+  assert.equal(patches, 1);
 });
 
-test('lease loss while card intent persistence is blocked prevents the platform call', async () => {
+test('original card create precedes sidecar persistence and does not repeat after lease loss', async () => {
   const job = jobFixture();
   job.sourceMessageId = null;
+  delete job.result.executionCard;
   let releasePersist;
   let persistenceStarted;
   let lost = false;
@@ -170,7 +161,20 @@ test('lease loss while card intent persistence is blocked prevents the platform 
   lost = true;
   releasePersist();
   await state.card.chain;
-  assert.equal(creates, 0);
+  state.card.stop();
+  assert.equal(creates, 1);
+});
+
+test('legacy unconfirmed card state is held without another platform write', async () => {
+  const job = jobFixture();
+  job.sourceMessageId = null;
+  job.result.executionCard = { status: 'completed', entries: [], delivery: 'unknown',
+    deliveryState: { operation: 'create', status: 'unknown' } };
+  let writes = 0;
+  const feedback = createExecutionFeedback({ jobs: { async patchFeedback() {} }, sessions: {}, chat: {}, executor: {},
+    cardClient: { im: { v1: { message: { async create() { writes += 1; }, async patch() { writes += 1; } } } } } });
+  await assert.rejects(feedback.finish(job, job.result), { code: 'execution_card_delivery_unknown', outcome: 'unknown' });
+  assert.equal(writes, 0);
 });
 
 test('stop callback is fenced to the original sender/card/turn and replay does not interrupt twice', async () => {

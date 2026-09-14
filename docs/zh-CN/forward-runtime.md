@@ -14,7 +14,7 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 system 等待只授予已持久化且非空的 `executionNamespace`：它必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭，确认入场后才激活一次。已绑定 turn 的观察失败、turn start 结果不明和未决 steer 核对失败始终进入 `held`，保留 native/intent 身份，不受重试次数影响。
 
-卡片保存期望/已确认版本、消息 ID、终态快照和十进制字符串游标。明确拒绝才可走完整正文 fallback；创建结果未知时不重建卡片，也不改发正文来假装成功。正文和每个附件在平台调用前持久化 intent，确认后持久化收据；崩溃遗留的 intent 公开为 `unknown`，不会自行重发。明确失败保留事实，后续附件仍各自尝试。文件只在发送收据落库后清理。Typing 结果不明时只核对原消息返回的前 50 条 reaction，并按 `operator_type=app` 与配置 emoji 匹配；这不能精确证明属于某一个 app，也不能证明后续分页不存在。终态清理有独立租约重试。
+执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。附件与 Typing 仍保留当前 intent/收据处理，文件只在发送收据落库后清理；Typing 结果不明时只核对原消息返回的前 50 条 reaction，并按 `operator_type=app` 与配置 emoji 匹配。
 
 bridge 的投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`；caller 终态为 `not_requested`。投递失败或未知不会重跑已经完成的模型 turn。公开附件 `id` 是十进制资源索引，可直接用于 `/v1/runs/:id/resources/:index`。
 

@@ -161,7 +161,8 @@ export async function startService({ config, configPath, env = process.env, log,
       spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'),
       allowedGroupChatIds, maxTotalBytes: config.feishu.outputBudgetBytes, log });
     checkCancelled();
-    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,log});
+    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,
+      replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
     const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
     const feedback=factories.feedback({jobs,sessions,chat,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
     forward=factories.forward({config:{

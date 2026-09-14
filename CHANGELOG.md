@@ -4,6 +4,8 @@
 
 - Restore the frozen production runtime defaults: the launching user's shared Codex home, a 60-second idle child close, and `shell_environment_policy.inherit=all` within the explicitly constructed child environment.
 - Add optional `codex.sharedHome`. A configured value and inherited `CODEX_HOME` must resolve to the same directory; explicit `codex.idleCloseMs: 0` remains supported.
+- Restore the frozen production execution-card controller and ordinary reply path. Cards use the original create/patch throttle and fall back to chat-created post or text messages; ordinary replies use the original Markdown conversion, output cap and 3000/1900-character chunks.
+- Add optional `feishu.replyAsPost` (default `true`) and `feishu.maxOutputChars` (default `3500`). Persisted legacy unconfirmed card/text effects remain held without replay during this transition.
 
 No database migration is added. Validation uses offline configuration, lifecycle and synthetic child-process fixtures; no real message or model acceptance was run.
 
