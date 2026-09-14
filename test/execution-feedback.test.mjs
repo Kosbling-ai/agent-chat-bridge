@@ -78,6 +78,20 @@ test('normal completion removes the confirmed Typing reaction before audit and l
   assert.deepEqual(removed, ['known-reaction']);
 });
 
+test('terminal snapshot persistence failure stops before any card delivery', async () => {
+  const job = jobFixture();
+  delete job.result.executionCard;
+  let creates = 0;
+  const feedback = createExecutionFeedback({
+    jobs: { async patchFeedback() { throw Object.assign(new Error('lost'), { code: 'forward_lease_lost' }); } },
+    sessions: {}, typing: { async start() { return null; } },
+    cardClient: { im: { v1: { message: { async create() { creates += 1; } } } } },
+  });
+  const state = await feedback.start(job);
+  await assert.rejects(feedback.prepare(job, { answer: 'done' }, state), { code: 'forward_lease_lost' });
+  assert.equal(creates, 0);
+});
+
 test('busy waiting reuses one card and does not repeat Typing until admission succeeds', async () => {
   const job = jobFixture();
   job.result = { execution: { bindingOpenId: 'group:binding' } };

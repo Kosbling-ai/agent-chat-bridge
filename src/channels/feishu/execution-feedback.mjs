@@ -152,6 +152,9 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       await state.card.chain;
       result.executionCard = state.card.snapshot();
     }
+    if (result.executionCard && !result.deferred) {
+      await persist(job, state, 'executionCard', result.executionCard);
+    }
   }
 
   async function finish(job, result, _unused, control = {}) {

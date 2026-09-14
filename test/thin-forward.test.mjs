@@ -94,8 +94,10 @@ function memoryJobs(initial){
     loadRecoverable:async()=>job.status==='pending'&&due()&&!unsafe()?[job]:[],claimById:claim,claimReplyById:async({owner})=>job.status==='reply_pending'?(job={...job,leaseOwner:owner}):null,
     claimReplyPending:async({owner})=>job.status==='reply_pending'?[(job={...job,leaseOwner:owner})]:[],claim:async input=>{const value=await claim(input);return value?[value]:[];},
     renew:async()=>({renewed:true}),patchPreparedInput:async({execution})=>{calls.push(['prepared',execution]);job={...job,result:{...job.result,execution}};return job;},
-    patchExecution:async({execution})=>{calls.push(['execution',execution]);job={...job,result:{...job.result,execution}};},patchFeedback:async()=>{},
-    markReplyPending:async({result})=>{calls.push(['reply_pending']);job={...job,status:'reply_pending',result};},markFinished:finish,markFinishedWithoutReply:finish,
+    patchExecution:async({execution})=>{calls.push(['execution',execution]);job={...job,result:{...job.result,execution}};},
+    patchFeedback:async({key,value})=>{calls.push(['feedback',key]);job={...job,result:{...job.result,[key]:structuredClone(value)}};},
+    markReplyPending:async({result})=>{const value=structuredClone(result);delete value.executionCard;delete value.typing;delete value.stop;
+      calls.push(['reply_pending']);job={...job,status:'reply_pending',result:{...job.result,...value}};},markFinished:finish,markFinishedWithoutReply:finish,
     markRetry:async input=>{calls.push(['retry',input]);job={...job,status:input.held?'held':input.terminal?'failed':'pending',last_error:input.errorCode,nextAttemptAt:input.nextAttemptAt,leaseOwner:''};},
     getRun:async()=>job,readEvents:async()=>[]};
 }
@@ -117,6 +119,7 @@ test('successful live and recovered steering do not create a synthetic execution
     await runtime.stop();
     assert.equal(jobs.job.status,'deferred',recovered?'recovered':'live');
     assert.equal(creates,0,recovered?'recovered':'live');
+    assert.equal(jobs.calls.filter(([name])=>name==='feedback').length,0,recovered?'recovered':'live');
   }
 });
 
