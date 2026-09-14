@@ -124,7 +124,8 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
       const kind = input.messageKind ?? 'text';
       if (!['text', 'post', 'interactive', 'image', 'file'].includes(kind)) throw new ApiError('invalid_message_kind');
       const content = kind === 'text' && typeof input.content === 'string' ? { text: input.content } : input.content;
-      if (!content || typeof content !== 'object' || Array.isArray(content) || Buffer.byteLength(JSON.stringify(content)) > 20000) throw new ApiError('invalid_content');
+      const contentMaxBytes = kind === 'interactive' ? 28_000 : 20_000;
+      if (!content || typeof content !== 'object' || Array.isArray(content) || Buffer.byteLength(JSON.stringify(content)) > contentMaxBytes) throw new ApiError('invalid_content');
       if (kind === 'text' && (typeof content.text !== 'string' || !content.text.trim())) throw new ApiError('invalid_content');
       if (kind === 'image') identifier(content.image_key);
       if (kind === 'file') identifier(content.file_key);
