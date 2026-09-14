@@ -51,7 +51,7 @@ export function boundedFeishuHttp(base, { proxyAgent } = {}) {
   for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value));
   return http;
 }
-export async function startService({ config, configPath, env = process.env, log, signal, dependencies = {} }) {
+export async function startService({ config, configPath, env = process.env, log, signal, onRestartRequired = async () => {}, dependencies = {} }) {
   log = safeObserver(log);
   if (signal?.aborted) throw new ConfigError('startup_cancelled');
   if (!config.storage) return startServer({ config, log });
@@ -160,6 +160,7 @@ export async function startService({ config, configPath, env = process.env, log,
     executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,onRestartRequired:async reason=>{
       log('warning','codex_executor','restart_required',{code:reason});
       await close();
+      await onRestartRequired(reason);
     }});
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };

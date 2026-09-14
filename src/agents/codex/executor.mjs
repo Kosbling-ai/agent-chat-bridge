@@ -309,17 +309,18 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }
   }
 
-  async function steer(active, input) {
-    const operation = active.steerQueue.then(() => steerLocked(active, input));
+  async function steer(active, input, { signal } = {}) {
+    const operation = active.steerQueue.then(() => steerLocked(active, input, { signal }));
     active.steerQueue = operation.catch(() => {});
-    return operation;
+    const result = await operation;
+    return result?.followUp || result;
   }
 
-  async function steerLocked(active, input) {
+  async function steerLocked(active, input, { signal } = {}) {
     if (active.settled) return { restart: true, input };
     if (input.messageId && input.messageId === active.messageId) {
       if (hasOpenWaiter(active)) return { deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId };
-      return waitForTurn(active, input.messageId, { takeover: true });
+      return { followUp: waitForTurn(active, input.messageId, { takeover: true, signal }) };
     }
     if (active.pendingSteerId && active.pendingSteerId !== input.messageId) throw coded('previous steer delivery unconfirmed', 'CODEX_STEER_UNCONFIRMED', { outcome: 'unknown' });
     const duplicate = await sessionStore.findAcceptedMessageEvent(active.binding, input.messageId, { includeInFlight: true });
@@ -350,9 +351,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       throw coded('steer delivery unconfirmed', 'CODEX_STEER_UNCONFIRMED', { outcome: 'unknown' });
     }
-    await persistUser(active.binding, input, 'user-steer-confirmed', input.prompt, { attemptId });
+    try { await persistUser(active.binding, input, 'user-steer-confirmed', input.prompt, { attemptId }); }
+    catch { throw coded('steer delivery unconfirmed', 'CODEX_STEER_UNCONFIRMED', { outcome: 'unknown' }); }
     active.pendingSteerId = null;
-    if (!hasOpenWaiter(active)) return waitForTurn(active, input.messageId, { takeover: true });
+    if (!hasOpenWaiter(active)) return { followUp: waitForTurn(active, input.messageId, { takeover: true, signal }) };
     return { deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId };
   }
 
@@ -486,7 +488,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           retryable: true, outcome: 'rejected', phase: 'pre_admission', busyOrigin: 'local',
         });
         if (active.settled) return { afterFinal: active.finalized, restart: { input: normalized } };
-        return { completion: steer(active, normalized).then((result) => result?.restart ? execute(result.input, options) : result) };
+        return { completion: steer(active, normalized, { signal: options.signal }).then((result) => result?.restart ? execute(result.input, options) : result) };
       }
       let binding = await ensureBinding(actor, normalized.messageId);
       const duplicate = await sessionStore.findAcceptedMessageEvent(binding, normalized.messageId);
@@ -534,7 +536,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         Object.assign(error, { threadId: state.threadId, turnId, startedAt });
         throw error;
       }
-      await sessionStore.saveCodexRealtimeEvent(binding, { messageId: normalized.messageId, eventKey: `public:${turnId}:started`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: startedAt, detail: { kind: 'started', id: turnId, turnId, at: startedAt } });
+      await sessionStore.saveCodexRealtimeEvent(binding, { messageId: normalized.messageId, eventKey: `public:${turnId}:started`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: startedAt, detail: { kind: 'started', id: turnId, turnId, at: startedAt } })
+        .catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_started', status: 'failed', threadId: binding.codexSessionId, turnId }));
       return { completion: waitForTurn(state, normalized.messageId, { created: binding.created, signal: options.signal }) };
       });
       if (routed.restart) {

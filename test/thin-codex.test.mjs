@@ -267,6 +267,79 @@ test('steer and duplicate paths do not create a second start intent', async () =
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test('a takeover waiter does not occupy the steering queue while it waits for final', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const runtime = fakeRuntime({ completeStarts: false }); const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl });
+    const rootController = new AbortController();
+    const root = executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'root', prompt: 'root' }, { signal: rootController.signal });
+    while (executor.status().activeTurns !== 1) await new Promise((resolve) => setImmediate(resolve));
+    rootController.abort(); await assert.rejects(root, { code: 'CODEX_WAIT_ABORTED' });
+    const first = executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'follow-1', prompt: 'one' });
+    while (runtime.calls.filter((call) => call.method === 'turn/steer').length < 1) await new Promise((resolve) => setImmediate(resolve));
+    const second = executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'follow-2', prompt: 'two' });
+    const secondResult = await Promise.race([second, new Promise((_, reject) => setTimeout(() => reject(new Error('second steer stayed behind takeover waiter')), 100))]);
+    assert.equal(secondResult.deferred, true);
+    assert.equal(runtime.calls.filter((call) => call.method === 'turn/steer').length, 2);
+    runtime.children[0].send({ method: 'turn/completed', params: { turnId: 'turn-1', turn: { id: 'turn-1', status: 'completed', items: [] } } });
+    assert.equal((await first).takeover, true);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('the steering takeover waiter receives and releases its caller abort signal', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const runtime = fakeRuntime({ completeStarts: false }); const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl });
+    const rootController = new AbortController();
+    const root = executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'root', prompt: 'root' }, { signal: rootController.signal });
+    while (executor.status().activeTurns !== 1) await new Promise((resolve) => setImmediate(resolve));
+    rootController.abort(); await assert.rejects(root, { code: 'CODEX_WAIT_ABORTED' });
+    const takeoverController = new AbortController();
+    const takeover = executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'follow', prompt: 'more' }, { signal: takeoverController.signal });
+    while (!runtime.calls.some((call) => call.method === 'turn/steer')) await new Promise((resolve) => setImmediate(resolve));
+    takeoverController.abort();
+    await assert.rejects(takeover, { code: 'CODEX_WAIT_ABORTED' });
+    assert.equal(executor.status().activeTurnResponseWaiters, 0);
+    runtime.children[0].send({ method: 'turn/completed', params: { turnId: 'turn-1', turn: { id: 'turn-1', status: 'completed', items: [] } } });
+    while (executor.status().activeTurns) await new Promise((resolve) => setImmediate(resolve));
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('started progress persistence is best effort after native admission', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const store = memoryStore(); const save = store.saveCodexRealtimeEvent;
+    store.saveCodexRealtimeEvent = async (binding, event) => {
+      if (event.eventKey === 'public:turn-1:started') throw new Error('synthetic started persistence failure');
+      return save(binding, event);
+    };
+    const logs = []; const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: fakeRuntime().spawnImpl, log: (level, detail) => logs.push([level, detail]) });
+    assert.equal((await executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'root', prompt: 'work' })).answer, 'answer turn-1');
+    assert.ok(logs.some(([level, detail]) => level === 'warning' && detail.operation === 'publish_started' && detail.turnId === 'turn-1'));
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('confirmed steering receipt persistence failure remains delivery-unconfirmed', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const store = memoryStore(); const save = store.saveCodexRealtimeEvent;
+    store.saveCodexRealtimeEvent = async (binding, event) => {
+      if (event.eventKey === 'user-steer-confirmed:follow') throw new Error('synthetic receipt store failure');
+      return save(binding, event);
+    };
+    const runtime = fakeRuntime({ completeStarts: false }); const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    const root = executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'root', prompt: 'root' });
+    while (executor.status().activeTurns !== 1) await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'follow', prompt: 'more' }), { code: 'CODEX_STEER_UNCONFIRMED', outcome: 'unknown' });
+    runtime.children[0].send({ method: 'turn/completed', params: { turnId: 'turn-1', turn: { id: 'turn-1', status: 'completed', items: [] } } });
+    await root;
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
 test('normal resume interrupts orphan activity before starting while the transition adapter observes a known turn', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {

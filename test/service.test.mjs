@@ -239,3 +239,30 @@ test('startup cancellation closes an idle executor while Feishu start is pending
   await rejected;
   assert(storeClosed); assert(socketStopped); assert(executorClosed);
 });
+
+test('memory restart callback runs only after the service has completed ordered shutdown', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-restart-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events = []; let requestRestart;
+  const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 }, codex: { bin: process.execPath, cwd: directory, envNames: [] }, feishu: { ...config.feishu, catchup: false } });
+  const worker = { start() {}, beginStop() { events.push('forward-stop-ingress'); }, async stop() { events.push('worker-stop'); }, status: () => ({ running: true }) };
+  const service = await startService({
+    config: runtimeConfig, configPath: join(directory, 'config.json'),
+    env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' },
+    onRestartRequired: async reason => { events.push(`exit:${reason}`); },
+    dependencies: {
+      pool: () => ({}), store: async () => ({ async assertCurrent() {}, async close() { events.push('store-close'); } }),
+      sessions: () => ({}), jobs: () => ({}), inbound: () => ({}),
+      executor: input => { requestRestart = input.onRestartRequired; return { status: () => ({ closing: false, restartPending: null, fault: null }), async close() { events.push('executor-close'); } }; },
+      feedback: () => ({ handleCardAction() {} }), replies: () => ({}), communication: () => worker, forward: () => worker,
+      media: async () => ({}), outbound: async () => ({}), chat: () => ({}),
+      sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} },
+      feishu: () => ({ async start() {}, async stop() { events.push('feishu-stop'); }, status: () => ({ connected: true }) }),
+    },
+  });
+  await requestRestart('rss threshold');
+  assert.equal(events.at(-1), 'exit:rss threshold');
+  assert.ok(events.indexOf('executor-close') < events.indexOf('exit:rss threshold'));
+  assert.ok(events.indexOf('store-close') < events.indexOf('exit:rss threshold'));
+  await service.close();
+});

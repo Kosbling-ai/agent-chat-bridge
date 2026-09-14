@@ -42,10 +42,11 @@ try {
       const { startService } = await import('../src/service.mjs');
       const controller = new AbortController();
       let service;
+      const exitAfterShutdown = code => { if (config.storage) process.exit(code); };
       const shutdown = () => {
         controller.abort();
         if (!service) return;
-        service.close().then(() => { if (config.storage) process.exit(0); }).catch(() => {
+        service.close().then(() => exitAfterShutdown(0)).catch(() => {
           log('error', 'shutdown', 'failed', { code: 'shutdown_failed' });
           process.exit(1);
         });
@@ -53,7 +54,7 @@ try {
       process.on('SIGTERM', shutdown);
       process.on('SIGINT', shutdown);
       try {
-        service = await startService({ config, configPath: path, log, signal: controller.signal });
+        service = await startService({ config, configPath: path, log, signal: controller.signal, onRestartRequired: () => exitAfterShutdown(0) });
         if (controller.signal.aborted) shutdown();
       } catch (error) {
         if (!controller.signal.aborted) throw error;
