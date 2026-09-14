@@ -223,6 +223,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       if (held(error)) {
         execution = { ...execution, threadId: error.threadId || execution.threadId, turnId: error.turnId || execution.turnId, startedAt: error.startedAt || execution.startedAt, status: 'unknown', unconfirmed: true, waiting: null, heldReason: error.code || 'native_outcome_unknown', ...(error.intent ? { intent: error.intent } : {}) };
         await feedback?.prepare?.(job, {}, state).catch(() => {});
+        await feedback?.cleanup?.(job, lease).catch(() => {});
         await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
         await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, held: true, errorCode: error.code || 'native_outcome_unknown' });
         log('warning', 'forward_execution', 'held', { code: error.code || 'native_outcome_unknown', stage: error.phase || error.rpcMethod || 'execute', rpcMethod: error.rpcMethod, runId: job.id, attempt: job.attempts, maxAttempts });
@@ -270,22 +271,28 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         if (!result.deferred) result = await replies?.prepare?.(job, result) || result;
         lease.assertOwned();
         let delivery = { status: job.deliveryMode === 'caller' ? 'not_requested' : 'sent' };
-        if (job.deliveryMode === 'bridge') {
-          const cardDelivered = await feedback?.finish(job, result, null, lease);
-          lease.assertOwned();
-          delivery = await replies.deliver(job, result, { skipText: cardDelivered || result.deferred, signal: lease.signal, assertLease: lease.assertOwned });
-          if (delivery.status === 'unknown') {
-            await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, replyPending: true, errorCode: 'reply_delivery_unknown', nextAttemptAt: now() + 300000 });
-            return;
+        try {
+          if (job.deliveryMode === 'bridge') {
+            const cardDelivered = await feedback?.finish(job, result, null, lease);
+            lease.assertOwned();
+            delivery = await replies.deliver(job, result, { skipText: cardDelivered || result.deferred, signal: lease.signal, assertLease: lease.assertOwned });
+            if (delivery.status === 'unknown') {
+              await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, replyPending: true, errorCode: 'reply_delivery_unknown', nextAttemptAt: now() + 300000 });
+              return;
+            }
           }
-        }
-        lease.assertOwned();
-        const status = result.deferred ? 'deferred' : result.failed ? 'failed' : 'completed';
-        await jobs.markFinished({ id: job.id, leaseOwner: job.leaseOwner, status, result,
-          replySent: job.deliveryMode === 'bridge' && delivery.status === 'sent',
-          errorCode: delivery.status === 'failed' ? 'reply_delivery_failed' : job.last_error || result.errorCode });
-        if (inbound && job.deliveryMode === 'bridge' && delivery.status === 'sent') {
-          await inbound.recordReply({ messageId: `bridge-reply:${job.id}`, chatId: job.chatId, chatType: job.chatType, text: result.answer || '', createdAt: now() });
+          lease.assertOwned();
+          const status = result.deferred ? 'deferred' : result.failed ? 'failed' : 'completed';
+          await jobs.markFinished({ id: job.id, leaseOwner: job.leaseOwner, status, result,
+            replySent: job.deliveryMode === 'bridge' && delivery.status === 'sent',
+            errorCode: delivery.status === 'failed' ? 'reply_delivery_failed' : job.last_error || result.errorCode });
+          if (inbound && job.deliveryMode === 'bridge' && delivery.status === 'sent') {
+            await inbound.recordReply({ messageId: `bridge-reply:${job.id}`, chatId: job.chatId, chatType: job.chatType, text: result.answer || '', createdAt: now() });
+          }
+        } finally {
+          if (job.deliveryMode === 'bridge') await feedback?.cleanup?.(job, lease).catch(() => {
+            log('warning', 'typing_reaction', 'cleanup_failed', { code: 'typing_reaction_cleanup_failed' });
+          });
         }
       });
     } catch (error) {

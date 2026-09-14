@@ -12,9 +12,8 @@ const productionCardState = saved => {
   return state;
 };
 
-export function createExecutionFeedback({ jobs, sessions, chat, cardClient, authorize = async () => true,
+export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClient, authorize = async () => true,
   executor, config = {}, log = () => {}, now = Date.now } = {}) {
-  const emoji = config.typingEmoji || 'Typing';
   const bindingOpenId = (job, result = job.result || {}) => result.execution?.bindingOpenId
     || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType });
 
@@ -27,64 +26,6 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     await jobs.patchFeedback({ id: job.id, leaseOwner: job.leaseOwner, key, value });
     state.control.assertOwned?.();
     state.result = { ...state.result, [key]: structuredClone(value) };
-  }
-
-  async function listTyping(job, state) {
-    state.control.assertOwned?.();
-    const response = await chat.listReactions({ messageId: job.sourceMessageId, pageSize: 50 });
-    return (response?.items || []).filter(reaction => reaction?.operator?.operator_type === 'app'
-      && reaction?.reaction_type?.emoji_type === emoji)
-      .map(reaction => reaction.reaction_id).filter(Boolean);
-  }
-
-  async function typingDesired(job, state, desired) {
-    if (!job.sourceMessageId) return { desired: false, outcome: 'not_applicable' };
-    const previous = state.result.typing || {};
-    const intent = { ...previous, desired, operation: desired ? 'add' : 'remove', intentAt: now(), outcome: 'pending' };
-    await persist(job, state, 'typing', intent);
-    try {
-      if (desired) {
-        state.control.assertOwned?.();
-        const response = await chat.addReaction({ messageId: job.sourceMessageId, emojiType: emoji });
-        const reactionId = response?.reaction_id || response?.reactionId || '';
-        if (!reactionId) throw Object.assign(new Error('typing add unconfirmed'), { code: 'typing_add_unconfirmed', outcome: 'unknown' });
-        if (state.result.typing?.desired === false) {
-          const late = { ...state.result.typing, reactionId, outcome: 'late_add_confirmed', confirmedAt: now() };
-          await persist(job, state, 'typing', late);
-          return typingDesired(job, state, false);
-        }
-        const confirmed = { ...intent, reactionId, outcome: 'confirmed', confirmedAt: now() };
-        await persist(job, state, 'typing', confirmed);
-        return confirmed;
-      }
-
-      const reactionIds = new Set(previous.reactionId ? [previous.reactionId] : []);
-      if (!previous.reactionId || previous.outcome !== 'confirmed') {
-        for (const reactionId of await listTyping(job, state)) reactionIds.add(reactionId);
-      }
-      for (const reactionId of reactionIds) {
-        state.control.assertOwned?.();
-        await chat.removeReaction({ messageId: job.sourceMessageId, reactionId });
-      }
-      const confirmed = { ...intent, reactionId: '', removedReactionIds: [...reactionIds], outcome: 'confirmed', confirmedAt: now() };
-      await persist(job, state, 'typing', confirmed);
-      return confirmed;
-    } catch (error) {
-      const unknown = { ...intent, outcome: error?.outcome === 'failed' ? 'failed' : 'unknown',
-        errorCode: error?.code || 'typing_reaction_unknown', nextRetryAt: now() + 1000 };
-      await persist(job, state, 'typing', unknown);
-      throw error;
-    }
-  }
-
-  async function ensureTypingStopped(job, state) {
-    const settled = () => state.result.typing?.desired === false && state.result.typing?.outcome === 'confirmed';
-    if (settled()) return state.result.typing;
-    const pending = { ...(state.result.typing || {}), desired: false, operation: 'remove', intentAt: now(), outcome: 'pending' };
-    await persist(job, state, 'typing', pending);
-    await state.typing;
-    if (settled()) return state.result.typing;
-    return typingDesired(job, state, false);
   }
 
   function cardFor(job, state, saved) {
@@ -109,10 +50,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     if (job.deliveryMode === 'caller') return null;
     const state = stateFor(job, control);
     state.card = cardFor(job, state, state.result.executionCard);
-    state.typing = typingDesired(job, state, true).catch(error => {
-      log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
-      return null;
-    });
+    state.typing = await typing?.start?.(job) || null;
     state.card?.push({ kind: 'started' });
     return state;
   }
@@ -137,11 +75,8 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
   async function restore(job, control = {}) {
     if (job.deliveryMode === 'caller') return null;
     const state = stateFor(job, control);
-    await typingDesired(job, state, false).catch(error => {
-      log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
-    });
+    await typing?.cleanup?.(job).catch(() => {});
     state.card = cardFor(job, state, state.result.executionCard);
-    state.typing = typingDesired(job, state, true).catch(() => null);
     state.card?.push({ kind: 'started', turnId: state.result.execution?.turnId });
     return state;
   }
@@ -155,10 +90,6 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
 
   function activate(job, state, execution) {
     if (!state || state.result.executionCard?.status !== 'retrying') return;
-    state.typing = typingDesired(job, state, true).catch(error => {
-      log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
-      return null;
-    });
     state.card?.push({ kind: 'started', turnId: execution?.turnId });
     state.card?.enqueue?.();
   }
@@ -168,9 +99,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
     if (state.result.executionCard?.status !== 'retrying' && state.card) {
       state.result.executionCard = await state.card.pause();
     }
-    await ensureTypingStopped(job, state).catch(error => {
-      log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
-    });
+    await typing?.cleanup?.(job, state.typing).catch(() => {});
   }
 
   async function prepare(job, result, state) {
@@ -181,9 +110,6 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
       await state.card.chain;
       result.executionCard = state.card.snapshot();
     }
-    await ensureTypingStopped(job, state).catch(error => {
-      log('warning', 'typing_reaction', 'pending', { code: error?.code || 'typing_reaction_unknown' });
-    });
   }
 
   async function finish(job, result, _unused, control = {}) {
@@ -207,7 +133,6 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
         } catch (error) { cardError = error; }
       }
     }
-    await typingDesired(job, state, false);
     if (cardError) throw cardError;
     return delivered;
   }
@@ -258,8 +183,9 @@ export function createExecutionFeedback({ jobs, sessions, chat, cardClient, auth
 
   async function cleanup(job, control = {}) {
     if (job.deliveryMode === 'caller' || !job.sourceMessageId) return;
-    const state = stateFor(job, control);
-    await typingDesired(job, state, false);
+    control.assertOwned?.();
+    await typing?.cleanup?.(job);
+    control.assertOwned?.();
   }
 
   return Object.freeze({ start, observe, restore, restoreWaiting, activate, wait, prepare, finish, handleCardAction, abandon, cleanup });

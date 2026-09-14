@@ -1,56 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createOutboundMedia } from '../src/channels/feishu/outbound-media.mjs';
 import { createFeishuReplies, markdownToFeishuPost } from '../src/channels/feishu/replies.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 
-test('card delivery sends attachments and never repeats an unknown upload after lease loss', async t => {
+test('bridge attachments use executor paths, delete successes and retain failures without blocking text', async t => {
   const root = await mkdtemp(join(tmpdir(), 'bridge-forward-replies-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const calls = [];
-  const chat = {
-    async uploadFile({ fileName }) { calls.push(`upload:${fileName}`); return { file_key: `key:${fileName}` }; },
-    async uploadImage() { throw new Error('unexpected image'); },
-    async sendMessage({ content }) { calls.push(`send:${content.file_key}`); return { message_id: `message:${content.file_key}` }; },
-    async replyMessage() { throw new Error('card success must skip fallback text'); },
-  };
-  const outbound = await createOutboundMedia({
-    workspace: root, outboxDir: join(root, 'outbox'), bindingOutboxDir: join(root, 'data/feishu-outbox'),
-    spoolDir: join(root, 'spool'), allowedGroupChatIds: new Set(['chat']), chat,
-  });
-  const scope = { connectionId: 'fixture', conversationId: 'chat', runId: 'run', conversationType: 'group', bindingOpenId: 'group:binding', sinceMs: 1000 };
-  const directory = await outbound.directory(scope);
-  for (const name of ['first.txt', 'second.txt']) {
-    await writeFile(join(directory, name), name);
-    await utimes(join(directory, name), 1, 1);
-  }
+  const chat = { async sendMessage(){calls.push('text');return{message_id:'text'};} };
+  const first=join(root,'first.txt'),second=join(root,'second.txt');await writeFile(first,'first');await writeFile(second,'second');
   const job = { id: 'run', leaseOwner: 'worker', chatId: 'chat', chatType: 'group', sourceMessageId: 'source', startedAt: 1000,
-    result: { execution: { bindingOpenId: 'group:binding', startedAt: 1000 }, answer: 'done' } };
-  const jobs = {
-    async patchReplyResult({ result }) { job.result = structuredClone(result); },
-    async patchFeedback({ value }) { job.result = { ...job.result, delivery: structuredClone(value) }; },
-  };
-  const replies = createFeishuReplies({ chat, outbound, jobs, connectionId: 'fixture' });
-  job.result = await replies.prepare(job, job.result);
-
-  let fences = 0;
-  await assert.rejects(replies.deliver(job, job.result, { skipText: true, assertLease() {
-    fences += 1;
-    if (fences === 4) throw Object.assign(new Error('lost'), { code: 'forward_lease_lost' });
-  } }), { code: 'forward_lease_lost' });
-  assert.equal(job.result.delivery.attachments[0].status, 'cleaned');
-  assert.equal(job.result.delivery.attachments[1].status, 'upload_intent');
-
-  const resumed = await replies.deliver(job, job.result, { skipText: true, assertLease() {} });
-  assert.deepEqual(calls, [
-    'upload:first.txt', 'send:key:first.txt',
-  ]);
-  assert.equal(resumed.status, 'unknown');
-  assert.equal(job.result.delivery.attachments[0].status, 'cleaned');
-  assert.equal(job.result.delivery.attachments[1].status, 'unknown');
+    result: { execution: { bindingOpenId: 'group:binding', startedAt: 1000 }, answer: 'done', attachments:[first,second] } };
+  const replies = createFeishuReplies({ chat, jobs:{}, connectionId:'fixture', allowedGroupChatIds:new Set(['chat']),
+    async sendAttachment({filePath}){calls.push(`attachment:${filePath}`);if(filePath===second)throw new Error('synthetic');return{messageId:'sent'};} });
+  const delivered=await replies.deliver(job,job.result,{assertLease(){}});
+  assert.equal(delivered.status,'sent');assert.deepEqual(delivered.attachments.map(item=>item.status),['sent','failed']);
+  await assert.rejects(stat(first),{code:'ENOENT'});assert.equal((await stat(second)).isFile(),true);
+  assert.deepEqual(calls,['text',`attachment:${first}`,`attachment:${second}`]);
 });
 
 test('API run without a source message creates the original post in the conversation', async () => {

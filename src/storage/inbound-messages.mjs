@@ -24,5 +24,20 @@ export function createInboundMessageStore({pool,now=Date.now,operationTimeoutMs=
       (message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,content_text,content_json,mentions_json,raw_event_json,bot_mentioned,group_context_candidate,message_created_at,message_updated_at,received_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,[messageId,text(input.chatId,191),input.chatType||'group','text',input.senderOpenId||'bot',input.senderName||'Agent Chat Bridge',input.text||'',json({text:input.text||''}),'[]',json({synthetic:true,source:'bridge_reply'}),0,0,input.createdAt??at,input.createdAt??at,at,at]); return {persisted:true};});},
     recordEvent(input){return write(async connection=>{const [result]=await connection.execute(`INSERT INTO assistant_message_events (message_id,chat_id,event,ok,reason,detail,chat_type,message_type,elapsed_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,[text(input.messageId,191),text(input.chatId,191),text(input.event,64),input.ok?1:0,input.reason||'',typeof input.detail==='string'?input.detail:json(input.detail||{}),input.chatType||'',input.messageType||'',input.elapsedMs??null,now()]); return {id:String(result.insertId)};});},
+    loadOpenProcessingReactionIds({messageId}) {
+      return read(async connection => {
+        const [rows] = await connection.execute(`SELECT event,detail FROM assistant_message_events
+          WHERE message_id=? AND event IN ('processing_reaction_added','processing_reaction_removed')
+          ORDER BY id ASC`, [text(messageId,191)]);
+        const open = new Set();
+        for (const row of rows) {
+          const match = /(?:^|\s)reaction_id=([^\s]+)/.exec(String(row.detail || ''));
+          if (!match) continue;
+          if (row.event === 'processing_reaction_added') open.add(match[1]);
+          else open.delete(match[1]);
+        }
+        return open;
+      });
+    },
   });
 }

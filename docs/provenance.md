@@ -9,7 +9,7 @@ The extraction used the frozen `kosbling-automation` source commit `f77d976355e7
 - Group prompt/context and recall filtering became `src/channels/feishu/input.mjs` and `src/storage/inbound-messages.mjs`.
 - The execution card, Typing and stop behavior became `execution-card.mjs` and `execution-feedback.mjs`; answer and attachment delivery became `replies.mjs` plus the controlled outbound module.
 
-The independent versions replace the old in-process HTTP hop with an injected executor, add caller/namespace isolation, explicit delivery modes, fenced unknown-outcome recovery, durable effect receipts, safe public projections, total attachment budget, source-version claims and controlled resource reads. They should not be described as unchanged copies or as already production-validated after modification. The public 28 MiB attachment budget is total across a run; the frozen source used a per-file upload cap.
+The independent versions replace the old in-process HTTP hop with an injected executor and add caller/namespace isolation, explicit delivery modes, fenced unknown-outcome recovery and safe public projections. Bridge-mode Typing, media and attachment delivery use the frozen production control flow with necessary client, config and Store injection. Caller mode retains controlled resource snapshots and their source-version claims. Bridge uploads use the frozen per-file 28 MiB cap. These adaptations are not evidence of real production acceptance.
 
 Feishu and Codex protocol clients use the declared pinned dependencies and Codex app-server protocol. Dependencies are installed through npm rather than vendored into this repository and retain their own licenses/notices.
 

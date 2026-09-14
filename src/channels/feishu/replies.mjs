@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
+import { unlink } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
+import { canDeliverOutboxAttachments } from '../../agents/codex/outbox-policy.mjs';
 
 const stable = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 32);
 const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const imageTypes = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
-const effectUnknown = code => Object.assign(new Error(code), { code, outcome: 'unknown' });
 
 export function publicAttachments(attachments = []) {
   return attachments.map((value, index) => {
@@ -18,7 +19,7 @@ export function publicAttachments(attachments = []) {
   });
 }
 
-export function createFeishuReplies({ chat, outbound, jobs, connectionId, replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
+export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, connectionId, allowedGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
   function artifactScope(job, result = job.result || {}) {
     const execution = result.execution || job.result?.execution || {};
     return {
@@ -28,13 +29,8 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, replyA
     };
   }
 
-  async function persist(job, delivery) {
-    await jobs.patchFeedback({ id: job.id, leaseOwner: job.leaseOwner, key: 'delivery', value: delivery });
-    job.result = { ...job.result, delivery };
-  }
-
   async function prepare(job, result) {
-    if (!outbound || result.delivery?.artifactsPrepared) return result;
+    if (job.deliveryMode !== 'caller' || !outbound || result.delivery?.artifactsPrepared) return result;
     const prepared = await outbound.prepare(artifactScope(job, result));
     const previous = new Map((result.delivery?.attachments || []).map(item => [item.artifactId, item]));
     const attachments = prepared.artifacts.map(artifact => ({
@@ -77,68 +73,29 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, replyA
   }
 
   async function sendAttachments(job, result, control) {
-    if (!outbound) return [];
-    const scope = artifactScope(job, result);
-    const delivery = structuredClone(job.result?.delivery || result.delivery || {});
-    delivery.attachments ||= [];
+    const paths = Array.isArray(result.attachments) ? result.attachments.filter(value => typeof value === 'string' && value) : [];
+    if (!paths.length || !sendAttachment) return [];
+    if (!canDeliverOutboxAttachments({ chatType: job.chatType, chatId: job.chatId, allowedGroupChatIds })) {
+      log('warning', 'forward_attachment', 'skipped', { code: 'attachment_conversation_not_allowed', attachments: paths.length });
+      return [];
+    }
+    const legacy = job.result?.delivery?.attachments || result.delivery?.attachments || [];
+    if (legacy.some(item => ['upload_intent', 'send_intent', 'unknown'].includes(item.status))) {
+      return legacy.map((item, index) => ({ ...item, index }));
+    }
     const facts = [];
-    for (const [index, artifact] of (result.attachments || []).entries()) {
-      const artifactId = artifact.ref?.artifactId;
-      let item = delivery.attachments.find(value => value.artifactId === artifactId);
-      if (!item) {
-        item = { artifactId, status: 'pending' };
-        delivery.attachments.push(item);
-      }
-      if (['upload_intent', 'send_intent'].includes(item.status)) {
-        item.status = 'unknown';
-        item.errorCode ||= item.uploadResult ? 'attachment_send_unknown' : 'attachment_upload_unknown';
-        await persist(job, delivery);
-      }
-      if (['cleaned', 'failed', 'unknown'].includes(item.status)) { facts.push({ ...item, index }); continue; }
-      if (!item.uploadResult) {
-        item.status = 'upload_intent';
-        await persist(job, delivery);
-        control.assertLease();
-        try {
-          item.uploadResult = await outbound.upload({ scope, ref: artifact.ref });
-          item.status = 'uploaded';
-        } catch (error) {
-          item.status = error?.outcome === 'failed' ? 'failed' : 'unknown';
-          item.errorCode = error?.code || 'attachment_upload_unknown';
-        }
-        await persist(job, delivery);
-        if (['failed', 'unknown'].includes(item.status)) { facts.push({ ...item, index }); continue; }
-      }
-      if (!item.messageId) {
-        item.status = 'send_intent';
-        await persist(job, delivery);
-        control.assertLease();
-        try {
-          const response = await outbound.send({ scope, ref: artifact.ref, uploadResult: item.uploadResult,
-            uuid: stable(`run:${job.id}:attachment:${index}`) });
-          item.messageId = response?.message_id || response?.messageId || '';
-          if (!item.messageId) throw effectUnknown('attachment_send_unconfirmed');
-          item.status = 'sent';
-        } catch (error) {
-          item.status = error?.outcome === 'failed' ? 'failed' : 'unknown';
-          item.errorCode = error?.code || 'attachment_send_unknown';
-        }
-        await persist(job, delivery);
-        if (['failed', 'unknown'].includes(item.status)) { facts.push({ ...item, index }); continue; }
-      }
-      control.assertLease();
+    for (const [index, filePath] of paths.entries()) {
       try {
-        await outbound.cleanup({ scope, ref: artifact.ref, confirmedSent: true });
-        item.status = 'cleaned';
-        item.cleanedAt = Date.now();
-        await persist(job, delivery);
+        control.assertLease();
+        const response = await sendAttachment({ chatId: job.chatId, filePath,
+          uuid: stable(`run:${job.id}:attachment:${index}`), maxBytes: 28 * 1024 * 1024 });
+        await unlink(filePath).catch(() => log('warning', 'forward_attachment', 'cleanup_failed', { code: 'attachment_cleanup_failed' }));
+        facts.push({ index, fileName: basename(filePath), messageId: response?.messageId || '', status: 'sent' });
       } catch (error) {
-        item.status = 'cleanup_pending';
-        item.errorCode = error?.code || 'attachment_cleanup_pending';
-        await persist(job, delivery);
-        throw error;
+        if (error?.code === 'forward_lease_lost') throw error;
+        log('warning', 'forward_attachment', 'failed', { code: error?.code || 'attachment_send_failed' });
+        facts.push({ index, fileName: basename(filePath), status: 'failed', errorCode: error?.code || 'attachment_send_failed' });
       }
-      facts.push({ ...item, index });
     }
     return facts;
   }
@@ -151,10 +108,9 @@ export function createFeishuReplies({ chat, outbound, jobs, connectionId, replyA
       const text = skipText ? { sent: 0, status: 'sent' } : await sendText(job, result, control);
       const attachments = await sendAttachments(job, result, control);
       const statuses = [text.status, ...attachments.map(item => item.status)];
-      const status = statuses.some(value => value === 'unknown') ? 'unknown'
-        : statuses.some(value => value === 'failed') ? 'failed' : 'sent';
+      const status = statuses.some(value => value === 'unknown') ? 'unknown' : 'sent';
       log(status === 'sent' ? 'info' : 'warning', 'forward_reply', status === 'sent' ? 'succeeded' : status,
-        { attachments: attachments.filter(item => item.status === 'cleaned').length });
+        { attachments: attachments.filter(item => ['sent', 'cleaned'].includes(item.status)).length });
       return { messages: text.sent, attachments, status };
     },
     async readResource(job, index) {

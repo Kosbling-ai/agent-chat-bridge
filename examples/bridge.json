@@ -6,7 +6,7 @@
     "passwordEnv": "BRIDGE_DB_PASSWORD", "databaseEnv": "BRIDGE_DB_DATABASE"
   },
   "codex": { "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"], "jobRetryMs": 60000, "jobMaxAttempts": 3 },
-  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id", "displayName": "Agent" },
+  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id", "displayName": "Agent", "processingReaction": true, "processingReactionEmoji": "Typing", "processingFallbackText": "收到，正在查询。", "mediaEnabled": true, "mediaInboxDir": "data/feishu-inbox", "mediaMaxBytes": 20971520 },
   "routing": {
     "version": "1",
     "privateUserIds": ["replace_with_allowed_open_id"],

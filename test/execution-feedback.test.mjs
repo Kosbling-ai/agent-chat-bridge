@@ -21,10 +21,10 @@ function jobFixture() {
   };
 }
 
-test('terminal typing intent removes an add reaction that confirms late', async () => {
+test('live feedback awaits production Typing before starting the execution card', async () => {
   const job = jobFixture();
   const calls = [];
-  let confirmAdd;
+  let release;
   const feedback = createExecutionFeedback({
     jobs: {
       async patchFeedback({ key, value }) {
@@ -32,32 +32,19 @@ test('terminal typing intent removes an add reaction that confirms late', async 
       },
     },
     sessions: {},
-    chat: {
-      async addReaction() {
-        calls.push('add');
-        return new Promise(resolve => { confirmAdd = resolve; });
-      },
-      async removeReaction({ reactionId }) {
-        calls.push(`remove:${reactionId}`);
-        return {};
-      },
-      async listReactions() { return { items: [] }; },
-    },
+    chat: {},
+    typing: { async start() { calls.push('typing:start'); await new Promise(resolve => { release = resolve; }); return { reactionId:'reaction-1' }; } },
     cardClient: {},
     executor: {},
   });
 
-  const state = await feedback.start(job);
-  while (!confirmAdd) await new Promise(resolve => setImmediate(resolve));
-  const prepared = feedback.prepare(job, {}, state);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(job.result.typing.desired, false);
-  confirmAdd({ reaction_id: 'reaction-1' });
-  await prepared;
-
-  assert.deepEqual(calls, ['add', 'remove:reaction-1']);
-  assert.equal(job.result.typing.outcome, 'confirmed');
-  assert.equal(job.result.typing.desired, false);
+  const started = feedback.start(job);
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ['typing:start']);
+  release();
+  const state = await started;
+  assert.equal(state.typing.reactionId, 'reaction-1');
+  state.card.stop();
 });
 
 test('busy waiting reuses one card and does not repeat Typing until admission succeeds', async () => {
@@ -68,10 +55,10 @@ test('busy waiting reuses one card and does not repeat Typing until admission su
   const feedback = createExecutionFeedback({
     jobs: { async patchFeedback({ key, value }) { job.result = { ...job.result, [key]: structuredClone(value) }; } },
     sessions: {},
-    chat: {
-      async addReaction() { const id = `reaction-${++reaction}`; effects.push(`typing:add:${id}`); return { reaction_id: id }; },
-      async removeReaction({ reactionId }) { effects.push(`typing:remove:${reactionId}`); },
-      async listReactions() { effects.push('typing:list'); return { items: [] }; },
+    chat: {},
+    typing: {
+      async start() { const id = `reaction-${++reaction}`; effects.push(`typing:add:${id}`); return { reactionId:id }; },
+      async cleanup(_job, value) { effects.push(`typing:remove:${value?.reactionId || 'persisted'}`); },
     },
     cardClient: { im: { v1: { message: {
       async create() { effects.push('card:create'); return { code: 0, data: { message_id: 'card-message' } }; },
@@ -82,10 +69,9 @@ test('busy waiting reuses one card and does not repeat Typing until admission su
   const first = await feedback.start(job);
   await first.card.chain;
   await feedback.wait(job, first);
-  const afterFirstWait = [...effects];
   const second = feedback.restoreWaiting(job);
   await feedback.wait(job, second);
-  assert.deepEqual(effects, afterFirstWait);
+  assert.deepEqual(effects.filter(value => value.startsWith('typing:add')), ['typing:add:reaction-1']);
 
   const admitted = feedback.restoreWaiting(job);
   feedback.activate(job, admitted, { turnId: 'turn-1' });
@@ -93,8 +79,8 @@ test('busy waiting reuses one card and does not repeat Typing until admission su
   await admitted.card.chain;
   assert.equal(effects.filter(value => value === 'card:create').length, 1);
   assert.equal(effects.filter(value => value === 'card:patch').length, 2, 'one waiting patch and one confirmed-admission patch');
-  assert.deepEqual(effects.filter(value => value.startsWith('typing:add')), ['typing:add:reaction-1', 'typing:add:reaction-2']);
-  assert.deepEqual(effects.filter(value => value.startsWith('typing:remove')), ['typing:remove:reaction-1']);
+  assert.deepEqual(effects.filter(value => value.startsWith('typing:add')), ['typing:add:reaction-1']);
+  assert.deepEqual(effects.filter(value => value.startsWith('typing:remove')), ['typing:remove:reaction-1','typing:remove:persisted']);
 });
 
 test('busy waiting follows the original single pause patch and then stays quiet', async () => {
@@ -217,26 +203,17 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
   assert.equal(interrupts, 1);
 });
 
-test('unknown typing add is reconciled from app reactions on an independent persisted snapshot', async () => {
+test('recovery delegates persisted and app reaction cleanup without replaying add', async () => {
   const durable = jobFixture();
   durable.result.typing = { desired: false, operation: 'remove', outcome: 'unknown' };
-  const removed = [];
+  const calls = [];
   const feedback = createExecutionFeedback({
     jobs: { async patchFeedback({ key, value }) { durable.result = { ...durable.result, [key]: structuredClone(value) }; } },
-    sessions: {}, cardClient: {}, executor: {},
-    chat: {
-      async listReactions() { return { items: [
-        { reaction_id:'ours',operator:{operator_type:'app'},reaction_type:{emoji_type:'Typing'} },
-        { reaction_id:'human',operator:{operator_type:'user'},reaction_type:{emoji_type:'Typing'} },
-        { reaction_id:'other',operator:{operator_type:'app'},reaction_type:{emoji_type:'OK'} },
-      ] }; },
-      async removeReaction({ reactionId }) { removed.push(reactionId); },
-    },
+    sessions: {}, cardClient: {}, executor: {}, chat: {},
+    typing: { async start() { calls.push('add'); }, async cleanup() { calls.push('cleanup'); } },
   });
-  await feedback.cleanup(structuredClone(durable));
-  assert.deepEqual(removed, ['ours']);
-  assert.equal(durable.result.typing.outcome, 'confirmed');
-  assert.equal(durable.result.typing.desired, false);
+  await feedback.restore(structuredClone(durable));
+  assert.deepEqual(calls, ['cleanup']);
 });
 
 test('concurrent stop callbacks register once and replay only inspects the exact turn', async () => {

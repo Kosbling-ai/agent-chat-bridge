@@ -6,6 +6,7 @@
 - Add optional `codex.sharedHome`. A configured value and inherited `CODEX_HOME` must resolve to the same directory; explicit `codex.idleCloseMs: 0` remains supported.
 - Restore the frozen production execution-card controller and ordinary reply path. Cards use the original create/patch throttle and fall back to chat-created post or text messages; ordinary replies use the original Markdown conversion, output cap and 3000/1900-character chunks.
 - Add optional `feishu.replyAsPost` (default `true`) and `feishu.maxOutputChars` (default `3500`). Persisted legacy unconfirmed card/text effects remain held without replay during this transition.
+- Restore the frozen production Typing lifecycle, private-chat image preparation, and direct executor attachment delivery. Typing add is awaited before live execution, add failure uses the configured text fallback, and final cleanup is best effort. Successful attachment sends remove their source file; individual failures retain it and do not block the text reply.
 
 No database migration is added. Validation uses offline configuration, lifecycle and synthetic child-process fixtures; no real message or model acceptance was run.
 

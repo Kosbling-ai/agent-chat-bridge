@@ -13,8 +13,9 @@ import { createForwardJobStore } from './storage/forward-jobs.mjs';
 import { createInboundMessageStore } from './storage/inbound-messages.mjs';
 import { createFeishuAdapter } from './channels/feishu/adapter.mjs';
 import { createFeishuChatClient } from './channels/feishu/chat-client.mjs';
-import { createFeishuMedia } from './channels/feishu/media.mjs';
+import { createFeishuMedia, resolveMediaInboxDir, sendOutboundAttachment } from './channels/feishu/media.mjs';
 import { createOutboundMedia } from './channels/feishu/outbound-media.mjs';
+import { createProcessingTyping } from './channels/feishu/typing.mjs';
 import { createForwardRuntime } from './core/forward-runtime.mjs';
 import { createCommunicationRuntime } from './core/communication-runtime.mjs';
 import { createExecutionFeedback } from './channels/feishu/execution-feedback.mjs';
@@ -78,7 +79,7 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, replies: createFeishuReplies, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
   const pool = factories.pool(config.storage, env);
   let store, executor, feishu, communication, forward, catchup, http;
   let writerHealthy = true;
@@ -154,17 +155,22 @@ export async function startService({ config, configPath, env = process.env, log,
     const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance, { proxyAgent });
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
     const chat = factories.chat({ client, maxMediaBytes: 28 * 1024 * 1024 });
-    const media = await factories.media({ chat, workspace: cwd, inboxDir: resolve(cwd, '.agent-chat-bridge/inbox'), maxTotalBytes: config.feishu.mediaBudgetBytes, log });
+    const media = await factories.media({ client, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
+      enabled: config.feishu.mediaEnabled, maxBytes: config.feishu.mediaMaxBytes,
+      unsupportedReplyText: config.feishu.mediaUnsupportedReply, log });
     const outbound = await factories.outbound({ chat, workspace: cwd,
       outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'),
       bindingOutboxDir: resolve(cwd, 'data/feishu-outbox'),
       spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'),
       allowedGroupChatIds, maxTotalBytes: config.feishu.outputBudgetBytes, log });
     checkCancelled();
-    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,
+    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,allowedGroupChatIds,
+      sendAttachment: input => sendOutboundAttachment({ client, ...input }),
       replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
     const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
-    const feedback=factories.feedback({jobs,sessions,chat,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
+    const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
+      emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
+    const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
     forward=factories.forward({config:{
       steering:config.codex.steering,
       retryDelayMs:config.codex.jobRetryMs,

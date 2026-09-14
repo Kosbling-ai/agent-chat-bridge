@@ -65,6 +65,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   let executorInstance;
   let forwardConfig;
   let repliesConfig;
+  let mediaConfig;
+  let typingConfig;
   let sessions;
   const logEvents = [];
   const forwardJobs = [
@@ -97,7 +99,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
       return executorInstance;
     },
     forward: input => { forwardConfig = input.config; return createForwardRuntime(input); },
-    media: async () => ({}), outbound: async () => ({}), chat: () => ({}),
+    media: async input => (mediaConfig=input,{}), typing: input => (typingConfig=input,{}),
+    outbound: async () => ({}), chat: () => ({}),
     sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} },
     feishu: () => ({ async start() {}, async stop() {}, status: () => ({ connected: true }) }),
   } });
@@ -117,6 +120,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(forwardConfig.maxAttempts, 3);
   assert.equal(repliesConfig.replyAsPost, true);
   assert.equal(repliesConfig.maxOutputChars, 3500);
+  assert.equal(mediaConfig.enabled, true);
+  assert.equal(mediaConfig.maxBytes, 20 * 1024 * 1024);
+  assert.equal(typingConfig.enabled, true);
+  assert.equal(typingConfig.emoji, 'Typing');
+  assert.equal(typingConfig.fallbackText, '收到，正在查询。');
   await sessions.saveCodexBinding({feishuOpenId:'system:log',chatId:'log-chat',chatType:'group',codexSessionId:'log-reject',threadName:'log',created:false});
   await assert.rejects(executorInstance.execute({bindingOpenId:'system:log',chatId:'log-chat',chatType:'group',messageId:'log-message',prompt:'work',busyPolicy:'reject'}), {code:'CODEX_THREAD_BUSY'});
   const rpcLog = logEvents.find(event => event.operation === 'rpc_request');

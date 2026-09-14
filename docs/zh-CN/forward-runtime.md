@@ -12,15 +12,15 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 人工飞书请求在 native turn 尚未开始前遇到其他客户端持有会话写锁时，第一次明确的 `CODEX_THREAD_BUSY` 就终止本次请求，并只通过原卡片/回复链提示“会话被其他客户端占用，请释放后重试或新建会话。”bridge 保留原 binding，不新建会话，也不自动重放。其他明确可重试的入场失败默认最多 3 次，每次相隔 60 秒；`codex.jobRetryMs` 允许 10 秒到 30 分钟，`codex.jobMaxAttempts` 允许 1 到 10。
 
-system 等待只授予已持久化且非空的 `executionNamespace`：它必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭，确认入场后才激活一次。已绑定 turn 的观察失败、turn start 结果不明和未决 steer 核对失败始终进入 `held`，保留 native/intent 身份，不受重试次数影响。
+system 等待只授予已持久化且非空的 `executionNamespace`：它必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭；确认入场后更新卡片，恢复流程不再添加 Typing。已绑定 turn 的观察失败、turn start 结果不明和未决 steer 核对失败始终进入 `held`，保留 native/intent 身份，不受重试次数影响。
 
-执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。附件与 Typing 仍保留当前 intent/收据处理，文件只在发送收据落库后清理；Typing 结果不明时只核对原消息返回的前 50 条 reaction，并按 `operator_type=app` 与配置 emoji 匹配。
+执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
 
-bridge 的投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`；caller 终态为 `not_requested`。投递失败或未知不会重跑已经完成的模型 turn。公开附件 `id` 是十进制资源索引，可直接用于 `/v1/runs/:id/resources/:index`。
+私聊支持单图和 post 内图片，下载路径按原格式追加到文字 prompt；群聊只保留文字，忽略媒体。`mediaMaxBytes` 是原实现下载后的告警阈值，不会拒绝图片。bridge 模式直接投递 executor 返回的路径：私聊允许，群聊沿现有 bridge/API 会话 allowlist；单文件上限 28 MiB，成功后删除，单件失败保留文件且不阻断文字或其他附件。旧未确认附件 intent 不重放。
+
+bridge 的投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`；caller 终态为 `not_requested`。投递失败或未知不会重跑已经完成的模型 turn。caller 附件快照的公开 `id` 是十进制资源索引，可用于 `/v1/runs/:id/resources/:index`；bridge 成功发送后会删除路径文件，因此不承诺之后仍可下载，查询可能返回不存在。
 
 已知 thread/turn 的恢复只观察，不重新提交；原生结果不确定时进入 held。`GET /v1/runs/:id/attempt`、`POST /v1/recoveries` 和 `POST /v1/sessions/reset` 在完成相应认证、管理权限和会话 scope 检查后返回 `409 unsupported_execution_model`，不会伪造 generation 或假装已登记恢复动作。`GET /v1/recoveries/:id` 只读取 communication schema 中真实存在的旧 recovery 记录，并保留原管理权限和会话检查；不存在时返回 404。
-
-附件最多九件，公开 bridge 的读取/发送采用 **总计 28 MiB** 预算。这比冻结生产源“最多九件、每次上传单文件 28 MiB”更严格，属于公开边界，不应描述为原样复制。
 
 迁移 002–003 只用于 bridge 自己的新 MySQL schema，并非把 Kosbling 生产/P 原库原地转换成 0.2.0。启动只校验迁移账本，不自动执行 DDL；新开发实例应使用空的独立 schema 显式迁移。已有 0.1.1 bridge 试用库如需升级，必须先停唯一 writer，并把数据库与 workspace/outbox 一起备份。应用 002–003 后回退 0.1.1 需要恢复旧库快照或使用另一份兼容 schema，不能删迁移记录假装降级。
 

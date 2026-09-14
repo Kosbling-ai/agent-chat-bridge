@@ -68,6 +68,17 @@ test('unknown native outcome becomes held and is not submitted again',async()=>{
   const jobs=memoryJobs({status:'pending'});let calls=0;const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions:{},executor:{execute:async()=>{calls++;throw Object.assign(new Error('lost'),{code:'CODEX_TURN_START_UNCONFIRMED',outcome:'unknown',threadId:'thread'});}},replies:{readResource:async()=>null},authorize:async()=>true});runtime.start();await flush();await runtime.stop();assert.equal(calls,1);assert.equal(jobs.job.status,'held');assert.equal(jobs.calls.filter(x=>x[0]==='retry').length,1);
 });
 
+test('bridge delivery cleans Typing after replies and cleanup failure does not undo completion',async()=>{
+  const effects=[];let claimed=false;
+  const job={id:'run',leaseOwner:'owner',status:'reply_pending',callerId:'live',chatId:'chat',chatType:'p2p',messageId:'message',sourceMessageId:'message',deliveryMode:'bridge',result:{answer:'done'},createdAt:1};
+  const jobs={async claimReplyPending(){if(claimed)return[];claimed=true;return[job];},async claim(){return[];},async renew(){},async markFinished(){effects.push('finished');job.status='completed';}};
+  const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions:{},executor:{},
+    feedback:{async finish(){effects.push('card');return false;},async cleanup(){effects.push('typing:cleanup');throw new Error('synthetic cleanup failure');}},
+    replies:{async prepare(_job,result){return result;},async deliver(){effects.push('reply');return{status:'sent'};},async readResource(){return null;}},authorize:async()=>true});
+  runtime.start();await flush();await runtime.stop();
+  assert.equal(job.status,'completed');assert.deepEqual(effects,['card','reply','finished','typing:cleanup']);
+});
+
 test('run API freezes namespace/delivery mode and rejects ledger management after scope checks',async()=>{
   const token='synthetic-token-at-least-24-characters';const submitted=[];const current={id:'run',conversationId:'chat',status:'completed'};const forwardRuntime={submit:async input=>{submitted.push(input);return{id:'run',duplicate:false};},getRun:async()=>current,readRunEvents:async()=>({items:[{sequence:'9007199254740993',payload:{type:'progress'}}],nextCursor:'9007199254740993'}),getResource:async({index})=>index===0?{fileName:'answer.txt',kind:'file',size:6,base64:'YW5zd2Vy'}:null};const api=createApi({config:validateConfig(base),store:{getRecovery:async()=>({id:'recovery',connectionId:'test',conversationId:'chat',status:'applied'})},chat:{},tokens:{caller:token},forwardRuntime});
   const request=(method,url,value)=>Object.assign(Readable.from(value?[Buffer.from(JSON.stringify(value))]:[]),{method,url,headers:{authorization:`Bearer ${token}`}});

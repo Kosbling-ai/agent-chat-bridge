@@ -23,6 +23,11 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).feishu.catchup, true);
   assert.equal(validateConfig(config).feishu.replyAsPost, true);
   assert.equal(validateConfig(config).feishu.maxOutputChars, 3500);
+  assert.equal(validateConfig(config).feishu.processingReaction, true);
+  assert.equal(validateConfig(config).feishu.processingReactionEmoji, 'Typing');
+  assert.equal(validateConfig(config).feishu.processingFallbackText, '收到，正在查询。');
+  assert.equal(validateConfig(config).feishu.mediaEnabled, true);
+  assert.equal(validateConfig(config).feishu.mediaMaxBytes, 20 * 1024 * 1024);
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, replyAsPost: false, maxOutputChars: 7000 } }).feishu.replyAsPost, false);
   assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
   assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
@@ -36,6 +41,8 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, codex: { ...config.codex, idleCloseMs: -1 } },
     { ...config, feishu: { ...config.feishu, replyAsPost: 'yes' } },
     { ...config, feishu: { ...config.feishu, maxOutputChars: 0 } },
+    { ...config, feishu: { ...config.feishu, processingReaction: 'yes' } },
+    { ...config, feishu: { ...config.feishu, mediaMaxBytes: -1 } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
     { ...config, feishu: { ...config.feishu, appSecret: 'synthetic' } },
     { ...config, hooks: [{ id: 'h', url: 'https://user:synthetic@example.invalid', tokenEnv: 'TEST_HOOK', conversationIds: [] }] },
@@ -214,6 +221,8 @@ test('startup cancellation closes an idle executor while Feishu start is pending
     pool: () => ({}), store: async () => ({ close: async () => { storeClosed = true; } }),
     executor: () => ({status:()=>({closing:false,restartPending:null}),close:async()=>{executorClosed=true;}}),
     sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} }, chat: () => ({ downloadResource: async () => { throw new Error('unexpected download'); }, uploadImage() {}, uploadFile() {}, sendMessage() {} }),
+    media: async () => ({ prepare() {}, release() {} }),
+    typing: () => ({ start() {}, cleanup() {} }),
     feishu: () => ({ start: () => { enter(); return new Promise(() => {}); }, stop: () => { socketStopped = true; } }),
   } });
   const rejected = assert.rejects(started, { code: 'startup_cancelled' });
