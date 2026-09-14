@@ -81,7 +81,6 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     const state = stateFor(job, control);
     state.card = cardFor(job, state, state.result.executionCard);
     state.typing = await typing?.start?.(job) || null;
-    state.card?.push({ kind: 'started' });
     return state;
   }
 
@@ -112,7 +111,9 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     const state = stateFor(job, control);
     await typing?.cleanup?.(job).catch(() => {});
     state.card = cardFor(job, state, state.result.executionCard);
-    state.card?.push({ kind: 'started', turnId: state.result.execution?.turnId });
+    if (state.result.executionCard?.messageId) {
+      state.card?.push({ kind: 'started', turnId: state.result.execution?.turnId });
+    }
     return state;
   }
 

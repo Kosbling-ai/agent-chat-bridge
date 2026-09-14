@@ -109,7 +109,7 @@ test('busy waiting reuses one card and does not repeat Typing until admission su
   await new Promise(resolve => setImmediate(resolve));
   await admitted.card.chain;
   assert.equal(effects.filter(value => value === 'card:create').length, 1);
-  assert.equal(effects.filter(value => value === 'card:patch').length, 2, 'one waiting patch and one confirmed-admission patch');
+  assert.equal(effects.filter(value => value === 'card:patch').length, 0, 'an unsent waiting card is created only after confirmed admission');
   assert.deepEqual(effects.filter(value => value.startsWith('typing:add')), ['typing:add:reaction-1']);
   assert.deepEqual(effects.filter(value => value.startsWith('typing:remove')), ['typing:remove:reaction-1','typing:remove:persisted']);
 });
@@ -149,7 +149,7 @@ test('busy waiting follows the original single pause patch and then stays quiet'
   assert.equal(patches, 1);
 });
 
-test('original card create precedes sidecar persistence and does not repeat after lease loss', async () => {
+test('real progress card create precedes sidecar persistence and does not repeat after lease loss', async () => {
   const job = jobFixture();
   job.sourceMessageId = null;
   delete job.result.executionCard;
@@ -174,6 +174,7 @@ test('original card create precedes sidecar persistence and does not repeat afte
       if (lost) throw Object.assign(new Error('lease lost'), { code: 'forward_lease_lost' });
     },
   });
+  state.card.push({ kind: 'started', turnId: 'turn-1' });
   await started;
   lost = true;
   releasePersist();

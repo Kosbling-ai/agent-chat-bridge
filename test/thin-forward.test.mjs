@@ -100,6 +100,62 @@ function memoryJobs(initial){
     getRun:async()=>job,readEvents:async()=>[]};
 }
 
+const bridgeInput={source:'live',callerId:'live',idempotencyKey:'message',conversationId:'chat',chatType:'p2p',actor:{openId:'human'},prompt:'work'};
+const bridgeJob=()=>({status:'pending',callerId:'live',executionNamespace:null,deliveryMode:'bridge',sourceMessageId:'message',senderOpenId:'human',chatType:'p2p'});
+const quietTyping={async start(){return null;},async cleanup(){}};
+
+test('successful live and recovered steering do not create a synthetic execution card',async()=>{
+  for(const recovered of [false,true]){
+    const jobs=memoryJobs(bridgeJob());let creates=0;
+    const sessions={async loadBinding(){return null;},async readPublicProgress(){return[];}};
+    const feedback=createExecutionFeedback({jobs,sessions,typing:quietTyping,
+      cardClient:{im:{v1:{message:{async create(){creates+=1;return{code:0,data:{message_id:'card'}};}}}}}});
+    const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions,feedback,
+      executor:{async execute(){return{threadId:'thread',turnId:'turn',answer:'steered',rawAnswer:'steered',attachments:[],deferred:true,accepted:true};}},
+      replies:{},authorize:async()=>true});
+    if(recovered)await runtime.recover();else await runtime.handleMessage(bridgeInput);
+    await runtime.stop();
+    assert.equal(jobs.job.status,'deferred',recovered?'recovered':'live');
+    assert.equal(creates,0,recovered?'recovered':'live');
+  }
+});
+
+test('real started progress creates a stoppable card and normal completion updates it',async()=>{
+  const jobs=memoryJobs(bridgeJob());const cards=[];let releaseCreate;
+  const created=new Promise(resolve=>{releaseCreate=resolve;});let deliveredProgress=false;
+  const sessions={async loadBinding(){return{codexSessionId:'thread'};},async readPublicProgress(){
+    if(deliveredProgress)return[];deliveredProgress=true;
+    return[{id:1,created_at:2,detail_json:{kind:'started',turnId:'turn'}}];
+  }};
+  const feedback=createExecutionFeedback({jobs,sessions,typing:quietTyping,
+    cardClient:{im:{v1:{message:{
+      async create(input){cards.push(JSON.parse(input.data.content));releaseCreate();return{code:0,data:{message_id:'card'}};},
+      async patch(input){cards.push(JSON.parse(input.data.content));return{code:0};},
+    }}}}});
+  const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions,feedback,
+    executor:{async execute(){await created;return{threadId:'thread',turnId:'turn',answer:'done',rawAnswer:'done',attachments:[]};}},
+    replies:{async prepare(_job,result){return result;},async deliver(){return{status:'sent'};}},authorize:async()=>true});
+  await runtime.handleMessage(bridgeInput);await runtime.stop();
+  assert.equal(cards.length,2);
+  assert.match(JSON.stringify(cards[0]),/stop_execution/);
+  assert.equal(cards.at(-1).header.template,'green');
+  assert.match(JSON.stringify(cards.at(-1)),/done/);
+});
+
+test('normal completion without progress still creates one terminal card',async()=>{
+  const jobs=memoryJobs(bridgeJob());const cards=[];
+  const sessions={async loadBinding(){return null;},async readPublicProgress(){return[];}};
+  const feedback=createExecutionFeedback({jobs,sessions,typing:quietTyping,
+    cardClient:{im:{v1:{message:{async create(input){cards.push(JSON.parse(input.data.content));return{code:0,data:{message_id:'card'}};}}}}}});
+  const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions,feedback,
+    executor:{async execute(){return{threadId:'thread',turnId:'turn',answer:'done',rawAnswer:'done',attachments:[]};}},
+    replies:{async prepare(_job,result){return result;},async deliver(){return{status:'sent'};}},authorize:async()=>true});
+  await runtime.handleMessage(bridgeInput);await runtime.stop();
+  assert.equal(cards.length,1);
+  assert.equal(cards[0].header.template,'green');
+  assert.match(JSON.stringify(cards[0]),/done/);
+});
+
 test('forward runtime uses only its response waiter signal and persists caller result',async()=>{
   const jobs=memoryJobs({status:'pending'});const options=[];const executor={execute:async(_input,value)=>{options.push(value);return{threadId:'thread',turnId:'turn',answer:'shown',rawAnswer:'full machine answer',attachments:[]};}};
   const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1,leaseMs:10000},jobs,sessions:{},executor,replies:{readResource:async()=>null},feedback:null,authorize:async()=>true});runtime.start();await flush();await runtime.stop();
@@ -425,11 +481,11 @@ test('ordinary busy finishes the real feedback card and stops its observer and l
   globalThis.setInterval=(callback,ms)=>{const token={id:++sequence,unref(){}};timers.set(token,{callback,ms});return token;};
   globalThis.clearInterval=token=>timers.delete(token);
   try {
-    const jobs=memoryJobs({status:'pending',callerId:'live',executionNamespace:null,deliveryMode:'bridge',sourceMessageId:'message',
-      result:{execution:{bindingOpenId:'human'},executionCard:{messageId:'card-message',status:'running',entries:[]}}});
+    const jobs=memoryJobs({status:'pending',callerId:'live',executionNamespace:null,deliveryMode:'bridge',sourceMessageId:'message',senderOpenId:'human',
+      result:{execution:{bindingOpenId:'human'}}});
     const sessions={async loadBinding(){reads+=1;return{codexSessionId:'thread'};},async readPublicProgress(){return[];}};
     const feedback=createExecutionFeedback({jobs,sessions,typing:{async start(){return null;},async cleanup(){}},
-      cardClient:{im:{v1:{message:{async patch(input){cards.push(JSON.parse(input.data.content));return{code:0};}}}}}});
+      cardClient:{im:{v1:{message:{async create(input){cards.push(JSON.parse(input.data.content));return{code:0,data:{message_id:'card-message'}};}}}}}});
     const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions,feedback,
       executor:{async execute(){throw Object.assign(new Error('busy'),{code:'CODEX_THREAD_BUSY'});}},
       replies:{async prepare(_job,result){return result;},async deliver(){return{status:'sent'};}},authorize:async()=>true});
@@ -441,7 +497,10 @@ test('ordinary busy finishes the real feedback card and stops its observer and l
     assert.equal(reads,readsAfterFailure);
     assert.equal(jobs.calls.filter(([name])=>name==='retry').length,0);
     assert.equal(jobs.job.status,'failed');
+    assert.equal(jobs.job.result.busyFork?.sourceThreadId,'thread');
+    assert.equal(jobs.job.result.executionCard?.forkSourceThreadId,'thread');
     assert(cards.some(card=>card.header.template==='red'&&JSON.stringify(card).includes('会话被其他客户端占用')));
+    assert.match(JSON.stringify(cards.at(-1)),/fork_busy_session/);
     await runtime.stop();
     assert.equal(timers.size,0);
   } finally {
