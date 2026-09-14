@@ -29,10 +29,23 @@ test('one message has commentary, nested tools and final answer; replay patches 
   assert.ok(JSON.stringify(final).includes('最终答案'));
   assert.equal(final.body.elements[1].tag, 'collapsible_panel');
   assert.equal(final.body.elements[1].elements[0].tag, 'collapsible_panel');
+  assert.deepEqual(final.body.elements[0], { tag: 'div', text: { tag: 'plain_text', content: '我先核对记录。', text_size: 'normal', text_color: 'grey' } });
+  assert.deepEqual(final.body.elements[1].elements[0].elements[0], { tag: 'div', text: { tag: 'plain_text', content: '正在处理', text_size: 'normal', text_color: 'grey' } });
+  const answer = final.body.elements.find((element) => element.content === '最终答案');
+  assert.equal(answer.text_size, 'heading');
   const replay = fixture(persisted.at(-1));
   assert.equal(await replay.card.finish('最终答案'), true);
   assert.equal(replay.calls[0].method, 'patch');
   assert.equal(replay.calls[0].payload.path.message_id, 'om_card');
+});
+
+test('progress uses normal grey plain text while final Markdown stays intact and larger', () => {
+  const commentary = '过程段落\n\n- 一项\n- 二项\n\n```js\nconst value = 1;\n```';
+  const answer = '# 最终标题\n\n正文包含 **加粗**。\n\n1. 第一项\n2. 第二项\n\n```js\nconst answer = 42;\n```';
+  const card = renderExecutionCard({ status: 'completed', entries: [{ kind: 'commentary', id: 'c', text: commentary }] }, answer);
+  assert.deepEqual(card.body.elements[0], { tag: 'div', text: { tag: 'plain_text', content: commentary, text_size: 'normal', text_color: 'grey' } });
+  assert.deepEqual(card.body.elements[1], { tag: 'markdown', content: answer, text_size: 'heading' });
+  assert.deepEqual(card.body.elements[2], { tag: 'markdown', content: '**已完成**' });
 });
 
 test('slow SDK keeps only one request in flight and final waits for it once', async () => {

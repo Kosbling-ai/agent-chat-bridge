@@ -2,7 +2,9 @@ import { publicText } from '../../shared/public-progress.mjs';
 
 const statuses = { running: '执行中', completed: '已完成', failed: '执行失败', interrupted: '已中断', retrying: '连接恢复中', deferred: '补充已转达' };
 const panel = (id, title, elements) => ({ tag: 'collapsible_panel', element_id: id, expanded: false, header: { title: { tag: 'plain_text', content: title }, icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' }, icon_position: 'follow_text', icon_expanded_angle: -180 }, elements });
-const md = (content) => ({ tag: 'markdown', content });
+const md = (content, textSize) => ({ tag: 'markdown', content, ...(textSize ? { text_size: textSize } : {}) });
+const progressText = (content) => ({ tag: 'div', text: { tag: 'plain_text', content, text_size: 'normal', text_color: 'grey' } });
+const answerMd = (content) => md(content, 'heading');
 export function renderExecutionCard(state, answer = '', displayName = 'agent-chat-bridge') {
   const entries = (state.entries || []).slice(-24);
   const elements = [];
@@ -10,17 +12,17 @@ export function renderExecutionCard(state, answer = '', displayName = 'agent-cha
   const flush = () => {
     if (!group.length) return;
     const running = group.filter((x) => x.status === 'running').length;
-    elements.push(panel(`group_${elements.length}`, `${group.length} 个工具调用 · ${running ? `${running} 个执行中` : '已结束'}`, group.map((x, i) => panel(`tool_${elements.length}_${i}`, `${x.title} · ${statuses[x.status] || '已结束'}`, [md(x.summary || statuses[x.status] || '已结束')]))));
+    elements.push(panel(`group_${elements.length}`, `${group.length} 个工具调用 · ${running ? `${running} 个执行中` : '已结束'}`, group.map((x, i) => panel(`tool_${elements.length}_${i}`, `${x.title} · ${statuses[x.status] || '已结束'}`, [progressText(x.summary || statuses[x.status] || '已结束')]))));
     group = [];
   };
   for (const entry of entries) {
     if (entry.kind === 'tool') group.push(entry);
-    else { flush(); elements.push(md(publicText(entry.text, 800))); }
+    else { flush(); elements.push(progressText(publicText(entry.text, 800))); }
   }
   flush();
-  if (state.omitted) elements.unshift(md('较早的执行过程已收起，仅展示最近进度。'));
-  if (answer) elements.push(md(answer));
-  if (!elements.length) elements.push(md('已收到，正在处理你的请求。'));
+  if (state.omitted) elements.unshift(progressText('较早的执行过程已收起，仅展示最近进度。'));
+  if (answer) elements.push(answerMd(answer));
+  if (!elements.length) elements.push(progressText('已收到，正在处理你的请求。'));
   elements.push(md(`**${statuses[state.status] || '执行中'}**${state.delivery === 'fallback' ? ' · 结果将通过普通消息送达' : ''}`));
   if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: '停止执行' }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
   if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: '保留历史并新建会话' }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
