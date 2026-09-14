@@ -31,10 +31,10 @@ function secret(env, key) {
   if (typeof env[key] !== 'string' || !env[key]) throw new ConfigError('required_environment_missing');
   return env[key];
 }
-export async function migrateService({ config, env = process.env }) {
+export async function migrateService({ config, env = process.env, legacyConnectionId }) {
   if (!config.storage) throw new ConfigError('storage_unconfigured');
   const pool = createPoolFromEnvironment(config.storage, env);
-  try { return await migrate(pool); } finally { await pool.end(); }
+  try { return await migrate(pool, { legacyConnectionId }); } finally { await pool.end(); }
 }
 export function createFeishuProxyAgent(value, options) {
   try {
@@ -113,14 +113,14 @@ export async function startService({ config, configPath, env = process.env, log,
     if (failures.length) throw new Error('service_shutdown_failed');
   })();
   try {
-    store = await factories.store({ pool, onWriterLost: () => { writerHealthy = false; log('error', 'store_writer', 'failed', { code: 'writer_lost' }); } });
+    store = await factories.store({ pool, connectionId: config.feishu.connectionId, onWriterLost: () => { writerHealthy = false; log('error', 'store_writer', 'failed', { code: 'writer_lost' }); } });
     checkCancelled();
     // The default pool has already validated this reference. Dependency-injected
     // unit stores may omit database credentials and use this inert identifier.
     const schema=typeof env[config.storage.databaseEnv]==='string'&&env[config.storage.databaseEnv]?env[config.storage.databaseEnv]:'bridge_test';
-    const sessions=pool?.query?factories.sessions({pool,schema}):{};
-    const jobs=factories.jobs({pool});
-    const inbound=factories.inbound({pool});
+    const sessions=pool?.query?factories.sessions({pool,schema,connectionId:config.feishu.connectionId}):{};
+    const jobs=factories.jobs({pool,connectionId:config.feishu.connectionId});
+    const inbound=factories.inbound({pool,connectionId:config.feishu.connectionId});
     const allowedGroupChatIds = new Set([
       ...config.routing.groups.filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId),
       ...config.auth.clients.flatMap(client => client.conversationIds),

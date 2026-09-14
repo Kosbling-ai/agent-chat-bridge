@@ -7,7 +7,7 @@ const refs=Object.fromEntries(['host','port','user','password','database'].map(k
 test('real MySQL canonical receipt wins across live/history while recalls and known scopes stay distinct',{
   skip:!process.env.BRIDGE_TEST_PASSWORD,timeout:30000,
 },async()=>{
-  const pool=createPoolFromEnvironment(refs);await migrate(pool);const store=await createMysqlStore({pool});
+  const pool=createPoolFromEnvironment(refs);await migrate(pool);const store=await createMysqlStore({connectionId:'c',pool});
   const input=(key,source='live',chat='a')=>({connectionId:'c',conversationId:chat,conversationType:'p2p',source,eventKey:key,eventType:'message.received',messageId:'message',revision:'1',payload:{source,conversationType:'p2p',text:key,actor:{name:source}},policyVersion:'v1',passiveContext:true,agentJob:{payload:{text:key}},hooks:[{hookId:'business',payload:{text:key}}]});
   try{
     const pair=await Promise.all([store.acceptInbound(input('live')),store.acceptInbound(input('history','history_catchup'))]);

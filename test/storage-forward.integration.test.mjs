@@ -28,7 +28,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
   try {
     await migrate(pool);
     let now = 1000;
-    const store = createForwardJobStore({ pool, now: () => now });
+    const store = createForwardJobStore({connectionId:'fixture', pool, now: () => now });
     const input = {
       callerId: 'caller', idempotencyKey: 'daily:1', conversationId: 'chat',
       messageId: 'system:daily:1', chatType: 'group', senderOpenId: 'system:scope',
@@ -72,10 +72,10 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal(result.result.rawAnswer, 'raw');
     assert.equal(result.result.typing.reactionId, 'reaction');
     await pool.execute(`INSERT INTO assistant_codex_events
-      (codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?),(?,?,?,?,?,?,?,?,?,?,?)`, [
-      'thread','group:binding','chat','system:daily:1','visible','public_progress','activity','Progress','',JSON.stringify({kind:'tool',id:'safe'}),1200,
-      'thread','system:other','chat','system:daily:1','hidden','public_progress','activity','Other','',JSON.stringify({kind:'tool',id:'hidden'}),1200,
+      (connection_id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?),(?,?,?,?,?,?,?,?,?,?,?,?)`, [
+      'fixture','thread','group:binding','chat','system:daily:1','visible','public_progress','activity','Progress','',JSON.stringify({kind:'tool',id:'safe'}),1200,
+      'fixture','thread','system:other','chat','system:daily:1','hidden','public_progress','activity','Other','',JSON.stringify({kind:'tool',id:'hidden'}),1200,
     ]);
     const events=await store.readEvents({id:first.id,after:'0',limit:10});
     assert.deepEqual(events.map(event=>event.title),['Progress']);
@@ -83,6 +83,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.deepEqual(events[0].payload.progress, {kind:'tool',id:'safe'});
 
     const progressStore = createCodexSessionStore({
+      connectionId: 'fixture',
       pool,
       schema: process.env.BRIDGE_TEST_DATABASE,
       now: () => now,
@@ -91,11 +92,11 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     try {
       await delayed.beginTransaction();
       await delayed.execute(`INSERT INTO assistant_codex_events
-        (id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000001,'late-thread','group:late','late-chat','late-message','tool:late','public_progress','activity','Late','',JSON.stringify({kind:'tool',id:'late',status:'completed'}),1300]);
+        (connection_id,id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, ['fixture',9000001,'late-thread','group:late','late-chat','late-message','tool:late','public_progress','activity','Late','',JSON.stringify({kind:'tool',id:'late',status:'completed'}),1300]);
       await pool.execute(`INSERT INTO assistant_codex_events
-        (id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, [9000002,'late-thread','group:late','late-chat','late-message','tool:visible','public_progress','activity','Visible','',JSON.stringify({kind:'tool',id:'visible',status:'running'}),1301]);
+        (connection_id,id,codex_session_id,feishu_open_id,chat_id,message_id,event_key,event_type,role,title,text,detail_json,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, ['fixture',9000002,'late-thread','group:late','late-chat','late-message','tool:visible','public_progress','activity','Visible','',JSON.stringify({kind:'tool',id:'visible',status:'running'}),1301]);
       const binding = { feishuOpenId: 'group:late', chatId: 'late-chat' };
       let cardState = { entries: [] };
       const card = {
@@ -304,11 +305,11 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
 
     await pool.execute('DELETE FROM assistant_codex_forward_jobs');
     await pool.execute(`INSERT INTO assistant_codex_forward_jobs
-      (public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,chat_id,
+      (connection_id,public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,chat_id,
        chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,
        context_entries_json,status,result_json,last_error,created_at,updated_at)
       WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM seq WHERE n<1000)
-      SELECT UUID(),SHA2(CONCAT('history-',n),256),SHA2(CONCAT('history-request-',n),256),'history','','bridge',
+      SELECT 'fixture',UUID(),SHA2(CONCAT('history-',n),256),SHA2(CONCAT('history-request-',n),256),'history','','bridge',
        CONCAT('history-',n),'chat','group','text','system:history','','group','history','null','[]','completed',
        JSON_OBJECT('typing',JSON_OBJECT('desired',false,'outcome','confirmed')),'',?,? FROM seq`, [now, now]);
     const cleanupRun = await store.upsert({ ...input, idempotencyKey: 'indexed-cleanup', messageId: 'indexed-cleanup', deliveryMode: 'bridge' });
@@ -321,7 +322,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     await store.markRetry({ id: cleanupRun.id, leaseOwner: cleanupOwner.leaseOwner, held: true, errorCode: 'cleanup_fixture' });
     const [plan] = await pool.query(`EXPLAIN SELECT id FROM assistant_codex_forward_jobs
       FORCE INDEX (idx_forward_feedback_cleanup)
-      WHERE feedback_cleanup_pending=1 AND feedback_cleanup_at<=?
+      WHERE connection_id='fixture' AND feedback_cleanup_pending=1 AND feedback_cleanup_at<=?
         AND status IN ('held','completed','failed','deferred')
         AND (lease_expires_at IS NULL OR lease_expires_at<=?)
       ORDER BY feedback_cleanup_at,id LIMIT 5`, [now, now]);
@@ -359,7 +360,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal((await store.beginStop({ id: cardStopRun.id, threadId: 'wrong-thread', bindingThreadId: 'card-stop-thread',
       turnId: 'card-stop-turn', messageId: 'card-stop-source', actor: 'human' })).outcome,'stale');
 
-    const communication = await createMysqlStore({ pool, now: () => now });
+    const communication = await createMysqlStore({connectionId:'fixture', pool, now: () => now });
     const receipt = {
       connectionId: 'fixture', conversationId: 'chat', source: 'live', conversationType: 'group',
       eventKey: 'event-1', eventType: 'message.received', messageId: 'message-1',
@@ -385,7 +386,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
       eventKey: 'recall-1', eventType: 'message.recalled', messageId: 'message-1', recalledMessageId: 'message-1',
       payload: { source: 'live', conversationType: 'group' }, policyVersion: '1',
     });
-    const inbound = createInboundMessageStore({ pool, now: () => now });
+    const inbound = createInboundMessageStore({connectionId:'fixture', pool, now: () => now });
     const context = await inbound.loadRecentGroupContext({ connectionId: 'fixture', chatId: 'chat', beforeMs: 2100 });
     assert.deepEqual(context, []);
 

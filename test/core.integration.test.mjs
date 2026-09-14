@@ -19,7 +19,7 @@ async function eventually(read, predicate) {
 test('real Store core: immediate completion, independent hook, API authorization and unknown recovery', { skip: !enabled, timeout: 30000 }, async () => {
   const pool = createPoolFromEnvironment(refs);
   await migrate(pool);
-  let store = await createMysqlStore({ pool });
+  let store = await createMysqlStore({connectionId:'fixture', pool });
   const config = { listen: { host: '127.0.0.1', port: 0 }, feishu: { connectionId: 'fixture', botOpenId: 'bot' }, auth: { clients: [{ id: 'tester', conversationIds: ['chat', 'unknown', 'unsupported'], admin: true }] }, routing: { version: '1', privateUserIds: ['human'], groups: [] }, hooks: [{ id: 'hook', url: 'http://synthetic.invalid', conversationIds: ['chat'] }] };
   let runtime, server, mode = 'normal', turns = 0, threadStarts = 0, hooks = 0;
   let firstChunkGate, releaseChunk, failFirstChunk = false;

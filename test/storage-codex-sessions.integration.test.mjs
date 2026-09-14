@@ -7,12 +7,12 @@ import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 const enabled = Boolean(process.env.BRIDGE_TEST_PASSWORD);
 const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map((key) => [`${key}Env`, `BRIDGE_TEST_${key.toUpperCase()}`]));
 
-test('isolated MySQL upgrades v1 and preserves exact Codex session/event queries', { skip: !enabled, timeout: 40_000 }, async () => {
+test('isolated MySQL migrates and preserves exact scoped Codex session/event queries', { skip: !enabled, timeout: 40_000 }, async () => {
   const pool = createPoolFromEnvironment(refs);
   try {
-    assert.deepEqual(await migrate(pool), { version: 2, applied: true });
-    assert.deepEqual(await assertSchemaCurrent(pool), { version: 2 });
-    const store = createCodexSessionStore({ pool, schema: process.env.BRIDGE_TEST_DATABASE, now: () => 1000 });
+    assert.deepEqual(await migrate(pool), { version: 4, applied: true });
+    assert.deepEqual(await assertSchemaCurrent(pool), { version: 4 });
+    const store = createCodexSessionStore({connectionId:'fixture', pool, schema: process.env.BRIDGE_TEST_DATABASE, now: () => 1000 });
     const binding = { feishuOpenId: 'system:fixture', chatId: 'chat-a', chatType: 'group', codexSessionId: 'thread-a', threadName: 'fixture' };
     await store.saveCodexBinding(binding, { messageId: 'message-a' });
     assert.equal((await store.loadBinding({ bindingOpenId: binding.feishuOpenId, chatId: binding.chatId, chatType: 'group' })).codexSessionId, 'thread-a');
@@ -20,11 +20,7 @@ test('isolated MySQL upgrades v1 and preserves exact Codex session/event queries
     assert.equal((await store.readPublicProgress({ binding, threadId: 'thread-a', messageId: 'message-a' })).length, 1);
     assert.equal((await store.readPublicProgress({ binding: { ...binding, feishuOpenId: 'system:other' }, threadId: 'thread-a', messageId: 'message-a' })).length, 0);
 
-    // Recreate a released v1-only ledger inside this task-owned temporary schema.
-    await pool.query('DROP TABLE assistant_codex_events');
-    await pool.query('DROP TABLE assistant_codex_sessions');
-    await pool.query('DELETE FROM bridge_schema_migrations WHERE version = 2');
-    assert.deepEqual(await migrate(pool), { version: 2, applied: true });
-    assert.deepEqual(await assertSchemaCurrent(pool), { version: 2 });
+    assert.deepEqual(await migrate(pool), { version: 4, applied: false });
+    assert.deepEqual(await assertSchemaCurrent(pool), { version: 4 });
   } finally { await pool.end(); }
 });

@@ -18,7 +18,7 @@ test('resource worker frees empty output independently and resumes sealed input 
   const scope = { connectionId: 'resource-fixture', conversationId: 'chat', agentId: 'codex' };
   const chat = { downloadResource: async () => ({ contentType: 'image/png', stream: Readable.from(['synthetic-image']) }) };
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'resource-fixture', pool });
     const job = await store.enqueueJob({ ...scope, kind: 'agent', idempotencyKey: 'completed', payload: { text: 'completed' } });
     const [claim] = await store.claimJobs({ kind: 'agent', owner: 'fixture', leaseMs: 60000, limit: 1 });
     const media = await createFeishuMedia({ workspace, inboxDir: join(workspace, 'inbox'), chat });

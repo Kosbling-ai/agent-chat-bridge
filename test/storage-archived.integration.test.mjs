@@ -7,7 +7,7 @@ const refs=Object.fromEntries(['host','port','user','password','database'].map(k
 test('real MySQL explicit archived rejection replaces only an unadmitted attempt and cannot replay creation',{
   skip:!process.env.BRIDGE_TEST_PASSWORD,timeout:30000,
 },async()=>{
-  let pool=createPoolFromEnvironment(refs);await migrate(pool);let store=await createMysqlStore({pool});
+  let pool=createPoolFromEnvironment(refs);await migrate(pool);let store=await createMysqlStore({connectionId:'archived',pool});
   const scope=chat=>({connectionId:'archived',conversationId:chat,agentId:'codex'});
   async function start(chat){
     await store.setSession({...scope(chat),expectedGeneration:0,nativeThreadId:`old-${chat}`});
@@ -37,7 +37,7 @@ test('real MySQL explicit archived rejection replaces only an unadmitted attempt
     pool.getConnection=async()=>{const connection=await originalGet();if(inject){inject=false;const commit=connection.commit.bind(connection);connection.commit=async()=>{connection.commit=commit;await commit();throw new Error('synthetic commit loss');};}return connection;};
     await assert.rejects(store.resetRejectedThreadAdmission(lost),{code:'commit_unknown'});pool.getConnection=originalGet;
     assert.equal((await store.resetRejectedThreadAdmission(lost)).recoveryRequired,true);
-    await store.close();pool=createPoolFromEnvironment(refs);store=await createMysqlStore({pool});
+    await store.close();pool=createPoolFromEnvironment(refs);store=await createMysqlStore({connectionId:'archived',pool});
     const recovered=await store.beginAgentAttempt({...lost,agentId:'codex'});
     assert.equal(recovered.recoveryRequired,true);assert.equal(recovered.nativeThreadId,null);assert.equal(Number(recovered.generation),2);
     await store.holdAgentAttempt({...lost,errorCode:'thread_creation_uncertain'});

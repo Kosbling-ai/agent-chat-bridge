@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { StoreError } from './errors.mjs';
 
 function quoteIdentifier(value) {
   const name = String(value || '').trim();
@@ -8,8 +9,9 @@ function quoteIdentifier(value) {
 const limit = (value, max) => String(value || '').slice(0, max);
 const stableKey = (value) => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 
-export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
+export function createCodexSessionStore({ pool, schema, connectionId, now = Date.now } = {}) {
   if (!pool?.query) throw new Error('codex session store requires an injected pool');
+  if (typeof connectionId !== 'string' || !connectionId || connectionId.length > 128) throw new StoreError('invalid_store_input');
   const prefix = `${quoteIdentifier(schema)}.`;
   const table = (name) => `${prefix}${quoteIdentifier(name)}`;
   const rows = async (sql, params = []) => (await pool.query(sql, params))[0];
@@ -18,7 +20,7 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
   async function loadBinding(identity) {
     const bindingOpenId = identity.feishuOpenId || identity.bindingOpenId;
     const row = await one(`SELECT codex_session_id, thread_name, chat_type, created_at, updated_at, last_message_id, last_message_at, last_error
-      FROM ${table('assistant_codex_sessions')} WHERE feishu_open_id = ? AND chat_id = ? LIMIT 1`, [bindingOpenId, identity.chatId]);
+      FROM ${table('assistant_codex_sessions')} WHERE connection_id = ? AND feishu_open_id = ? AND chat_id = ? LIMIT 1`, [connectionId,bindingOpenId, identity.chatId]);
     if (!row) return null;
     return {
       feishuOpenId: bindingOpenId, chatId: identity.chatId,
@@ -31,13 +33,13 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
   async function saveCodexBinding(binding, options = {}) {
     const timestamp = now();
     await rows(`INSERT INTO ${table('assistant_codex_sessions')} (
-      feishu_open_id, chat_id, chat_type, codex_session_id, thread_name, created_at,
+      connection_id, feishu_open_id, chat_id, chat_type, codex_session_id, thread_name, created_at,
       updated_at, last_message_id, last_message_at, last_error
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE chat_type=VALUES(chat_type), codex_session_id=VALUES(codex_session_id),
       thread_name=VALUES(thread_name), updated_at=VALUES(updated_at), last_message_id=VALUES(last_message_id),
       last_message_at=VALUES(last_message_at), last_error=VALUES(last_error)`, [
-      binding.feishuOpenId, binding.chatId, binding.chatType || '', binding.codexSessionId,
+      connectionId,binding.feishuOpenId, binding.chatId, binding.chatType || '', binding.codexSessionId,
       binding.threadName || '', timestamp, timestamp, options.messageId || '', timestamp, limit(options.lastError, 1000),
     ]);
   }
@@ -47,12 +49,12 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
     if (!threadId) return;
     const eventKey = limit(event.eventKey || stableKey(JSON.stringify(event)), 180);
     await rows(`INSERT INTO ${table('assistant_codex_events')} (
-      codex_session_id, feishu_open_id, chat_id, message_id, event_key,
+      connection_id, codex_session_id, feishu_open_id, chat_id, message_id, event_key,
       event_type, role, title, text, detail_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE event_type=VALUES(event_type), role=VALUES(role), title=VALUES(title),
       text=VALUES(text), detail_json=VALUES(detail_json), created_at=VALUES(created_at)`, [
-      threadId, binding.feishuOpenId || '', binding.chatId || '', event.messageId || '', eventKey,
+      connectionId,threadId, binding.feishuOpenId || '', binding.chatId || '', event.messageId || '', eventKey,
       limit(event.eventType, 60), limit(event.role || 'activity', 30), limit(event.title, 180),
       limit(event.text, 12000), JSON.stringify(event.detail || {}), Number(event.createdAt) || now(),
     ]);
@@ -61,7 +63,7 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
   async function findAcceptedMessageEvent(binding, messageId, { includeInFlight = false } = {}) {
     if (!messageId || !binding?.codexSessionId) return null;
     const result = await rows(`SELECT event_key, event_type, role, title, text, detail_json, created_at, id
-      FROM ${table('assistant_codex_events')} WHERE codex_session_id = ? AND message_id = ? ORDER BY id DESC LIMIT 20`, [binding.codexSessionId, messageId]);
+      FROM ${table('assistant_codex_events')} WHERE connection_id = ? AND codex_session_id = ? AND message_id = ? ORDER BY id DESC LIMIT 20`, [connectionId,binding.codexSessionId, messageId]);
     for (const prefix of ['assistant-final:', 'error:', ...(includeInFlight ? ['user-steer-confirmed:'] : [])]) {
       const match = result.find((row) => String(row.event_key || '').startsWith(prefix));
       if (match) return match;
@@ -71,7 +73,7 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
 
   async function loadSteerEvents(binding, messageId) {
     return rows(`SELECT event_key, detail_json FROM ${table('assistant_codex_events')}
-      WHERE codex_session_id = ? AND event_key IN (?, ?, ?)`, [binding.codexSessionId,
+      WHERE connection_id = ? AND codex_session_id = ? AND event_key IN (?, ?, ?)`, [connectionId,binding.codexSessionId,
       `user-steer-attempt:${messageId}`, `user-steer-confirmed:${messageId}`, `user-steer-rejected:${messageId}`]);
   }
 
@@ -83,16 +85,20 @@ export function createCodexSessionStore({ pool, schema, now = Date.now } = {}) {
     if (!/^\d+$/.test(afterId) || !Number.isSafeInteger(afterAt) || afterAt < 0) throw new Error('invalid progress cursor');
     return rows(`SELECT id, event_key, event_type, role, title, text, detail_json, created_at
       FROM ${table('assistant_codex_events')}
-      WHERE feishu_open_id = ? AND chat_id = ? AND codex_session_id = ? AND message_id = ?
+      WHERE connection_id = ? AND feishu_open_id = ? AND chat_id = ? AND codex_session_id = ? AND message_id = ?
         AND event_type = 'public_progress' AND created_at >= ? AND (created_at > ? OR id > ?)
       ORDER BY created_at ASC,id ASC LIMIT ?`, [
-      binding.feishuOpenId, binding.chatId, threadId, messageId, afterAt, afterAt, afterId, bounded,
+      connectionId,binding.feishuOpenId, binding.chatId, threadId, messageId, afterAt, afterAt, afterId, bounded,
     ]);
   }
 
-  return Object.freeze({
+  const operations = {
     loadBinding, saveCodexBinding,
     touchCodexBinding: saveCodexBinding,
     saveCodexRealtimeEvent, findAcceptedMessageEvent, loadSteerEvents, readPublicProgress,
-  });
+  };
+  return Object.freeze(Object.fromEntries(Object.entries(operations).map(([name, operation]) => [name, (input, ...rest) => {
+    if (input?.connectionId !== undefined && input.connectionId !== connectionId) throw new StoreError('invalid_store_input');
+    return operation(input, ...rest);
+  }])));
 }

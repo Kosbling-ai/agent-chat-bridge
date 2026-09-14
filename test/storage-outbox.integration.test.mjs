@@ -11,7 +11,7 @@ test('real MySQL multipart order survives concurrent claims, restart, unknown an
   let pool = createPoolFromEnvironment(refs);
   await migrate(pool);
   let clock = Date.now();
-  let store = await createMysqlStore({ pool, now: () => clock });
+  let store = await createMysqlStore({connectionId:'multipart', pool, now: () => clock });
   const claim = () => store.claimOutbox({ owner: 'worker', limit: 100, leaseMs: 1000 });
   async function completedJob(key) {
     const registered = await store.enqueueJob({
@@ -50,7 +50,7 @@ test('real MySQL multipart order survives concurrent claims, restart, unknown an
     // can be reclaimed after expiry, never the second or third part.
     await store.close();
     pool = createPoolFromEnvironment(refs);
-    store = await createMysqlStore({ pool, now: () => clock });
+    store = await createMysqlStore({connectionId:'multipart', pool, now: () => clock });
     assert.deepEqual(await claim(), []);
     clock += 1100;
     const [retried] = await claim();

@@ -8,7 +8,7 @@ test('real MySQL artifact effects retain UUID/order and cleanup is durable witho
   skip:!process.env.BRIDGE_TEST_PASSWORD,timeout:30000,
 },async()=>{
   let pool=createPoolFromEnvironment(refs);await migrate(pool);
-  let clock=Date.now();let store=await createMysqlStore({pool,now:()=>clock});
+  let clock=Date.now();let store=await createMysqlStore({connectionId:'media',pool,now:()=>clock});
   async function createRun(chat,count=1){
     const run=await store.enqueueJob({connectionId:'media',conversationId:chat,kind:'agent',idempotencyKey:chat,payload:{}});
     const [job]=await store.claimJobs({kind:'agent',owner:'agent',leaseMs:1000});assert.equal(job.id,run.id);
@@ -42,7 +42,7 @@ test('real MySQL artifact effects retain UUID/order and cleanup is durable witho
     const [secondUpload]=await claim();assert.equal(secondUpload.kind,'artifact_upload');await settle(secondUpload,'sent',{image_key:'synthetic-image'});
     const [secondSend]=await claim();await settle(secondSend,'sent',{message_id:'synthetic-message-2'});
     assert.equal((await store.getJob({id:first.run.id})).status,'succeeded');
-    await store.close();pool=createPoolFromEnvironment(refs);store=await createMysqlStore({pool,now:()=>clock});
+    await store.close();pool=createPoolFromEnvironment(refs);store=await createMysqlStore({connectionId:'media',pool,now:()=>clock});
     const page=await store.listPendingCleanup({limit:1});assert.equal(page.items.length,1);assert.ok(page.nextCursor);
     const tail=await store.listPendingCleanup({limit:1,afterId:page.nextCursor});assert.equal(tail.items.length,1);assert.equal(tail.nextCursor,null);
     assert.notEqual(page.items[0].id,tail.items[0].id);

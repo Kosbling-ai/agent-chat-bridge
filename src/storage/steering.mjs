@@ -1,6 +1,6 @@
 import {StoreError} from './errors.mjs';
 
-export function steeringOperations({read,write,now,hash,decode}) {
+export function steeringOperations({read,write,now,hash,decode,connectionId}) {
   function field(value,max=255) {
     if(typeof value!=='string'||!value.length||value.length>max) throw new StoreError('invalid_steer');
     return value;
@@ -10,7 +10,7 @@ export function steeringOperations({read,write,now,hash,decode}) {
   async function lockJob(c,input) {
     field(input.id,36);field(input.leaseToken,36);
     const [[job]]=await c.execute(`SELECT id,kind,connection_id,conversation_id,status,lease_token,lease_expires_at
-      FROM bridge_jobs WHERE id=? FOR UPDATE`,[input.id]);
+      FROM bridge_jobs WHERE id=? AND connection_id=? FOR UPDATE`,[input.id,connectionId]);
     return job;
   }
   function assertLease(job,input) {
@@ -23,7 +23,7 @@ export function steeringOperations({read,write,now,hash,decode}) {
   }
   async function lockParent(c,targetRunId) {
     // Parent job serializes execution settlement and all of its guidance writes.
-    const [[parent]]=await c.execute('SELECT status FROM bridge_jobs WHERE id=? FOR UPDATE',[targetRunId]);
+    const [[parent]]=await c.execute('SELECT status FROM bridge_jobs WHERE id=? AND connection_id=? FOR UPDATE',[targetRunId,connectionId]);
     const [[attempt]]=await c.execute(`SELECT connection_id,conversation_id,agent_id,generation,native_thread_id,native_turn_id
       FROM bridge_attempts WHERE job_id=? FOR UPDATE`,[targetRunId]);
     if(!attempt)return {parent};
@@ -77,7 +77,7 @@ export function steeringOperations({read,write,now,hash,decode}) {
       return write(async(c)=>{
         const job=await lockJob(c,input);
         const [[settled]]=await c.execute(`SELECT status,result_hash FROM bridge_steering
-          WHERE guidance_job_id=? AND settled_lease_token=?`,[input.id,input.leaseToken]);
+          WHERE guidance_job_id=? AND connection_id=? AND settled_lease_token=?`,[input.id,connectionId,input.leaseToken]);
         if(settled){
           if(settled.result_hash!==digest)throw new StoreError('steer_conflict');
           return {status:settled.status};
@@ -111,7 +111,7 @@ export function steeringOperations({read,write,now,hash,decode}) {
       field(id,36);
       return read(async(c)=>{
         const [[row]]=await c.execute(`SELECT ${columns} FROM bridge_steering
-          WHERE guidance_job_id=? ORDER BY sequence DESC LIMIT 1`,[id]);
+          WHERE guidance_job_id=? AND connection_id=? ORDER BY sequence DESC LIMIT 1`,[id,connectionId]);
         return decode(row)??null;
       });
     },

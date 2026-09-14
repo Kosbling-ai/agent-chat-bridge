@@ -15,7 +15,7 @@ test('scoped audited guidance abandonment cancels only its job with zero native 
   const tokens = Object.fromEntries(config.auth.clients.map(client => [client.id, `synthetic-${client.id}-token-only`]));
   const logs = [];
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'guidance-recovery', pool });
     const parent = await store.enqueueJob({ ...scope, kind: 'agent', idempotencyKey: 'parent', payload: { text: 'parent' } });
     const [claim] = await store.claimJobs({ kind: 'agent', owner: 'fixture', leaseMs: 300000, limit: 1 });
     const attempt = await store.beginAgentAttempt({ ...claim, agentId: 'codex' });

@@ -8,7 +8,7 @@ test('real MySQL steering is serial, durable and never replays an uncertain guid
   skip:!process.env.BRIDGE_TEST_PASSWORD,timeout:30000,
 },async()=>{
   let pool=createPoolFromEnvironment(refs);await migrate(pool);let clock=Date.now();
-  let store=await createMysqlStore({pool,now:()=>clock});
+  let store=await createMysqlStore({connectionId:'steering',pool,now:()=>clock});
   const scope=conversationId=>({connectionId:'steering',conversationId,agentId:'codex'});
   let sequence=0;
   async function enqueue(chat){return store.enqueueJob({...scope(chat),kind:'agent',idempotencyKey:`job-${++sequence}`,payload:{}});}
@@ -48,7 +48,7 @@ test('real MySQL steering is serial, durable and never replays an uncertain guid
     // Crash after durable intent: a fresh worker must hold, never emit the RPC again.
     const uncertainParent=await parent('unknown');await enqueue('unknown');const [uncertain]=await claim(100);
     assert.equal((await begin(uncertain)).kind,'new');
-    await store.close();pool=createPoolFromEnvironment(refs);store=await createMysqlStore({pool,now:()=>clock});clock+=101;
+    await store.close();pool=createPoolFromEnvironment(refs);store=await createMysqlStore({connectionId:'steering',pool,now:()=>clock});clock+=101;
     const [recovered]=await claim();assert.equal(recovered.id,uncertain.id);
     assert.equal((await begin(recovered)).kind,'recovery_required');
     await assert.rejects(finish(uncertain,'accepted'),{code:'stale_lease'});

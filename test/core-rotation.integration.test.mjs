@@ -21,7 +21,7 @@ test('idle native session rotates once before admission and subsequent messages 
   } };
   const scope = { connectionId: config.feishu.connectionId, conversationId: 'chat', agentId: 'codex' };
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'rotation-fixture', pool });
     await store.setSession({ ...scope, expectedGeneration: 0, nativeThreadId: 'old-thread' });
     runtime = createRuntime({ config, store, codex, workspace, chat: { sendMessage: async () => ({ message_id: 'sent' }) } }); runtime.start();
     const first = await store.enqueueJob({ ...scope, kind: 'agent', idempotencyKey: 'first', payload: { source: 'api', text: 'first' } });

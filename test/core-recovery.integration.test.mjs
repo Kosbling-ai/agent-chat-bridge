@@ -32,7 +32,7 @@ test('admin scoped recovery reads/adopts or verified-abandons unknown native wor
     return { id: job.id, generation: attempt.generation };
   }
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'recovery-fixture', pool });
     const jobs = {};
     for (const conversationId of scopes) jobs[conversationId] = await seed(conversationId, conversationId === 'active' ? 'active-thread' : conversationId === 'owner' ? 'owned-thread' : undefined, conversationId === 'active' ? 'active-turn' : conversationId === 'owner' ? 'owned-turn' : undefined);
     threads.set('adopt-thread', { id: 'adopt-thread', cwd: '/synthetic/workspace', turns: [{ id: 'adopt-turn', status: 'completed', items: [{ type: 'agentMessage', text: 'Recovered original execution' }] }] });

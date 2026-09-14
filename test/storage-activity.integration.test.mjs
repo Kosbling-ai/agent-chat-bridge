@@ -7,7 +7,7 @@ const refs=Object.fromEntries(['host','port','user','password','database'].map(k
 test('real MySQL conversation activity retains unknown native and guidance facts without a lock',{
   skip:!process.env.BRIDGE_TEST_PASSWORD,timeout:30000,
 },async()=>{
-  const pool=createPoolFromEnvironment(refs);await migrate(pool);const store=await createMysqlStore({pool});
+  const pool=createPoolFromEnvironment(refs);await migrate(pool);const store=await createMysqlStore({connectionId:'activity',pool});
   const scope=conversationId=>({connectionId:'activity',conversationId,agentId:'codex'});
   let sequence=0;
   async function create(chat){

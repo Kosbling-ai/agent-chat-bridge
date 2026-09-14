@@ -10,7 +10,7 @@ test('real MySQL administrative recovery is fenced, idempotent and preserves per
   let pool = createPoolFromEnvironment(refs);
   await migrate(pool);
   let clock = Date.now();
-  let store = await createMysqlStore({ pool, now: () => clock });
+  let store = await createMysqlStore({connectionId:'recovery', pool, now: () => clock });
   const scope = conversationId => ({ connectionId:'recovery', conversationId, agentId:'codex' });
   const claim = () => store.claimJobs({ kind:'agent', owner:'worker', leaseMs:1000 });
   async function attempt(conversationId, unknown = true) {
@@ -37,7 +37,7 @@ test('real MySQL administrative recovery is fenced, idempotent and preserves per
     await assert.rejects(store.enqueueRecovery({...input,evidence:'different'}),{code:'recovery_conflict'});
     await store.close();
     pool = createPoolFromEnvironment(refs);
-    store = await createMysqlStore({pool,now:()=>clock});
+    store = await createMysqlStore({connectionId:'recovery',pool,now:()=>clock});
     let recovery = await claimRecovery(); assert.equal(recovery.evidence,input.evidence);
     assert.equal(Object.hasOwn(await store.getRecovery({id:recovery.id}),'evidence'),false);
     await assert.rejects(store.finishRecovery({id:recovery.id,leaseToken:recovery.leaseToken,outcome:'applied',verifiedNative:{threadId:'wrong',turnId:input.nativeTurnId}}),{code:'recovery_conflict'});

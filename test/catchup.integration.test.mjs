@@ -11,7 +11,7 @@ const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database']
 test('real Store catchup resumes fixed pagination window and replays a committed page without duplicate jobs', { skip: !enabled, timeout: 30000 }, async () => {
   let pool = createPoolFromEnvironment(refs);
   await migrate(pool);
-  let store = await createMysqlStore({ pool });
+  let store = await createMysqlStore({connectionId:'catchup-fixture', pool });
   let worker, fail = true;
   const clock = 1789250000000, calls = [], ids = new Set();
   const item = id => ({ message_id: id, chat_id: 'chat', msg_type: 'text', create_time: String(clock - 1000),
@@ -32,10 +32,10 @@ test('real Store catchup resumes fixed pagination window and replays a committed
     } });
   try {
     worker = make(); assert.equal((await worker.runOnce()).failed, 1); await worker.stop();
-    await store.close(); pool = createPoolFromEnvironment(refs); store = await createMysqlStore({ pool });
+    await store.close(); pool = createPoolFromEnvironment(refs); store = await createMysqlStore({connectionId:'catchup-fixture', pool });
     fail = false; worker = make(); assert.equal((await worker.runOnce()).incomplete, 1); await worker.stop();
     assert.equal(ids.size, 1);
-    await store.close(); pool = createPoolFromEnvironment(refs); store = await createMysqlStore({ pool });
+    await store.close(); pool = createPoolFromEnvironment(refs); store = await createMysqlStore({connectionId:'catchup-fixture', pool });
     worker = make(); assert.equal((await worker.runOnce()).failed, 0); await worker.stop();
     assert.equal(ids.size, 2); assert.equal(calls[2].pageToken, 'page2');
     assert.equal(calls[0].startTime, calls[2].startTime); assert.equal(calls[0].endTime, calls[2].endTime);
