@@ -129,6 +129,24 @@ test('chat effect registration covers media/reaction and checks reply membership
   await assert.rejects(api(request({ kind: 'reply', conversationId: 'chat', messageId: 'foreign', idempotencyKey: 'rejected', content: 'synthetic' })), { status: 403 });
   assert.equal(effects.length, 6);
 });
+test('chat effect registration accepts 28 KB interactive cards without raising other message budgets', async () => {
+  const effects = [];
+  const token = 'synthetic-long-token-for-local-test';
+  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: { recordOutbox: async effect => { effects.push(effect); return { id: 'effect' }; } }, chat: {} });
+  function request(value) { const request = Readable.from([Buffer.from(JSON.stringify(value))]); request.url = '/v1/deliveries'; request.method = 'POST'; request.headers = { authorization: `Bearer ${token}` }; return request; }
+  function contentAtBytes(size) {
+    const content = { schema: '2.0', body: { elements: [] }, padding: '' };
+    const fixedBytes = Buffer.byteLength(JSON.stringify(content));
+    content.padding = 'x'.repeat(size - fixedBytes);
+    assert.equal(Buffer.byteLength(JSON.stringify(content)), size);
+    return content;
+  }
+  assert.equal((await api(request({ kind: 'create', conversationId: 'chat', idempotencyKey: 'interactive-exact', messageKind: 'interactive', content: contentAtBytes(28_000) }))).status, 202);
+  await assert.rejects(api(request({ kind: 'create', conversationId: 'chat', idempotencyKey: 'interactive-over', messageKind: 'interactive', content: contentAtBytes(28_001) })), { code: 'invalid_content', status: 400 });
+  await assert.rejects(api(request({ kind: 'create', conversationId: 'chat', idempotencyKey: 'post-over', messageKind: 'post', content: contentAtBytes(20_001) })), { code: 'invalid_content', status: 400 });
+  assert.equal(effects.length, 1);
+  assert.equal(Buffer.byteLength(JSON.stringify(effects[0].payload.content)), 28_000);
+});
 test('error reporter is bounded, sanitized and cannot recursively report failures', async () => {
   const output = [];
   const warning = createLogger({ write: value => output.push(JSON.parse(value)) });
