@@ -101,6 +101,10 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
 
   async function wait(job, state) {
     if (job.deliveryMode === 'caller' || !state) return;
+    if (state.observer) {
+      state.result.executionCard = await state.observer.stop();
+      state.observer = null;
+    }
     if (state.result.executionCard?.status !== 'retrying' && state.card) {
       state.result.executionCard = await state.card.pause();
     }

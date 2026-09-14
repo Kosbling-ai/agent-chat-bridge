@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import { validateConfig } from '../src/config.mjs';
 import { createForwardRuntime, publicRun } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
+import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 import { createApi } from '../src/core/api.mjs';
 import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
 
@@ -106,8 +107,26 @@ test('forward runtime uses only its response waiter signal and persists caller r
   assert.deepEqual(Object.keys(options[0]),['signal']);
 });
 
-test('unknown native outcome becomes held and is not submitted again',async()=>{
-  const jobs=memoryJobs({status:'pending'});let calls=0;const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions:{},executor:{execute:async()=>{calls++;throw Object.assign(new Error('lost'),{code:'CODEX_TURN_START_UNCONFIRMED',outcome:'unknown',threadId:'thread'});}},replies:{readResource:async()=>null},authorize:async()=>true});runtime.start();await flush();await runtime.stop();assert.equal(calls,1);assert.equal(jobs.job.status,'held');assert.equal(jobs.calls.filter(x=>x[0]==='retry').length,1);
+test('a new unconfirmed native outcome follows the ordinary failed reply path',async()=>{
+  const jobs=memoryJobs({status:'pending'});let calls=0;const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions:{},executor:{execute:async()=>{calls++;throw Object.assign(new Error('lost'),{code:'CODEX_TURN_START_UNCONFIRMED',outcome:'unknown',threadId:'thread'});}},replies:{readResource:async()=>null},authorize:async()=>true});runtime.start();await flush();await runtime.stop();assert.equal(calls,1);assert.equal(jobs.job.status,'failed');assert.equal(jobs.calls.filter(x=>x[0]==='retry').length,0);assert.equal(jobs.job.result.execution.terminal,'failed');
+});
+
+test('original transport network errors retain the bounded retry classification',async()=>{
+  for (const error of [
+    new TypeError('fetch failed'),
+    Object.assign(new Error('write failed'),{code:'EPIPE'}),
+    Object.assign(new Error('request failed'),{cause:new Error('network unavailable')}),
+    new Error('stream disconnected before completion'),
+    new Error('error sending request'),
+  ]) {
+    const jobs=memoryJobs({status:'pending',attempts:0});
+    const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions:{},executor:{execute:async()=>{throw error;}},replies:{readResource:async()=>null},authorize:async()=>true});
+    await runtime.handleMessage({source:'api',callerId:'caller',idempotencyKey:'network',conversationId:'chat',executionNamespace:'daily',deliveryMode:'caller',prompt:'work'});
+    await runtime.stop();
+    assert.equal(jobs.job.status,'pending',`${error.code||error.message} should retry`);
+    assert.equal(jobs.calls.filter(([name])=>name==='retry').length,1);
+    assert.equal(jobs.calls.filter(([name])=>name==='reply_pending').length,0);
+  }
 });
 
 test('bridge delivery cleans Typing after replies and cleanup failure does not undo completion',async()=>{
@@ -289,6 +308,32 @@ test('manual pre-admission busy follows the ordinary bounded retry policy', asyn
   assert.equal(jobs.calls.find(([name])=>name==='retry')[1].preserveAttempt,false);
 });
 
+test('ordinary busy retry stops the real feedback observer before releasing its lease', async () => {
+  const originalSetInterval=globalThis.setInterval;const originalClearInterval=globalThis.clearInterval;
+  const timers=new Map();let sequence=0;let reads=0;
+  globalThis.setInterval=(callback,ms)=>{const token={id:++sequence,unref(){}};timers.set(token,{callback,ms});return token;};
+  globalThis.clearInterval=token=>timers.delete(token);
+  try {
+    const jobs=memoryJobs({status:'pending',callerId:'live',executionNamespace:null,deliveryMode:'bridge',sourceMessageId:'message',
+      result:{execution:{bindingOpenId:'human'},executionCard:{messageId:'card-message',status:'running',entries:[]}}});
+    const sessions={async loadBinding(){reads+=1;return{codexSessionId:'thread'};},async readPublicProgress(){return[];}};
+    const feedback=createExecutionFeedback({jobs,sessions,typing:{async start(){return null;},async cleanup(){}},
+      cardClient:{im:{v1:{message:{async patch(){return{code:0};}}}}}});
+    const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions,feedback,
+      executor:{async execute(){throw Object.assign(new Error('busy'),{code:'CODEX_THREAD_BUSY'});}},replies:{},authorize:async()=>true});
+    await runtime.handleMessage({source:'live',callerId:'live',idempotencyKey:'message',conversationId:'chat',chatType:'p2p',actor:{openId:'human'},prompt:'work'});
+    await new Promise(setImmediate);
+    const readsAfterRetry=reads;
+    assert.equal(timers.size,0);
+    for(const {callback} of timers.values())await callback();
+    assert.equal(reads,readsAfterRetry);
+    await runtime.stop();
+    assert.equal(timers.size,0);
+  } finally {
+    globalThis.setInterval=originalSetInterval;globalThis.clearInterval=originalClearInterval;
+  }
+});
+
 test('only a persisted caller-derived system binding gets the 60-second wait policy', async () => {
   let clock = 100_000;
   const bindingOpenId = deriveExecutionScope('caller', 'daily');
@@ -392,7 +437,7 @@ test('other retryable admission failures stop after three 60-second-spaced claim
   let admissions = 0;
   const runtime = createForwardRuntime({
     config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {},
-    executor: { async execute() { admissions += 1; throw Object.assign(new Error('closing'), { code: 'CODEX_EXECUTOR_CLOSING', retryable: true, phase: 'pre_admission' }); } },
+    executor: { async execute() { admissions += 1; throw Object.assign(new Error('write failed'), { code: 'EPIPE' }); } },
     replies: {}, now: () => clock,
   });
   const settle = async () => {
@@ -414,14 +459,20 @@ test('other retryable admission failures stop after three 60-second-spaced claim
   assert.equal(job.status, 'failed');
 });
 
-test('claim failure marks the only worker unhealthy', async () => {
+test('a transient recovery claim failure is contained to one poll', async () => {
+  let polls = 0;
   const runtime = createForwardRuntime({
     config: { owner: 'owner', pollMs: 1 },
-    jobs: { async claimReplyPending() { throw new Error('database unavailable'); } },
+    jobs: {
+      async claimReplyPending() { polls += 1; if (polls === 1) throw new Error('database unavailable'); return []; },
+      async loadRecoverable() { return []; },
+    },
     sessions: {}, executor: {}, replies: {},
   });
   runtime.start(); await flush();
-  assert.equal(runtime.status().healthy, false);
+  assert.ok(polls > 1);
+  assert.equal(runtime.status().healthy, true);
+  assert.equal(runtime.status().running, true);
   await runtime.stop();
 });
 

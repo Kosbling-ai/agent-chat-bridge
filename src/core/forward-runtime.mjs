@@ -7,16 +7,13 @@ const stableMessageId = value => `api:${createHash('sha256').update(value).diges
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED'].includes(error?.code);
 const preAdmissionBusy = error => error?.code === 'CODEX_THREAD_BUSY'
   && (error?.phase === 'pre_admission' || error?.outcome === 'rejected');
-const heldError = error => error?.outcome === 'unknown' || [
-  'CODEX_BINDING_UNCERTAIN', 'CODEX_TURN_START_UNCONFIRMED', 'CODEX_START_UNCONFIRMED',
-  'CODEX_TURN_UNKNOWN', 'CODEX_OBSERVATION_LOST', 'CODEX_STEER_UNCONFIRMED',
-].includes(error?.code);
 const retryableError = error => {
+  if (error?.code === 'CODEX_THREAD_BUSY') return true;
   if (terminalTurnError(error)) return false;
-  if (error?.retryable === true || ['CODEX_THREAD_BUSY', 'CODEX_EXECUTOR_CLOSING', 'CODEX_FORWARD_TIMEOUT',
-    'CODEX_STEER_UNCONFIRMED', 'CODEX_OBSERVATION_LOST'].includes(error?.code)) return true;
-  const value = [error?.name, error?.code, error?.cause?.code, error?.message].filter(Boolean).join(' ').toLowerCase();
-  return /(?:abort|timeout|timed out|socket|connection|econnreset|econnrefused|etimedout|eai_again|enotfound|und_err_)/.test(value);
+  const value = [error?.name, error?.code, error?.cause?.code, error?.message, error?.cause?.message]
+    .filter(Boolean).join(' ');
+  return /\b(?:AbortError|TimeoutError|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)\b/i.test(value)
+    || /steer delivery unconfirmed|timed out|timeout|network|socket hang up|fetch failed|aborted|stream disconnected before completion|error sending request/i.test(value);
 };
 
 function trustedBusyQueue(job) {
@@ -236,7 +233,6 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       needsDelivery = true;
     } catch (error) {
       if (lease.signal.aborted || ['forward_lease_lost', 'forward_runtime_stopping'].includes(error?.code)) {
-        feedback?.abandon?.(state);
         lease.assertOwned();
         throw error;
       }
@@ -252,15 +248,6 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         });
         return;
       }
-      if (heldError(error)) {
-        execution = { ...execution, threadId: error.threadId || execution.threadId, turnId: error.turnId || execution.turnId,
-          status: 'unknown', unconfirmed: true, heldReason: error.code || 'native_outcome_unknown' };
-        await feedback?.prepare?.(job, {}, state).catch(() => {});
-        await jobs.patchExecution({ id: job.id, leaseOwner: job.leaseOwner, execution });
-        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, held: true, errorCode: error.code || 'native_outcome_unknown' });
-        log('warning', 'forward_execution', 'held', { code: error.code || 'native_outcome_unknown', runId: job.id });
-        return;
-      }
       execution = { ...execution, terminal: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', finishedAt: now() };
       const failed = { failed: true, turnStatus: execution.terminal,
         answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : preAdmissionBusy(error) ? '会话被其他客户端占用，请释放后重试或新建会话。' : '执行未完成，请稍后重试。',
@@ -269,6 +256,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: error.code || 'forward_execution_failed' });
       needsDelivery = true;
     } finally {
+      feedback?.abandon?.(state);
       if (state && !needsDelivery) await feedback?.cleanup?.(job, { ...lease, reaction: state.typing }).catch(() => {
         log('warning', 'typing_reaction', 'cleanup_failed', { code: 'typing_reaction_cleanup_failed' });
       });
@@ -369,13 +357,12 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   }
   async function loop() {
     await wait(Math.min(5000, pollMs));
-    while (!stopping && healthy) {
+    while (!stopping) {
       try { await recover(); }
       catch (error) {
-        healthy = false;
         log('error', 'forward_worker', 'failed', { code: error?.code || 'worker_poll_failed' });
       }
-      if (!stopping && healthy) await wait(pollMs);
+      if (!stopping) await wait(pollMs);
     }
   }
   function beginStop() {
