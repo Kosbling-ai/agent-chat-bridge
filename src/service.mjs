@@ -70,7 +70,7 @@ export async function startService({ config, configPath, env = process.env, log,
   for (const [name, source] of Object.entries(proxyEnv)) childEnv[name] = secret(env, source);
   const sharedHome = resolveSharedHome({
     configuredHome: config.codex.sharedHome,
-    inheritedHome: env.CODEX_HOME,
+    inheritedHome: env.CODEX_HOME ?? '',
     home: env.HOME,
   });
   const tokens = Object.fromEntries(config.auth.clients.map(client => [client.id, secret(env, client.tokenEnv)]));

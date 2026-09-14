@@ -162,6 +162,34 @@ test('service rejects configured and inherited Codex homes that differ', async t
     },
   }), { code: 'CODEX_HOME_CONFLICT' });
 });
+test('explicit service env does not fall back to ambient CODEX_HOME', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-ambient-home-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const previous = process.env.CODEX_HOME;
+  const hadPrevious = Object.hasOwn(process.env, 'CODEX_HOME');
+  process.env.CODEX_HOME = '/synthetic/ambient-codex-home';
+  const reachedPool = new Error('synthetic_pool_boundary');
+  try {
+    const runtimeConfig = validateConfig({
+      ...config,
+      codex: { bin: process.execPath, cwd: directory, sharedHome: join(directory, '.codex'), envNames: [] },
+    });
+    await assert.rejects(startService({
+      config: runtimeConfig,
+      configPath: join(directory, 'config.json'),
+      env: {
+        HOME: directory,
+        TEST_TOKEN: 'synthetic-token-for-service-only',
+        TEST_APP: 'synthetic',
+        TEST_SECRET: 'synthetic',
+      },
+      dependencies: { pool() { throw reachedPool; } },
+    }), error => error === reachedPool);
+  } finally {
+    if (hadPrevious) process.env.CODEX_HOME = previous;
+    else delete process.env.CODEX_HOME;
+  }
+});
 test('failed async warning sinks never become unhandled rejections', async () => {
   const reporter = createErrorReporter({ url: 'http://synthetic.invalid', token: 'synthetic', warn: async () => { throw new Error('synthetic warning failure'); }, fetchImpl: async () => { throw new Error('synthetic HTTP failure'); } });
   for (let i = 0; i < 6; i++) reporter.report({ code: 'fixture' });
