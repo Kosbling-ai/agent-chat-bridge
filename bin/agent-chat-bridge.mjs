@@ -10,7 +10,7 @@ Usage:
   agent-chat-bridge --version
   agent-chat-bridge check-config --config <path>
   agent-chat-bridge start --config <path>
-  agent-chat-bridge migrate --config <path>
+  agent-chat-bridge migrate --config <path> [--legacy-connection-id <original-connection-id>]
 
 An explicit JSON config path is required; no config or .env auto-discovery.
 check-config validates syntax only and never resolves environment secrets.
@@ -28,7 +28,7 @@ try {
     process.stdout.write(await readFile(new URL('../VERSION', import.meta.url), 'utf8'));
   } else {
     if (!['check-config', 'start', 'migrate'].includes(command) || flag !== '--config'
-        || !path || path.startsWith('--') || extra.length) {
+        || !path || path.startsWith('--') || (command === 'migrate' ? (extra.length !== 0 && (extra.length !== 2 || extra[0] !== '--legacy-connection-id' || !extra[1])) : extra.length !== 0)) {
       throw new ConfigError('invalid_arguments');
     }
     const config = await loadConfig(path);
@@ -36,7 +36,7 @@ try {
       log('info', 'check_config', 'succeeded');
     } else if (command === 'migrate') {
       const { migrateService } = await import('../src/service.mjs');
-      await migrateService({ config });
+      await migrateService({ config, legacyConnectionId: extra[1] });
       log('info', 'migration', 'succeeded');
     } else {
       const { startService } = await import('../src/service.mjs');

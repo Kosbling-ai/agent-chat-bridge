@@ -1,6 +1,6 @@
 # Versions and migrations
 
-Application version: `0.2.4`
+Application version: `0.2.5`
 
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
@@ -11,6 +11,14 @@ Application versions, config `schemaVersion` and numbered database migrations ar
 Development changes are integrated and tested on `staging` before a `staging` to `main` promotion pull request. `main` remains the default branch. Moving source to either branch does not automatically run a migration, deploy an instance, publish npm, create or move a tag, or declare a release. See the [staging workflow](docs/staging-workflow.md).
 
 A schema change must reach `staging` with its immutable forward migration and rollback plan. Apply it only to a dedicated staging database through the explicit migrate command after an authorized backup and writer stop. Promotion to `main` preserves that reviewed migration history; production migration remains a separate, authorized operation.
+
+## 0.2.5 shared-schema bot isolation
+
+Migration `004-bot-connection.sql` adds a required `connection_id` to five assistant runtime tables and places it first in their uniqueness, claim, history and context indexes. It also puts the existing connection first in the bridge job, outbox and recovery claim indexes. Existing `bridge_*` ownership is unchanged; migrations 001–003 and their checksums remain immutable. The configuration schema stays at 1. Each running process still owns one Feishu bot and one Codex executor; multiple processes can use one dedicated bridge database after their storage is scoped by connection.
+
+Stop **all** old bridge writers before migration and keep them stopped until the new version is ready. Back up the bridge database together with its matching workspace/outbox files. For an existing database with any assistant rows, invoke `agent-chat-bridge migrate --config <path> --legacy-connection-id <original-bot-connection-id>` using the original bot's exact connection ID. Do not infer that value from the new bot's config. The separate storage CLI accepts the same optional flag. A completely empty new database can run `migrate --config <path>` without it. The migration refuses missing ownership before 004 DDL, holds the old database-level writer lock, stores the selected ownership for interrupted DDL recovery, and verifies non-null columns and expected indexes before recording ledger version 4. Resume a partial migration with the same explicit legacy ID; a different ID is rejected. A completed 004 is a no-op on rerun.
+
+MySQL DDL commits independently. If migration fails, leave all writers stopped and resolve the cause before resuming with the same legacy ID. Do not delete the scope record or migration ledger to change ownership. Rollback after 004 requires stopping the writers and restoring the pre-migration database and matching workspace/outbox backup; the old binary cannot accept ledger 4. This source change does not authorize migration of a real installation or a provider turn.
 
 ## 0.2.4 production runtime defaults
 

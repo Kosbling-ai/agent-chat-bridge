@@ -2,7 +2,11 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.4`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.5`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+
+0.2.5 的版本化迁移 004 让五张 assistant 运行时表以 `connection_id` 隔离，并为唯一键、恢复、历史和群上下文查询增加连接前缀索引；bridge 表保留原有归属，只调整必要的 claim 索引。配置 `schemaVersion` 仍为 1。一个进程仍只运行一个飞书 bot 和一个 Codex executor；升级后可让多个不同连接的进程使用同一个专用 bridge schema。
+
+升级旧库前须停止全部旧版 writer，并备份 bridge 数据库及配套 workspace/outbox。只要五张 assistant 表中有旧行，必须显式运行 `agent-chat-bridge migrate --config <路径> --legacy-connection-id <原bot的connectionId>`；不能拿新 bot 的配置 ID 猜旧行归属。全空新库可省略此参数。004 在 DDL 前拒绝旧行缺参，持有旧版数据库级 writer 锁，记录归属，分步回填并核验；中断后只能用同一旧连接 ID 续跑，改 ID 会拒绝。已成功的 004 重跑不会再次归属。失败时保持 writer 停止；回退需恢复升级前的数据库及配套文件快照，不能删账本伪装回退。真实实例迁移和真实消息/模型验收需单独授权。
 
 开发改动先进入 `staging` 集成和测试，稳定后再用 `staging` 到 `main` 的 PR 提升；`main` 继续作为默认分支。代码进入任一分支都不会自动迁移数据库、部署、发布 npm、创建或移动 tag，也不代表已经发布。详见 [staging 流程](docs/zh-CN/staging-workflow.md)。
 

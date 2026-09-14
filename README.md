@@ -2,9 +2,11 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.4` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.5` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
+
+Version 0.2.5 adds migration 004 for multiple bot processes sharing one dedicated bridge MySQL schema. Existing assistant rows need an explicit original `connection_id` at migration time; see [upgrade instructions](MIGRATIONS.md).
 
 The runtime assembles an independent MySQL schema, one Codex app-server/executor, one Feishu bot and WebSocket owner, scoped hooks and authenticated run/chat APIs. Version 0.2.4 restores the production runtime defaults for the shared Codex home, 60-second idle child cleanup and inherited shell environment policy, plus the production execution-card controller, chat-created post/text replies, Typing lifecycle, private image input and direct attachment delivery. It includes the production-derived forward lease, reply-pending delivery, bounded recovery, group context, execution card, Typing, stop callback and replies in the bridge. Ordinary retryable admission failures use three attempts spaced 60 seconds apart. Only an authenticated client configured with `queueIfBusy` can opt its validated caller/namespace system scope into the busy queue exception. It also uses the Codex app-server's `auto_review` approval-reviewer enum for new and resumed threads. Business parsing, polling, cron scheduling, lark-cli queries and document/table/contact tools remain outside it. See the [forward runtime contract](docs/runtime.md) and [Chinese supplement](docs/zh-CN/forward-runtime.md).
 

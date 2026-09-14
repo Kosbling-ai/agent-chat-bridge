@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.5] — Unreleased
+
+- Migration 004 scopes five assistant runtime tables by `connection_id`, including their uniqueness, recovery and context indexes. It also prefixes bridge claim indexes with the existing connection owner. Existing bridge rows keep their ownership.
+- Existing assistant rows require an explicit `--legacy-connection-id` when migrating. The migration records that decision, backfills with a parameterized update, and resumes only with the same value after partial MySQL DDL. An empty new database needs no legacy value.
+- Stop every old writer and back up the bridge schema and matching workspace/outbox before applying 004. The migration holds the old database-level writer lock while upgrading. Startup does not run DDL; real-instance upgrade and provider validation remain separate authorized operations.
+
 ## [0.2.4] — Unreleased
 
 - Restore the frozen production runtime defaults: the launching user's shared Codex home, a 60-second idle child close, and `shell_environment_policy.inherit=all` within the explicitly constructed child environment.
