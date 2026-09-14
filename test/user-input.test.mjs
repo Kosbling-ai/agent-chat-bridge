@@ -27,9 +27,23 @@ test('app-server enables a discovered Default-mode feature and preserves typed i
   await client.close();
 });
 
+test('app-server overrides inherited user input off and rejects requests unless explicitly opted in',async()=>{
+  for(const requestUserInput of [undefined,false]){
+    const writes=[];let child;let probes=0;let inbound=0;
+    const client=new CodexAppServerClient({config:{bin:'/codex',cwd:'/tmp',sharedHome:'/tmp/home',requestUserInput,rpcTimeoutMs:100},
+      spawnSyncImpl:()=>{probes++;return{status:0,stdout:'default_mode_request_user_input under_development false\n'};},
+      spawnImpl:(_bin,args)=>{assert(args.includes('features.default_mode_request_user_input=false'));assert(!args.includes('features.default_mode_request_user_input=true'));child=new Child((message,instance)=>{writes.push(message);if(message.method==='initialize')instance.send({id:message.id,result:{}});});return child;},
+      serverRequestSink:()=>{inbound++;}});
+    await client.ensureStarted();child.send({id:'disabled',method:'item/tool/requestUserInput',params:{}});
+    while(!writes.some(value=>value.id==='disabled'&&value.error))await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(probes,1);assert.equal(inbound,0);assert.equal(writes.find(value=>value.id==='disabled').error.code,-32601);
+    await client.close();
+  }
+});
+
 test('closing app-server does not wait for a backpressured server-response write',async()=>{
   let child;let inbound;
-  const client=new CodexAppServerClient({config:{bin:'/codex',cwd:'/tmp',sharedHome:'/tmp/home',rpcTimeoutMs:100,closeGraceMs:20},spawnSyncImpl:()=>({status:1}),
+  const client=new CodexAppServerClient({config:{bin:'/codex',cwd:'/tmp',sharedHome:'/tmp/home',requestUserInput:true,rpcTimeoutMs:100,closeGraceMs:20},spawnSyncImpl:()=>({status:0,stdout:'default_mode_request_user_input under_development false\n'}),
     spawnImpl:()=>{child=new Child((message,instance)=>{if(message.method==='initialize')instance.send({id:message.id,result:{}});});return child;},
     serverRequestSink:request=>{inbound=request;return request.respondError(-32002,'expired');}});
   await client.ensureStarted();const original=child.stdin.write;child.stdin.write=(line,callback)=>{const message=JSON.parse(line);if(message.id==='blocked'&&!message.method)return false;return original(line,callback);};

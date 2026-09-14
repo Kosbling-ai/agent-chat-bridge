@@ -104,7 +104,7 @@ function validateRuntime(raw) {
   codex.approvalsReviewer = raw.codex.approvalsReviewer === undefined || raw.codex.approvalsReviewer === 'auto' ? 'auto_review' : string(raw.codex.approvalsReviewer);
   codex.networkAccess = raw.codex.networkAccess ?? true;
   if (typeof codex.networkAccess !== 'boolean') throw new ConfigError('invalid_codex_network_access');
-  codex.requestUserInput = raw.codex.requestUserInput ?? true;
+  codex.requestUserInput = raw.codex.requestUserInput ?? false;
   if (typeof codex.requestUserInput !== 'boolean') throw new ConfigError('invalid_codex_request_user_input');
   codex.threadNamePrefix = raw.codex.threadNamePrefix === undefined ? 'bridge' : string(raw.codex.threadNamePrefix);
   codex.steering = raw.codex.steering ?? true;

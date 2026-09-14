@@ -10,7 +10,7 @@ export function codexAppServerArgs(config = {}, { requestUserInputFeature = fals
     'app-server', '--listen', 'stdio://',
     '-c', `sandbox_workspace_write.network_access=${config.networkAccess === false ? 'false' : 'true'}`,
     '-c', 'shell_environment_policy.inherit=all',
-    ...(requestUserInputFeature ? ['-c', `features.default_mode_request_user_input=${config.requestUserInput === false ? 'false' : 'true'}`] : []),
+    ...(requestUserInputFeature ? ['-c', `features.default_mode_request_user_input=${config.requestUserInput === true ? 'true' : 'false'}`] : []),
   ];
 }
 
@@ -53,7 +53,7 @@ export class CodexAppServerClient {
     this.childGenerations = new WeakMap();
     this.inbound = new Map();
     this.requestUserInputFeature = hasRequestUserInputFeature(config, this.childEnv, spawnSyncImpl);
-    if (config.requestUserInput !== false && !this.requestUserInputFeature) emitLog(this.log, 'warning', 'request_user_input_feature', 'unavailable');
+    if (config.requestUserInput === true && !this.requestUserInputFeature) emitLog(this.log, 'warning', 'request_user_input_feature', 'unavailable');
     this.lifecycle = new IdleLifecycle({
       idleMs: config.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS,
       close: () => this.close('idle'),
@@ -163,7 +163,7 @@ export class CodexAppServerClient {
 
   handleServerRequest(message, child) {
     const generation=this.childGenerations.get(child);
-    if (!validRequestId(message.id) || message.method !== 'item/tool/requestUserInput') {
+    if (!validRequestId(message.id) || message.method !== 'item/tool/requestUserInput' || this.config.requestUserInput !== true) {
       try { child.stdin.write(`${JSON.stringify({ id: message.id ?? null, error: { code: -32601, message: 'Unsupported server request' } })}\n`); } catch { /* disconnect path settles the child */ }
       return;
     }

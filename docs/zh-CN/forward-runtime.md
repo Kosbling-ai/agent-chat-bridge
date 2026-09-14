@@ -4,7 +4,7 @@
 
 `codex.idleCloseMs` 只控制 bridge 活动归零后是否自动关闭其 app-server 子进程。原业务缺省值为 `60000` 毫秒；显式写 `0` 仍可关闭该定时器，其他值最大为 86400000。正常 shutdown 仍会关闭子进程，异常退出仍走既有故障处理。这不改变会话空闲两天、规则更新或归档时的 rollover。Codex 状态缺省使用启动用户共享的 `~/.codex`；可选 `codex.sharedHome` 与启动环境 `CODEX_HOME` 同时存在时必须解析到同一目录。app-server shell 继承策略只基于 bridge 传给子进程的受控环境。
 
-`codex.requestUserInput` 缺省为 `true`。bridge 启动时先检查当前 Codex 可执行文件是否提供 Default 模式的用户提问功能，只在确认支持时启用；功能不可用不会阻断其他执行，但 Codex 不能打开飞书提问卡。显式设为 `false` 会保持关闭。
+`codex.requestUserInput` 缺省为 `false`。bridge 启动时检查当前 Codex 可执行文件是否提供 Default 模式用户提问功能；若存在，会显式传入 `features.default_mode_request_user_input=false`，覆盖共享 Codex home 继承的设置，并防御性拒绝意外收到的请求。显式设为 `true` 才选择启用，同一探测只在确认支持时打开该功能。功能不可用不会阻断其他执行，但 Codex 不能打开飞书提问卡。此配置控制 bridge 当前使用的 Default 模式功能；bridge 不会启动 Plan 模式工作流。
 
 受支持的提问会为当前 active turn 创建一张独立飞书表单，可以一次包含多道题；每题接受一个已有选项、允许的“其他”输入或自由填空。只有原消息发送者能在原聊天中提交，bridge 会重新核对当前 job、卡片、授权、thread 和 turn。只要一批请求中包含 secret 提问，整批就会在展示和收集内容前被拒绝；普通飞书表单不是秘密输入通道。
 

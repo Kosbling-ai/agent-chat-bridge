@@ -432,7 +432,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       await request.respondError(-32602, error.code === 'CODEX_USER_INPUT_SECRET_UNSUPPORTED' ? 'Secret questions are unsupported' : 'Invalid user input request').catch(() => {});
       return;
     }
-    if (closing || config.requestUserInput === false) {
+    if (closing || config.requestUserInput !== true) {
       await request.respondError(-32002, 'User input request unavailable').catch(() => {}); return;
     }
     const resolvedKey = `${request.generation}:${normalized.threadId}:${typedRequestKey(normalized.requestId)}`;

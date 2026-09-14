@@ -9,7 +9,7 @@
     "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"],
     "idleCloseMs": 60000, "closeGraceMs": 5000, "rpcTimeoutMs": 120000, "turnTimeoutMs": 10800000,
     "sandbox": "workspace-write", "approvalPolicy": "on-request", "approvalsReviewer": "auto_review", "networkAccess": true,
-    "requestUserInput": true,
+    "requestUserInput": false,
     "rolloverIdleMs": 172800000, "rolloverCheckTimeoutMs": 30000,
     "memoryCheckIntervalMs": 60000, "memoryMaxRssMb": 1536, "memoryMaxHeapUsedMb": 1024,
     "jobRetryMs": 60000, "jobMaxAttempts": 3

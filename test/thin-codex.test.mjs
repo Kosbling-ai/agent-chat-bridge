@@ -17,6 +17,18 @@ class FakeStream extends EventEmitter {
   setEncoding() {}
 }
 
+test('requestUserInput is unavailable when the executor option is omitted',async t=>{
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-codex-input-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+  mkdirSync(join(cwd,'home'));const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[{id:'disabled'}]});let opens=0;
+  const executor=createCodexExecutor({config:config(cwd),sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:'default_mode_request_user_input under_development false\n'}),onUserInput:async()=>{opens++;}});
+  const running=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'message',prompt:'work'});running.catch(()=>{});
+  while(!runtime.calls.some(message=>message.id==='disabled'&&message.error))await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(opens,0);assert.equal(runtime.calls.find(message=>message.id==='disabled').error.code,-32601);
+  assert(runtime.args[0].includes('features.default_mode_request_user_input=false'));
+  await executor.close();await assert.rejects(running);
+});
+
 test('requestUserInput resolved before turn admission never opens a card', async t => {
   const cwd=mkdtempSync(join(tmpdir(),'bridge-codex-input-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
   mkdirSync(join(cwd,'home'));const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[{id:0}],resolveServerRequestBeforeResponse:true});let opens=0;
