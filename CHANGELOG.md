@@ -5,6 +5,7 @@
 - Migration 004 scopes five assistant runtime tables by `connection_id`, including their uniqueness, recovery and context indexes. It also prefixes bridge claim indexes with the existing connection owner. Existing bridge rows keep their ownership.
 - Existing assistant rows require an explicit `--legacy-connection-id` when migrating. The migration records that decision, backfills with a parameterized update, and resumes only with the same value after partial MySQL DDL. An empty new database needs no legacy value.
 - Stop every old writer and back up the bridge schema and matching workspace/outbox before applying 004. The migration holds the old database-level writer lock while upgrading. Startup does not run DDL; real-instance upgrade and provider validation remain separate authorized operations.
+- Ordinary Feishu and API runs now send one failed occupied-session notice on the first `CODEX_THREAD_BUSY` result, including turn-start unknown outcomes. Trusted system busy queue behavior remains unchanged.
 
 ## [0.2.4] — Unreleased
 
@@ -26,7 +27,7 @@ No database migration is added. Validation uses synthetic child-process and life
 
 ## [0.2.2] — Unreleased
 
-- Deliver a failed occupied-session notice on the first `CODEX_THREAD_BUSY` result for ordinary Feishu and API runs, including turn-start unknown outcomes, without replacing the binding or retrying; the validated system busy queue remains available.
+- End a manual Feishu request on its first confirmed pre-admission `CODEX_THREAD_BUSY` result and deliver one explicit occupied-session notice without replacing the binding or replaying the request.
 - Retain 60-second waiting only for a validated persisted caller/namespace system binding. Other retryable admission failures remain bounded to three claims by default; configuration enforces the original 10-second retry-delay floor.
 - Keep known-turn observation, unconfirmed start and unresolved steer confirmation in `held` with their native/intent identity. Reuse the waiting card and keep Typing off between system probes.
 - Preserve sanitized RPC method, stable code, phase and bounded retry facts through the service logger and optional reporter.
