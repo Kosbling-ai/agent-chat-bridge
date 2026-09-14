@@ -21,4 +21,4 @@ npm test
 npm run check
 ```
 
-迁移或启动前只使用独立 bridge schema 和受控凭证注入。不要把 token 写入 JSON、`.env`、日志或版本控制。迁移边界见[中文说明](MIGRATIONS.zh-CN.md)。
+迁移或启动前只使用独立 bridge schema 和受控凭证注入。不要把 token 写入 JSON、`.env`、日志或版本控制。迁移边界见[中文说明](MIGRATIONS.zh-CN.md)；从旧业务只读快照承接现有 Codex thread 时，使用[受控绑定导入](docs/zh-CN/binding-import.md)。
