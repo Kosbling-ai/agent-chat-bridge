@@ -291,26 +291,40 @@ test('prepared media prompt is reused without downloading again', async () => {
   assert.match(prompt, /safe\/image\.png/);
 });
 
-test('manual pre-admission busy follows the ordinary bounded retry policy', async () => {
-  const jobs = memoryJobs({ status: 'pending', callerId: 'live', executionNamespace: null, deliveryMode: 'bridge', result: {} });
-  let admissions = 0;
-  const runtime = createForwardRuntime({
-    config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
-    executor: { async execute() { admissions += 1; throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' }); } },
-    feedback: { async start() { return {}; }, async prepare() {}, async finish() { return false; } },
-    replies: { async prepare(_job, result) { return result; }, async deliver() { return { status: 'sent' }; }, readResource: async () => null }, authorize: async () => true,
-  });
-  runtime.start(); await flush(); await runtime.stop();
-  assert.equal(admissions, 1);
-  assert.equal(jobs.calls.filter(([name]) => name === 'retry').length,1);
-  assert.equal(jobs.calls.filter(([name]) => name === 'reply_pending').length,0);
-  assert.equal(jobs.job.status,'pending');
-  assert.equal(jobs.calls.find(([name])=>name==='retry')[1].preserveAttempt,false);
+test('ordinary live and API busy failures deliver on the first attempt without retrying', async () => {
+  for (const [callerId, facts] of [
+    ['live', { outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' }],
+    ['api', { outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' }],
+    ['live', { outcome: 'unknown', phase: 'turn_start', rpcMethod: 'turn/start' }],
+    ['api', {}],
+  ]) {
+    const jobs = memoryJobs({ status: 'pending', attempts: 0, callerId, executionNamespace: null, deliveryMode: 'bridge', result: {} });
+    let admissions = 0;
+    let deliveries = 0;
+    const error = Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, ...facts });
+    const runtime = createForwardRuntime({
+      config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+      executor: { async execute() { admissions += 1; throw error; } },
+      feedback: { async start() { return {}; }, async prepare() {}, async finish() { return false; } },
+      replies: { async prepare(_job, result) { return result; }, async deliver() { deliveries += 1; return { status: 'sent' }; } }, authorize: async () => true,
+    });
+    runtime.start(); await flush(); await runtime.stop();
+    assert.equal(admissions, 1, callerId);
+    assert.equal(jobs.job.attempts, 1);
+    assert.equal(jobs.calls.filter(([name]) => name === 'retry').length, 0);
+    assert.equal(jobs.calls.filter(([name]) => name === 'reply_pending').length, 1);
+    assert.equal(deliveries, 1);
+    assert.equal(jobs.job.status, 'failed');
+    assert.equal(jobs.job.result.failed, true);
+    assert.match(jobs.job.result.answer, /会话被其他客户端占用/);
+    assert.equal(jobs.job.result.execution.terminal, 'failed');
+    assert.equal(error.outcome, facts.outcome);
+  }
 });
 
-test('ordinary busy retry stops the real feedback observer before releasing its lease', async () => {
+test('ordinary busy finishes the real feedback card and stops its observer and lease timer', async () => {
   const originalSetInterval=globalThis.setInterval;const originalClearInterval=globalThis.clearInterval;
-  const timers=new Map();let sequence=0;let reads=0;
+  const timers=new Map();let sequence=0;let reads=0;const cards=[];
   globalThis.setInterval=(callback,ms)=>{const token={id:++sequence,unref(){}};timers.set(token,{callback,ms});return token;};
   globalThis.clearInterval=token=>timers.delete(token);
   try {
@@ -318,15 +332,19 @@ test('ordinary busy retry stops the real feedback observer before releasing its 
       result:{execution:{bindingOpenId:'human'},executionCard:{messageId:'card-message',status:'running',entries:[]}}});
     const sessions={async loadBinding(){reads+=1;return{codexSessionId:'thread'};},async readPublicProgress(){return[];}};
     const feedback=createExecutionFeedback({jobs,sessions,typing:{async start(){return null;},async cleanup(){}},
-      cardClient:{im:{v1:{message:{async patch(){return{code:0};}}}}}});
+      cardClient:{im:{v1:{message:{async patch(input){cards.push(JSON.parse(input.data.content));return{code:0};}}}}}});
     const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions,feedback,
-      executor:{async execute(){throw Object.assign(new Error('busy'),{code:'CODEX_THREAD_BUSY'});}},replies:{},authorize:async()=>true});
+      executor:{async execute(){throw Object.assign(new Error('busy'),{code:'CODEX_THREAD_BUSY'});}},
+      replies:{async prepare(_job,result){return result;},async deliver(){return{status:'sent'};}},authorize:async()=>true});
     await runtime.handleMessage({source:'live',callerId:'live',idempotencyKey:'message',conversationId:'chat',chatType:'p2p',actor:{openId:'human'},prompt:'work'});
     await new Promise(setImmediate);
-    const readsAfterRetry=reads;
+    const readsAfterFailure=reads;
     assert.equal(timers.size,0);
     for(const {callback} of timers.values())await callback();
-    assert.equal(reads,readsAfterRetry);
+    assert.equal(reads,readsAfterFailure);
+    assert.equal(jobs.calls.filter(([name])=>name==='retry').length,0);
+    assert.equal(jobs.job.status,'failed');
+    assert(cards.some(card=>card.header.template==='red'&&JSON.stringify(card).includes('会话被其他客户端占用')));
     await runtime.stop();
     assert.equal(timers.size,0);
   } finally {
@@ -396,12 +414,14 @@ test('only a persisted caller-derived system binding gets the 60-second wait pol
   for(const spoof of [
     { executionNamespace: '', senderOpenId: 'system:pretend', result: { execution: { bindingOpenId: 'system:pretend' },policy:{queueIfBusy:true} } },
     { executionNamespace: 'daily', senderOpenId: bindingOpenId, result: { execution: { bindingOpenId: 'system:mismatch' },policy:{queueIfBusy:true} } },
+    { executionNamespace: 'daily', senderOpenId: bindingOpenId, result: { execution: { bindingOpenId },policy:{queueIfBusy:true} }, busyFacts: { outcome: 'unknown', phase: 'turn_start' } },
   ]) {
     const spoofJobs = memoryJobs({ status: 'pending', deliveryMode: 'caller', ...spoof });
-    const one = createForwardRuntime({ config: { owner: 'owner', pollMs: 1 }, jobs: spoofJobs, sessions: {}, executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission' }); } }, replies: {},allowBusyQueue:async()=>true });
+    const one = createForwardRuntime({ config: { owner: 'owner', pollMs: 1 }, jobs: spoofJobs, sessions: {}, executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission', ...spoof.busyFacts }); } }, replies: {},allowBusyQueue:async()=>true });
     one.start(); await flush(); await one.stop();
-    assert.equal(spoofJobs.calls.find(([name]) => name === 'retry')[1].preserveAttempt, false);
-    assert.equal(spoofJobs.job.status, 'pending');
+    assert.equal(spoofJobs.calls.filter(([name]) => name === 'retry').length, 0);
+    assert.equal(spoofJobs.job.status, 'failed');
+    assert.match(spoofJobs.job.result.answer, /会话被其他客户端占用/);
   }
 });
 

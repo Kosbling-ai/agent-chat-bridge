@@ -5,10 +5,11 @@ import { publicAttachments } from '../channels/feishu/replies.mjs';
 const terminal = new Set(['completed', 'failed', 'deferred']);
 const stableMessageId = value => `api:${createHash('sha256').update(value).digest('hex')}`;
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED'].includes(error?.code);
-const preAdmissionBusy = error => error?.code === 'CODEX_THREAD_BUSY'
+const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
+const preAdmissionBusy = error => isBusy(error)
   && (error?.phase === 'pre_admission' || error?.outcome === 'rejected');
 const retryableError = error => {
-  if (error?.code === 'CODEX_THREAD_BUSY') return true;
+  if (isBusy(error)) return false;
   if (terminalTurnError(error)) return false;
   const value = [error?.name, error?.code, error?.cause?.code, error?.message, error?.cause?.message]
     .filter(Boolean).join(' ');
@@ -238,7 +239,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       }
       lease.assertOwned();
       const queueBusy = preAdmissionBusy(error) && queueIfBusy;
-      if (retryableError(error) && (queueBusy || job.attempts < maxAttempts)) {
+      if (queueBusy || (retryableError(error) && job.attempts < maxAttempts)) {
         const nextRetryAt = now() + retryDelayMs;
         await feedback?.wait?.(job, state).catch(() => {});
         await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, preserveAttempt: queueBusy,
@@ -250,7 +251,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       }
       execution = { ...execution, terminal: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', finishedAt: now() };
       const failed = { failed: true, turnStatus: execution.terminal,
-        answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : preAdmissionBusy(error) ? '会话被其他客户端占用，请释放后重试或新建会话。' : '执行未完成，请稍后重试。',
+        answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : isBusy(error) ? '会话被其他客户端占用，请释放后重试。原会话绑定保持不变。' : '执行未完成，请稍后重试。',
         rawAnswer: '', attachments: [], execution };
       await feedback?.prepare?.(job, failed, state);
       await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: error.code || 'forward_execution_failed' });
