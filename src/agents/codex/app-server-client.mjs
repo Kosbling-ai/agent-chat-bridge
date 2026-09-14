@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { IdleLifecycle, closeOwnedChild, classifyCodexRpcError } from './idle-lifecycle.mjs';
+import { DEFAULT_IDLE_CLOSE_MS, IdleLifecycle, closeOwnedChild, classifyCodexRpcError } from './idle-lifecycle.mjs';
 
 function emitLog(log, level, operation, status, detail = {}) {
   try { log?.(level, { module: 'agent-chat-bridge', component: 'codex-app-server', operation, status, ...detail }); } catch { /* logging is observational */ }
@@ -9,7 +9,7 @@ export function codexAppServerArgs(config = {}) {
   return [
     'app-server', '--listen', 'stdio://',
     '-c', `sandbox_workspace_write.network_access=${config.networkAccess === false ? 'false' : 'true'}`,
-    '-c', 'shell_environment_policy.inherit=none',
+    '-c', 'shell_environment_policy.inherit=all',
   ];
 }
 
@@ -35,7 +35,7 @@ export class CodexAppServerClient {
     this.fault = null;
     this.disconnectedChildren = new WeakSet();
     this.lifecycle = new IdleLifecycle({
-      idleMs: config.idleCloseMs ?? 0,
+      idleMs: config.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS,
       close: () => this.close('idle'),
       onError: () => emitLog(this.log, 'error', 'app_server_close', 'failed'),
     });
@@ -72,7 +72,7 @@ export class CodexAppServerClient {
     child.on('error', (error) => { if (this.child === child) this.fail(error, child); });
     child.once('exit', (code, signal) => this.handleExit(new Error(`codex app-server exited${code == null ? '' : ` code=${code}`}${signal ? ` signal=${signal}` : ''}`), child));
     await this.request('initialize', {
-      clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.2.3' },
+      clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.2.4' },
       capabilities: { experimentalApi: true },
     }, { skipStart: true });
     if (this.child !== child) throw new Error('codex app-server child changed during initialize');

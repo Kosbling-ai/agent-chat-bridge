@@ -1,8 +1,8 @@
 # Forward Runtime 中文补充
 
-尚未发布的 0.2.3 开发版用一条带租约的 Codex forward worker 替换 0.1.1 的 generation worker；communication worker 只负责 hook 和已登记的消息 outbox。进程只持有一个飞书 bot/WebSocket 和一个 Codex app-server/executor。线程新建、恢复和 turn 启动使用协议定义的 `auto_review` 审批 reviewer。当前仅完成公开 bridge 代码与合成验证，Kosbling 业务 producer 的实际切换属于后续独立工作。
+尚未发布的 0.2.4 开发版用一条带租约的 Codex forward worker 替换 0.1.1 的 generation worker；communication worker 只负责 hook 和已登记的消息 outbox。进程只持有一个飞书 bot/WebSocket 和一个 Codex app-server/executor。线程新建、恢复和 turn 启动使用协议定义的 `auto_review` 审批 reviewer。当前仅完成公开 bridge 代码与合成验证，Kosbling 业务 producer 的实际切换属于后续独立工作。
 
-`codex.idleCloseMs` 只控制 bridge 活动归零后是否自动关闭其 app-server 子进程。缺省 `0` 表示 bridge 服务存活期间不因空闲自动关闭；不会发送 keepalive，也不保证服务停止、崩溃或子进程退出后仍持有原生写锁。正整数（最大 86400000 毫秒）可恢复定时关闭。正常 shutdown 仍会关闭子进程，异常退出仍走既有故障处理。这不改变会话空闲两天、规则更新或归档时的 rollover。
+`codex.idleCloseMs` 只控制 bridge 活动归零后是否自动关闭其 app-server 子进程。原业务缺省值为 `60000` 毫秒；显式写 `0` 仍可关闭该定时器，其他值最大为 86400000。正常 shutdown 仍会关闭子进程，异常退出仍走既有故障处理。这不改变会话空闲两天、规则更新或归档时的 rollover。Codex 状态缺省使用启动用户共享的 `~/.codex`；可选 `codex.sharedHome` 与启动环境 `CODEX_HOME` 同时存在时必须解析到同一目录。app-server shell 继承策略只基于 bridge 传给子进程的受控环境。
 
 群授权必须显式出现在 `routing.groups`。`capabilities` 只允许 `bridge`、`hook`，缺省两者都开，`[]` 表示两者都关。`bridge` 仍继续检查 @/all trigger 和可选 `userIds`；`hook` 只按自己的群授权与订阅过滤，不参加 Agent 路由、执行或回复。旧配置中只写在 `hooks[].conversationIds` 的群，需要补入 `routing.groups`，纯 hook 群可写 `capabilities:["hook"]`。
 
@@ -24,6 +24,6 @@ bridge 的投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknow
 
 迁移 002–003 只用于 bridge 自己的新 MySQL schema，并非把 Kosbling 生产/P 原库原地转换成 0.2.0。启动只校验迁移账本，不自动执行 DDL；新开发实例应使用空的独立 schema 显式迁移。已有 0.1.1 bridge 试用库如需升级，必须先停唯一 writer，并把数据库与 workspace/outbox 一起备份。应用 002–003 后回退 0.1.1 需要恢复旧库快照或使用另一份兼容 schema，不能删迁移记录假装降级。
 
-0.2.3 目前只是开发版本号和变更记录：没有打 tag、发布，也没有真实飞书/Codex 验收。现有 P 实例保持不动，业务的定时提交、caller 结果消费与 hook 后 lark-cli 查询仍需后续独立改造。
+0.2.4 目前只是开发版本号和变更记录：没有打 tag、发布，也没有真实飞书/Codex 验收。现有 P 实例保持不动，业务的定时提交、caller 结果消费与 hook 后 lark-cli 查询仍需后续独立改造。
 
 完整英文契约见 [Forward runtime and API](../runtime.md)。

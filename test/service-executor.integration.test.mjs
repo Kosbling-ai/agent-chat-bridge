@@ -50,7 +50,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     schemaVersion: 1,
     listen: { host: '127.0.0.1', port: 0 },
     storage: { hostEnv: 'DB_HOST', portEnv: 'DB_PORT', userEnv: 'DB_USER', passwordEnv: 'DB_PASSWORD', databaseEnv: 'DB_DATABASE' },
-    codex: { bin: child, cwd: directory, envNames: ['PATH', 'HOME', 'OBSERVED_FILE'], rulesFiles: ['AGENTS.md'], rolloverOnRulesUpdate: true },
+    codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], rulesFiles: ['AGENTS.md'], rolloverOnRulesUpdate: true },
     feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot', catchup: false },
     routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true, capabilities: ['bridge'] }] },
     auth: { clients: [{ id: 'caller', tokenEnv: 'API_TOKEN', conversationIds: ['api-chat'], admin: false }] },
@@ -107,9 +107,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await access(`${observed}.steer`);
   const childEnv = JSON.parse(await readFile(observed, 'utf8'));
   assert.equal(childEnv.UNSELECTED_SECRET, undefined);
+  assert.equal(childEnv.HOME, undefined);
   assert.equal(childEnv.CODEX_HOME, join(directory, '.codex'));
   assert.deepEqual(executorConfig.rulesPaths, ['AGENTS.md']);
-  assert.equal(executorConfig.idleCloseMs, 0);
+  assert.equal(executorConfig.idleCloseMs, 60_000);
   assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['api-chat', 'chat']);
   assert.equal(forwardConfig.retryDelayMs, 60_000);
   assert.equal(forwardConfig.maxAttempts, 3);

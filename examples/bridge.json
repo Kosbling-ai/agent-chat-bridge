@@ -5,7 +5,7 @@
     "hostEnv": "BRIDGE_DB_HOST", "portEnv": "BRIDGE_DB_PORT", "userEnv": "BRIDGE_DB_USER",
     "passwordEnv": "BRIDGE_DB_PASSWORD", "databaseEnv": "BRIDGE_DB_DATABASE"
   },
-  "codex": { "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"], "idleCloseMs": 0, "jobRetryMs": 60000, "jobMaxAttempts": 3 },
+  "codex": { "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"], "jobRetryMs": 60000, "jobMaxAttempts": 3 },
   "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id", "displayName": "Agent" },
   "routing": {
     "version": "1",
