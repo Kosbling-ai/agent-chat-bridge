@@ -210,6 +210,19 @@ test('idle lifecycle gates new work until owned close finishes', async () => {
   finish(); await closing; await incoming; assert.equal(entered, true); lifecycle.stop();
 });
 
+test('zero idle timeout keeps the app-server open until explicit shutdown', async () => {
+  let closes = 0;
+  const lifecycle = new IdleLifecycle({
+    close: async () => { closes += 1; },
+    idleMs: 0,
+    setTimer() { throw new Error('disabled idle close scheduled a timer'); },
+  });
+  await lifecycle.run(async () => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closes, 0);
+  lifecycle.stop();
+});
+
 test('executor binds, records start intent/bound, and completes from an event racing the response', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
@@ -565,6 +578,22 @@ test('a fresh child resumes its binding after idle close before starting another
     assert.equal(runtime.children.length, 2);
     assert.ok(runtime.calls.some((call) => call.method === 'thread/resume' && call.params.threadId === 'thread-1'));
     await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('disabled idle close reuses one child and explicit executor shutdown closes it', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const runtime = fakeRuntime({ strictThreadLoading: true });
+    const executor = createCodexExecutor({ config: { ...config(cwd), idleCloseMs: 0 }, sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl });
+    await executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'one', prompt: 'one', busyPolicy: 'steer' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(executor.status().ready, true);
+    await executor.execute({ bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'two', prompt: 'two', busyPolicy: 'steer' });
+    assert.equal(runtime.children.length, 1);
+    await executor.close();
+    assert.equal(runtime.children[0].exitCode, 0);
+    assert.equal(executor.status().ready, false);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 

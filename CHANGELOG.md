@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3] — Unreleased
+
+- Keep the owned Codex app-server open while the bridge service remains running by default. This removes the 60-second idle child close without adding keepalive traffic or changing native writer-lock behavior.
+- Add optional `codex.idleCloseMs`: `0` disables automatic idle close; a positive value retains the bounded idle timer. Explicit service shutdown and unexpected child-exit handling remain unchanged.
+
+No database migration is added. Validation uses synthetic child-process and lifecycle fixtures; no real message or model acceptance was run.
+
 ## [0.2.2] — Unreleased
 
 - End a manual Feishu request on its first confirmed pre-admission `CODEX_THREAD_BUSY` result and deliver one explicit occupied-session notice without replacing the binding or replaying the request.

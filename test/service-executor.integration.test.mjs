@@ -109,6 +109,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(childEnv.UNSELECTED_SECRET, undefined);
   assert.equal(childEnv.CODEX_HOME, join(directory, '.codex'));
   assert.deepEqual(executorConfig.rulesPaths, ['AGENTS.md']);
+  assert.equal(executorConfig.idleCloseMs, 0);
   assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['api-chat', 'chat']);
   assert.equal(forwardConfig.retryDelayMs, 60_000);
   assert.equal(forwardConfig.maxAttempts, 3);
