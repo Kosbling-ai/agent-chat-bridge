@@ -60,7 +60,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   };
   const env = {
     DB_HOST: 'unused', DB_PORT: '3306', DB_USER: 'unused', DB_PASSWORD: 'unused', DB_DATABASE: 'unused',
-    APP_ID: 'app', APP_SECRET: 'secret', API_TOKEN: 'synthetic-token-at-least-24-characters',
+    APP_ID: 'app', APP_SECRET: 'secret',
     PATH: process.env.PATH, HOME: directory, OBSERVED_FILE: observed, UNSELECTED_SECRET: 'must-not-enter-child',
   };
   let executorConfig;
@@ -127,7 +127,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(executorConfig.memoryCheckIntervalMs, 60_000);
   assert.equal(executorConfig.memoryMaxRssBytes, 1536 * 1024 * 1024);
   assert.equal(executorConfig.memoryMaxHeapUsedBytes, 1024 * 1024 * 1024);
-  assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['api-chat', 'chat']);
+  assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['chat']);
   assert.equal(forwardConfig.executeTimeoutMs, 12 * 60 * 60 * 1000 + 10_000);
   assert.equal(forwardConfig.retryDelayMs, 60_000);
   assert.equal(forwardConfig.maxAttempts, 3);

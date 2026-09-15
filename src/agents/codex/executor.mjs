@@ -532,7 +532,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   async function execute(input, options = {}) {
     if (closing) throw coded('executor is closing', 'CODEX_EXECUTOR_CLOSING', { retryable: true });
     const actor = identity(input);
-    const normalized = { ...input, prompt: String(input.prompt || ''), messageId: trim(input.messageId), busyPolicy: input.busyPolicy || (input.queueIfBusy === false ? 'reject' : 'steer') };
+    const normalized = { ...input, prompt: String(input.prompt || ''), messageId: trim(input.messageId), busyPolicy: input.busyPolicy || 'steer' };
     if (!normalized.prompt.trim()) throw coded('empty prompt', 'CODEX_INVALID_INPUT');
     if (!['steer', 'reject'].includes(normalized.busyPolicy)) throw coded('invalid busy policy', 'CODEX_INVALID_INPUT');
     return client.lifecycle.run(async () => {

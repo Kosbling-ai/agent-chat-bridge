@@ -1,6 +1,6 @@
 # Forward Runtime 中文补充
 
-尚未发布的 0.2.4 开发版用一条带租约的 Codex forward worker 替换 0.1.1 的 generation worker；communication worker 只负责 hook 和已登记的消息 outbox。进程只持有一个飞书 bot/WebSocket 和一个 Codex app-server/executor。线程新建、恢复和 turn 启动使用协议定义的 `auto_review` 审批 reviewer。当前仅完成公开 bridge 代码与合成验证，Kosbling 业务 producer 的实际切换属于后续独立工作。
+尚未发布的 0.2.6 开发版使用一条带租约的 Codex forward worker 处理人类飞书会话；communication worker 负责 hook 和 bridge 内部的持久消息 outbox。进程只持有一个飞书 bot/WebSocket 和一个 Codex app-server/executor。线程新建、恢复和 turn 启动使用协议定义的 `auto_review` 审批 reviewer。当前仅完成公开 bridge 代码与合成验证，Kosbling 业务保留原生链路并只消费 hook。
 
 `codex.idleCloseMs` 只控制 bridge 活动归零后是否自动关闭其 app-server 子进程。原业务缺省值为 `60000` 毫秒；显式写 `0` 仍可关闭该定时器，其他值最大为 86400000。正常 shutdown 仍会关闭子进程，异常退出仍走既有故障处理。这不改变独立的会话 rollover；后者的闲置缺省值为五天（`432000000` 毫秒），规则更新或归档触发也保持原样。Codex 状态缺省使用启动用户共享的 `~/.codex`；可选 `codex.sharedHome` 与启动环境 `CODEX_HOME` 同时存在时必须解析到同一目录。app-server shell 继承策略只基于 bridge 传给子进程的受控环境。
 
@@ -16,26 +16,22 @@
 
 hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lark-cli 等自身查询接口为数据真源，并保留业务轮询兜底及双入口 messageId 去重；bridge 不迁入业务回补、历史同步、缓存或 cron，也不让业务另建飞书 WebSocket。
 
-普通运行接口为 `POST /v1/runs`，接受可选 `executionNamespace`、`deliveryMode:"bridge"|"caller"` 与 boolean `queueIfBusy`，仍返回 `202 {id,duplicate}`。bridge 模式负责 Typing、执行卡片、停止按钮、答案与附件；caller 模式只执行并保存结果，不自动发送这些飞书效果。`GET /v1/runs/:id` 分开暴露执行和投递状态，并保留 `rawAnswer`、native 与 held 事实；事件接口按该 run 的 binding/thread/chat/message 精确过滤且只返回安全公开投影。附件资源接口需通过相同会话授权，且不暴露本机绝对路径。
-
-`POST /v1/deliveries` 的 create/reply 交互卡片按完整 JSON 序列化后最多 28,000 字节，与 bridge 执行卡预算一致；text、post 等其他消息内容继续使用 20,000 字节限制，底层飞书客户端仍保留 30,000 字节传输防线。超限请求在写入 outbox 前返回 `invalid_content`。飞书实际返回非零 API 码时，异步投递记为 `failed` 和 `feishu_api_rejected`；本地内容拒绝记为 `failed` 和 `invalid_content`。SDK 抛出的传输异常或超时仍记为 `unknown` 和 `chat_delivery_unconfirmed`，调用方不得据此改发另一条消息。
+HTTP 监听器只公开 `GET /health/live` 和 `GET /health/ready`。原 `/v1` run、event、resource、recovery、delivery 和 upload 路径均不再提供；未知 GET 返回 404，非 GET 请求返回 405。业务系统只消费配置的 outbound hook，并保留自己的原生 SDK、Codex、调度和消息投递链路。配置中的 `auth.clients` 已失效且会被严格校验拒绝；hook token 继续由各 `hooks[].tokenEnv` 引用。
 
 普通任务收到 `CODEX_THREAD_BUSY` 后第一次即走失败投递，即使 turn/start 的原生接收结果仍未知，也不等待下一次 claim；原卡片/回复链提示“会话被其他客户端占用，请释放后重试。原会话绑定保持不变。”其他可重试入场失败默认最多 3 次、每次相隔 60 秒；`codex.jobRetryMs` 允许 10 秒到 30 分钟，`codex.jobMaxAttempts` 允许 1 到 10。bridge 不自动新建会话或更换原 binding。
 
 真实飞书用户已有 binding 时，busy 失败卡片提供“保留历史并新建会话”。只有原消息发送者可点击，回调会重新核对当前 bot 范围内的 job、卡片、聊天、授权和冻结的源线程；它只执行一次显式 `thread/fork`，使用当前 bridge 的工作目录与权限默认值，并在同一 binding admission 锁内完成持久化与旧线程 CAS 切换。该操作不 resume/interrupt 源线程、不启动 turn，也不重放失败消息。原生明确拒绝或 binding 已变化时保留当前 binding；原生结果或数据库提交结果未知时会记录为未确认，不会自动重试，需管理员核查持久状态。跨进程 writer 占用时 native 是否支持 fork 取决于 Codex 实现，bridge 会将拒绝作为可见失败处理，不假定一定成功。
 
-忙碌排队例外只授予配置中显式启用 `queueIfBusy` 的认证客户端：已持久化且非空的 `executionNamespace` 必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。已获授权的 caller 可在单次 run 请求中传 `false` 关闭其配置默认值；只有 caller 本身已获授权时才能传 `true`，省略则沿用 caller 默认值。有效策略随 run 持久化，显式冲突的幂等重放会被拒绝。请求 payload、sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭；恢复流程不再添加 Typing。
-
 执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
 
-私聊支持单图和 post 内图片，下载路径按原格式追加到文字 prompt；群聊只保留文字，忽略媒体。`mediaMaxBytes` 是原实现下载后的告警阈值，不会拒绝图片。bridge 模式直接投递 executor 返回的路径：私聊允许，群聊沿现有 bridge/API 会话 allowlist；单文件上限 28 MiB，成功后删除，单件失败保留文件且不阻断文字或其他附件。旧未确认附件 intent 不重放。
+私聊支持单图和 post 内图片，下载路径按原格式追加到文字 prompt；群聊只保留文字，忽略媒体。`mediaMaxBytes` 是原实现下载后的告警阈值，不会拒绝图片。bridge 直接投递 executor 返回的路径：私聊允许，群聊必须启用 `bridge` capability；单文件上限 28 MiB，成功后删除，单件失败保留文件且不阻断文字或其他附件。旧未确认附件 intent 不重放。
 
-bridge 的投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`；caller 终态为 `not_requested`。投递失败或未知不会重跑已经完成的模型 turn。caller 附件快照的公开 `id` 是十进制资源索引，可用于 `/v1/runs/:id/resources/:index`；bridge 成功发送后会删除路径文件，因此不承诺之后仍可下载，查询可能返回不存在。
+bridge 内部投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`。投递失败或未知不会重跑已经完成的模型 turn。飞书明确返回非零 API 码时记为确认拒绝；返回格式异常、SDK 传输异常或超时仍记为未知，不自动重发另一条消息。
 
-恢复循环先串行处理 reply-pending，再串行处理最多 5 条可执行任务，并阻止重入。已有 start intent、bound/native identity、未知 native 结果或未确认投递效果的旧行保持隔离，不重新提交或重发。`GET /v1/runs/:id/attempt`、`POST /v1/recoveries` 和 `POST /v1/sessions/reset` 在完成相应认证、管理权限和会话 scope 检查后返回 `409 unsupported_execution_model`，不会伪造 generation 或假装已登记恢复动作。`GET /v1/recoveries/:id` 只读取 communication schema 中真实存在的旧 recovery 记录，并保留原管理权限和会话检查；不存在时返回 404。
+恢复循环先串行处理 reply-pending，再串行处理最多 5 条可执行任务，并阻止重入。已有 start intent、bound/native identity、未知 native 结果或未确认投递效果的旧行保持隔离，不重新提交或重发。历史 API/system 行不会由当前版本新建，也不会自动迁移、删除或重放；本次不清理数据库历史结构。
 
 迁移 002–003 只用于 bridge 自己的新 MySQL schema，并非把 Kosbling 生产/P 原库原地转换成 0.2.0。启动只校验迁移账本，不自动执行 DDL；新开发实例应使用空的独立 schema 显式迁移。已有 0.1.1 bridge 试用库如需升级，必须先停唯一 writer，并把数据库与 workspace/outbox 一起备份。应用 002–003 后回退 0.1.1 需要恢复旧库快照或使用另一份兼容 schema，不能删迁移记录假装降级。
 
-0.2.4 目前只是开发版本号和变更记录：没有打 tag、发布，也没有真实飞书/Codex 验收。现有 P 实例保持不动，业务的定时提交、caller 结果消费与 hook 后 lark-cli 查询仍需后续独立改造。
+0.2.6 目前只是开发版本号和变更记录：没有打 tag、发布，也没有真实飞书/Codex 验收。现有 P 实例保持不动；业务保留原生执行与发送链路，只接收 hook 通知。
 
-完整英文契约见 [Forward runtime and API](../runtime.md)。
+完整英文契约见 [Forward runtime and hooks](../runtime.md)。
