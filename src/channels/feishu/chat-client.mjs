@@ -38,9 +38,10 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
         if (typeof result?.[uploadKey] !== 'string' || !result[uploadKey]) throw new FeishuChatError('feishu_upload_unconfirmed', 'unknown');
         return result;
       }
-      // A returned non-zero API code is an explicit rejection. Thrown transport
-      // errors and timeouts below remain unknown for writes.
-      if (result?.code !== 0) throw new FeishuChatError('feishu_api_rejected', 'failed', result?.code);
+      // Only an integer non-zero API code is an explicit rejection. A malformed
+      // response cannot prove whether a write was accepted.
+      if (!Number.isInteger(result?.code)) throw new FeishuChatError('feishu_response_unconfirmed', write ? 'unknown' : 'failed');
+      if (result.code !== 0) throw new FeishuChatError('feishu_api_rejected', 'failed', result.code);
       return result.data;
     } catch (error) {
       if (error instanceof FeishuChatError) throw error;
