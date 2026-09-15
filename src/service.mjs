@@ -24,7 +24,6 @@ import { createUserInputRuntime } from './channels/feishu/user-input-runtime.mjs
 import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
-import { createApi } from './core/api.mjs';
 import { startServer } from './server.mjs';
 import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
 import { resolveSharedHome } from './agents/codex/idle-lifecycle.mjs';
@@ -77,7 +76,6 @@ export async function startService({ config, configPath, env = process.env, log,
     inheritedHome: env.CODEX_HOME ?? '',
     home: env.HOME,
   });
-  const tokens = Object.fromEntries(config.auth.clients.map(client => [client.id, secret(env, client.tokenEnv)]));
   const hookTokens = Object.fromEntries(config.hooks.map(hook => [hook.id, secret(env, hook.tokenEnv)]));
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
@@ -142,10 +140,8 @@ export async function startService({ config, configPath, env = process.env, log,
     const sessions=pool?.query?factories.sessions({pool,schema,connectionId:config.feishu.connectionId}):{};
     const jobs=factories.jobs({pool,connectionId:config.feishu.connectionId});
     const inbound=factories.inbound({pool,connectionId:config.feishu.connectionId});
-    const allowedGroupChatIds = new Set([
-      ...config.routing.groups.filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId),
-      ...config.auth.clients.flatMap(client => client.conversationIds),
-    ]);
+    const allowedGroupChatIds = new Set(config.routing.groups
+      .filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId));
     const executorLog = (level, event = {}) => log(level, event.operation || 'codex_executor', event.status || 'unknown', {
       code: event.error_code || event.code,
       rpcMethod: event.rpc_method,
@@ -217,21 +213,19 @@ export async function startService({ config, configPath, env = process.env, log,
       retryDelayMs:config.codex.jobRetryMs,
       maxAttempts:config.codex.jobMaxAttempts,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
-    },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,
-    allowBusyQueue:async({callerId,conversationId})=>Boolean(config.auth.clients.some(client=>client.id===callerId&&client.queueIfBusy===true&&client.conversationIds.includes(conversationId))),log});
+    },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
     communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest,
       onCardAction: payload => handleCardOperation(async()=>{
         const answered=await userInput.handleCardAction(payload); return answered??feedback.handleCardAction(payload);
       }), log });
-    const api = createApi({ config, store, forwardRuntime:forward, chat, tokens });
     await Promise.race([feishu.start(), cancelled]);
     checkCancelled();
     if (config.feishu.catchup !== false) catchup = factories.catchup({ connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, chat, store, onEvent: communication.ingest, listConversations: () => listCatchupConversations({ config, store }), log });
     forward.start();
     communication.start();
     catchup?.start();
-    http = await startServer({ config, log, api, readiness: async () => {
+    http = await startServer({ config, log, readiness: async () => {
       let storeReady = writerHealthy;
       try { await store.assertCurrent(); } catch { storeReady = false; }
       const executorStatus=executor.status();

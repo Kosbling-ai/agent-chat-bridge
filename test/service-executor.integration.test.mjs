@@ -56,7 +56,6 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], rulesFiles: ['AGENTS.md'], rolloverOnRulesUpdate: true },
     feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot', catchup: false },
     routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true, capabilities: ['bridge'] }] },
-    auth: { clients: [{ id: 'caller', tokenEnv: 'API_TOKEN', conversationIds: ['api-chat'], admin: false }] },
     hooks: [],
   };
   const env = {

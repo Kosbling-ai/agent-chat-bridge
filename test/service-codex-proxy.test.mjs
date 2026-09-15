@@ -13,7 +13,6 @@ const base = {
   codex: { bin: '/synthetic/codex', cwd: '/synthetic/workspace', envNames: ['PATH', 'HOME'] },
   feishu: { connectionId: 'proxy-test', appIdEnv: 'TEST_APP', appSecretEnv: 'TEST_SECRET', botOpenId: 'bot', catchup: false },
   routing: { version: '1', privateUserIds: [], groups: [] },
-  auth: { clients: [{ id: 'test', tokenEnv: 'TEST_TOKEN', conversationIds: [], admin: false }] },
   hooks: [],
 };
 test('only Codex environment selection allows lowercase names; secret references stay strict', () => {
@@ -27,7 +26,6 @@ test('only Codex environment selection allows lowercase names; secret references
   for (const config of [
     { ...base, storage: { ...base.storage, passwordEnv: 'db_password' } },
     { ...base, feishu: { ...base.feishu, appSecretEnv: 'app_secret' } },
-    { ...base, auth: { clients: [{ ...base.auth.clients[0], tokenEnv: 'api_token' }] } },
   ]) assert.throws(() => validateConfig(config), { code: 'invalid_environment_reference' });
 });
 

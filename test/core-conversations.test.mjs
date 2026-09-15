@@ -19,7 +19,7 @@ test('catchup scope combines groups/hooks with keyset-paged known private conver
   assert(calls.every(call => call.connectionId === 'fixture' && call.limit === 100 && call.conversationType === 'p2p'));
 });
 test('hook catchup groups require explicit scoped configuration', () => {
-  const config = { schemaVersion: 1, storage: Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, 'SYNTHETIC'])), codex: { bin: '/fixture', cwd: '/fixture' }, feishu: { connectionId: 'fixture', appIdEnv: 'SYNTHETIC', appSecretEnv: 'SYNTHETIC', botOpenId: 'bot' }, routing: { version: '1', privateUserIds: [], groups: [] }, auth: { clients: [{ id: 'client', tokenEnv: 'SYNTHETIC', conversationIds: [], admin: false }] }, hooks: [{ id: 'hook', url: 'http://example.invalid', tokenEnv: 'SYNTHETIC', conversationIds: ['group'] }] };
+  const config = { schemaVersion: 1, storage: Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, 'SYNTHETIC'])), codex: { bin: '/fixture', cwd: '/fixture' }, feishu: { connectionId: 'fixture', appIdEnv: 'SYNTHETIC', appSecretEnv: 'SYNTHETIC', botOpenId: 'bot' }, routing: { version: '1', privateUserIds: [], groups: [] }, hooks: [{ id: 'hook', url: 'http://example.invalid', tokenEnv: 'SYNTHETIC', conversationIds: ['group'] }] };
   assert.deepEqual(validateConfig(config).hooks[0].catchupGroupIds, []);
   config.hooks[0].catchupGroupIds = ['foreign'];
   assert.throws(() => validateConfig(config), { code: 'invalid_hook_catchup_scope' });
