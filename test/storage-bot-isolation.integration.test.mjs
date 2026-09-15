@@ -6,7 +6,6 @@ import { createMysqlStore } from '../src/storage/store.mjs';
 import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 import { createForwardJobStore } from '../src/storage/forward-jobs.mjs';
 import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
-import { createApi } from '../src/core/api.mjs';
 
 const enabled = Boolean(process.env.BRIDGE_TEST_PASSWORD);
 const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `BRIDGE_TEST_${key.toUpperCase()}`]));
@@ -128,13 +127,6 @@ test('two bots share one MySQL schema without sharing bindings, jobs, context, d
       assert.match(String(plan.possible_keys), new RegExp(index));
     }
 
-    const api = createApi({ config: { feishu: { connectionId: 'bot-a' }, auth: { clients: [{ id: 'caller', conversationIds: ['same-chat'] }] } },
-      store: writerA, forwardRuntime: { getRun: input => jobsA.getRun(input), readRunEvents: input => jobsA.readEvents(input) },
-      tokens: { caller: 'a-token-long-enough-for-this-test' } });
-    await assert.rejects(api({ method: 'GET', url: `/v1/runs/${runA.id}`, headers: { authorization: 'Bearer b-token-long-enough-for-this-test' } }), { status: 401 });
-    for (const suffix of ['', '/events', '/resources/0']) {
-      await assert.rejects(api({ method: 'GET', url: `/v1/runs/${runB.id}${suffix}`, headers: { authorization: 'Bearer a-token-long-enough-for-this-test' } }), { status: 404 });
-    }
   } finally {
     if (writerA) await writerA.close(); else await pool.end();
     if (writerB) await writerB.close();

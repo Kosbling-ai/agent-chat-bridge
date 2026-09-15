@@ -8,7 +8,7 @@ MySQL 8.4 is the durable boundary. Migration `001` remains the released communic
 
 The existing `bridge_jobs` and outbox tables continue to carry hook and communication effects. New Agent execution does not enqueue a second `kind=agent` worker. `acceptInbound` registers the canonical receipt, normalized inbound fact, eligible forward job, and eligible hook jobs in its short transaction. It performs no network or model operation.
 
-Existing communication inbox, delivery, cursor, recovery, resource and ownership tables remain available to their public endpoints and internal media/catchup paths. Their detailed effect and filesystem rules remain in [outbound media](outbound-media.md), [input media](media.md), and [catchup](catchup.md); the forward tables do not replace those ledgers.
+Existing communication inbox, delivery, cursor, recovery, resource and ownership tables remain for internal media/catchup paths and historical data. They are not exposed through public endpoints. Their detailed effect and filesystem rules remain in [outbound media](outbound-media.md), [input media](media.md), and [catchup](catchup.md); the forward tables do not replace those ledgers.
 
 Forward claims use `SKIP LOCKED`, stable ordering, a lease owner and expiry. Every mutation requires the current lease owner. Expired known work can be reclaimed; the executor observes a persisted known thread/turn. Unknown native admission or observation becomes held and is not eligible for automatic re-execution.
 
@@ -16,7 +16,7 @@ Forward claims use `SKIP LOCKED`, stable ordering, a lease owner and expiry. Eve
 
 Terminal rows with unresolved Typing removal are claimed separately for feedback cleanup. That lease permits only the persisted cleanup sidecar update and cannot reopen Codex execution. Stop callbacks use a transactional intent keyed to the persisted run/thread/turn/message; repeated pending or unknown callbacks inspect that exact turn, and an unconfirmed observation cannot overwrite a later definitive stop result.
 
-Run event reads first resolve the public run, then require its persisted execution binding and thread. The indexed query matches binding, chat, Codex session, source message, and decimal-string cursor. It selects only public event types and returns the shared safe projection; raw tool parameters, tool output, and internal event payloads are not public.
+Forward event rows remain scoped to the persisted execution binding, thread, chat and source message for internal recovery and diagnostics. They are not exposed through HTTP.
 
 The Store has no scheduler and does not query business history. It retains IDs as signed `BIGINT`, matching the frozen production schema. Migrations are explicit; start only asserts the current ledger version.
 

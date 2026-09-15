@@ -5,7 +5,6 @@ import { readFile } from 'node:fs/promises';
 import { StoreError } from '../src/storage/errors.mjs';
 
 const SAFE_MIGRATION_CODES = new Set(['legacy_connection_id_required', 'legacy_connection_id_mismatch', 'invalid_legacy_connection_id', 'writer_busy', 'migration_busy', 'schema_version_mismatch']);
-
 const HELP = `agent-chat-bridge
 
 Usage:
@@ -30,8 +29,8 @@ try {
   } else if (command === '--version' && flag === undefined) {
     process.stdout.write(await readFile(new URL('../VERSION', import.meta.url), 'utf8'));
   } else {
-    if (!['check-config', 'start', 'migrate'].includes(command) || flag !== '--config'
-        || !path || path.startsWith('--') || (command === 'migrate' ? (extra.length !== 0 && (extra.length !== 2 || extra[0] !== '--legacy-connection-id' || !extra[1])) : extra.length !== 0)) {
+    if ((!['check-config', 'start', 'migrate'].includes(command) || flag !== '--config'
+        || !path || path.startsWith('--') || (command === 'migrate' ? (extra.length !== 0 && (extra.length !== 2 || extra[0] !== '--legacy-connection-id' || !extra[1])) : extra.length !== 0))) {
       throw new ConfigError('invalid_arguments');
     }
     const config = await loadConfig(path);
@@ -67,7 +66,8 @@ try {
   }
 } catch (error) {
   const safeMigrationCode = command === 'migrate' && error instanceof StoreError && SAFE_MIGRATION_CODES.has(error.code);
-  log(error instanceof ConfigError || safeMigrationCode ? 'warning' : 'error', 'startup', 'failed', {
+  log(error instanceof ConfigError || safeMigrationCode ? 'warning' : 'error',
+    'startup', 'failed', {
     code: error instanceof ConfigError || safeMigrationCode ? error.code : 'startup_failed',
   });
   process.exitCode = 1;

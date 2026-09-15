@@ -109,7 +109,7 @@ test('help and strict arguments require an explicit configuration', async (t) =>
 });
 
 test('check-config validates shape without resolving or printing secrets', async (t) => {
-  const { path } = await fixture(t, { ...base, auth: { tokenEnv: 'BRIDGE_TEST_TOKEN' } });
+  const { path } = await fixture(t, base);
   for (const env of [{}, { BRIDGE_TEST_TOKEN: sentinel }]) {
     const result = await run(t, ['check-config', '--config', path], { env }).finished;
     assert.equal(result.code, 0);
@@ -164,7 +164,7 @@ test('non-loopback requires explicit opt-in; validation never opens remote socke
 });
 
 test('real local process is live but never integration-ready, without any credentials', async (t) => {
-  const { path, dir } = await fixture(t, { ...base, auth: { tokenEnv: 'NOT_SET' } });
+  const { path, dir } = await fixture(t, base);
   const app = run(t, ['start', '--config', path], { cwd: dir });
   const listening = await app.waitFor((line) => line.operation === 'listen' && line.status === 'succeeded');
   const url = `http://127.0.0.1:${listening.port}`;
@@ -174,8 +174,14 @@ test('real local process is live but never integration-ready, without any creden
   const ready = await fetch(`${url}/health/ready`);
   assert.equal(ready.status, 503);
   assert.deepEqual(await ready.json(), { ready: false, reason: 'components_unconfigured', missing: ['feishu', 'codex', 'store'] });
-  const unavailable = await fetch(`${url}/api/messages`, { headers: { authorization: `Bearer ${sentinel}` } });
-  assert.equal(unavailable.status, 404);
+  for (const path of ['/api/messages', '/v1/runs/fixture', '/v1/runs/fixture/events', '/v1/runs/fixture/resources/0', '/v1/deliveries/fixture']) {
+    const unavailable = await fetch(`${url}${path}`, { headers: { authorization: `Bearer ${sentinel}` } });
+    assert.equal(unavailable.status, 404, path);
+  }
+  for (const path of ['/v1/runs', '/v1/deliveries', '/v1/uploads']) {
+    const unavailable = await fetch(`${url}${path}`, { method: 'POST', headers: { authorization: `Bearer ${sentinel}` }, body: '{}' });
+    assert.equal(unavailable.status, 405, path);
+  }
   const post = await fetch(`${url}/health/live`, { method: 'POST', body: sentinel });
   assert.equal(post.status, 405);
   app.child.kill('SIGTERM');
