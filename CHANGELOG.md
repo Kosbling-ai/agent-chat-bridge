@@ -3,7 +3,6 @@
 ## [0.2.6] — Unreleased
 
 - Preserve the existing interactive-card budget by accepting up to 28,000 UTF-8 bytes at the delivery API boundary. Text and post deliveries retain their 20,000-byte limit, and the provider client retains its 30,000-byte guard.
-- Add a dry-run-first operator CLI for importing strictly validated legacy Codex thread bindings. Apply holds the target writer lock, preserves source timestamps, rejects active target jobs and conflicting thread ownership, and never imports jobs or invokes Codex.
 - Preserve a safe asynchronous delivery reason: an explicit non-zero Feishu response is a confirmed rejection, while malformed responses, thrown transport errors and timeouts remain unknown and cannot trigger a different fallback delivery.
 - Allow an authorized run to disable its caller's busy-queue default, while rejecting unauthorized enablement and explicit policy changes on an idempotent replay.
 
