@@ -53,6 +53,8 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, feishu: { ...config.feishu, processingReaction: 'yes' } },
     { ...config, feishu: { ...config.feishu, mediaMaxBytes: -1 } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
+    { ...config, auth: { clients: [{ id: 'caller', tokenEnv: 'TEST_TOKEN', conversationIds: ['chat'], admin: true }] } },
+    { ...config, auth: {} },
     { ...config, feishu: { ...config.feishu, appSecret: 'synthetic' } },
     { ...config, hooks: [{ id: 'h', url: 'https://user:synthetic@example.invalid', tokenEnv: 'TEST_HOOK', conversationIds: [] }] },
     { ...config, errorReporting: { url: 'file:///tmp/report', tokenEnv: 'TEST_REPORT' } },
