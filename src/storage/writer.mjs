@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { StoreError } from './errors.mjs';
 
-function acquireLockedConnection(pool, timeoutMs) {
+function acquireLockedConnection(pool, timeoutMs, connectionId) {
   return new Promise((resolve, reject) => {
     let connection;
     let expired = false;
@@ -16,7 +16,7 @@ function acquireLockedConnection(pool, timeoutMs) {
         if (expired) { connection.destroy(); return; }
         const [[db]] = await connection.query('SELECT DATABASE() AS name');
         if (expired) return;
-        const name = `bridge:writer:${createHash('sha256').update(db.name).digest('hex').slice(0, 40)}`;
+        const name = `bridge:writer:${createHash('sha256').update(JSON.stringify([db.name, connectionId])).digest('hex').slice(0, 40)}`;
         const [[row]] = await connection.query('SELECT GET_LOCK(?, 0) AS acquired', [name]);
         if (expired) return;
         if (Number(row.acquired) !== 1) throw new StoreError('writer_busy');
@@ -30,9 +30,10 @@ function acquireLockedConnection(pool, timeoutMs) {
 }
 
 // The connection remains dedicated for the complete writer lifetime.
-export async function acquireWriter(pool, onLost = () => {}, { timeoutMs = 1800 } = {}) {
+export async function acquireWriter(pool, onLost = () => {}, { timeoutMs = 1800, connectionId } = {}) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 30000) throw new StoreError('invalid_storage_deadline');
-  const { connection, name } = await acquireLockedConnection(pool, timeoutMs);
+  if (typeof connectionId !== 'string' || !connectionId || connectionId.length > 128) throw new StoreError('invalid_store_input');
+  const { connection, name } = await acquireLockedConnection(pool, timeoutMs, connectionId);
   let alive = true;
   let timer;
   const lose = () => {

@@ -1,7 +1,7 @@
 import { StoreError } from './errors.mjs';
 
 // Filesystem work happens after this durable seal, never inside a database transaction.
-export function resourceOperations({ read, write, now, decode }) {
+export function resourceOperations({ read, write, now, decode, connectionId }) {
   const terminal = "('succeeded','failed','cancelled','delivery_failed')";
   function field(value, max = 128) {
     if (typeof value !== 'string' || !value.length || value.length > max) throw new StoreError('invalid_retirement');
@@ -39,7 +39,7 @@ export function resourceOperations({ read, write, now, decode }) {
   }
   async function locked(c, runId) {
     const [[job]] = await c.execute(`SELECT id,kind,connection_id,conversation_id,status,input_resource_state,output_resource_state
-      FROM bridge_jobs WHERE id=? FOR UPDATE`, [runId]);
+      FROM bridge_jobs WHERE id=? AND connection_id=? FOR UPDATE`, [runId,connectionId]);
     if (!job || job.kind !== 'agent') throw new StoreError('retirement_conflict');
     return job;
   }
@@ -90,7 +90,7 @@ export function resourceOperations({ read, write, now, decode }) {
         if (Number(guidance.unresolved) === 1) throw new StoreError('retirement_conflict');
         if (job[column] === 'sealed') return { runId, connectionId: job.connection_id, conversationId: job.conversation_id, state: 'sealed' };
         const [[row]] = await c.execute(`WITH candidates AS (SELECT id,connection_id,conversation_id,status,
-          input_resource_state,output_resource_state FROM bridge_jobs WHERE id=?) ${facts}`,[runId]);
+          input_resource_state,output_resource_state FROM bridge_jobs WHERE id=? AND connection_id=?) ${facts}`,[runId,connectionId]);
         if (Number(row[`${kind}_retirable`]) !== 1) throw new StoreError('retirement_conflict');
         if (kind === 'input' && row.native_thread_id) {
           await c.execute(`UPDATE bridge_thread_owners SET resource_retired_at=COALESCE(resource_retired_at,?)

@@ -76,19 +76,20 @@ test('SDK 1.60.0 exposes the version-pinned socket probe without opening a netwo
   } finally { ws.close({ force: true }); intervals.forEach(clearInterval); }
 });
 
-test('handler waits for durable commit, and forwards deadline/signal without acknowledging early', async () => {
-  let commit; let settled = false; let options;
+test('handler acknowledges immediately while tracking durable ingress in the background', async () => {
+  let commit; let options;
   const { receive } = ingress((_, context) => { options = context; return new Promise((resolve) => { commit = resolve; }); });
-  const pending = receive(event).then((value) => { settled = true; return value; });
+  assert.deepEqual(await receive(event), {});
   await new Promise(setImmediate);
-  assert.equal(settled, false); assert.equal(options.signal.aborted, false);
+  assert.equal(options.signal.aborted, false);
   assert.ok(options.deadlineAt > Date.now());
-  commit(); assert.equal(await pending, undefined);
+  commit();
 });
 
-test('durable failures throw sanitized errors; observer failure cannot change ACK', async () => {
+test('durable failures are observed asynchronously and cannot change ACK', async () => {
   const { receive } = ingress(async () => { throw new Error('secret'); }, { log() { throw new Error('logger'); } });
-  await assert.rejects(receive(event), (error) => error.code === 'feishu_ingress_failed' && !error.message.includes('secret'));
+  assert.deepEqual(await receive(event), {});
+  await new Promise(setImmediate);
 });
 
 test('retryable ingress failures warn, and asynchronous terminal error reporting cannot escape', async () => {
@@ -96,7 +97,8 @@ test('retryable ingress failures warn, and asynchronous terminal error reporting
   const { receive, adapter } = ingress(async () => { throw new Error('temporary store issue'); }, {
     log: (...args) => logs.push(args), reportError: async () => { reports++; throw new Error('reporter secret'); },
   });
-  await assert.rejects(receive(event));
+  assert.deepEqual(await receive(event), {});
+  await new Promise(setImmediate);
   assert.equal(logs[0][0], 'warning'); assert.equal(reports, 0);
   adapter.status(); adapter.status(); // Unsupported probe is terminal and reported once.
   await new Promise(setImmediate);
@@ -111,16 +113,18 @@ test('asynchronous logger rejection is contained at both ingress and reporting-f
     log: async () => { count++; throw new Error('logger failed'); },
     reportError: async () => { throw new Error('reporting failed'); },
   });
-  await assert.rejects(receive(event));
+  assert.deepEqual(await receive(event), {});
+  await new Promise(setImmediate);
   adapter.status();
   await new Promise(setImmediate);
   assert.equal(count, 3);
 });
 
-test('deadline aborts storage and throws even if persistence later resolves', async () => {
+test('deadline aborts background storage without retracting the ACK', async () => {
   let finish; let signal;
   const { receive } = ingress((_, context) => { signal = context.signal; return new Promise((resolve) => { finish = resolve; }); }, { deadlineMs: 10 });
-  await assert.rejects(receive(event), { code: 'feishu_ingress_timeout' });
+  assert.deepEqual(await receive(event), {});
+  await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(signal.aborted, true); finish();
 });
 
@@ -128,15 +132,17 @@ test('stop cancels active receive and future receives; lifecycle cannot start tw
   const { adapter, wsClient, receive } = ingress(() => new Promise(() => {}));
   await adapter.start();
   await assert.rejects(adapter.start(), /already_started/);
-  const pending = receive(event); adapter.stop();
-  await assert.rejects(pending, { code: 'feishu_stopped' });
-  await assert.rejects(receive(event), { code: 'feishu_stopped' });
+  const pending = receive(event); await adapter.stop();
+  assert.deepEqual(await pending, {});
+  assert.deepEqual(await receive(event), {});
+  await new Promise(setImmediate);
   assert.equal(wsClient.closed, true); assert.equal(adapter.status().activeReceives, 0);
 });
 
 test('malformed events fail without invoking persistence; budget must be below platform 3 seconds', async () => {
   let called = false;
-  await assert.rejects(ingress(() => { called = true; }).receive({}), /ingress_failed/);
+  assert.deepEqual(await ingress(() => { called = true; }).receive({}), {});
+  await new Promise(setImmediate);
   assert.equal(called, false);
   assert.throws(() => ingress(() => {}, { deadlineMs: 3000 }), /deadline/);
 });

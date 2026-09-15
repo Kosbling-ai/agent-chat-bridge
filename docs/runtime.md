@@ -1,155 +1,89 @@
-# Runtime and API
+# Forward runtime and API
 
-This stage assembles an independent Feishu + Codex process and MySQL Store. It is locally validated with synthetic provider protocols and an isolated real MySQL database. It has not been validated against a real bot/model and is not yet the complete migration of the old application's chat features.
+The unreleased 0.2.4 development version replaces the 0.1.1 generation worker with one leased Codex forward worker. It keeps the communication worker for hook delivery and registered chat outbox effects. One Feishu bot and WebSocket client feed both routes; one Codex app-server and forward worker start or observe Codex work. Thread start, resume and turn start use the protocol-defined `auto_review` approval reviewer.
 
-## Start and configuration
+The implementation is validated with synthetic providers and disposable MySQL. It has not been connected to a real bot or model, deployed, or wired into the Kosbling business producer. The producer migration is separate work.
 
-Use `examples/bridge.json` as a shape example. Replace IDs and executable/workspace paths; paths are relative to the config file. `codex.bin` is an explicit file path, not PATH lookup. The workspace must be owned by the runtime UID; neither workspace nor executable can be world writable. Constructor policy is fixed to approvalPolicy=never and sandbox=workspace-write; HTTP callers cannot override these settings or cwd. Only environment names listed in codex.envNames are copied into the child. Choosing HOME/CODEX_HOME gives Codex access to that explicit native environment; operators are responsible for assigning an appropriately restricted Agent workspace/account.
+## Routing
 
-Secrets are resolved from explicitly named environment variables only at start/migrate, never from `.env` or repository credentials. `check-config` validates shape without resolving them. API tokens must have at least 24 characters and be distinct. Every client has an explicit conversation list and admin boolean; there is no wildcard or default full access. Health remains public and contains fixed component states.
+Private Agent messages still require `routing.privateUserIds`. Every authorized group is listed in `routing.groups`; unlisted groups stay closed. `routing.groups[].capabilities` accepts only `bridge` and `hook`, removes duplicates, and defaults to both when omitted. An empty list disables both routes for that group.
+
+The `bridge` capability permits Agent routing. The existing `trigger` (`mention` or `all`) and optional `userIds` then decide whether a human message starts Codex. The `hook` capability permits hook subscriptions for that group and does not depend on Agent mentions, member filtering, execution, or replies. A message that qualifies for both routes may register both under the same canonical receipt; neither route consumes the other. Replay keeps each target idempotent.
+
+Groups previously present only in `hooks[].conversationIds` must now also appear in `routing.groups`; use `capabilities:["hook"]` for a hook-only group. P2P rules are unchanged.
+
+Hook delivery remains `{deliveryId,event}` with stable event, chat, and message identifiers from the normalized Feishu event. It is a lightweight notification. Business consumers use their own authoritative reader, such as lark-cli, and own polling fallback and message-ID deduplication. They do not create another Feishu WebSocket through this bridge.
+
+## Input and execution
+
+Live messages preserve the sender name. A bot mention is removed only when it identifies the configured bot. Group passive context reads at most the ten messages strictly before the current message and no more than two hours old. Context and the current speaker are formatted into the prompt; business parsers, role SQL, lark-cli queries, and cron scheduling stay outside the bridge.
+
+Every forward job and any prepared private media prompt are committed before its first claim and native work. Live and API registrations enter the same direct forward path. Recovery processes reply-pending delivery first, then at most five executable jobs serially, with a reentry guard. The executor owns native lifecycle and response waiters; closing an HTTP response or the Feishu SDK acknowledgement does not interrupt a native turn. Legacy rows that already contain start intent, bound/native identity, an unknown native outcome, or an unconfirmed delivery effect remain isolated without replay.
+
+`codex.idleCloseMs` controls only automatic app-server child cleanup after bridge activity reaches zero. The production-derived default is `60000` milliseconds. Set it explicitly to `0` to disable the timer, or to another nonnegative value up to 86400000. Explicit bridge shutdown still closes the child, and an unexpected exit still follows the existing fault/restart path. This setting does not change the separate conversation rollover, whose idle default is five days (`432000000` milliseconds), or the rules/archived rollover policy.
+
+`codex.requestUserInput` defaults to `false`. At startup the bridge checks whether the installed Codex executable exposes the Default-mode user-input feature; when present, it explicitly passes `features.default_mode_request_user_input=false`, overriding an inherited setting from the shared Codex home. The bridge also defensively rejects an unexpected request. Set the option to `true` to opt in; the same probe then enables the feature only when supported. If the feature is unavailable, other execution remains available but Codex cannot open a Feishu question card. This setting controls the Default-mode feature used by this bridge; the bridge does not start a Plan-mode workflow.
+
+A supported Codex request creates a separate Feishu form for the current active turn. It can contain several questions; each question accepts one listed option, an allowed Other value, or free text. Only the original sender in the original chat can submit it, and the bridge rechecks the current job, card, authorization, thread and turn. Requests containing a secret question are rejected without displaying or collecting their contents; the ordinary Feishu form is not a secret-input channel.
+
+The first bridge version accepts at most 3 questions and 20 options per question, with up to 1,000 characters in a free-text answer and a 28 KB rendered-card budget. These are bridge and Feishu delivery limits rather than Codex protocol limits; oversized requests are rejected instead of truncated.
+
+Submission is single-use. A submitted card confirms that the bridge accepted the form for delivery to the live native request; it does not claim that Codex has consumed the answer. Native resolution, stop, turn completion or failure, app-server disconnect, and service shutdown expire the card. The bridge does not invent timeout answers, restore an old RPC after restart, or replay a prompt or answer.
+
+Ordinary `CODEX_THREAD_BUSY` results fail on the first attempt, including a turn-start result whose native admission outcome is unknown. Once the RPC returns busy, the existing card/reply path reports “会话被其他客户端占用，请释放后重试。原会话绑定保持不变。” without waiting for another claim. Other retryable admission failures use at most `codex.jobMaxAttempts` claims (default 3), spaced by `codex.jobRetryMs` (default 60 seconds; valid range 10 seconds to 30 minutes). The bridge keeps the binding and does not create a replacement thread.
+
+For a busy failure tied to an existing human Feishu binding, the failed card offers “保留历史并新建会话”. Only the original sender can invoke it, and the callback rechecks the bot-scoped job, card, chat, current authorization and frozen source thread. It performs one explicit `thread/fork` with the current bridge cwd and permission defaults, persists the fork, and conditionally switches the binding before releasing that binding's admission lock. It does not resume or interrupt the source, start a turn, or replay the failed message. A native rejection or changed binding leaves the current binding unchanged. An unknown native or database commit result is recorded as unconfirmed and is not retried automatically; an administrator must inspect durable state before deciding what happened. Cross-process active-writer fork support depends on the native Codex implementation and is therefore handled as a normal visible failure rather than assumed.
+
+A busy queue exception is allowed only when an authenticated client explicitly enables `queueIfBusy` and its nonempty validated `executionNamespace` plus `callerId` derive the same persisted system binding stored with the run. It retains its attempt count and waits `codex.jobRetryMs`; request payloads, sender strings, message prefixes, prompt text, or disabled steering do not grant this policy. The saved card stays in retrying state and Typing remains off between probes. Recovery does not add a new Typing reaction.
+
+`deliveryMode:"bridge"` owns Typing, an execution card, the stop callback, final answer, and attachments. The execution card uses the frozen production create/patch controller: the first running card is immediate, later updates are throttled, and final card failure selects the ordinary-message fallback. Stop is fenced to the original card, message, turn, authorized conversation, and live sender; replay cannot interrupt a newer turn.
+
+The card sidecar stores the original message ID, status, bounded progress entries and stop identity. Card create or patch failure follows the original fallback path; a saved message ID is patched on reply recovery. Legacy unconfirmed card effects written by the previous controller remain held without another platform write.
+
+Ordinary fallback replies use chat create rather than source-message reply. Post mode is the default and uses the production Markdown-to-Feishu conversion with 3000-character chunks; optional text mode uses 1900-character chunks. Both apply `feishu.maxOutputChars` (default 3500) and deterministic UUIDs. Legacy unconfirmed text effects remain held. Live Agent work awaits the production Typing add; a failed add sends `feishu.processingFallbackText`, and final cleanup is best effort. Recovery removes reaction IDs recorded in `assistant_message_events` and app-owned reactions from the first returned page for the configured emoji without replaying an unconfirmed add.
+
+Bridge delivery consumes the executor's attachment paths directly. P2P is allowed; group delivery uses the existing bridge/API conversation allowlist. Every file is capped at 28 MiB. A successful upload and send removes that file; an individual failure keeps it for manual follow-up and does not block the text reply or other attachments. Legacy unconfirmed attachment intents are not replayed.
+
+`deliveryMode:"caller"` creates no progress card, Typing reaction, final message, or attachment send. It retains the same execution and recovery rules and stores the result for an authorized caller.
+
+The final result keeps both the display answer and `rawAnswer`. Public attachment facts never expose a local path. Caller delivery snapshots its controlled outbox and keeps decimal resource IDs usable with the resource endpoint. Bridge delivery sends and then removes successful path results, so those bridge-delivered files are not promised as later downloadable resources; a resource lookup may return not found. The frozen production upload limit is 28 MiB per file.
+
+`feishu.displayName` sets the execution-card title and defaults to `agent-chat-bridge`.
+
+## HTTP contract
+
+All `/v1` endpoints require a bearer token. The configured client must include the target conversation. Request registration is idempotent by caller plus `idempotencyKey`; reuse with different execution input is a conflict.
+
+| Endpoint | Contract |
+| --- | --- |
+| `POST /v1/runs` | `{conversationId,idempotencyKey,text,executionNamespace?,deliveryMode?}` → `202 {id,duplicate}`. `deliveryMode` is `bridge` by default or `caller`. |
+| `GET /v1/runs/:id` | Execution status, delivery status/mode, namespace, answer, raw answer, public attachment facts, native thread/turn/status, held reason, error code, and timestamps. |
+| `GET /v1/runs/:id/events?after=0&limit=50` | `{events,nextCursor}`. Cursor values are decimal strings. Events are scoped to the run's persisted binding, thread, chat, and message and pass the shared safe public projector. |
+| `GET /v1/runs/:id/resources/:index` | Authorized JSON resource `{fileName,kind,size,base64}` within the controlled result outbox. |
+
+The 0.1.1 generation-ledger actions are not implemented by this execution model. `GET /v1/runs/:id/attempt`, `POST /v1/recoveries`, and `POST /v1/sessions/reset` return `409 unsupported_execution_model` after applicable authentication, administration, and conversation-scope checks. They do not fabricate a generation or return a registration `202`. `GET /v1/recoveries/:id` remains a read-only view of a real recovery record already stored by the communication schema, with its existing administration and conversation checks; a missing record is `404`.
+
+Existing `/v1/deliveries` APIs remain available to registered communication callers. `POST /v1/deliveries` accepts the common `{conversationId,idempotencyKey,kind}` fields, with `kind:"create"|"reply"` using `messageKind` and `content` (`reply` also requires `messageId`), `kind:"reaction"` using `messageId` plus exactly one of `emojiType` or `reactionId`, and `kind:"upload"` using `mediaType`, `base64`, and `fileName` for files. It returns `202 {id,duplicate}`; `GET /v1/deliveries/:id` returns the durable delivery state. Scheduled or delayed business work is submitted when due by the business producer; the bridge has no cron scheduler.
+
+Bridge delivery status is `waiting`, `pending`, `sent`, `failed`, or `unknown`; caller delivery becomes `not_requested` at a terminal run. A known delivery failure or ambiguity does not rerun the completed model turn. `unknown` remains in reply recovery for external reconciliation, while an explicit `failed` result terminates with `reply_delivery_failed` and its item receipts intact.
+
+## Configuration and validation
+
+Use `examples/bridge.json` for the current shape. Secrets are read only from explicit environment-variable names. `codex.bin` and `codex.cwd` are explicit; only `codex.envNames` plus configured proxy mappings enter the child. Codex lifecycle, RPC/turn timeout, approval/reviewer, sandbox, network, user-input, rollover and memory-guard settings expose the production defaults shown in the example. `codex.jobRetryMs` and `codex.jobMaxAttempts` retain the forward retry limits. Optional `feishu.replyAsPost` and `feishu.maxOutputChars` select the original ordinary reply mode and cap. `feishu.processingReaction`, `processingReactionEmoji`, and `processingFallbackText` control the original live Typing behavior. `feishu.mediaEnabled`, `mediaInboxDir`, `mediaMaxBytes`, and `mediaUnsupportedReply` control private image preparation; the byte setting is the original post-download advisory warning rather than a rejection limit. The process uses one Feishu HTTP client and one WebSocket client.
+
+Paths are resolved from the config file. The executable and workspace must satisfy the ownership checks. Codex state defaults to the launching user's shared `~/.codex`. Optional `codex.sharedHome` may select an absolute path or a path beginning with `~/`; if the launch environment also sets `CODEX_HOME`, both must resolve to the same directory or startup fails. The child still receives only explicitly selected environment names and proxy mappings; the production-derived app-server shell policy inherits from that controlled child environment. Approval policy defaults to `on-request`, the reviewer defaults to the installed protocol value `auto_review`, sandbox defaults to `workspace-write`, and HTTP callers cannot override these settings, cwd or execution identity.
+
+Run:
 
 ```sh
 node bin/agent-chat-bridge.mjs check-config --config ./examples/bridge.json
 node bin/agent-chat-bridge.mjs migrate --config ./examples/bridge.json
 node bin/agent-chat-bridge.mjs start --config ./examples/bridge.json
+npm test
+npm run check
+node scripts/test-storage.mjs test/storage-forward.integration.test.mjs
 ```
 
-Migration is explicit and should use the deployment's controlled migration credentials; start only checks schema and acquires a single-writer lock. A config containing only schemaVersion/listen retains health-only operation with ready=503. A partial provider configuration is rejected. The legacy health-only auth.tokenEnv placeholder does not grant API access.
+Migration is explicit; start only checks the migration ledger and acquires the single-writer lock. `/health/live` reports the HTTP process, while readiness requires the configured Store, worker, Feishu and Codex components. The storage command creates and removes a temporary MySQL container. These checks do not contact Feishu or Codex.
 
-`/health/ready` requires Store schema and writer health, Codex handshake, actual Feishu socket OPEN, and running workers. `/health/live` only checks the HTTP process. SIGTERM/SIGINT stop HTTP admission, stop Feishu ingress, drain workers, close Codex, close Store and error reporting. Unknown work stays durable. The CLI explicitly exits after cleanup because the locked Feishu SDK retains a cache interval; embedders must account for that SDK limitation.
-
-## Routing and execution
-
-Private messages require actor.openId in privateUserIds. Group routing requires an explicit group, then either mention or all trigger. All human group members are admitted by default; optional group.userIds narrows membership only when explicitly configured (an empty list admits none). Hook conversation scopes remain independent from Agent user/group admission. Self/app messages are excluded from Agent and hook routing. Passive context is an explicit group policy, independent from hooks, and only contains admitted human messages not triggering Agent. The first routing snapshot is preserved on duplicate input. Recall tombstones exclude passive context even when recall arrives first; recalls never launch another model turn.
-
-Inbox and independent agent/hook jobs commit before the Feishu handler resolves. Agent work persists an attempt before native RPC; thread/turn binding uses lease/generation fencing. Native notifications are buffered durably before admission bookkeeping, then associated by thread/turn. Random receive keys preserve repeated deltas as distinct receipts; they are not semantic deduplication keys. Terminal effects use stable per-run outbox keys and fenced atomic completion. A known admitted turn can recover by thread/read; graceful shutdown keeps that attempt pending for recovery rather than classifying its admission as unknown. A missing native admission ID becomes status=unknown, locks the session and is never replayed automatically. GET run exposes that state. Trusted admins can register audited adopt_turn/abandon_verified actions through the controlled recovery API described below; there is no automatic replay.
-
-Same-conversation work uses a durable steering intent when a known active native turn is available. Explicitly rejected or not-yet-steerable guidance is durably deferred and later resumes the shared native thread. Reset requires admin plus conversation authorization and exact generation, and rejects active/unknown runs. Passive context reads are bounded to 100 rows per turn. Recalls do not retroactively cancel Agent jobs, matching the old runtime. History catchup runs only for missing first receipts; it does not expose a public edit stream.
-
-RPC failures are classified by phase: an explicit refusal of this run's thread/turn admission may fail the run and release its session. A rejected native read, including the final item read after a terminal notification, cannot prove that an admitted turn failed. The known attempt remains pending for reconciliation with its session binding intact; successful later reads finish delivery without a new turn/start.
-
-Hook subscriptions are static `{id,url,tokenEnv,conversationIds}`. Each delivery is `{deliveryId,event}`, with `Idempotency-Key: deliveryId`. The consumer must durably accept/deduplicate before returning **204**. This acknowledges durable receipt, not completion of business processing. Redirects are forbidden, requests time out after 3 seconds, bodies are cancelled immediately, and delivery retries stop after 8 attempts. Hook failure never recreates Agent output. Business message/history/member/resource queries and document/Base APIs remain outside this service. Existing business SDK/REST readers stay in the business process; no forced lark-cli rewrite.
-
-## Authenticated HTTP APIs
-
-All `/v1/` operations require `Authorization: Bearer <token>`. Run/delivery reads check stored connection and conversation ownership. Reply/reaction writes verify platform message membership internally before registration. No caller-provided actor or connection/workspace overrides are accepted.
-
-| Endpoint | Contract |
-| --- | --- |
-| POST /v1/runs | `{conversationId,idempotencyKey,text}` → 202 `{id,duplicate}`; text <=64 KiB UTF-8; JSON body <=512 KiB including escaping |
-| GET /v1/runs/:id | durable status/result/errorCode/timestamps |
-| GET /v1/runs/:id/events | `after` sequence, `limit` 1–100; read-only |
-| POST /v1/deliveries | common `{conversationId,idempotencyKey,kind,...}` → 202; see below |
-| GET /v1/deliveries/:id | durable delivery status/result/errorCode |
-| POST /v1/sessions/reset | `{conversationId,generation}`; admin required; busy/conflict=409 |
-
-Delivery kinds: create/reply accept `messageKind=text|post|interactive|image|file` and platform content object; text also accepts a string. Reply requires messageId belonging to the same authorized conversation. Reaction accepts messageId plus emojiType to add or reactionId to remove. Upload accepts mediaType=image|file and base64; file requires fileName. Upload is capped at 2 MiB and persists bytes in the independent Store; use a subsequent authorized image/file delivery with the returned key. These are separate effects, not one fake atomic send. Content is capped at 20 KB; unsupported operations return 422. Inline source paths are never accepted.
-
-Create/reply retries preserve platform UUID within the Store's conservative 55-minute window. Multipart replies have durable predecessor links: the next piece is eligible only after the previous piece is confirmed sent, including after restart. A failed predecessor blocks later pieces and makes the run delivery_failed; it does not make the model eligible to rerun. Unknown upload/reaction effects are held for reconciliation, never automatically repeated. Unknown result and failed result are distinct API states.
-
-## Capability matrix and remaining work
-
-| Capability | This stage |
-| --- | --- |
-| Inbound text → Codex → text reply | implemented; real Store + synthetic providers tested |
-| Inbound private image/post → Agent | internal image download and textual path prompt; durable job before prepare, known attempt recovery skips downloads |
-| Inbound group post / private file/audio/media | group captions only; originally unsupported private binary types retain explicit rejection |
-| Outbound text/post/interactive/image/file | durable create/reply API wired to adapter; platform acceptance not live tested |
-| Private Agent-generated files | snapshot → upload → predecessor-confirmed send → durable cleanup; unknown upload held |
-| Reaction add/remove | Write API + adapter wired; unknown writes held |
-| Upload image/file | bounded durable API wired; unknown upload held |
-| Internal resource/history reads | Agent media and catch-up only; business reads remain outside the public bridge API |
-| Business edit/reconcile and recall cancellation | Business edit/reconcile remains outside bridge; old recall did not cancel execution |
-| Reconnect catch-up | service starts internal first-receipt gap recovery by default; `feishu.catchup:false` disables it |
-| Active steer | durable single-parent intent; accepted guidance shares parent result, explicit rejection defers, unknown held |
-| Unknown admission without native ID | no automatic replay; scoped admin recovery API supports audited adopt or verified abandon |
-
-This matrix is a staging boundary, not a declaration that existing required media/chat behavior may be removed. The missing existing capabilities remain follow-up work before production replacement. File input was unsupported in the old bridge; cancelling Codex on recall was not old behavior and is not an implied migration requirement.
-
-## Observability and tests
-
-Logs contain fixed module/component/operation/status/code/duration fields and no raw payload/SDK errors. Optional errorReporting `{url,tokenEnv}` forwards terminal structured error events to a trusted HTTP endpoint with a 2-second deadline and at most four concurrent requests. Failed/full reporting emits warning without recursion; response bodies are cancelled and redirects rejected. Without this option only structured logs are emitted; configure a production error collector before deployment.
-
-Run `npm test`, `npm run check`, and `node scripts/test-storage.mjs test/core.integration.test.mjs`. The latter creates disposable local MySQL and injects synthetic credentials. It does not contact a real bot/model. Core coverage includes early terminal notifications, duplicate input, independent hooks, authorization, unknown admission no-replay, reset busy rejection and recovery of an already-completed native turn.
-
-## Receive-gap catchup integration
-
-Service starts catchup after native/WS startup and stops it before workers/Store teardown. It combines configured Agent groups and explicitly declared hook `catchupGroupIds` with keyset-paged previously received private chats, with a hard 1000-conversation bound. Hook `catchupGroupIds` defaults to an empty list and must be a subset of its `conversationIds`. An arbitrary hook target never implies group type; previously received private chats are discovered through Store. Conflicting explicit group and observed private types reject catchup rather than poison canonical receipts. No bot-wide chat enumeration or public read API is exposed. Default private lookback/overlap remains three hours/five minutes.
-
-Live/history canonical first receipt is atomic in Store. Changed history content never fabricates an edit hook. If a history sender lacks the open ID needed for private/group-member admission, or mention IDs cannot identify the configured bot, core rejects before canonical registration. The page checkpoint remains retryable so incomplete history cannot suppress a later complete live event. Groups allowing all members do not require open IDs merely for membership. SDK 1.60.0 message.list has no user_id_type parameter; this safeguard does not guess or translate identities.
-
-## Agent input media lifecycle
-
-The service constructs the internal Feishu image preparer under the configured Codex workspace at `.agent-chat-bridge/inbox`. `feishu.mediaBudgetBytes` defaults to 128 MiB (20 MiB to 1 GiB allowed); individual files remain capped at 20 MiB. No HTTP caller supplies an input path.
-
-Ingress only persists authorized jobs. The worker prepares private image/post inputs before its first native attempt, renews its lease before admission, and adds validated local paths using the existing textual prompt format. Existing native attempts skip preparation during recovery. Text and group post captions use the legacy text extractor; group images are ignored. Failed downloads and unsupported private types produce explicit durable result facts/replies without native execution. Interrupted preparation returns the unadmitted job to pending.
-
-Input resources survive completed turns and restarts. Core does not invoke release until a later retirement workflow can prove there are no native recovery references; there is no age-based deletion. The budget therefore fails explicitly when retained resources fill it. Automatic Agent output upload/send is wired through the separate durable output lifecycle below.
-
-## Final answer projection
-
-Normal completion and restart recovery replay the same persisted assistant projection. Supported shapes are `agentMessage.text`, explicit assistant `message.text` or content strings/text/input_text/output_text, the two agent-message delta methods, completed items, and terminal item arrays. User, tool, reasoning and unknown-role message content never becomes reply fallback. Terminal explicit final answers take precedence; otherwise durable final answers survive later commentary, then terminal/stream assistant text is used. The last two rules deliberately correct the old fallback's commentary overwrite and unknown-role-as-assistant behavior.
-
-Delta accumulation keeps the previous 12,000-character tail, with at most 128 active item accumulators. Native replay is turn-filtered, paged by durable receipt sequence and capped at 100,000 events. If replay cannot reach the end within the bound, the run remains recoverable instead of committing a partial reply. Frozen production projection/extraction functions are replayed with identical event sequences in `test/core-answer.test.mjs`; explicit old/new divergences have separate assertions.
-
-## Controlled unknown-admission recovery
-
-Admin clients with the target conversation scope can GET `/v1/runs/:id/attempt` and POST `/v1/recoveries` with `{runId,idempotencyKey,generation,action,evidence,nativeThreadId?,nativeTurnId?}`. Evidence is required, at most 4096 characters, and kept only in Store audit. POST returns 202 after registration; GET `/v1/recoveries/:id` exposes action/status/error facts without evidence. Non-admin and foreign-conversation clients are rejected. Conflicts return 409.
-
-Only unknown original runs qualify. `adopt_turn` requires explicit native thread/turn IDs: the worker reads the thread, verifies its configured workspace and turn existence/status, then the Store atomically enforces generation/active run and permanent thread ownership. The original run becomes pending for read recovery, never turn/start. `abandon_verified` requires the administrator's explicit reconciliation statement; a known thread is read and any active/indeterminate turn rejects abandonment. Missing native IDs may be abandoned from that explicit statement, cancelling the original run and releasing its generation without creating a replacement job. There is no force-retry endpoint and no native interrupt side effect.
-
-Provider read rejection leaves the administrative action leased for later read-only retry; it does not imply execution rejection. A lost application COMMIT response is reconciled through the persisted action state. Unconfirmed application is reported without converting it into a contradictory rejection. Fixed error codes/logs never include native error payloads or audit evidence.
-
-`node scripts/test-storage.mjs test/core-recovery.integration.test.mjs` verifies real Store registration, authorization, successful adoption/abandonment, active-turn refusal, workspace checks, ownership conflicts, idempotence and zero new native admissions. Synthetic protocol tests cover rejected reads and lost COMMIT responses. No real provider or administrative action against production was executed.
-
-## Private Agent output delivery
-
-Service creates disjoint workspace directories `.agent-chat-bridge/outbox` and `.agent-chat-bridge/outbound-spool`; the former supplies each new private thread's output prompt. After completion, core scans using the persisted original native attempt time, snapshots up to nine selected files, and commits text plus separate upload/send effects atomically. Group output stays text-only. Preparation failures and omitted counts remain in the run result and an explicit text notice; successful text does not imply every file succeeded.
-
-An artifact send can only read a confirmed upload predecessor result. The 55-minute same-UUID send retry policy applies to artifact_send; unknown artifact_upload never retries automatically. File uploads preserve the old 28 MiB cap, with an internal 32 MiB HTTP bound for multipart overhead and the separate image 10 MiB limit. `feishu.outputBudgetBytes` defaults to 512 MiB and accepts 28 MiB through 1 GiB. The public upload endpoint remains separately bounded at 2 MiB and never accepts internal artifact references or paths.
-
-A confirmed artifact send atomically sets cleanup_pending. A bounded sweep retries filesystem cleanup and clears the flag only on success; restart cleanup cannot resend or rerun the Agent. Source modifications are retained by the module's identity/hash checks. Unknown uploads/sends keep their snapshots and source files, and remain observable through blocked delivery facts. There is no age-based deletion.
-
-`node scripts/test-storage.mjs test/core-outbound.integration.test.mjs` uses real MySQL, local 3 MiB PDF bytes and synthetic model/chat callbacks to prove upload predecessor gating, actual key-based send, cleanup failure/restart without duplicate execution, and held unknown upload. It does not contact a provider.
-
-Platform execution and outbox settlement have separate error boundaries. A lost sent COMMIT response is read back through getOutbox; a confirmed sent fact is retained and cleanup can proceed. A stale/conflicting settlement is never relabeled as a platform unknown, and unrelated workers continue. `test/core-delivery.integration.test.mjs` injects real committed-response loss for text, upload and artifact upload/send, plus a settled failed effect, and verifies no reverse settlement, duplicate call or worker shutdown.
-
-## Idle and rules retirement
-
-`codex.rolloverIdleMs` defaults to two days (0 disables idle retirement). `rolloverOnRulesUpdate` defaults true and `rulesFiles` defaults to `["AGENTS.md"]`; at most 20 relative workspace files may be configured. Kosbling-specific rule locations are not embedded. Missing files are ignored. The original native second/millisecond normalization and one-second rule-update margin are retained.
-
-Before a new attempt, core reads the existing inactive binding and checks native turns before retirement. Existing durable attempts and active sessions never rotate. Idle retirement compares the previous confirmed input timestamp with an atomic expectedLastMessageAt check; successful bind/adopt records the original attempt time, while polling/recovery does not refresh it. Rules retirement takes precedence, as before. Provider/metadata inspection failures leave the unadmitted job pending with a sanitized warning rather than discarding a possibly active thread.
-
-Retirement increments generation and records the former native thread, preserving permanent conversation ownership. It never archives/deletes the native thread. Input resources remain until their native thread is no longer current and no native, accepted-guidance, unresolved-guidance or management reference needs them. The retirement worker uses a durable seal before deleting files; sealing input prevents future binding/adoption of that resource-retired thread. It never guesses release from file age. A full retained-input budget rejects new preparation explicitly. A proven, identity-matched archived refusal from thread/resume before turn admission uses an atomic active-attempt reset. Only its fresh acknowledgement permits one replacement thread/start; a lost reset response or unknown replacement result retains unknown state for reconciliation. Replaying the reset never grants a second start. Read-side explicit archived refusal can also retire an inactive binding.
-
-## Durable active-turn guidance
-
-`codex.steering` defaults true; false keeps new work in the deferred queue while still reconciling any earlier unresolved steering intent. Before turn/steer, Store records the guidance job, target run/generation/thread/turn and stable client message ID. Only a new intent causes an RPC. At most one unresolved guidance request targets a parent run at a time. A pending/unknown native parent without a known actionable turn is never guessed into an RPC target.
-
-Accepted guidance finishes its own bookkeeping with `{deferred:true,targetRunId,nativeTurnId}` and produces no second reply; the parent final answer remains authoritative. A parent may complete before the steer response without losing the accepted fact. Explicit rejection defers the guidance and never sends it to the same target twice. Unknown responses or a recovered unresolved intent become unknown guidance, never a repeated steer or automatic new turn. Parent state is preserved. Active-turn mismatch does not trigger the old speculative native interruption.
-
-Admin GET `/v1/runs/:id/attempt` returns native and steering attempt facts. Unknown guidance is distinct from unknown native admission; native adopt/abandon does not apply to it. Admin POST `/v1/recoveries` with `action: "abandon_guidance_verified"`, runId, generation, idempotencyKey and bounded evidence cancels only an unknown guidance job after explicit operator reconciliation. It makes no provider call, does not alter the parent or session, and retains the original unknown steering fact. No native IDs are accepted for this action. The retained uncertainty still prevents another steer to that same active parent; after the parent ends, new work proceeds normally. This is not force retry or a claim that the provider never received the guidance.
-
-`test/core-steering.integration.test.mjs` verifies real Store serialization, parent completion before steer acknowledgement, one shared reply, rejected guidance deferred to the next turn, and unknown guidance not replayed after restart. Offline tests cover lost settlement responses and disabling new steering while retaining old uncertainty.
-
-Recovered steering intent is checked before any input preparation, output-directory access, rotation or new native attempt, even when new steering is disabled. Missing local media therefore cannot relabel an already submitted guidance request as input failure. Only the required `TurnSteerResponse.turnId` matching the recorded target is accepted; missing/mismatched IDs remain unknown. The expired-intent real Store regression asserts zero media, output-directory and native-attempt preparation calls.
-
-## Artifact publication and cleanup ownership
-
-A single-writer conversation guard allows native execution, steering and administrative reconciliation to share activity, while artifact cleanup is exclusive. Cleanup first takes local ownership, then checks durable active native runs and unresolved guidance; both survive process restart. New native/adopt work waits until filesystem cleanup and its durable acknowledgement leave the guard. No database lock is held over filesystem or provider work.
-
-Published output files must be complete and closed before the turn finishes. Background processes or retained file descriptors must not continue writing published artifacts after completion; this requirement is also included in private output prompts. Quarantine/version checks protect path replacement, but cannot protect arbitrary same-user background writers holding an inode open. The lifecycle guard prevents bridge-controlled later turns from creating that overlap.
-
-## Resource retirement
-
-The worker scans independent output and input cursor pages, output first, with at most 25 candidates each. Output uses its own indexed pending/sealed state, so already-completed output on current-thread input history never enters the output scan. Backlogged pages continue after one second; an exhausted scan waits 30 seconds. Each SQL candidate page is bounded before reference aggregation. Under the conversation cleanup guard, an atomic Store seal rechecks current execution/guidance and resource references. Input deletion runs only after a retired thread is permanently sealed against future adoption; output retirement can free empty manifests independently of thread lifetime. Filesystem deletion runs outside SQL transactions, and completion is recorded afterward. Sealed rows remain replayable after deletion or acknowledgement failure.
-
-Output release retains manifests while their source-version claim or quarantine is still needed. Failed/unknown output stays retained for controlled reconciliation; retirement does not retry a model or platform upload. Rebinding/adopting a resource-retired native thread returns `resource_retired` (HTTP 409).
-
-Fast unit tests cover seal-before-files ordering, acknowledgement loss, source-claim retention, local execution exclusion, rejected seals and cursor replay. `test/core-resource-retirement.integration.test.mjs` is prepared for later local MySQL/filesystem integration; it has not been executed in this stage because real and end-to-end testing was paused at the user’s request.
-
-## Native error observation and recovery differences
-
-A persisted error for the bound thread/turn with `willRetry !== true` wakes a native thread read. Only `completed`, `failed` or `interrupted` can finish that attempt; an in-progress/missing/unknown turn or failed read remains pending with the existing IDs. `willRetry: true` keeps waiting for the provider. Neither branch starts another model turn.
-
-This is a deliberate reliability change: the old runtime rejected its local promise on non-retrying errors and let transport classify retry/failure. The old predecessor and orphan handlers also interrupted native turns. Bridge does not reproduce broad automatic interruption: durable admission/generation, explicit known-turn reads and audited unknown reconciliation replace that behavior. Strict predecessor/orphan timing is therefore not behaviorally identical, and unknown work can require an operator instead of automatic interruption/retry. Fast observation tests cover error-only streams, terminal/retrying controls, read rejection, missing turn and unknown status; no new live-model or end-to-end test was run.
+Reply/reaction membership, client conversation scope, body/byte limits and unknown-write recovery remain enforced for the communication APIs. Hook delivery still requires a durable consumer acknowledgement before it returns 204. The connected media and outbox components retain their current constraints in [input media](media.md) and [outbound media](outbound-media.md). [Catchup](catchup.md) describes the earlier generation implementation and is historical for the current forward execution path.

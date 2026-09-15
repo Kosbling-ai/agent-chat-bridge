@@ -1,6 +1,6 @@
 {
   "name": "agent-chat-bridge",
-  "version": "0.1.0",
+  "version": "0.2.5",
   "private": true,
   "type": "module",
   "description": "Independent Feishu and Codex client with durable hooks and message delivery",
@@ -19,6 +19,8 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.60.0",
+    "https-proxy-agent": "7.0.6",
+    "mdast-util-from-markdown": "2.0.3",
     "mysql2": "3.24.4"
   },
   "overrides": {

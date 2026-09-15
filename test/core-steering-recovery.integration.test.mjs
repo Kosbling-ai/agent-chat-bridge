@@ -9,7 +9,7 @@ const refs=Object.fromEntries(['host','port','user','password','database'].map(k
 test('unresolved steer intent survives input resource failure on restart',{skip:!process.env.BRIDGE_TEST_PASSWORD,timeout:10000},async()=>{
   const pool=createPoolFromEnvironment(refs);let store,runtime;let prepared=0,directories=0,nativeReads=0;
   try {
-    await migrate(pool);store=await createMysqlStore({pool});
+    await migrate(pool);store=await createMysqlStore({connectionId:'fixture',pool});
     const scope={connectionId:'fixture',conversationId:'chat'};
     const parent=await store.enqueueJob({...scope,kind:'agent',idempotencyKey:'parent',payload:{text:'parent'}
 });

@@ -13,7 +13,7 @@ test('lost outbox COMMIT responses never reverse confirmed platform facts or sto
   const chat = { sendMessage: async input => { calls.push('text'); if (input.content.text === 'reject') throw Object.assign(new Error('synthetic'), { outcome: 'failed' }); return { message_id: 'text' }; }, uploadImage: async () => { calls.push('upload'); return { image_key: 'uploaded' }; } };
   const outbound = { upload: async () => { calls.push('artifact_upload'); return { file_key: 'file' }; }, send: async input => { assert.equal(input.uploadResult.file_key, 'file'); calls.push('artifact_send'); return { message_id: 'file' }; }, cleanup: async () => { calls.push('cleanup'); } };
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'delivery-fixture', pool });
     const scope = { connectionId: config.feishu.connectionId, conversationId: 'chat' };
     const text = await store.recordOutbox({ ...scope, idempotencyKey: 'text', kind: 'create', payload: { kind: 'text', content: { text: 'fixture' } } });
     const rejected = await store.recordOutbox({ ...scope, idempotencyKey: 'reject', kind: 'create', payload: { kind: 'text', content: { text: 'reject' } } });

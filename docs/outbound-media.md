@@ -1,5 +1,7 @@
 # Agent output files
 
+This controlled snapshot module now serves caller-mode resource retention and reads. Bridge-mode Feishu delivery has returned to the frozen production path described in [Feishu media](media.md): it consumes executor paths directly, applies a 28 MiB per-file cap, deletes successful files, and retains individual failures without blocking text. The detailed spool lifecycle below applies only to caller-mode snapshots and compatibility data; it is not the bridge-mode send controller.
+
 This module restores the old private-chat output discovery algorithm: a flat per-chat directory, regular files modified since turn start minus one second, modification-time order, newest nine files when more exist. Group output remains text-only. File size is actually bounded to 28 MiB, retaining the old transport's `28 * 1024 * 1024` limit. It does not treat the public upload endpoint's 2 MiB JSON limit as the Agent output limit.
 
 Images are recognized by `.png/.jpg/.jpeg/.gif/.webp/.bmp`, as in the original helper. `.pdf/.doc/.xls/.ppt/.mp4/.opus` use corresponding Feishu upload file types; modern office formats, archives and other extensions use `stream`. Image upload keeps the adapter's separate 10 MiB platform cap. Larger images therefore produce an explicit failed effect and remain available for follow-up. Extension mapping is not MIME inspection and does not expand inbound media support.

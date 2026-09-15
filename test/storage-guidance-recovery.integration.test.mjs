@@ -9,7 +9,7 @@ test('real MySQL guidance abandonment cancels only unknown guidance and preserve
 }, async () => {
   const pool = createPoolFromEnvironment(refs);
   await migrate(pool);
-  const store = await createMysqlStore({ pool });
+  const store = await createMysqlStore({connectionId:'guidance-recovery', pool });
   let sequence = 0;
   const scope = { connectionId: 'guidance-recovery', conversationId: 'chat', agentId: 'codex' };
   async function job() {

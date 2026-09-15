@@ -17,7 +17,7 @@ export function createSessionRotation({ store, codex, connectionId, workspace, c
         catch (error) { if (error.code !== 'ENOENT') throw error; }
       }
     }
-    const idleMs = config.rolloverIdleMs ?? 2 * 24 * 60 * 60 * 1000;
+    const idleMs = config.rolloverIdleMs ?? 5 * 24 * 60 * 60 * 1000;
     if (!rulesMtimeMs && (!idleMs || (session.lastMessageAt && now() - Number(session.lastMessageAt) < idleMs))) return;
     let thread, reason;
     try { ({ thread } = await codex.readThread({ threadId: session.nativeThreadId, includeTurns: true })); }

@@ -5,12 +5,20 @@
     "hostEnv": "BRIDGE_DB_HOST", "portEnv": "BRIDGE_DB_PORT", "userEnv": "BRIDGE_DB_USER",
     "passwordEnv": "BRIDGE_DB_PASSWORD", "databaseEnv": "BRIDGE_DB_DATABASE"
   },
-  "codex": { "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"] },
-  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id" },
+  "codex": {
+    "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"],
+    "idleCloseMs": 60000, "closeGraceMs": 5000, "rpcTimeoutMs": 120000, "turnTimeoutMs": 43200000,
+    "sandbox": "workspace-write", "approvalPolicy": "on-request", "approvalsReviewer": "auto_review", "networkAccess": true,
+    "requestUserInput": false,
+    "rolloverIdleMs": 432000000, "rolloverCheckTimeoutMs": 30000,
+    "memoryCheckIntervalMs": 60000, "memoryMaxRssMb": 1536, "memoryMaxHeapUsedMb": 1024,
+    "jobRetryMs": 60000, "jobMaxAttempts": 3
+  },
+  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id", "displayName": "Agent", "processingReaction": true, "processingReactionEmoji": "Typing", "processingFallbackText": "收到，正在查询。", "mediaEnabled": true, "mediaInboxDir": "data/feishu-inbox", "mediaMaxBytes": 20971520 },
   "routing": {
     "version": "1",
     "privateUserIds": ["replace_with_allowed_open_id"],
-    "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "passiveContext": true }]
+    "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "passiveContext": true, "capabilities": ["bridge", "hook"] }]
   },
   "auth": { "clients": [{ "id": "application", "tokenEnv": "BRIDGE_API_TOKEN", "conversationIds": ["replace_with_chat_id"], "admin": false }] },
   "hooks": [],

@@ -8,7 +8,7 @@ test('real MySQL resource seals protect native and guidance references while out
   skip: !process.env.BRIDGE_TEST_PASSWORD, timeout: 30000,
 }, async () => {
   const pool = createPoolFromEnvironment(refs); await migrate(pool);
-  const store = await createMysqlStore({ pool });
+  const store = await createMysqlStore({connectionId:'resources', pool });
   const scope = { connectionId: 'resources', conversationId: 'chat', agentId: 'codex' };
   let counter = 0;
   async function job() {

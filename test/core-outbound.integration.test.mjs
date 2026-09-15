@@ -35,7 +35,7 @@ test('Agent files use durable upload/send dependencies and restart cleanup witho
   const event = conversationId => ({ schemaVersion: 1, channel: 'feishu', connectionId: config.feishu.connectionId, source: 'live', type: 'message.received', eventKey: conversationId, eventId: conversationId, messageId: conversationId, conversationId, conversationType: 'p2p', actor: { type: 'user', openId: 'human' }, message: { kind: 'text', content: '{"text":"make a file"}', parsedContent: { text: 'make a file' }, mentions: [] } });
   async function effect(jobId, kind) { const [[row]] = await pool.execute('SELECT id,status,cleanup_pending FROM bridge_outbox WHERE job_id=? AND kind=?', [jobId, kind]); return row; }
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'output-fixture', pool });
     const module = await createOutboundMedia({ workspace, outboxDir: join(workspace, 'outbox'), spoolDir: join(workspace, 'spool'), chat });
     output = { ...module, async cleanup(input) { cleanupCalls++; if (cleanupBlocked) throw new Error('synthetic cleanup unavailable'); return module.cleanup(input); } };
     runtime = createRuntime({ config, store, codex, chat, outbound: output });

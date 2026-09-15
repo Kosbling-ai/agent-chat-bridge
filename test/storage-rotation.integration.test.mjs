@@ -8,7 +8,7 @@ test('real MySQL idle rotation fences activity and preserves only confirmed-admi
   skip:!process.env.BRIDGE_TEST_PASSWORD,timeout:30000,
 },async()=>{
   const pool=createPoolFromEnvironment(refs);await migrate(pool);
-  let clock=Date.now();const store=await createMysqlStore({pool,now:()=>clock});
+  let clock=Date.now();const store=await createMysqlStore({connectionId:'rotation',pool,now:()=>clock});
   const scope=conversationId=>({connectionId:'rotation',conversationId,agentId:'codex'});
   async function job(conversationId,idempotencyKey=conversationId){
     const added=await store.enqueueJob({...scope(conversationId),kind:'agent',idempotencyKey,payload:{}});

@@ -1,0 +1,271 @@
+import { spawn, spawnSync } from 'node:child_process';
+import { DEFAULT_IDLE_CLOSE_MS, IdleLifecycle, closeOwnedChild, classifyCodexRpcError } from './idle-lifecycle.mjs';
+
+function emitLog(log, level, operation, status, detail = {}) {
+  try { log?.(level, { module: 'agent-chat-bridge', component: 'codex-app-server', operation, status, ...detail }); } catch { /* logging is observational */ }
+}
+
+export function codexAppServerArgs(config = {}, { requestUserInputFeature = false } = {}) {
+  return [
+    'app-server', '--listen', 'stdio://',
+    '-c', `sandbox_workspace_write.network_access=${config.networkAccess === false ? 'false' : 'true'}`,
+    '-c', 'shell_environment_policy.inherit=all',
+    ...(requestUserInputFeature ? ['-c', `features.default_mode_request_user_input=${config.requestUserInput === true ? 'true' : 'false'}`] : []),
+  ];
+}
+
+export function hasRequestUserInputFeature(config, childEnv, spawnSyncImpl = spawnSync) {
+  try {
+    const result = spawnSyncImpl(config.bin, ['features', 'list'], {
+      cwd: config.cwd, env: { ...childEnv }, shell: false, encoding: 'utf8', timeout: 5_000,
+      maxBuffer: 256 * 1024,
+    });
+    return result?.status === 0 && /^default_mode_request_user_input\s+/m.test(String(result.stdout || ''));
+  } catch { return false; }
+}
+
+const requestKey = id => `${typeof id}:${JSON.stringify(id)}`;
+const validRequestId = id => (typeof id === 'string' && id.length > 0 && id.length <= 512)
+  || (typeof id === 'number' && Number.isSafeInteger(id));
+
+export class CodexAppServerClient {
+  constructor({ config, childEnv = {}, spawnImpl = spawn, spawnSyncImpl = spawnSync, eventSink = async () => {}, serverRequestSink = async () => {}, onDisconnect = () => {}, onIdle = () => {}, log = () => {}, now = Date.now } = {}) {
+    if (!config?.bin || !config?.cwd || !config?.sharedHome) throw new Error('Codex app-server requires bin, cwd and sharedHome');
+    if (!childEnv || typeof childEnv !== 'object' || Array.isArray(childEnv)) throw new Error('childEnv must be an object');
+    this.config = config;
+    this.spawnImpl = spawnImpl;
+    this.eventSink = eventSink;
+    this.serverRequestSink = serverRequestSink;
+    this.onDisconnect = onDisconnect;
+    this.log = log;
+    this.now = now;
+    this.childEnv = Object.freeze({ ...childEnv, CODEX_HOME: config.sharedHome });
+    this.child = null;
+    this.ready = false;
+    this.starting = null;
+    this.closing = null;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.stdoutBuffer = '';
+    this.fault = null;
+    this.disconnectedChildren = new WeakSet();
+    this.childGeneration = 0;
+    this.childGenerations = new WeakMap();
+    this.inbound = new Map();
+    this.requestUserInputFeature = hasRequestUserInputFeature(config, this.childEnv, spawnSyncImpl);
+    if (config.requestUserInput === true && !this.requestUserInputFeature) emitLog(this.log, 'warning', 'request_user_input_feature', 'unavailable');
+    this.lifecycle = new IdleLifecycle({
+      idleMs: config.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS,
+      close: () => this.close('idle'),
+      onIdle,
+      onError: () => emitLog(this.log, 'error', 'app_server_close', 'failed'),
+    });
+  }
+
+  async ensureStarted() {
+    this.lifecycle.assertRunning();
+    if (this.closing) await this.closing;
+    this.lifecycle.assertRunning();
+    if (this.ready && this.child) return;
+    if (this.starting) return this.starting;
+    this.starting = this.start();
+    try { await this.starting; }
+    catch (error) { await this.close('initialize_failure').catch(() => {}); throw error; }
+    finally { this.starting = null; }
+  }
+
+  async start() {
+    this.lifecycle.assertRunning();
+    const child = this.spawnImpl(this.config.bin, codexAppServerArgs(this.config, { requestUserInputFeature: this.requestUserInputFeature }), {
+      cwd: this.config.cwd,
+      env: { ...this.childEnv },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+    });
+    const generation=++this.childGeneration;
+    this.childGenerations.set(child,generation);
+    this.child = child;
+    this.ready = false;
+    this.stdoutBuffer = '';
+    child.stdout.setEncoding?.('utf8');
+    child.stderr.setEncoding?.('utf8');
+    child.stdin.on('error', (error) => { if (this.child === child && !this.closing) this.fail(error, child); });
+    child.stdout.on('data', (chunk) => this.handleStdout(chunk, child));
+    child.stderr.on('data', () => {}); // drain without retaining possibly sensitive output
+    child.on('error', (error) => { if (this.child === child) this.fail(error, child); });
+    child.once('exit', (code, signal) => this.handleExit(new Error(`codex app-server exited${code == null ? '' : ` code=${code}`}${signal ? ` signal=${signal}` : ''}`), child));
+    await this.request('initialize', {
+      clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.2.4' },
+      capabilities: { experimentalApi: true },
+    }, { skipStart: true });
+    if (this.child !== child) throw new Error('codex app-server child changed during initialize');
+    this.ready = true;
+    this.fault = null;
+    emitLog(this.log, 'info', 'app_server_start', 'succeeded');
+  }
+
+  async request(method, params = {}, { skipStart = false, timeoutMs } = {}) {
+    if (!skipStart) await this.ensureStarted();
+    const child = this.child;
+    if (!child?.stdin?.writable) throw new Error(`codex app-server unavailable before ${method}`);
+    const id = this.nextId++;
+    const duration = Number(timeoutMs || this.config.rpcTimeoutMs || 120_000);
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        const error = new Error(`codex app-server ${method} timed out after ${duration}ms`);
+        error.code = 'CODEX_RPC_TIMEOUT'; error.outcome = 'unknown'; reject(error); this.fail(error, child);
+      }, duration);
+      timer.unref?.();
+      this.pending.set(id, {
+        method, child, timer, resolve, reject,
+        threadId: typeof params?.threadId === 'string' ? params.threadId : undefined,
+        expectedTurnId: typeof params?.expectedTurnId === 'string' ? params.expectedTurnId
+          : method === 'turn/interrupt' && typeof params?.turnId === 'string' ? params.turnId : undefined,
+      });
+    });
+    try { child.stdin.write(`${JSON.stringify({ id, method, params })}\n`); }
+    catch (error) { this.rejectPending(id, error); this.fail(error, child); }
+    return promise;
+  }
+
+  rejectPending(id, error) {
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id); clearTimeout(pending.timer); pending.reject(error);
+  }
+
+  handleStdout(chunk, child) {
+    if (this.child !== child) return;
+    const generation=this.childGenerations.get(child);
+    this.stdoutBuffer += String(chunk || '');
+    let newline;
+    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
+      const line = this.stdoutBuffer.slice(0, newline).trim();
+      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      try { message = JSON.parse(line); }
+      catch { emitLog(this.log, 'warning', 'rpc_frame', 'invalid'); continue; }
+      if (Object.hasOwn(message, 'id') && !message.method) this.handleResponse(message, child);
+      else if (message.method && Object.hasOwn(message, 'id')) {
+        this.handleServerRequest(message, child);
+      } else if (message.method) {
+        const release = this.lifecycle.hold();
+        Promise.resolve().then(() => (this.child === child
+          ? this.eventSink({ method: message.method, params: message.params || {}, receivedAt: this.now(), generation })
+          : undefined))
+          .catch(() => emitLog(this.log, 'warning', 'notification', 'failed'))
+          .finally(release);
+      }
+    }
+  }
+
+  handleServerRequest(message, child) {
+    const generation=this.childGenerations.get(child);
+    if (!validRequestId(message.id) || message.method !== 'item/tool/requestUserInput' || this.config.requestUserInput !== true) {
+      try { child.stdin.write(`${JSON.stringify({ id: message.id ?? null, error: { code: -32601, message: 'Unsupported server request' } })}\n`); } catch { /* disconnect path settles the child */ }
+      return;
+    }
+    const key = requestKey(message.id);
+    if (this.inbound.has(key)) return;
+    const release = this.lifecycle.hold();
+    const entry = { child, settled: false, release };
+    this.inbound.set(key, entry);
+    const respond = async (payload) => {
+      if (entry.settled || this.child !== child || !child.stdin?.writable) throw Object.assign(new Error('server request is no longer live'), { code: 'CODEX_USER_INPUT_EXPIRED' });
+      entry.settled = true;
+      this.inbound.delete(key);
+      try {
+        await new Promise((resolve, reject) => {
+          let callbackCalled = false;
+          const timer=setTimeout(()=>reject(Object.assign(new Error('server response write unconfirmed'),{code:'CODEX_USER_INPUT_WRITE_UNKNOWN',outcome:'unknown'})),
+            Math.min(1_000,Number(this.config.rpcTimeoutMs||1_000)));
+          timer.unref?.();
+          const settle=callback=>value=>{clearTimeout(timer);callback(value);};
+          const accepted = child.stdin.write(`${JSON.stringify({ id: message.id, ...payload })}\n`, error => {
+            callbackCalled = true;
+            if (error) settle(reject)(error); else settle(resolve)();
+          });
+          // Several test streams are synchronous and do not implement callbacks.
+          if (accepted !== false && child.stdin.write.length < 2 && !callbackCalled) settle(resolve)();
+        });
+      } finally { release(); }
+    };
+    const abandon = () => {
+      if (entry.settled) return false;
+      entry.settled = true; this.inbound.delete(key); release(); return true;
+    };
+    Promise.resolve().then(() => this.serverRequestSink({
+      method: message.method, requestId: message.id, params: message.params || {}, receivedAt: this.now(), generation,
+      respondResult: result => respond({ result }),
+      respondError: (code, text) => respond({ error: { code, message: text } }),
+      abandon,
+    })).catch(() => respond({ error: { code: -32001, message: 'User input request unavailable' } }).catch(() => {}));
+  }
+
+  handleResponse(message, child) {
+    const pending = this.pending.get(message.id);
+    if (!pending || pending.child !== child) return;
+    this.pending.delete(message.id); clearTimeout(pending.timer);
+    if (message.error) {
+      const error = classifyCodexRpcError(message.error, pending);
+      emitLog(this.log, 'warning', 'rpc_request', 'rejected', { rpc_method: error.rpcMethod, error_code: error.code });
+      pending.reject(error);
+    } else pending.resolve(message.result);
+  }
+
+  close(reason = 'shutdown') {
+    if (this.closing) return this.closing;
+    const child = this.child;
+    if (!child) return Promise.resolve();
+    this.ready = false;
+    const startedAt = this.now();
+    emitLog(this.log, 'info', 'app_server_close', 'started', { reason });
+    this.closing = closeOwnedChild(child, {
+      graceMs: this.config.closeGraceMs ?? 5_000,
+      onEscalate: (signal) => emitLog(this.log, 'warning', 'app_server_close', 'escalating', { reason, signal }),
+    }).then(() => {
+      if (this.child === child) this.handleExit(new Error('codex app-server closed'), child);
+      this.closing = null;
+      emitLog(this.log, 'info', 'app_server_close', 'succeeded', { reason, durationMs: this.now() - startedAt });
+    });
+    return this.closing;
+  }
+
+  fail(error, child) {
+    if (this.child !== child) return;
+    this.ready = false;
+    this.fault = 'rpc_failure';
+    this.rejectAll(error);
+    this.notifyDisconnect(error, child);
+    this.close('rpc_failure').catch(() => emitLog(this.log, 'error', 'app_server_close', 'failed'));
+  }
+
+  rejectAll(error) {
+    const reason = error instanceof Error ? error : new Error(String(error || 'codex app-server exited'));
+    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(reason); }
+    this.pending.clear();
+  }
+
+  handleExit(error, child) {
+    if (this.child !== child) return;
+    if (!this.closing) this.fault = 'unexpected_exit';
+    this.ready = false; this.child = null; this.rejectAll(error); this.notifyDisconnect(error, child);
+  }
+
+  notifyDisconnect(error, child) {
+    if (!child || this.disconnectedChildren.has(child)) return;
+    this.disconnectedChildren.add(child);
+    for (const [key, request] of this.inbound) {
+      if (request.child !== child) continue;
+      this.inbound.delete(key); request.settled = true; request.release();
+    }
+    try { this.onDisconnect(error instanceof Error ? error : new Error(String(error || 'codex app-server exited')), child); }
+    catch { emitLog(this.log, 'error', 'disconnect_callback', 'failed'); }
+  }
+
+  status() {
+    return { ready: this.ready, starting: Boolean(this.starting), closing: Boolean(this.closing), active: this.lifecycle.active, pending: this.pending.size, fault: this.fault };
+  }
+}

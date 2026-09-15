@@ -32,7 +32,7 @@ test('durable media ingress downloads only authorized jobs before native admissi
   let sequence = 0;
   const event = (kind, content, conversationType = 'p2p') => ({ schemaVersion: 1, channel: 'feishu', connectionId: 'media-fixture', source: 'live', type: 'message.received', eventKey: `media-${++sequence}`, eventId: `media-${sequence}`, messageId: `message-${sequence}`, conversationId: conversationType === 'group' ? 'group' : `private-${sequence}`, conversationType, actor: { type: 'user', openId: 'human' }, message: { kind, content: JSON.stringify(content), parsedContent: content, mentions: [] } });
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'media-fixture', pool });
     const media = await createFeishuMedia({ workspace, inboxDir: join(workspace, 'inbox'), chat });
     runtime = createRuntime({ config, store, codex, chat, media });
     const source = event('image', { image_key: 'image' });

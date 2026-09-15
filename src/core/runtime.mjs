@@ -1,3 +1,4 @@
+import { splitReplyCards } from '../channels/feishu/reply-card.mjs';
 import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { safeObserver } from '../logger.mjs';
@@ -101,12 +102,11 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
       output = await outbound.prepare({ ...artifactScope, conversationType: 'p2p', sinceMs: Number(native.createdAt) });
       if (output.failures.length || output.omitted) text += `\n\n附件处理提示：${output.failures.length} 个文件准备失败，${output.omitted} 个文件超过单次发送数量上限。`;
     }
-    // Independent text effects are small enough for the platform JSON limit.
-    const pieces = [];
-    let piece = '';
-    for (const char of text) { if (Buffer.byteLength(piece + char) > 12000) { pieces.push(piece); piece = ''; } piece += char; }
-    if (piece) pieces.push(piece);
-    const outbox = pieces.map((content, index) => ({ idempotencyKey: `run:${job.id}:text:${index}`, kind: payload.messageId ? 'reply' : 'create', payload: { kind: 'text', content: { text: content }, ...(payload.messageId ? { messageId: payload.messageId } : {}) } }));
+    const outbox = splitReplyCards(text).map((content, index) => ({
+      idempotencyKey: `run:${job.id}:final-card:${index}`,
+      kind: payload.messageId ? 'reply' : 'create',
+      payload: { kind: 'interactive', content, ...(payload.messageId ? { messageId: payload.messageId } : {}) },
+    }));
     for (const artifact of output?.artifacts ?? []) for (const effect of ['upload', 'send']) outbox.push({ idempotencyKey: `run:${job.id}:artifact:${artifact.ref.artifactId}:${effect}`, kind: `artifact_${effect}`, payload: { scope: artifactScope, ref: artifact.ref } });
     await store.finishJobWithOutbox({ id: job.id, leaseToken: job.leaseToken, result: { nativeTurnId: turn.id, status: turn.status,
       ...(output ? { artifactCount: output.artifacts.length, artifactFailures: output.failures, artifactOmitted: output.omitted } : {}) }, outbox });
@@ -146,7 +146,15 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
       const rejected = prepared && prepared.status !== 'ready' ? prepared.status : (!prepared && payload.unsupported && !media ? 'unsupported' : null);
       if (rejected) {
         const reply = prepared?.replyText ?? (rejected === 'failed' ? '图片准备失败，这条消息尚未交给 Agent，请重试或改用文字。' : '这条消息的附件类型暂不支持，尚未交给 Agent，请改用文字或图片。');
-        await store.finishJobWithOutbox({ id: job.id, leaseToken: job.leaseToken, result: { status: `input_${rejected}`, ...(prepared?.reason ? { code: prepared.reason } : {}) }, outbox: rejected === 'ignored' ? [] : [{ idempotencyKey: `run:${job.id}:input-status`, kind: 'reply', payload: { messageId: payload.messageId, kind: 'text', content: { text: reply } } }] });
+        const outbox = rejected === 'ignored' ? [] : splitReplyCards(reply, rejected === 'failed' ? 'failed' : 'rejected').map((content, index) => ({
+          idempotencyKey: `run:${job.id}:input-status-card:${index}`,
+          kind: payload.messageId ? 'reply' : 'create',
+          payload: { ...(payload.messageId ? { messageId: payload.messageId } : {}), kind: 'interactive', content },
+        }));
+        await store.finishJobWithOutbox({
+          id: job.id, leaseToken: job.leaseToken,
+          result: { status: `input_${rejected}`, ...(prepared?.reason ? { code: prepared.reason } : {}) }, outbox,
+        });
         log(rejected === 'failed' ? 'error' : 'warning', 'agent_run', 'rejected', { code: `input_${rejected}` });
         return;
       }

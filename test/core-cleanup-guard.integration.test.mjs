@@ -35,7 +35,7 @@ test('cleanup excludes native execution and respects persisted activity after re
   const codex = { status: () => ({ state: 'ready' }), startThread: async () => { const id = `thread-${starts.length}`; starts.push(id); return { thread: { id } }; }, startTurn: async ({ threadId }) => { const turn = { id: `turn-${threadId}`, status: 'inProgress', items: [] }; turns.set(threadId, turn); return { turn }; } };
   const outbound = { cleanup: async ({ scope: artifact }) => { cleanups.push(artifact.conversationId); if (artifact.conversationId === 'cleanup-first') { cleanupEntered.release(); await heldCleanup.promise; } } };
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'fixture', pool });
     const claimJobs = store.claimJobs;
     store.claimJobs = async input => seeding && input.owner !== 'fixture' ? [] : claimJobs(input);
     // A native execution left unknown before process startup blocks cleanup.

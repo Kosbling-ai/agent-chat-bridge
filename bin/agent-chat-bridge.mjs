@@ -2,6 +2,9 @@
 import { ConfigError, loadConfig } from '../src/config.mjs';
 import { createLogger } from '../src/logger.mjs';
 import { readFile } from 'node:fs/promises';
+import { StoreError } from '../src/storage/errors.mjs';
+
+const SAFE_MIGRATION_CODES = new Set(['legacy_connection_id_required', 'legacy_connection_id_mismatch', 'invalid_legacy_connection_id', 'writer_busy', 'migration_busy', 'schema_version_mismatch']);
 
 const HELP = `agent-chat-bridge
 
@@ -10,7 +13,7 @@ Usage:
   agent-chat-bridge --version
   agent-chat-bridge check-config --config <path>
   agent-chat-bridge start --config <path>
-  agent-chat-bridge migrate --config <path>
+  agent-chat-bridge migrate --config <path> [--legacy-connection-id <original-connection-id>]
 
 An explicit JSON config path is required; no config or .env auto-discovery.
 check-config validates syntax only and never resolves environment secrets.
@@ -28,7 +31,7 @@ try {
     process.stdout.write(await readFile(new URL('../VERSION', import.meta.url), 'utf8'));
   } else {
     if (!['check-config', 'start', 'migrate'].includes(command) || flag !== '--config'
-        || !path || path.startsWith('--') || extra.length) {
+        || !path || path.startsWith('--') || (command === 'migrate' ? (extra.length !== 0 && (extra.length !== 2 || extra[0] !== '--legacy-connection-id' || !extra[1])) : extra.length !== 0)) {
       throw new ConfigError('invalid_arguments');
     }
     const config = await loadConfig(path);
@@ -36,16 +39,17 @@ try {
       log('info', 'check_config', 'succeeded');
     } else if (command === 'migrate') {
       const { migrateService } = await import('../src/service.mjs');
-      await migrateService({ config });
+      await migrateService({ config, legacyConnectionId: extra[1] });
       log('info', 'migration', 'succeeded');
     } else {
       const { startService } = await import('../src/service.mjs');
       const controller = new AbortController();
       let service;
+      const exitAfterShutdown = code => { if (config.storage) process.exit(code); };
       const shutdown = () => {
         controller.abort();
         if (!service) return;
-        service.close().then(() => { if (config.storage) process.exit(0); }).catch(() => {
+        service.close().then(() => exitAfterShutdown(0)).catch(() => {
           log('error', 'shutdown', 'failed', { code: 'shutdown_failed' });
           process.exit(1);
         });
@@ -53,7 +57,7 @@ try {
       process.on('SIGTERM', shutdown);
       process.on('SIGINT', shutdown);
       try {
-        service = await startService({ config, configPath: path, log, signal: controller.signal });
+        service = await startService({ config, configPath: path, log, signal: controller.signal, onRestartRequired: () => exitAfterShutdown(0) });
         if (controller.signal.aborted) shutdown();
       } catch (error) {
         if (!controller.signal.aborted) throw error;
@@ -62,8 +66,9 @@ try {
     }
   }
 } catch (error) {
-  log(error instanceof ConfigError ? 'warning' : 'error', 'startup', 'failed', {
-    code: error instanceof ConfigError ? error.code : 'startup_failed',
+  const safeMigrationCode = command === 'migrate' && error instanceof StoreError && SAFE_MIGRATION_CODES.has(error.code);
+  log(error instanceof ConfigError || safeMigrationCode ? 'warning' : 'error', 'startup', 'failed', {
+    code: error instanceof ConfigError || safeMigrationCode ? error.code : 'startup_failed',
   });
   process.exitCode = 1;
   // Locked SDK owns a cache interval even after WS close. All service cleanup

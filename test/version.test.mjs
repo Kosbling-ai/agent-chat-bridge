@@ -22,7 +22,9 @@ test('version check rejects drift, missing notes and accidental npm publication'
   try{
     for(const file of files)await writeFile(new URL(file,url),await readFile(new URL('../'+file,import.meta.url)));
     const pkg=JSON.parse(await readFile(new URL('package.json',url),'utf8'));
-    await writeFile(new URL('package.json',url),JSON.stringify({...pkg,version:'0.1.1'}));
+    const parts=pkg.version.split('.').map(Number);
+    parts[2]++;
+    await writeFile(new URL('package.json',url),JSON.stringify({...pkg,version:parts.join('.')}));
     await assert.rejects(checkVersion(url),/release_version_mismatch/);
     await writeFile(new URL('package.json',url),JSON.stringify({...pkg,private:false}));
     await assert.rejects(checkVersion(url),/npm_publishing_not_authorized/);

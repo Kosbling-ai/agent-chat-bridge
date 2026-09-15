@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { StoreError } from './errors.mjs';
 
 // Recovery is a small durable administrative action, not an Agent retry queue.
-export function recoveryOperations({ read, write, now, hash, decode, claimThread }) {
+export function recoveryOperations({ read, write, now, hash, decode, claimThread, connectionId }) {
   function field(value, max = 255) {
     if (typeof value !== 'string' || !value.length || value.length > max) throw new StoreError('invalid_recovery');
     return value;
@@ -12,7 +12,7 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
   async function target(c, runId, generation, action) {
     if (action === 'abandon_guidance_verified') {
       // Serialize against steering settlement, but never lock or mutate its parent.
-      const [[job]] = await c.execute('SELECT status FROM bridge_jobs WHERE id=? FOR UPDATE', [runId]);
+      const [[job]] = await c.execute('SELECT status FROM bridge_jobs WHERE id=? AND connection_id=? FOR UPDATE', [runId,connectionId]);
       const [[attempt]] = await c.execute(`SELECT connection_id,conversation_id,agent_id,generation,status
         FROM bridge_steering WHERE guidance_job_id=? ORDER BY sequence DESC LIMIT 1 FOR UPDATE`, [runId]);
       if (!job || job.status !== 'unknown' || !attempt || attempt.status !== 'unknown'
@@ -20,7 +20,7 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       return { attempt };
     }
     // Same lock order as execution: job, attempt, then session.
-    const [[job]] = await c.execute('SELECT status FROM bridge_jobs WHERE id=? FOR UPDATE', [runId]);
+    const [[job]] = await c.execute('SELECT status FROM bridge_jobs WHERE id=? AND connection_id=? FOR UPDATE', [runId,connectionId]);
     const [[attempt]] = await c.execute(`SELECT connection_id,conversation_id,agent_id,generation,
       native_thread_id,native_turn_id,created_at FROM bridge_attempts WHERE job_id=? FOR UPDATE`, [runId]);
     if (!job || !attempt || job.status !== 'unknown' || String(attempt.generation) !== String(generation)) {
@@ -40,7 +40,7 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       return read(async (c) => {
         const [[row]] = await c.execute(`SELECT a.job_id AS run_id,a.connection_id,a.conversation_id,
           a.agent_id,a.generation,a.native_thread_id,a.native_turn_id,a.created_at,j.status
-          FROM bridge_attempts a JOIN bridge_jobs j ON j.id=a.job_id WHERE a.job_id=?`, [id]);
+          FROM bridge_attempts a JOIN bridge_jobs j ON j.id=a.job_id WHERE a.job_id=? AND j.connection_id=?`, [id,connectionId]);
         return decode(row) ?? null;
       });
     },
@@ -57,27 +57,28 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       if (input.action === 'adopt_turn' && (!threadId || !turnId)) throw new StoreError('invalid_recovery');
       const digest = hash({ runId, action: input.action, generation: String(input.expectedGeneration), evidence, threadId, turnId });
       return write(async (c) => {
-        // Serialize retries before checking the target; a completed request stays replayable.
+        // The scoped unique key serializes retries before validating a target
+        // that may already have been settled by a completed recovery.
         const id = randomUUID();
         await c.execute(`INSERT INTO bridge_recoveries
-          (id,run_id,caller_id,idempotency_key,payload_hash,action,expected_generation,
+          (id,run_id,connection_id,caller_id,idempotency_key,payload_hash,action,expected_generation,
            native_thread_id,native_turn_id,evidence,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [
-          id, runId, callerId, key, digest, input.action, input.expectedGeneration, threadId, turnId, evidence, now(), now(),
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, [
+          id, runId, connectionId,callerId, key, digest, input.action, input.expectedGeneration, threadId, turnId, evidence, now(), now(),
         ]);
         const [[row]] = await c.execute(`SELECT id,payload_hash FROM bridge_recoveries
-          WHERE caller_id=? AND idempotency_key=?`, [callerId, key]);
+          WHERE connection_id=? AND caller_id=? AND idempotency_key=? FOR UPDATE`, [connectionId,callerId, key]);
         if (row.payload_hash !== digest) throw new StoreError('recovery_conflict');
         if (row.id !== id) return { id: row.id, duplicate: true };
         const { attempt } = await target(c, runId, input.expectedGeneration, input.action);
+        if (attempt.connection_id !== connectionId) throw new StoreError('recovery_conflict');
         if (input.action === 'adopt_turn') {
           const [[owner]] = await c.execute(`SELECT resource_retired_at FROM bridge_thread_owners
-            WHERE connection_id=? AND native_thread_id=? FOR UPDATE`, [attempt.connection_id,threadId]);
+            WHERE connection_id=? AND native_thread_id=? FOR UPDATE`, [connectionId,threadId]);
           if (owner?.resource_retired_at != null) throw new StoreError('resource_retired');
         }
-        await c.execute('UPDATE bridge_recoveries SET connection_id=?,conversation_id=? WHERE id=?', [
-          attempt.connection_id, attempt.conversation_id, id,
-        ]);
+        await c.execute('UPDATE bridge_recoveries SET conversation_id=? WHERE id=? AND connection_id=?',
+          [attempt.conversation_id,id,connectionId]);
         return { id, duplicate: false };
       });
     },
@@ -88,14 +89,14 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       field(input.owner, 128);
       return write(async (c) => {
         const [rows] = await c.execute(`SELECT ${columns} FROM bridge_recoveries
-          WHERE status='pending' OR (status='running' AND lease_expires_at<=?)
-          ORDER BY created_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [now()]);
+          WHERE connection_id=? AND (status='pending' OR (status='running' AND lease_expires_at<=?))
+          ORDER BY created_at,id LIMIT ${take} FOR UPDATE SKIP LOCKED`, [connectionId,now()]);
         for (const row of rows) {
           row.lease_token = randomUUID();
           row.lease_expires_at = now() + input.leaseMs;
           row.status = 'running';
           await c.execute(`UPDATE bridge_recoveries SET status='running',lease_owner=?,lease_token=?,
-            lease_expires_at=?,updated_at=? WHERE id=?`, [input.owner, row.lease_token, row.lease_expires_at, now(), row.id]);
+            lease_expires_at=?,updated_at=? WHERE id=? AND connection_id=?`, [input.owner, row.lease_token, row.lease_expires_at, now(), row.id,connectionId]);
         }
         return rows.map(decode);
       });
@@ -110,7 +111,7 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       };
       const digest = hash({ outcome: input.outcome, errorCode, verified });
       return write(async (c) => {
-        const [[row]] = await c.execute(`SELECT ${columns},result_hash FROM bridge_recoveries WHERE id=? FOR UPDATE`, [input.id]);
+        const [[row]] = await c.execute(`SELECT ${columns},result_hash FROM bridge_recoveries WHERE id=? AND connection_id=? FOR UPDATE`, [input.id,connectionId]);
         if (!row) throw new StoreError('recovery_not_found');
         if (row.lease_token !== input.leaseToken) throw new StoreError('stale_lease');
         if (['applied', 'rejected'].includes(row.status)) {
@@ -152,7 +153,7 @@ export function recoveryOperations({ read, write, now, hash, decode, claimThread
       field(id, 36);
       return read(async (c) => {
         const [[row]] = await c.execute(`SELECT id,run_id,connection_id,conversation_id,status,action,error_code,
-          created_at,updated_at FROM bridge_recoveries WHERE id=?`, [id]);
+          created_at,updated_at FROM bridge_recoveries WHERE id=? AND connection_id=?`, [id,connectionId]);
         return decode(row) ?? null;
       });
     },

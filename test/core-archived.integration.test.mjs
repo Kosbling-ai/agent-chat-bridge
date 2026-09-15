@@ -14,7 +14,7 @@ test('proven archived resume replaces once; replacement and reset uncertainty ne
   const chat = { sendMessage: async () => ({ message_id: 'sent' }) };
   async function enqueue(conversationId) { await store.setSession({ ...scope(conversationId), expectedGeneration: 0, nativeThreadId: `old-${conversationId}` }); return store.enqueueJob({ ...scope(conversationId), kind: 'agent', idempotencyKey: conversationId, payload: { text: conversationId } }); }
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'archived-fixture', pool });
     const reset = store.resetRejectedThreadAdmission;
     store.resetRejectedThreadAdmission = async input => { resets++; const result = await reset(input); if (mode === 'lost-reset') throw Object.assign(new Error('synthetic'), { code: 'commit_unknown' }); return result; };
     runtime = createRuntime({ config, store, codex, chat }); runtime.start();

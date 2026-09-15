@@ -24,7 +24,7 @@ test('active guidance shares one final reply, rejected guidance defers, unknown 
   const chat = { sendMessage: async input => { sent.push(input); return { message_id: `message-${sent.length}` }; } };
   const enqueue = (conversationId, text) => store.enqueueJob({ connectionId: config.feishu.connectionId, conversationId, kind: 'agent', idempotencyKey: text, payload: { source: 'api', text } });
   try {
-    await migrate(pool); store = await createMysqlStore({ pool });
+    await migrate(pool); store = await createMysqlStore({connectionId:'steer-fixture', pool });
     runtime = createRuntime({ config, store, codex, chat }); runtime.start();
     const first = await enqueue('accepted-chat', 'first-parent');
     await until(() => store.getAgentAttempt({ id: first.id }), row => row?.nativeTurnId);
