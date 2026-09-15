@@ -109,7 +109,7 @@ test('help and strict arguments require an explicit configuration', async (t) =>
 });
 
 test('check-config validates shape without resolving or printing secrets', async (t) => {
-  const { path } = await fixture(t, { ...base, auth: { tokenEnv: 'BRIDGE_TEST_TOKEN' } });
+  const { path } = await fixture(t, base);
   for (const env of [{}, { BRIDGE_TEST_TOKEN: sentinel }]) {
     const result = await run(t, ['check-config', '--config', path], { env }).finished;
     assert.equal(result.code, 0);
@@ -164,7 +164,7 @@ test('non-loopback requires explicit opt-in; validation never opens remote socke
 });
 
 test('real local process is live but never integration-ready, without any credentials', async (t) => {
-  const { path, dir } = await fixture(t, { ...base, auth: { tokenEnv: 'NOT_SET' } });
+  const { path, dir } = await fixture(t, base);
   const app = run(t, ['start', '--config', path], { cwd: dir });
   const listening = await app.waitFor((line) => line.operation === 'listen' && line.status === 'succeeded');
   const url = `http://127.0.0.1:${listening.port}`;

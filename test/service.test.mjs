@@ -1,13 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfig } from '../src/config.mjs';
-import { createApi } from '../src/core/api.mjs';
 import { createLogger, createErrorReporter } from '../src/logger.mjs';
 import { boundedFeishuHttp, startService } from '../src/service.mjs';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
 import { createRuntime } from '../src/core/runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 
@@ -16,7 +14,6 @@ const config = {
   codex: { bin: './codex', cwd: './workspace', envNames: ['PATH'] },
   feishu: { connectionId: 'test', appIdEnv: 'TEST_APP', appSecretEnv: 'TEST_SECRET', botOpenId: 'bot' },
   routing: { version: '1', privateUserIds: ['human'], groups: [{ conversationId: 'chat', userIds: ['human'], trigger: 'mention', passiveContext: true }] },
-  auth: { clients: [{ id: 'tester', tokenEnv: 'TEST_TOKEN', conversationIds: ['chat'], admin: false }] },
 };
 test('runtime configuration is explicit and rejects scope/secret overrides', () => {
   assert.equal(validateConfig(config).feishu.connectionId, 'test');
@@ -76,18 +73,6 @@ test('history identity needed for allowlist/mention routing cannot consume canon
   await assert.rejects(runtime.ingest({ ...event, message: { ...event.message, mentions: [{ userId: 'internal-bot' }] } }), { code: 'history_authorization_identity_missing' });
   assert.equal(accepted, 1);
 });
-test('API tokens must be distinct and sufficiently long', () => {
-  const validated = validateConfig(config);
-  assert.throws(() => createApi({ config: validated, store: {}, chat: {}, tokens: { tester: 'short' } }), { code: 'invalid_auth_environment' });
-});
-test('public chat read proxies are absent while send-scope checks remain internal', async () => {
-  const token = 'synthetic-long-token-for-local-test';
-  const chat = new Proxy({}, { get() { throw new Error('public read unexpectedly touched platform'); } });
-  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: {}, chat });
-  for (const url of ['/v1/conversations/chat/messages', '/v1/conversations/chat/members', '/v1/messages/m', '/v1/messages/m/reactions', '/v1/messages/m/resources']) {
-    await assert.rejects(api({ method: 'GET', url, headers: { authorization: `Bearer ${token}` } }), { status: 404 });
-  }
-});
 test('group defaults allow all human members; explicit member filter does not limit hooks', async () => {
   const observed = [];
   const forwarded = [];
@@ -101,51 +86,6 @@ test('group defaults allow all human members; explicit member filter does not li
   await restricted.ingest(event);
   await new Promise(setImmediate);
   assert.equal(forwarded.length,1);assert.equal(observed[1].forwardJob, undefined); assert.equal(observed[1].hooks.length, 1);
-});
-test('run API accepts existing long cron prompts and caps UTF-8 bytes including JSON escape allowance', async () => {
-  const accepted = [];
-  const token = 'synthetic-long-token-for-local-test';
-  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: {}, forwardRuntime:{submit:async value=>{accepted.push(value);return{id:'run'};}}, chat: {} });
-  const request = text => Object.assign(Readable.from([Buffer.from(JSON.stringify({ conversationId: 'chat', idempotencyKey: 'cron', text }))]), { method: 'POST', url: '/v1/runs', headers: { authorization: `Bearer ${token}` } });
-  assert.equal((await api(request('中'.repeat(10000)))).status, 202);
-  assert.equal((await api(request('\u0001'.repeat(64 * 1024)))).status, 202);
-  await assert.rejects(api(request('中'.repeat(22000))), { status: 413, code: 'text_too_large' });
-  assert.equal(accepted.length, 2);
-});
-test('chat effect registration covers media/reaction and checks reply membership', async () => {
-  const effects = [];
-  const token = 'synthetic-long-token-for-local-test';
-  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: { recordOutbox: async effect => { effects.push(effect); return { id: 'effect' }; } }, chat: { getMessage: async ({ messageId }) => ({ items: [{ message_id: messageId, chat_id: messageId === 'foreign' ? 'elsewhere' : 'chat' }] }) } });
-  function request(value) { const request = Readable.from([Buffer.from(JSON.stringify(value))]); request.url = '/v1/deliveries'; request.method = 'POST'; request.headers = { authorization: `Bearer ${token}` }; return request; }
-  for (const effect of [
-    { kind: 'create', messageKind: 'image', content: { image_key: 'synthetic' } },
-    { kind: 'reply', messageId: 'owned', messageKind: 'file', content: { file_key: 'synthetic' } },
-    { kind: 'create', messageKind: 'post', content: { en_us: { title: 'synthetic', content: [] } } },
-    { kind: 'create', messageKind: 'interactive', content: { elements: [] } },
-    { kind: 'reaction', messageId: 'owned', emojiType: 'OK' },
-    { kind: 'upload', mediaType: 'file', base64: Buffer.from('synthetic').toString('base64'), fileName: 'fixture.txt' },
-  ]) assert.equal((await api(request({ ...effect, conversationId: 'chat', idempotencyKey: `effect-${effects.length}` }))).status, 202);
-  assert.equal(effects.length, 6);
-  await assert.rejects(api(request({ kind: 'reply', conversationId: 'chat', messageId: 'foreign', idempotencyKey: 'rejected', content: 'synthetic' })), { status: 403 });
-  assert.equal(effects.length, 6);
-});
-test('chat effect registration accepts 28 KB interactive cards without raising other message budgets', async () => {
-  const effects = [];
-  const token = 'synthetic-long-token-for-local-test';
-  const api = createApi({ config: validateConfig(config), tokens: { tester: token }, store: { recordOutbox: async effect => { effects.push(effect); return { id: 'effect' }; } }, chat: {} });
-  function request(value) { const request = Readable.from([Buffer.from(JSON.stringify(value))]); request.url = '/v1/deliveries'; request.method = 'POST'; request.headers = { authorization: `Bearer ${token}` }; return request; }
-  function contentAtBytes(size) {
-    const content = { schema: '2.0', body: { elements: [] }, padding: '' };
-    const fixedBytes = Buffer.byteLength(JSON.stringify(content));
-    content.padding = 'x'.repeat(size - fixedBytes);
-    assert.equal(Buffer.byteLength(JSON.stringify(content)), size);
-    return content;
-  }
-  assert.equal((await api(request({ kind: 'create', conversationId: 'chat', idempotencyKey: 'interactive-exact', messageKind: 'interactive', content: contentAtBytes(28_000) }))).status, 202);
-  await assert.rejects(api(request({ kind: 'create', conversationId: 'chat', idempotencyKey: 'interactive-over', messageKind: 'interactive', content: contentAtBytes(28_001) })), { code: 'invalid_content', status: 400 });
-  await assert.rejects(api(request({ kind: 'create', conversationId: 'chat', idempotencyKey: 'post-over', messageKind: 'post', content: contentAtBytes(20_001) })), { code: 'invalid_content', status: 400 });
-  assert.equal(effects.length, 1);
-  assert.equal(Buffer.byteLength(JSON.stringify(effects[0].payload.content)), 28_000);
 });
 test('error reporter is bounded, sanitized and cannot recursively report failures', async () => {
   const output = [];
