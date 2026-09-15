@@ -174,8 +174,14 @@ test('real local process is live but never integration-ready, without any creden
   const ready = await fetch(`${url}/health/ready`);
   assert.equal(ready.status, 503);
   assert.deepEqual(await ready.json(), { ready: false, reason: 'components_unconfigured', missing: ['feishu', 'codex', 'store'] });
-  const unavailable = await fetch(`${url}/api/messages`, { headers: { authorization: `Bearer ${sentinel}` } });
-  assert.equal(unavailable.status, 404);
+  for (const path of ['/api/messages', '/v1/runs/fixture', '/v1/runs/fixture/events', '/v1/runs/fixture/resources/0', '/v1/deliveries/fixture']) {
+    const unavailable = await fetch(`${url}${path}`, { headers: { authorization: `Bearer ${sentinel}` } });
+    assert.equal(unavailable.status, 404, path);
+  }
+  for (const path of ['/v1/runs', '/v1/deliveries', '/v1/uploads']) {
+    const unavailable = await fetch(`${url}${path}`, { method: 'POST', headers: { authorization: `Bearer ${sentinel}` }, body: '{}' });
+    assert.equal(unavailable.status, 405, path);
+  }
   const post = await fetch(`${url}/health/live`, { method: 'POST', body: sentinel });
   assert.equal(post.status, 405);
   app.child.kill('SIGTERM');

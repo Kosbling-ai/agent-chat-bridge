@@ -7,13 +7,9 @@ import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 import { createMysqlStore } from '../src/storage/store.mjs';
 import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
 import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
-import { createApi } from '../src/core/api.mjs';
 import { createFeishuReplies } from '../src/channels/feishu/replies.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 import { observeExecutionCard } from '../src/channels/feishu/execution-card.mjs';
-import { validateConfig } from '../src/config.mjs';
-import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
-import { Readable } from 'node:stream';
 
 const enabled = Boolean(process.env.BRIDGE_TEST_PASSWORD);
 const refs = Object.fromEntries(
@@ -39,22 +35,6 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal(duplicate.id, first.id);
     assert.equal(duplicate.duplicate, true);
     await assert.rejects(store.upsert({ ...input, prompt: 'changed' }), { code: 'job_conflict' });
-    const queuedInput = { ...input, idempotencyKey: 'queue-policy', messageId: 'system:queue-policy',
-      initialResult: { policy: { queueIfBusy: true } }, queueIfBusySpecified: true, requestedQueueIfBusy: true };
-    const queued = await store.upsert(queuedInput);
-    assert.equal((await store.upsert(queuedInput)).id, queued.id);
-    assert.equal((await store.upsert({ ...queuedInput, queueIfBusySpecified: false,
-      initialResult: { policy: { queueIfBusy: false } } })).id, queued.id,
-    'an omitted per-run option keeps the persisted policy');
-    await assert.rejects(store.upsert({ ...queuedInput, requestedQueueIfBusy: false,
-      initialResult: { policy: { queueIfBusy: false } } }), { code: 'job_conflict' });
-    const legacyPolicy = await store.upsert({ ...input, idempotencyKey: 'legacy-queue-policy',
-      messageId: 'system:legacy-queue-policy', initialResult: {} });
-    assert.equal((await store.upsert({ ...input, idempotencyKey: 'legacy-queue-policy',
-      messageId: 'system:legacy-queue-policy', initialResult: { policy: { queueIfBusy: false } },
-      queueIfBusySpecified: true, requestedQueueIfBusy: false })).id, legacyPolicy.id);
-    await pool.execute('DELETE FROM assistant_codex_forward_jobs WHERE public_run_id IN (?,?)', [queued.id, legacyPolicy.id]);
-
     const [claimed] = await store.claim({ owner: 'worker-a', leaseMs: 100, limit: 1 });
     assert.equal(claimed.id, first.id);
     await assert.rejects(
@@ -405,28 +385,6 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const context = await inbound.loadRecentGroupContext({ connectionId: 'fixture', chatId: 'chat', beforeMs: 2100 });
     assert.deepEqual(context, []);
 
-    const apiConfig = validateConfig({
-      schemaVersion: 1,
-      storage: { hostEnv: 'DB_HOST', portEnv: 'DB_PORT', userEnv: 'DB_USER', passwordEnv: 'DB_PASSWORD', databaseEnv: 'DB_DATABASE' },
-      codex: { bin: './codex', cwd: './workspace', envNames: [] },
-      feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot' },
-      routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true }] },
-      auth: { clients: [{ id: 'api-caller', tokenEnv: 'API_TOKEN', conversationIds: ['chat'], admin: false }] },
-      hooks: [],
-    });
-    const runtime = createForwardRuntime({ jobs: store, sessions: {}, executor: {}, replies: {}, authorize: async () => true });
-    const token = 'synthetic-token-at-least-24-characters';
-    const api = createApi({ config: apiConfig, store: communication, forwardRuntime: runtime, chat: {}, tokens: { 'api-caller': token } });
-    const post = (idempotencyKey, executionNamespace) => Object.assign(Readable.from([Buffer.from(JSON.stringify({ conversationId: 'chat', idempotencyKey, executionNamespace, deliveryMode: 'caller', text: 'scheduled' }))]), {
-      method: 'POST', url: '/v1/runs', headers: { authorization: `Bearer ${token}` },
-    });
-    await api(post('scheduled-a', 'namespace-a'));
-    await api(post('scheduled-b', 'namespace-b'));
-    const [identities] = await pool.query("SELECT caller_id,sender_open_id,source_message_id FROM assistant_codex_forward_jobs WHERE caller_id IN ('live','api-caller') ORDER BY caller_id,sender_open_id");
-    const apiIdentities = identities.filter(row => row.caller_id === 'api-caller').map(row => row.sender_open_id).sort();
-    assert.deepEqual(apiIdentities, [deriveExecutionScope('api-caller', 'namespace-a'), deriveExecutionScope('api-caller', 'namespace-b')].sort());
-    assert.equal(identities.some(row => row.caller_id === 'live'), false);
-    assert(identities.filter(row => row.caller_id === 'api-caller').every(row => row.source_message_id === null));
     await communication.close();
   } finally {
     if (!pool.pool?._closed) await pool.end();
