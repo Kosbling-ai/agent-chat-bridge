@@ -16,7 +16,7 @@
 
 hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lark-cli 等自身查询接口为数据真源，并保留业务轮询兜底及双入口 messageId 去重；bridge 不迁入业务回补、历史同步、缓存或 cron，也不让业务另建飞书 WebSocket。
 
-HTTP 监听器只公开 `GET /health/live` 和 `GET /health/ready`。原 `/v1` run、event、resource、recovery、delivery 和 upload 路径均不再提供；未知 GET 返回 404，非 GET 请求返回 405。业务系统只消费配置的 outbound hook，并保留自己的原生 SDK、Codex、调度和消息投递链路。配置中的 `auth.clients` 已失效且会被严格校验拒绝；hook token 继续由各 `hooks[].tokenEnv` 引用。
+HTTP 监听器只公开 `GET /health/live` 和 `GET /health/ready`。原 `/v1` run、event、resource、recovery、delivery 和 upload 路径均不再提供；未知 GET 返回 404，非 GET 请求返回 405。业务系统只消费配置的 outbound hook，并保留自己的原生 SDK、Codex、调度和消息投递链路。原顶层 `auth` 配置（包括空对象）已失效且会被严格校验拒绝；hook token 继续由各 `hooks[].tokenEnv` 引用。
 
 普通任务收到 `CODEX_THREAD_BUSY` 后第一次即走失败投递，即使 turn/start 的原生接收结果仍未知，也不等待下一次 claim；原卡片/回复链提示“会话被其他客户端占用，请释放后重试。原会话绑定保持不变。”其他可重试入场失败默认最多 3 次、每次相隔 60 秒；`codex.jobRetryMs` 允许 10 秒到 30 分钟，`codex.jobMaxAttempts` 允许 1 到 10。bridge 不自动新建会话或更换原 binding。
 
@@ -28,7 +28,7 @@ HTTP 监听器只公开 `GET /health/live` 和 `GET /health/ready`。原 `/v1` r
 
 bridge 内部投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`。投递失败或未知不会重跑已经完成的模型 turn。飞书明确返回非零 API 码时记为确认拒绝；返回格式异常、SDK 传输异常或超时仍记为未知，不自动重发另一条消息。
 
-恢复循环先串行处理 reply-pending，再串行处理最多 5 条可执行任务，并阻止重入。已有 start intent、bound/native identity、未知 native 结果或未确认投递效果的旧行保持隔离，不重新提交或重发。历史 API/system 行不会由当前版本新建，也不会自动迁移、删除或重放；本次不清理数据库历史结构。
+恢复循环先串行处理 reply-pending，再串行处理最多 5 条可执行任务，并阻止重入。已有 start intent、bound/native identity、未知 native 结果或未确认投递效果的旧行保持隔离，不重新提交或重发。历史 API/system 行不会由当前版本新建，也不会自动迁移或删除；它们仍按现有的保守恢复与隔离规则处理。本次不清理数据库历史结构。
 
 迁移 002–003 只用于 bridge 自己的新 MySQL schema，并非把 Kosbling 生产/P 原库原地转换成 0.2.0。启动只校验迁移账本，不自动执行 DDL；新开发实例应使用空的独立 schema 显式迁移。已有 0.1.1 bridge 试用库如需升级，必须先停唯一 writer，并把数据库与 workspace/outbox 一起备份。应用 002–003 后回退 0.1.1 需要恢复旧库快照或使用另一份兼容 schema，不能删迁移记录假装降级。
 

@@ -4,7 +4,7 @@
 
 - Narrow business integration to durable outbound hooks. Remove the public `/v1` run, event, resource, recovery, message-delivery and upload endpoints together with bearer-client configuration and caller-only run policy.
 - Preserve the human Feishu bridge path for Codex execution cards, Typing, replies, attachments, stop and fork callbacks, and durable internal recovery. An explicit non-zero Feishu response is a confirmed rejection, while malformed responses, thrown transport errors and timeouts remain unknown and are not automatically resent.
-- Remove the obsolete `auth.clients` configuration. Existing configs must delete that block before upgrade; per-hook `hooks[].tokenEnv` remains required. Historical API/system rows and the existing storage schema are not automatically migrated or deleted.
+- Remove the obsolete top-level `auth` configuration. Existing configs must delete the entire block, including an empty object, before upgrade; per-hook `hooks[].tokenEnv` remains required. Historical API/system rows and the existing storage schema are not automatically migrated or deleted.
 
 No database migration is added. Validation for this change uses offline fixtures; no real database, Feishu or Codex call was made.
 
