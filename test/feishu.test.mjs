@@ -159,8 +159,9 @@ test('send/reply preserve stable UUID and SDK targets, no automatic retry', asyn
   assert.throws(() => chat.sendMessage({ ...send, kind: 'audio' }));
 });
 
-test('write uncertainty survives timeout and thrown network errors without leaking payload', async () => {
-  for (const handler of [() => { throw new Error('token secret'); }, () => new Promise(() => {})]) {
+test('write uncertainty survives timeout, thrown errors and malformed responses without leaking payload', async () => {
+  for (const handler of [() => { throw new Error('token secret'); }, () => new Promise(() => {}),
+    () => null, () => ({}), () => ({ code: '999' })]) {
     const { chat, calls } = fakeChat(handler, { timeoutMs: 10 });
     await assert.rejects(chat.sendMessage(send), (error) => error.outcome === 'unknown' && !error.message.includes('secret'));
     assert.equal(calls.length, 1);
