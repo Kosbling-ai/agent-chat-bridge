@@ -21,4 +21,3 @@ agent-chat-bridge import-bindings --config /path/to/bridge.json --input /path/to
 ```
 
 apply 会取得目标 connection 的 writer lock，因此目标 bridge 服务必须停止；目标库存在 `pending`、`running`、`reply_pending` 或 `held` forward job 也会拒绝。全部新增绑定位于同一个事务中：已存在且 native thread 相同的绑定保持原值并作为幂等 no-op，不同绑定冲突会让整批失败。若 COMMIT 结果未知，使用同一快照重新检查；稳定 identity 会把已经提交的行识别为不改值的 no-op。
-
