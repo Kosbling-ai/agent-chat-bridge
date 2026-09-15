@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.6] — Unreleased
+
+- Preserve the existing interactive-card budget by accepting up to 28,000 UTF-8 bytes at the delivery API boundary. Text and post deliveries retain their 20,000-byte limit, and the provider client retains its 30,000-byte guard.
+- Add a dry-run-first operator CLI for importing strictly validated legacy Codex thread bindings. Apply holds the target writer lock, preserves source timestamps, rejects active target jobs and conflicting thread ownership, and never imports jobs or invokes Codex.
+- Preserve a safe asynchronous delivery reason: an explicit non-zero Feishu response is a confirmed rejection, while malformed responses, thrown transport errors and timeouts remain unknown and cannot trigger a different fallback delivery.
+
+No database migration is added. Validation uses offline API, provider, CLI and disposable MySQL fixtures; no real Feishu or Codex acceptance was run.
+
 ## [0.2.5] — Unreleased
 
 - Migration 004 scopes five assistant runtime tables by `connection_id`, including their uniqueness, recovery and context indexes. It also prefixes bridge claim indexes with the existing connection owner. Existing bridge rows keep their ownership.
@@ -8,8 +16,6 @@
 - Ordinary Feishu and API runs now send one failed occupied-session notice on the first `CODEX_THREAD_BUSY` result, including turn-start unknown outcomes. Trusted system busy queue behavior remains unchanged.
 - A busy Feishu failure card can explicitly fork the bound Codex thread with its stored history and switch that conversation to the verified fork. The operation never replays the failed prompt; native or commit uncertainty is recorded without retry and requires durable-state inspection.
 - Optionally map supported Codex user-input requests to a separate Feishu form for the current turn. The integration is disabled by default and requires explicit `codex.requestUserInput: true`; the original sender can submit multiple single-choice or free-text answers once, while secret, expired, resolved or disconnected requests are rejected without fabricated answers or RPC replay.
-- Add a dry-run-first operator CLI for importing strictly validated legacy Codex thread bindings. Apply holds the target writer lock, preserves source timestamps, rejects active target jobs and conflicting thread ownership, and never imports jobs or invokes Codex.
-- Preserve a safe asynchronous delivery reason: an explicit non-zero Feishu response is a confirmed rejection, while thrown transport errors and timeouts remain unknown and cannot trigger a different fallback delivery.
 
 ## [0.2.4] — Unreleased
 
