@@ -53,4 +53,3 @@ agent-chat-bridge import-bindings --config /path/to/bridge.json --input /path/to
 ```
 
 Apply obtains the connection writer lock, so the target bridge service must be stopped. It also rejects any target `pending`, `running`, `reply_pending`, or `held` forward job. Inserts are one transaction: an identical existing binding is an unchanged no-op, while a different existing binding aborts the whole import. A commit reported as unknown must be inspected by rerunning the same snapshot; the stable identities make that retry read-only for rows already committed.
-
