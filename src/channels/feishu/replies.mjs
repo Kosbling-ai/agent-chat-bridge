@@ -1,23 +1,10 @@
 import { createHash } from 'node:crypto';
 import { unlink } from 'node:fs/promises';
-import { basename, extname } from 'node:path';
+import { basename } from 'node:path';
 import { canDeliverOutboxAttachments } from '../../agents/codex/outbox-policy.mjs';
 import { adaptLocalMarkdownImages, referencedCollectedLocalImages } from './markdown-images.mjs';
 
 const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
-const imageTypes = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
-export function publicAttachments(attachments = []) {
-  return attachments.map((value, index) => {
-    const path = typeof value === 'string' ? value : value?.filePath;
-    const fileName = value?.fileName || basename(path || `attachment-${index}`);
-    return {
-      id: String(index), fileName,
-      size: Number(value?.size || 0) || null,
-      kind: value?.kind || (imageTypes.has(extname(fileName).toLowerCase()) ? 'image' : 'file'),
-    };
-  });
-}
-
 export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, connectionId, workspace, allowedGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
   function artifactScope(job, result = job.result || {}) {
     const execution = result.execution || job.result?.execution || {};
@@ -135,12 +122,6 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
         { attachments: attachments.filter(item => ['sent', 'cleaned'].includes(item.status)).length });
       return { messages: text.sent + failureMessages, attachments, status };
     },
-    async readResource(job, index) {
-      const artifact = (job.result?.attachments || [])[index];
-      if (!artifact?.ref || !outbound) return null;
-      return outbound.read({ scope: artifactScope(job), ref: artifact.ref });
-    },
-    publicAttachments,
   });
 }
 
