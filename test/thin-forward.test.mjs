@@ -12,10 +12,45 @@ import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
 const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},auth:{clients:[{id:'caller',tokenEnv:'TEST_TOKEN',conversationIds:['chat'],admin:true}]},hooks:[]};
 const flush=()=>new Promise(resolve=>setTimeout(resolve,20));
 
+async function communicationDeliveryFailure(error) {
+  let claimed = false;
+  let settlement;
+  const logs = [];
+  const row = { id: 'effect', kind: 'create', payload: { kind: 'interactive', content: { schema: '2.0' } },
+    platformUuid: 'uuid', conversationId: 'chat', leaseToken: 'lease' };
+  const store = {
+    async claimJobs() { return []; },
+    async claimOutbox() { if (claimed) return []; claimed = true; return [row]; },
+    async settleOutbox(value) { settlement = value; },
+    async getOutbox() { return null; },
+  };
+  const runtime = createCommunicationRuntime({ config: validateConfig(base), store,
+    chat: { async sendMessage() { throw error; } }, log: (...entry) => logs.push(entry) });
+  runtime.start();
+  for (let attempt = 0; attempt < 20 && !settlement; attempt += 1) await flush();
+  await runtime.stop();
+  assert.ok(settlement);
+  return { settlement, logs };
+}
+
 test('group capabilities default to both and allow either side or neither',()=>{
   assert.deepEqual(validateConfig(base).routing.groups[0].capabilities,['bridge','hook']);
   for(const capabilities of [['bridge'],['hook'],[]])assert.deepEqual(validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],capabilities}]}}).routing.groups[0].capabilities,capabilities);
   assert.throws(()=>validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],capabilities:['unknown']}]}}),{code:'invalid_group_capabilities'});
+});
+
+test('delivery persists definite Feishu rejection separately from write uncertainty', async () => {
+  for (const [error, status, code] of [
+    [Object.assign(new Error('provider secret'), { code: 'feishu_api_rejected', outcome: 'failed' }), 'failed', 'feishu_api_rejected'],
+    [Object.assign(new Error('local detail'), { code: 'invalid_message_content', outcome: 'failed' }), 'failed', 'invalid_content'],
+    [Object.assign(new Error('other detail'), { code: 'other_failure', outcome: 'failed' }), 'failed', 'chat_delivery_failed'],
+    [Object.assign(new Error('network secret'), { code: 'feishu_transport_error', outcome: 'unknown' }), 'unknown', 'chat_delivery_unconfirmed'],
+  ]) {
+    const { settlement, logs } = await communicationDeliveryFailure(error);
+    assert.equal(settlement.status, status);
+    assert.equal(settlement.errorCode, code);
+    assert.equal(JSON.stringify(logs).includes('secret'), false);
+  }
 });
 
 test('group mention can register forward and hook branches without either consuming the other',async()=>{

@@ -18,7 +18,7 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 普通运行接口为 `POST /v1/runs`，接受可选 `executionNamespace` 与 `deliveryMode:"bridge"|"caller"`，仍返回 `202 {id,duplicate}`。bridge 模式负责 Typing、执行卡片、停止按钮、答案与附件；caller 模式只执行并保存结果，不自动发送这些飞书效果。`GET /v1/runs/:id` 分开暴露执行和投递状态，并保留 `rawAnswer`、native 与 held 事实；事件接口按该 run 的 binding/thread/chat/message 精确过滤且只返回安全公开投影。附件资源接口需通过相同会话授权，且不暴露本机绝对路径。
 
-`POST /v1/deliveries` 的 create/reply 交互卡片按完整 JSON 序列化后最多 28,000 字节，与 bridge 执行卡预算一致；text、post 等其他消息内容继续使用 20,000 字节限制，底层飞书客户端仍保留 30,000 字节传输防线。超限请求在写入 outbox 前返回 `invalid_content`。
+`POST /v1/deliveries` 的 create/reply 交互卡片按完整 JSON 序列化后最多 28,000 字节，与 bridge 执行卡预算一致；text、post 等其他消息内容继续使用 20,000 字节限制，底层飞书客户端仍保留 30,000 字节传输防线。超限请求在写入 outbox 前返回 `invalid_content`。飞书实际返回非零 API 码时，异步投递记为 `failed` 和 `feishu_api_rejected`；本地内容拒绝记为 `failed` 和 `invalid_content`。SDK 抛出的传输异常或超时仍记为 `unknown` 和 `chat_delivery_unconfirmed`，调用方不得据此改发另一条消息。
 
 普通任务收到 `CODEX_THREAD_BUSY` 后第一次即走失败投递，即使 turn/start 的原生接收结果仍未知，也不等待下一次 claim；原卡片/回复链提示“会话被其他客户端占用，请释放后重试。原会话绑定保持不变。”其他可重试入场失败默认最多 3 次、每次相隔 60 秒；`codex.jobRetryMs` 允许 10 秒到 30 分钟，`codex.jobMaxAttempts` 允许 1 到 10。bridge 不自动新建会话或更换原 binding。
 

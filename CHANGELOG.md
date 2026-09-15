@@ -9,6 +9,7 @@
 - A busy Feishu failure card can explicitly fork the bound Codex thread with its stored history and switch that conversation to the verified fork. The operation never replays the failed prompt; native or commit uncertainty is recorded without retry and requires durable-state inspection.
 - Optionally map supported Codex user-input requests to a separate Feishu form for the current turn. The integration is disabled by default and requires explicit `codex.requestUserInput: true`; the original sender can submit multiple single-choice or free-text answers once, while secret, expired, resolved or disconnected requests are rejected without fabricated answers or RPC replay.
 - Add a dry-run-first operator CLI for importing strictly validated legacy Codex thread bindings. Apply holds the target writer lock, preserves source timestamps, rejects active target jobs and conflicting thread ownership, and never imports jobs or invokes Codex.
+- Preserve a safe asynchronous delivery reason: an explicit non-zero Feishu response is a confirmed rejection, while thrown transport errors and timeouts remain unknown and cannot trigger a different fallback delivery.
 
 ## [0.2.4] — Unreleased
 
