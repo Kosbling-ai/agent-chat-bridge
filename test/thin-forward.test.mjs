@@ -239,7 +239,18 @@ test('run API freezes namespace/delivery mode and rejects ledger management afte
   const token='synthetic-token-at-least-24-characters';const submitted=[];const current={id:'run',conversationId:'chat',status:'completed'};const forwardRuntime={submit:async input=>{submitted.push(input);return{id:'run',duplicate:false};},getRun:async()=>current,readRunEvents:async()=>({items:[{sequence:'9007199254740993',payload:{type:'progress'}}],nextCursor:'9007199254740993'}),getResource:async({index})=>index===0?{fileName:'answer.txt',kind:'file',size:6,base64:'YW5zd2Vy'}:null};const api=createApi({config:validateConfig(base),store:{getRecovery:async()=>({id:'recovery',connectionId:'test',conversationId:'chat',status:'applied'})},chat:{},tokens:{caller:token},forwardRuntime});
   const request=(method,url,value)=>Object.assign(Readable.from(value?[Buffer.from(JSON.stringify(value))]:[]),{method,url,headers:{authorization:`Bearer ${token}`}});
   assert.equal((await api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'daily:1',text:'prompt',executionNamespace:'daily',deliveryMode:'caller'}))).status,202);assert.equal(submitted[0].deliveryMode,'caller');
+  assert.equal(submitted[0].queueIfBusy,false);assert.equal(submitted[0].queueIfBusySpecified,false);
   assert.equal(submitted[0].message.messageId,undefined);
+  await assert.rejects(api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'busy-denied',text:'prompt',executionNamespace:'daily',queueIfBusy:true})),{status:403,code:'forbidden'});
+  await assert.rejects(api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'busy-invalid',text:'prompt',executionNamespace:'daily',queueIfBusy:'false'})),{status:400,code:'invalid_queue_if_busy'});
+  const queuedConfig=validateConfig({...base,auth:{clients:[{...base.auth.clients[0],queueIfBusy:true}]}});
+  const queuedApi=createApi({config:queuedConfig,store:{},chat:{},tokens:{caller:token},forwardRuntime});
+  await queuedApi(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'busy-default',text:'prompt',executionNamespace:'daily'}));
+  await queuedApi(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'busy-disabled',text:'prompt',executionNamespace:'daily',queueIfBusy:false}));
+  await queuedApi(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'busy-enabled',text:'prompt',executionNamespace:'daily',queueIfBusy:true}));
+  assert.deepEqual(submitted.slice(-3).map(item=>[item.queueIfBusy,item.queueIfBusySpecified,item.requestedQueueIfBusy]),[
+    [true,false,undefined],[false,true,false],[true,true,true],
+  ]);
   await assert.rejects(api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'long',text:'prompt',executionNamespace:'a'.repeat(129)})),{status:400,code:'invalid_execution_namespace'});
   assert.equal((await api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'slash',text:'prompt',executionNamespace:'team/daily'}))).status,202);
   const events=await api(request('GET','/v1/runs/run/events?after=9007199254740992'));

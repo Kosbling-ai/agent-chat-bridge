@@ -118,6 +118,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       executionNamespace: input.executionNamespace || '', deliveryMode: input.deliveryMode || input.delivery?.mode || 'bridge',
       prompt: input.prompt || input.message?.text || '', groupChatContext: input.executionNamespace ? null : (input.groupChatContext || null),
       contextEntries: input.executionNamespace ? [] : (input.context || []), nextAttemptAt: input.notBefore,
+      queueIfBusySpecified: input.queueIfBusySpecified === true,
+      requestedQueueIfBusy: input.requestedQueueIfBusy,
       initialResult: { inputEvent: input.message?.event ?? null, policy: { queueIfBusy: input.queueIfBusy === true } },
     });
   }

@@ -16,7 +16,7 @@
 
 hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lark-cli 等自身查询接口为数据真源，并保留业务轮询兜底及双入口 messageId 去重；bridge 不迁入业务回补、历史同步、缓存或 cron，也不让业务另建飞书 WebSocket。
 
-普通运行接口为 `POST /v1/runs`，接受可选 `executionNamespace` 与 `deliveryMode:"bridge"|"caller"`，仍返回 `202 {id,duplicate}`。bridge 模式负责 Typing、执行卡片、停止按钮、答案与附件；caller 模式只执行并保存结果，不自动发送这些飞书效果。`GET /v1/runs/:id` 分开暴露执行和投递状态，并保留 `rawAnswer`、native 与 held 事实；事件接口按该 run 的 binding/thread/chat/message 精确过滤且只返回安全公开投影。附件资源接口需通过相同会话授权，且不暴露本机绝对路径。
+普通运行接口为 `POST /v1/runs`，接受可选 `executionNamespace`、`deliveryMode:"bridge"|"caller"` 与 boolean `queueIfBusy`，仍返回 `202 {id,duplicate}`。bridge 模式负责 Typing、执行卡片、停止按钮、答案与附件；caller 模式只执行并保存结果，不自动发送这些飞书效果。`GET /v1/runs/:id` 分开暴露执行和投递状态，并保留 `rawAnswer`、native 与 held 事实；事件接口按该 run 的 binding/thread/chat/message 精确过滤且只返回安全公开投影。附件资源接口需通过相同会话授权，且不暴露本机绝对路径。
 
 `POST /v1/deliveries` 的 create/reply 交互卡片按完整 JSON 序列化后最多 28,000 字节，与 bridge 执行卡预算一致；text、post 等其他消息内容继续使用 20,000 字节限制，底层飞书客户端仍保留 30,000 字节传输防线。超限请求在写入 outbox 前返回 `invalid_content`。飞书实际返回非零 API 码时，异步投递记为 `failed` 和 `feishu_api_rejected`；本地内容拒绝记为 `failed` 和 `invalid_content`。SDK 抛出的传输异常或超时仍记为 `unknown` 和 `chat_delivery_unconfirmed`，调用方不得据此改发另一条消息。
 
@@ -24,7 +24,7 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 真实飞书用户已有 binding 时，busy 失败卡片提供“保留历史并新建会话”。只有原消息发送者可点击，回调会重新核对当前 bot 范围内的 job、卡片、聊天、授权和冻结的源线程；它只执行一次显式 `thread/fork`，使用当前 bridge 的工作目录与权限默认值，并在同一 binding admission 锁内完成持久化与旧线程 CAS 切换。该操作不 resume/interrupt 源线程、不启动 turn，也不重放失败消息。原生明确拒绝或 binding 已变化时保留当前 binding；原生结果或数据库提交结果未知时会记录为未确认，不会自动重试，需管理员核查持久状态。跨进程 writer 占用时 native 是否支持 fork 取决于 Codex 实现，bridge 会将拒绝作为可见失败处理，不假定一定成功。
 
-忙碌排队例外只授予配置中显式启用 `queueIfBusy` 的认证客户端：已持久化且非空的 `executionNamespace` 必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。请求 payload、sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭；恢复流程不再添加 Typing。
+忙碌排队例外只授予配置中显式启用 `queueIfBusy` 的认证客户端：已持久化且非空的 `executionNamespace` 必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。已获授权的 caller 可在单次 run 请求中传 `false` 关闭其配置默认值；只有 caller 本身已获授权时才能传 `true`，省略则沿用 caller 默认值。有效策略随 run 持久化，显式冲突的幂等重放会被拒绝。请求 payload、sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭；恢复流程不再添加 Typing。
 
 执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
 

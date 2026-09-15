@@ -98,6 +98,10 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [connectionId,publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),input.sourceMessageId || null,required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,safeJson(initialResult),'',createdAt,createdAt]);
         const [[found]] = await connection.execute('SELECT id AS internal_id, assistant_codex_forward_jobs.* FROM assistant_codex_forward_jobs WHERE connection_id=? AND request_key_hash=? LIMIT 1', [connectionId,keyHash]);
         if (!found || found.request_hash !== requestHash) throw new StoreError('job_conflict');
+        if (input.queueIfBusySpecified === true
+          && (parse(found.result_json)?.policy?.queueIfBusy === true) !== input.requestedQueueIfBusy) {
+          throw new StoreError('job_conflict');
+        }
         return { ...row(found), duplicate: found.public_run_id !== publicRunId };
       });
     },

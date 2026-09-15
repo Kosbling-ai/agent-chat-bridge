@@ -39,6 +39,21 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     assert.equal(duplicate.id, first.id);
     assert.equal(duplicate.duplicate, true);
     await assert.rejects(store.upsert({ ...input, prompt: 'changed' }), { code: 'job_conflict' });
+    const queuedInput = { ...input, idempotencyKey: 'queue-policy', messageId: 'system:queue-policy',
+      initialResult: { policy: { queueIfBusy: true } }, queueIfBusySpecified: true, requestedQueueIfBusy: true };
+    const queued = await store.upsert(queuedInput);
+    assert.equal((await store.upsert(queuedInput)).id, queued.id);
+    assert.equal((await store.upsert({ ...queuedInput, queueIfBusySpecified: false,
+      initialResult: { policy: { queueIfBusy: false } } })).id, queued.id,
+    'an omitted per-run option keeps the persisted policy');
+    await assert.rejects(store.upsert({ ...queuedInput, requestedQueueIfBusy: false,
+      initialResult: { policy: { queueIfBusy: false } } }), { code: 'job_conflict' });
+    const legacyPolicy = await store.upsert({ ...input, idempotencyKey: 'legacy-queue-policy',
+      messageId: 'system:legacy-queue-policy', initialResult: {} });
+    assert.equal((await store.upsert({ ...input, idempotencyKey: 'legacy-queue-policy',
+      messageId: 'system:legacy-queue-policy', initialResult: { policy: { queueIfBusy: false } },
+      queueIfBusySpecified: true, requestedQueueIfBusy: false })).id, legacyPolicy.id);
+    await pool.execute('DELETE FROM assistant_codex_forward_jobs WHERE public_run_id IN (?,?)', [queued.id, legacyPolicy.id]);
 
     const [claimed] = await store.claim({ owner: 'worker-a', leaseMs: 100, limit: 1 });
     assert.equal(claimed.id, first.id);

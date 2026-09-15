@@ -59,14 +59,19 @@ export function createApi({ config, store, forwardRuntime, chat, tokens }) {
     const url = new URL(request.url, 'http://bridge.local');
     const path = url.pathname;
     if (request.method === 'POST' && path === '/v1/runs') {
-      const input = fields(await body(request, 512 * 1024), ['conversationId', 'idempotencyKey', 'text', 'executionNamespace', 'deliveryMode'], ['conversationId', 'idempotencyKey']);
+      const input = fields(await body(request, 512 * 1024), ['conversationId', 'idempotencyKey', 'text', 'executionNamespace', 'deliveryMode', 'queueIfBusy'], ['conversationId', 'idempotencyKey']);
       if (typeof input.text !== 'string' || !input.text.trim()) throw new ApiError('invalid_text');
       if (Buffer.byteLength(input.text) > 64 * 1024) throw new ApiError('text_too_large', 413);
       if (input.executionNamespace !== undefined && (typeof input.executionNamespace !== 'string' || !/^[a-z0-9][a-z0-9._:/-]{0,127}$/i.test(input.executionNamespace))) throw new ApiError('invalid_execution_namespace');
       if (input.deliveryMode !== undefined && !['bridge','caller'].includes(input.deliveryMode)) throw new ApiError('invalid_delivery_mode');
+      const queueIfBusySpecified = Object.hasOwn(input, 'queueIfBusy');
+      if (queueIfBusySpecified && typeof input.queueIfBusy !== 'boolean') throw new ApiError('invalid_queue_if_busy');
+      if (input.queueIfBusy === true && client.queueIfBusy !== true) throw new ApiError('forbidden', 403);
       authorize(client, input.conversationId);
       const idempotencyKey = identifier(input.idempotencyKey, 255);
-      const result = await forwardRuntime.submit({source:'api',callerId:client.id,idempotencyKey,executionNamespace:input.executionNamespace,message:{conversationId:input.conversationId,conversationType:'group',text:input.text},actor:{type:'service',id:client.id},prompt:input.text,deliveryMode:input.deliveryMode||'bridge',queueIfBusy:client.queueIfBusy===true});
+      const result = await forwardRuntime.submit({source:'api',callerId:client.id,idempotencyKey,executionNamespace:input.executionNamespace,message:{conversationId:input.conversationId,conversationType:'group',text:input.text},actor:{type:'service',id:client.id},prompt:input.text,deliveryMode:input.deliveryMode||'bridge',
+        queueIfBusy: queueIfBusySpecified ? input.queueIfBusy : client.queueIfBusy===true,
+        queueIfBusySpecified, requestedQueueIfBusy: input.queueIfBusy});
       return { status: 202, body: { id: result.id, duplicate: result.duplicate } };
     }
     const resource = /^\/v1\/runs\/([\w-]+)\/resources\/(\d+)$/.exec(path);
