@@ -1,29 +1,35 @@
+import {DEFAULT_CARD_TEXT} from './card-text.mjs';
+import {escapeMarkdown,formatText} from '../../shared/text-template.mjs';
+
 const md = content => ({ tag:'markdown', content });
 const plain = content => ({ tag:'plain_text', content });
 
-export function renderUserInputCard(userInput, { displayName='agent-chat-bridge', terminal }={}) {
+export function renderUserInputCard(userInput, { displayName='agent-chat-bridge', terminal, cardText }={}) {
+  const copy={...DEFAULT_CARD_TEXT,...cardText};
+  const title=copy.title||displayName;
   const elements=[];
   if(terminal){
-    elements.push(md(terminal==='submitted'?'**回答已提交。**':terminal==='unknown'?'**提交状态未确认，请勿重复提交。**':'**该提问已失效。**'));
+    const status=terminal==='submitted'?copy.inputSubmitted:terminal==='unknown'?copy.inputUnknown:copy.inputExpired;
+    elements.push(md(`**${escapeMarkdown(status)}**`));
   }else{
     const fields=[];
     userInput.questions.forEach((question,index)=>{
       fields.push(md(`**${question.header}**\n${question.question}`));
       if(question.options.length){
-        fields.push({tag:'select_static',name:`q_${index}_choice`,placeholder:plain('请选择'),required:!question.isOther,
+        fields.push({tag:'select_static',name:`q_${index}_choice`,placeholder:plain(copy.inputChoose),required:!question.isOther,
           options:question.options.map((option,optionIndex)=>({text:plain(option.description?`${option.label} · ${option.description}`:option.label),value:`o_${optionIndex}`}))});
       }
       if(!question.options.length||question.isOther){
-        fields.push({tag:'input',name:`q_${index}_other`,placeholder:plain(question.options.length?'其他（请填写）':'请输入回答'),
+        fields.push({tag:'input',name:`q_${index}_other`,placeholder:plain(question.options.length?copy.inputOther:copy.inputAnswer),
           input_type:'multiline_text',max_length:1000,required:!question.options.length});
       }
     });
-    fields.push({tag:'button',name:'submit_user_input',text:plain('提交回答'),type:'primary_filled',form_action_type:'submit',
+    fields.push({tag:'button',name:'submit_user_input',text:plain(copy.inputSubmit),type:'primary_filled',form_action_type:'submit',
       value:{action:'submit_user_input',jobId:userInput.jobId,requestKey:userInput.requestKey,itemId:userInput.itemId}});
     elements.push({tag:'form',name:'codex_user_input',elements:fields});
   }
-  const card={schema:'2.0',config:{update_multi:true,summary:{content:`${displayName} · Codex 提问`}},
-    header:{template:terminal==='expired'?'grey':terminal==='unknown'?'orange':'blue',title:plain(`${displayName} · 需要你的回答`)},body:{elements}};
+  const card={schema:'2.0',config:{update_multi:true,summary:{content:formatText(copy.inputSummary,{title})}},
+    header:{template:terminal==='expired'?'grey':terminal==='unknown'?'orange':'blue',title:plain(formatText(copy.inputTitle,{title}))},body:{elements}};
   if(Buffer.byteLength(JSON.stringify(card))>28000)throw Object.assign(new Error('user input card exceeds budget'),{code:'user_input_card_too_large'});
   return card;
 }
