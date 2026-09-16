@@ -16,7 +16,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextWindowMs=Number(config.codex.groupContextHours??2)*60*60*1000;
   function humanAllowed(event,group) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
-    if(event.conversationType==='p2p')return config.routing.privateUserIds.includes(event.actor.openId);
+    if(event.conversationType==='p2p')return (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId)));
     return Boolean(group&&capabilities(group).includes('bridge')&&(group.userIds===undefined||group.userIds.includes(event.actor.openId)));
   }
   function stale(event,createdAt) {

@@ -580,7 +580,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (reconciled) return { completion: Promise.resolve(reconciled) };
       binding = await maybeRollover(binding, normalized.messageId);
       binding = await ensureBindingThreadReadyWithArchiveRecovery(binding, normalized.messageId);
-      let prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
+      let prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, cardTextFile: config.cardTextFile, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
       await persistUser(binding, normalized, 'user', prompt);
       const startedAt = now();
       await options.onStartIntent?.({ binding, threadId: binding.codexSessionId, messageId: normalized.messageId, startedAt });
@@ -598,7 +598,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           loadedThreads.delete(binding.codexSessionId);
           binding = await rolloverArchivedBinding(binding, normalized.messageId, error);
           await ensureThreadReady(binding);
-          prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
+          prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, cardTextFile: config.cardTextFile, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
           await persistUser(binding, normalized, 'user', prompt);
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {

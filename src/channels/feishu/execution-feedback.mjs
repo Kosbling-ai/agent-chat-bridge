@@ -34,7 +34,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     if (unconfirmedCard(saved)) return null;
     return new ExecutionCard({
       client: cardClient, chatId: job.chatId, jobId: job.id, messageId: job.messageId,
-      displayName: config.displayName, uuid: stable(`execution-card:${job.messageId}`),
+      displayName: config.displayName, cardTextProvider: config.cardTextProvider, uuid: stable(`execution-card:${job.messageId}`),
       intervalMs: config.executionCardIntervalMs || 1000,
       persist: persistCard ? value => persist(job, state, 'executionCard', value) : async () => {},
       audit: event => sessions?.saveCodexRealtimeEvent?.({
@@ -194,7 +194,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       if (!job || !operator || job.chatId !== data?.context?.open_chat_id || job.senderOpenId !== operator
         || job.result?.executionCard?.messageId !== cardMessageId || job.status !== 'failed'
         || job.last_error !== 'CODEX_THREAD_BUSY' || candidate?.sourceThreadId !== value.expectedSourceThreadId) return toast('该卡片已失效');
-      if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator }, conversationId: job.chatId, operation: 'fork' }))) {
+      if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator }, conversationId: job.chatId, conversationType: job.chatType, operation: 'fork' }))) {
         return toast('没有切换该会话的权限', 'error');
       }
       const begun = await jobs.beginFork({ id: job.id, sourceThreadId: candidate.sourceThreadId,
@@ -238,7 +238,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     if (!job.senderOpenId.startsWith('system:') && !job.senderOpenId.startsWith('group:') && job.senderOpenId !== operator) {
       return toast('只有本次任务的发起者可以停止执行', 'error');
     }
-    if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator }, conversationId: job.chatId, operation: 'stop' }))) {
+    if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator }, conversationId: job.chatId, conversationType: job.chatType, operation: 'stop' }))) {
       return toast('没有停止该任务的权限', 'error');
     }
     const execution = job.result?.execution || {};

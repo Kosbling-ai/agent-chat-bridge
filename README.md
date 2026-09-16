@@ -33,3 +33,7 @@ node scripts/test-storage.mjs test/core.integration.test.mjs
 ```
 
 npm publishing remains disabled (`private: true`). The intended public source repository is [Kosbling-ai/agent-chat-bridge](https://github.com/Kosbling-ai/agent-chat-bridge); creating and pushing it is separate from deployment or platform acceptance. No production replacement has been performed. Licensing is pending: public visibility does not itself grant an open-source license. See [source provenance](docs/provenance.md).
+
+### Custom execution-card text
+
+See [per-bot card text](docs/card-text.md) for opt-in, hot-loaded wording that each bot can edit in its workspace.

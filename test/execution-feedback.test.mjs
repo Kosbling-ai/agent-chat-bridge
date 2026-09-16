@@ -216,6 +216,7 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
   let interrupts = 0;
   let stoppedIdentity;
   let authorized = true;
+  let authorization;
   const feedback = createExecutionFeedback({
     jobs: {
       async getRun() { return job; },
@@ -232,7 +233,7 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
     chat: {},
     cardClient: {},
     executor: { async interrupt() { interrupts += 1; return { status: 'requested' }; }, async inspect() { return { status:'inProgress' }; } },
-    authorize: async () => authorized,
+    authorize: async input => { authorization = input; return authorized; },
   });
   const action = {
     action: { value: { action: 'stop_execution', jobId: job.id, expectedTurnId: 'turn-1' } },
@@ -242,6 +243,7 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
 
   assert.equal((await feedback.handleCardAction(action)).toast.content, '已请求停止执行');
   assert.deepEqual(stoppedIdentity,{threadId:'thread-1',turnId:'turn-1'});
+  assert.equal(authorization.conversationType,'group');
   assert.equal((await feedback.handleCardAction(action)).toast.content, '已请求停止执行');
   assert.equal(interrupts, 1);
 

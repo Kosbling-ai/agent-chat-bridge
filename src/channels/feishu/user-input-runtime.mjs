@@ -54,7 +54,7 @@ export function createUserInputRuntime({jobs,executor,cardClient,authorize=async
     const operator=data?.operator?.open_id||''; const job=await jobs.getRun({id:String(value.jobId||'')}); const userInput=job?.result?.userInput;
     if(!job||!userInput||!operator||job.chatId!==data?.context?.open_chat_id||job.senderOpenId!==operator
       ||userInput.card?.messageId!==data?.context?.open_message_id||userInput.requestKey!==value.requestKey||userInput.itemId!==value.itemId)return toast('该提问已失效','error');
-    if(!(await authorize({source:'card',callerId:job.callerId,actor:{openId:operator},conversationId:job.chatId,operation:'user_input'})))return toast('没有回答该提问的权限','error');
+    if(!(await authorize({source:'card',callerId:job.callerId,actor:{openId:operator},conversationId:job.chatId,conversationType:job.chatType,operation:'user_input'})))return toast('没有回答该提问的权限','error');
     if(userInput.status==='submitted')return toast('回答已提交');
     if(userInput.status==='submitting')return toast('回答正在提交，状态确认前请勿重复提交');
     if(userInput.status==='unknown')return toast('提交状态未确认，请勿重复提交','error');

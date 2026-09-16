@@ -138,10 +138,16 @@ function validateRuntime(raw) {
   if (![memoryMaxRssMb, memoryMaxHeapUsedMb].every(value => Number.isFinite(value) && value >= 0)) throw new ConfigError('invalid_codex_memory_limit');
   codex.memoryMaxRssBytes = Math.round(memoryMaxRssMb * 1024 * 1024);
   codex.memoryMaxHeapUsedBytes = Math.round(memoryMaxHeapUsedMb * 1024 * 1024);
-  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaUnsupportedReply'], 'invalid_feishu_fields');
+  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'cardTextFile', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaUnsupportedReply'], 'invalid_feishu_fields');
   if (raw.feishu.catchup !== undefined && typeof raw.feishu.catchup !== 'boolean') throw new ConfigError('invalid_catchup_flag');
   const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };
   feishu.displayName = raw.feishu.displayName === undefined ? 'agent-chat-bridge' : identifier(raw.feishu.displayName, 80);
+  if (raw.feishu.cardTextFile !== undefined) {
+    const path = raw.feishu.cardTextFile;
+    if (typeof path !== 'string' || !path.trim() || path.length > 512 || path.startsWith('/')
+      || /[\\\u0000-\u001f\u007f]/u.test(path) || path.split('/').some(part => !part || part === '..' || part === '.')) throw new ConfigError('invalid_card_text_path');
+    feishu.cardTextFile = path;
+  }
   feishu.replyAsPost = raw.feishu.replyAsPost ?? true;
   if (typeof feishu.replyAsPost !== 'boolean') throw new ConfigError('invalid_feishu_reply_mode');
   feishu.maxOutputChars = raw.feishu.maxOutputChars ?? 3500;
@@ -163,7 +169,7 @@ function validateRuntime(raw) {
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
   if (raw.feishu.outputBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.outputBudgetBytes) || raw.feishu.outputBudgetBytes < 28 * 1024 * 1024 || raw.feishu.outputBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_output_budget');
   feishu.outputBudgetBytes = raw.feishu.outputBudgetBytes ?? 512 * 1024 * 1024;
-  object(raw.routing, ['version', 'privateUserIds', 'groups'], 'invalid_routing_fields');
+  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
     object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities'], 'invalid_group_fields');
@@ -174,7 +180,9 @@ function validateRuntime(raw) {
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
-  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), groups };
+  const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
+  if (typeof allowAllPrivateUsers !== 'boolean' || raw.routing.allowAllPrivateUsers === null) throw new ConfigError('invalid_private_access_policy');
+  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups };
   if (!Array.isArray(raw.auth?.clients) || !raw.auth.clients.length || raw.auth.clients.length > 100 || raw.auth.tokenEnv !== undefined) throw new ConfigError('runtime_auth_clients_required');
   const clients = raw.auth.clients.map(client => {
     object(client, ['id', 'tokenEnv', 'conversationIds', 'admin', 'queueIfBusy'], 'invalid_client_fields');
