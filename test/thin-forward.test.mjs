@@ -18,6 +18,33 @@ test('group capabilities default to both and allow either side or neither',()=>{
   assert.throws(()=>validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],capabilities:['unknown']}]}}),{code:'invalid_group_capabilities'});
 });
 
+test('private allow-all is opt-in and accepts only a boolean',()=>{
+  assert.equal(validateConfig(base).routing.allowAllPrivateUsers,false);
+  assert.equal(validateConfig({...base,routing:{...base.routing,allowAllPrivateUsers:true}}).routing.allowAllPrivateUsers,true);
+  for(const allowAllPrivateUsers of [null,'true',1])assert.throws(
+    ()=>validateConfig({...base,routing:{...base.routing,allowAllPrivateUsers}}),
+    {code:'invalid_private_access_policy'},
+  );
+});
+
+test('private allow-all admits human direct messages only and keeps groups closed',async()=>{
+  const forwarded=[];
+  const config=validateConfig({...base,routing:{...base.routing,privateUserIds:[],allowAllPrivateUsers:true}});
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async()=>({duplicate:false})},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{accepted:true};}},chat:{}});
+  const event=(id,overrides={})=>({connectionId:'test',source:'live',eventKey:id,type:'message.received',conversationId:`private-${id}`,
+    conversationType:'p2p',messageId:id,occurredAt:Date.now(),actor:{type:'user',openId:`human-${id}`,name:'Human'},
+    message:{kind:'text',content:'{"text":"hello"}',mentions:[]},...overrides});
+  await runtime.ingest(event('human'));
+  await runtime.ingest(event('app',{isApp:true}));
+  await runtime.ingest(event('self',{isSelf:true}));
+  await runtime.ingest(event('missing-open-id',{actor:{type:'user',name:'Human'}}));
+  await runtime.ingest(event('unlisted-group',{conversationId:'unlisted-group',conversationType:'group'}));
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,1);
+  assert.equal(forwarded[0].message.messageId,'human');
+});
+
 test('group mention can register forward and hook branches without either consuming the other',async()=>{
   const accepted=[];const forwarded=[];let receipts=0;const config=validateConfig({...base,hooks:[{id:'h',url:'https://example.invalid/h',tokenEnv:'TEST_HOOK',conversationIds:['chat']}]});
   const runtime=createCommunicationRuntime({config,store:{acceptInbound:async input=>{accepted.push(input);receipts++;return{duplicate:receipts>1,hookJobIds:['hook']};}},

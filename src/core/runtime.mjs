@@ -49,7 +49,7 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
       throw Object.assign(new Error('history_authorization_identity_missing'), { code: 'history_authorization_identity_missing' });
     }
     const human = !event.isApp && !event.isSelf && event.actor.type === 'user';
-    const allowed = human && (event.conversationType === 'p2p' ? config.routing.privateUserIds.includes(event.actor.openId) : Boolean(group && (group.userIds === undefined || group.userIds.includes(event.actor.openId))));
+    const allowed = human && (event.conversationType === 'p2p' ? (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId))) : Boolean(group && (group.userIds === undefined || group.userIds.includes(event.actor.openId))));
     const mentioned = event.message?.mentions?.some(mention => mention.openId === config.feishu.botOpenId);
     const triggered = allowed && event.type === 'message.received' && (event.conversationType === 'p2p' || group?.trigger === 'all' || mentioned);
     const text = extractMessageText(event);

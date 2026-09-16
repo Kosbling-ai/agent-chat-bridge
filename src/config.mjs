@@ -163,7 +163,7 @@ function validateRuntime(raw) {
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
   if (raw.feishu.outputBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.outputBudgetBytes) || raw.feishu.outputBudgetBytes < 28 * 1024 * 1024 || raw.feishu.outputBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_output_budget');
   feishu.outputBudgetBytes = raw.feishu.outputBudgetBytes ?? 512 * 1024 * 1024;
-  object(raw.routing, ['version', 'privateUserIds', 'groups'], 'invalid_routing_fields');
+  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
     object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities'], 'invalid_group_fields');
@@ -174,7 +174,9 @@ function validateRuntime(raw) {
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
-  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), groups };
+  const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
+  if (typeof allowAllPrivateUsers !== 'boolean' || raw.routing.allowAllPrivateUsers === null) throw new ConfigError('invalid_private_access_policy');
+  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups };
   if (!Array.isArray(raw.auth?.clients) || !raw.auth.clients.length || raw.auth.clients.length > 100 || raw.auth.tokenEnv !== undefined) throw new ConfigError('runtime_auth_clients_required');
   const clients = raw.auth.clients.map(client => {
     object(client, ['id', 'tokenEnv', 'conversationIds', 'admin', 'queueIfBusy'], 'invalid_client_fields');

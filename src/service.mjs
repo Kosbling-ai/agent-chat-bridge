@@ -201,7 +201,7 @@ export async function startService({ config, configPath, env = process.env, log,
     const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,
       sendAttachment: input => sendOutboundAttachment({ client, ...input }),
       replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
-    const stopAuthorize=async({actor,conversationId})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
+    const stopAuthorize=async({actor,conversationId,conversationType})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(conversationType==='p2p'&&config.routing.allowAllPrivateUsers===true)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
     userInput=factories.userInput({jobs,executor,cardClient:client,authorize:stopAuthorize,
       runAsync:runCardOperation,config:{displayName:config.feishu.displayName},log});
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,

@@ -70,7 +70,7 @@ test('card maps protocol choices and free text to one answer per qid without pro
 });
 
 function fixture(){
-  const job={id:'run-1',callerId:'live',status:'running',chatId:'chat',senderOpenId:'actor',messageId:'source',result:{execution:{threadId:'thread',turnId:'turn'}}};
+  const job={id:'run-1',callerId:'live',status:'running',chatId:'chat',chatType:'p2p',senderOpenId:'actor',messageId:'source',result:{execution:{threadId:'thread',turnId:'turn'}}};
   const creates=[];const patches=[];const asyncOps=[];let nativeCalls=0;
   const cardClient={im:{v1:{message:{async create(input){creates.push(input);return{code:0,data:{message_id:'card'}};},async patch(input){patches.push(input);return{code:0};}}}}};
   const executor={async answerUserInput(){nativeCalls++;return{status:'submitted'};}};
@@ -83,9 +83,10 @@ function fixture(){
     async markUserInputUnknown(input){if(['submitted','unknown'].includes(job.result.userInput.status))return{outcome:'replay',userInput:job.result.userInput};job.result.userInput={...job.result.userInput,status:'unknown',operationId:input.operationId};return{outcome:'unknown',userInput:job.result.userInput};},
     async expireUserInput(){job.result.userInput.status='expired';return{outcome:'expired',userInput:job.result.userInput};},
   };
-  const runtime=createUserInputRuntime({jobs,executor,authorize:async()=>true,cardClient,
+  let authorization;
+  const runtime=createUserInputRuntime({jobs,executor,authorize:async input=>{authorization=input;return true;},cardClient,
     runAsync:operation=>{const promise=Promise.resolve().then(operation);asyncOps.push(promise);promise.catch(()=>{});}});
-  return{job,jobs,runtime,cardClient,executor,creates,patches,asyncOps,get nativeCalls(){return nativeCalls;}};
+  return{job,jobs,runtime,cardClient,executor,creates,patches,asyncOps,get nativeCalls(){return nativeCalls;},get authorization(){return authorization;}};
 }
 
 test('user-input runtime authenticates exact card identity and submits once asynchronously',async()=>{
@@ -95,6 +96,7 @@ test('user-input runtime authenticates exact card identity and submits once asyn
   const payload={operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'number:0',itemId:'item'},form_value:{q_0_choice:'o_0'}}};
   assert.equal((await f.runtime.handleCardAction({...payload,operator:{open_id:'other'}})).toast.content,'该提问已失效');
   assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答正在提交');
+  assert.equal(f.authorization.conversationType,'p2p');
   await Promise.allSettled(f.asyncOps);assert.equal(f.nativeCalls,1);assert.equal(f.job.result.userInput.status,'submitted');assert.equal(f.patches.length,1);
   assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答已提交');assert.equal(f.nativeCalls,1);
   await f.runtime.close();
