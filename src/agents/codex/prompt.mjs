@@ -1,3 +1,4 @@
+import { DEFAULT_CARD_TEXT, CARD_TEXT_TEMPLATES } from '../../channels/feishu/card-text.mjs';
 import { createHash } from 'node:crypto';
 import { isScheduledBinding } from './thread-scope.mjs';
 import { canDeliverOutboxAttachments } from './outbox-policy.mjs';
@@ -13,7 +14,7 @@ export function outboxRelativeDirectory({ outboxRelativeRoot = 'data/feishu-outb
 }
 export function buildInitialPrompt({ binding, prompt, groupChatContext, cardTextFile, outboxRelativeRoot, allowedGroupChatIds = new Set() }) {
   if (!binding) return prompt;
-  if (cardTextFile) prompt = `【本机器人执行卡片文案】\n文案文件（相对项目目录）：${cardTextFile}\n用户要求修改自己的飞书卡片文案时，可读取并修改此 JSON 文件，运行时会在下一次卡片更新自动读取，无需重启。只修改用户指定的字段，使用临时文件加原子重命名保存。该文件对本机器人所有会话生效。\n可选字段：title、received、running、completed、failed、interrupted、retrying、deferred、stopButton、forkButton、omitted、fallback。值必须是非空单行纯文本；received/omitted/fallback 最长 200 字符，其余最长 80 字符；删除字段恢复默认值。保留状态和按钮动作的真实含义。不要修改其他机器人的配置或修改程序代码。\n\n${prompt}`;
+  if (cardTextFile) prompt = `【本机器人执行卡片文案】\n文案文件（相对项目目录）：${cardTextFile}\n用户要求修改自己的飞书卡片文案时，可读取并修改此 JSON 文件，运行时会在下一次卡片更新自动读取，无需重启。只修改用户指定的字段，使用临时文件加原子重命名保存。该文件对本机器人所有会话生效。\n可选字段：${Object.keys(DEFAULT_CARD_TEXT).join("、")}。值必须是非空单行纯文本；模板和较长提示最长 200 字符，其余最长 80 字符；删除字段恢复默认值。模板允许的占位符：${JSON.stringify(CARD_TEXT_TEMPLATES)}，不可增加其他占位符。例如 toolGroup 可设为「{count} 项操作 · {activity}」。只改标签，保留真实工具名称、计数、耗时、退出码和实际回答。保留状态和按钮动作的真实含义。不要修改其他机器人的配置或修改程序代码。\n\n${prompt}`;
   const outbox = outboxRelativeDirectory({ outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
   if (isScheduledBinding(binding.feishuOpenId)) {
     return `【独立系统任务】\n任务：${binding.feishuOpenId}\n结果投递群：${binding.chatId}\n本线程仅承接此系统任务，不承接目标群的人工对话。结果由运行时发送到目标群。\n回发文件目录：${outbox}\n\n${prompt}`;

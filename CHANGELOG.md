@@ -2,6 +2,8 @@
 
 ## [0.2.5] — Unreleased
 
+- Extend per-bot card copy to tool-group/count templates, safe tool details and user-input forms. Validated placeholders are rendered without code evaluation; active tool labels hot-load from sanitized metadata. Existing saved tool entries and default output remain compatible.
+
 - Add opt-in `feishu.cardTextFile`: per-instance execution-card text is hot-loaded from a workspace JSON file, with last-valid fallback for invalid edits and scoped editing instructions for Codex. Card actions, delivery and colors are unchanged.
 
 - Migration 004 scopes five assistant runtime tables by `connection_id`, including their uniqueness, recovery and context indexes. It also prefixes bridge claim indexes with the existing connection owner. Existing bridge rows keep their ownership.

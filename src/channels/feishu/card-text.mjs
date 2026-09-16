@@ -1,3 +1,4 @@
+import { DEFAULT_TOOL_COPY } from '../../shared/public-progress.mjs';
 import { open, realpath } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { relative, isAbsolute } from 'node:path';
@@ -8,14 +9,34 @@ export const DEFAULT_CARD_TEXT = Object.freeze({
   retrying: '连接恢复中', deferred: '补充已转达',
   stopButton: '停止执行', forkButton: '保留历史并新建会话',
   omitted: '较早的执行过程已收起，仅展示最近进度。', fallback: '结果将通过普通消息送达',
+  toolGroup: '{count} 个工具调用 · {activity}', toolGroupRunning: '{running} 个执行中',
+  toolGroupFinished: '已结束', toolItem: '{title} · {status}', toolUnknownStatus: '已结束',
+  cardSummary: '{title} · {status}', statusFooter: '{status}', fallbackSuffix: ' · {fallback}',
+  inputSubmitted: '回答已提交。', inputUnknown: '提交状态未确认，请勿重复提交。', inputExpired: '该提问已失效。',
+  inputChoose: '请选择', inputOther: '其他（请填写）', inputAnswer: '请输入回答', inputSubmit: '提交回答',
+  inputSummary: '{title} · Codex 提问', inputTitle: '{title} · 需要你的回答',
+  ...DEFAULT_TOOL_COPY,
 });
-const longFields = new Set(['received', 'omitted', 'fallback']);
+export const CARD_TEXT_TEMPLATES = Object.freeze({
+  toolGroup: ['count', 'running', 'activity'], toolGroupRunning: ['running'],
+  toolItem: ['title', 'status'], cardSummary: ['title', 'status'], statusFooter: ['status'], fallbackSuffix: ['fallback'],
+  inputSummary: ['title'], inputTitle: ['title'],
+  toolTitleTemplate: ['name', 'label'], fieldTemplate: ['label', 'value'],
+  readTargetTemplate: ['action', 'target'], readFallbackTemplate: ['action', 'file'],
+  skillReadTemplate: ['action', 'skill', 'skillLabel'], actionTargetTemplate: ['action', 'target'],
+  durationTemplate: ['label', 'seconds', 'unit'],
+});
+const longFields = new Set(['received', 'omitted', 'fallback', 'inputSubmitted', 'inputUnknown', 'inputExpired', ...Object.keys(CARD_TEXT_TEMPLATES)]);
 const MAX_BYTES = 16 * 1024;
 function validate(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_card_text');
   for (const [key, text] of Object.entries(value)) {
     if (!Object.hasOwn(DEFAULT_CARD_TEXT, key) || typeof text !== 'string' || !text.trim()
       || /[\p{Cc}\p{Zl}\p{Zp}]/u.test(text) || !text.isWellFormed() || Array.from(text).length > (longFields.has(key) ? 200 : 80)) throw new Error('invalid_card_text');
+    if (Object.hasOwn(CARD_TEXT_TEMPLATES, key)) {
+      const rest = text.replace(/\{([A-Za-z][A-Za-z0-9]*)\}/g, (token, name) => CARD_TEXT_TEMPLATES[key].includes(name) ? '' : token);
+      if (/[{}]/u.test(rest)) throw new Error('invalid_card_text_template');
+    }
   }
   return Object.freeze({ ...DEFAULT_CARD_TEXT, ...value });
 }

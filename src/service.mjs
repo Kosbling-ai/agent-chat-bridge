@@ -206,7 +206,7 @@ export async function startService({ config, configPath, env = process.env, log,
       replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
     const stopAuthorize=async({actor,conversationId,conversationType})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(conversationType==='p2p'&&config.routing.allowAllPrivateUsers===true)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
     userInput=factories.userInput({jobs,executor,cardClient:client,authorize:stopAuthorize,
-      runAsync:runCardOperation,config:{displayName:config.feishu.displayName},log});
+      runAsync:runCardOperation,config:{displayName:config.feishu.displayName,cardTextProvider},log});
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
       emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
     const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,workspace:cwd,

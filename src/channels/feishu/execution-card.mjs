@@ -1,8 +1,7 @@
 import { DEFAULT_CARD_TEXT } from './card-text.mjs';
-import { publicText } from '../../shared/public-progress.mjs';
+import { escapeMarkdown, formatText } from '../../shared/text-template.mjs';
+import { publicText, renderPublicToolEntry } from '../../shared/public-progress.mjs';
 
-const escapeMarkdown = text => text.replace(/[\\`*_{}[\]()<>!#|~]/g, '\\$&');
-const statuses = { running: '执行中', completed: '已完成', failed: '执行失败', interrupted: '已中断', retrying: '连接恢复中', deferred: '补充已转达' };
 const panel = (id, title, elements) => ({ tag: 'collapsible_panel', element_id: id, expanded: false, header: { title: { tag: 'plain_text', content: title }, icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' }, icon_position: 'follow_text', icon_expanded_angle: -180 }, elements });
 const md = (content, textSize) => ({ tag: 'markdown', content, ...(textSize ? { text_size: textSize } : {}) });
 const progressText = (content) => ({ tag: 'div', text: { tag: 'plain_text', content, text_size: 'normal', text_color: 'grey' } });
@@ -17,7 +16,12 @@ export function renderExecutionCard(state, answer = '', displayName = 'agent-cha
   const flush = () => {
     if (!group.length) return;
     const running = group.filter((x) => x.status === 'running').length;
-    elements.push(panel(`group_${elements.length}`, `${group.length} 个工具调用 · ${running ? `${running} 个执行中` : '已结束'}`, group.map((x, i) => panel(`tool_${elements.length}_${i}`, `${x.title} · ${copy[x.status] || '已结束'}`, [progressText(x.summary || copy[x.status] || '已结束')]))));
+    const activity = running ? formatText(copy.toolGroupRunning, { running }) : copy.toolGroupFinished;
+    elements.push(panel(`group_${elements.length}`, formatText(copy.toolGroup, { count: group.length, running, activity }), group.map((x, i) => {
+      const rendered = renderPublicToolEntry(x, copy);
+      const status = copy[x.status] || copy.toolUnknownStatus;
+      return panel(`tool_${elements.length}_${i}`, formatText(copy.toolItem, { title: rendered.title, status }), [progressText(rendered.summary || status)]);
+    })));
     group = [];
   };
   for (const entry of entries) {
@@ -28,10 +32,10 @@ export function renderExecutionCard(state, answer = '', displayName = 'agent-cha
   if (state.omitted) elements.unshift(progressText(copy.omitted));
   if (answer) elements.push(answerMd(answer));
   if (!elements.length) elements.push(progressText(copy.received));
-  elements.push(md(`**${escapeMarkdown(statusText)}**${state.delivery === 'fallback' ? ` · ${escapeMarkdown(copy.fallback)}` : ''}`));
+  elements.push(md(`**${escapeMarkdown(formatText(copy.statusFooter, { status: statusText }))}**${state.delivery === 'fallback' ? escapeMarkdown(formatText(copy.fallbackSuffix, { fallback: copy.fallback })) : ''}`));
   if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.stopButton }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
   if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.forkButton }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
-  let card = { schema: '2.0', config: { update_multi: true, summary: { content: `${title} · ${statusText}` } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: title } }, body: { elements } };
+  let card = { schema: '2.0', config: { update_multi: true, summary: { content: formatText(copy.cardSummary, { title, status: statusText }) } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: title } }, body: { elements } };
   // IM cards are limited to 30 KB, including UTF-8 and JSON scaffolding.
   while (Buffer.byteLength(JSON.stringify(card)) > 28000 && card.body.elements.length > (answer ? 2 : 1)) card.body.elements.shift();
   if (Buffer.byteLength(JSON.stringify(card)) > 28000) throw new Error('card final answer exceeds budget');
@@ -61,7 +65,7 @@ export class ExecutionCard {
     if (event.kind === 'commentary' || event.kind === 'tool') {
       const entries = this.state.entries;
       const existing = entries.findIndex((x) => x.id === event.id);
-      const value = event.kind === 'commentary' ? { kind: event.kind, id: event.id, text: publicText(event.text, 800), at: event.at } : { kind: 'tool', id: event.id, title: publicText(event.title, 100), summary: publicText(event.summary || statuses[event.status], 500), status: event.status, at: event.at };
+      const value = event.kind === 'commentary' ? { kind: event.kind, id: event.id, text: publicText(event.text, 800), at: event.at } : { kind: 'tool', id: event.id, title: publicText(event.title, 100), summary: publicText(event.summary || '', 500), ...(event.presentation ? { presentation: structuredClone(event.presentation) } : {}), status: event.status, at: event.at };
       if (existing >= 0 && entries[existing].kind === 'tool' && entries[existing].status !== 'running' && value.status === 'running') return;
       if (existing >= 0) { value.at = Math.min(entries[existing].at || value.at || 0, value.at || entries[existing].at || 0); entries[existing] = value; }
       else entries.push(value);

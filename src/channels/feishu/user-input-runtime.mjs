@@ -9,9 +9,10 @@ const check=response=>{if(response?.code!=null&&response.code!==0)throw Object.a
 export function createUserInputRuntime({jobs,executor,cardClient,authorize=async()=>true,runAsync=operation=>Promise.resolve().then(operation).catch(()=>{}),config={},log=()=>{},now=Date.now}={}){
   let accepting=true; const live=new Map(); const operations=new Set();
   const track=operation=>{const pending=Promise.resolve().then(operation).finally(()=>operations.delete(pending));operations.add(pending);pending.catch(()=>{});return pending;};
+  const cardText=async()=>config.cardTextProvider?await config.cardTextProvider():undefined;
   const patchTerminal=async(userInput,terminal)=>{
     if(!userInput.card?.messageId)return false;
-    check(await cardClient.im.v1.message.patch({path:{message_id:userInput.card.messageId},data:{content:JSON.stringify(renderUserInputCard(userInput,{displayName:config.displayName,terminal}))}}));
+    check(await cardClient.im.v1.message.patch({path:{message_id:userInput.card.messageId},data:{content:JSON.stringify(renderUserInputCard(userInput,{displayName:config.displayName,terminal,cardText:await cardText()}))}}));
     return true;
   };
   async function open(request){
@@ -28,7 +29,7 @@ export function createUserInputRuntime({jobs,executor,cardClient,authorize=async
       if(begun.outcome==='replay'&&userInput.card?.status==='confirmed'){live.set(`${job.id}:${requestKey}`,userInput);return;}
       if(userInput.card?.status==='unknown')throw Object.assign(new Error('card create unconfirmed'),{code:'user_input_card_unknown',outcome:'unknown'});
       let response;
-      try{response=await cardClient.im.v1.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:job.chatId,msg_type:'interactive',content:JSON.stringify(renderUserInputCard(userInput,{displayName:config.displayName})),uuid:cardUuid}});check(response);}
+      try{response=await cardClient.im.v1.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:job.chatId,msg_type:'interactive',content:JSON.stringify(renderUserInputCard(userInput,{displayName:config.displayName,cardText:await cardText()})),uuid:cardUuid}});check(response);}
       catch(error){await jobs.finishUserInputCard({id:job.id,requestKey,status:error?.outcome==='unknown'?'unknown':'failed'}).catch(()=>{});throw error;}
       const cardMessageId=response?.data?.message_id;
       if(!cardMessageId){await jobs.finishUserInputCard({id:job.id,requestKey,status:'unknown'}).catch(()=>{});throw Object.assign(new Error('card id missing'),{outcome:'unknown'});}

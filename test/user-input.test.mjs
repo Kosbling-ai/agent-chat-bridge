@@ -69,7 +69,21 @@ test('card maps protocol choices and free text to one answer per qid without pro
   assert.throws(()=>answersFromForm({...userInput,questions:[{id:'choice',header:'Choose',question:'Choose',options:[{label:'A',description:''}],isOther:false}]},{q_0_choice:'o_0',q_0_other:'forged'}));
 });
 
-function fixture(){
+test('user-input card customizes fixed copy without changing questions or submission payload',()=>{
+  const userInput={jobId:'run',requestKey:'key',itemId:'item',questions:[{id:'q',header:'原始标题',question:'原始问题',options:[{label:'原始选项',description:'原始说明'}],isOther:true}]};
+  const copy={title:'问答助手',inputSubmitted:'已*提交',inputUnknown:'未_确认',inputExpired:'已#失效',inputChoose:'选一个',inputOther:'另填',inputAnswer:'填答案',inputSubmit:'发送',inputSummary:'摘要 {title}',inputTitle:'标题 {title}'};
+  const card=renderUserInputCard(userInput,{displayName:'默认名称',cardText:copy});const fields=card.body.elements[0].elements;
+  assert.equal(card.header.title.content,'标题 问答助手');assert.equal(card.config.summary.content,'摘要 问答助手');
+  assert.equal(fields[0].content,'**原始标题**\n原始问题');assert.equal(fields[1].placeholder.content,'选一个');
+  assert.deepEqual(fields[1].options,[{text:{tag:'plain_text',content:'原始选项 · 原始说明'},value:'o_0'}]);
+  assert.equal(fields[2].placeholder.content,'另填');assert.equal(fields[3].text.content,'发送');
+  assert.deepEqual(fields[3].value,{action:'submit_user_input',jobId:'run',requestKey:'key',itemId:'item'});
+  assert.equal(renderUserInputCard(userInput,{terminal:'submitted',cardText:copy}).body.elements[0].content,'**已\\*提交**');
+  assert.equal(renderUserInputCard(userInput,{terminal:'unknown',cardText:copy}).body.elements[0].content,'**未\\_确认**');
+  assert.equal(renderUserInputCard(userInput,{terminal:'expired',cardText:copy}).body.elements[0].content,'**已\\#失效**');
+});
+
+function fixture({config={}}={}){
   const job={id:'run-1',callerId:'live',status:'running',chatId:'chat',chatType:'p2p',senderOpenId:'actor',messageId:'source',result:{execution:{threadId:'thread',turnId:'turn'}}};
   const creates=[];const patches=[];const asyncOps=[];let nativeCalls=0;
   const cardClient={im:{v1:{message:{async create(input){creates.push(input);return{code:0,data:{message_id:'card'}};},async patch(input){patches.push(input);return{code:0};}}}}};
@@ -85,7 +99,7 @@ function fixture(){
   };
   let authorization;
   const runtime=createUserInputRuntime({jobs,executor,authorize:async input=>{authorization=input;return true;},cardClient,
-    runAsync:operation=>{const promise=Promise.resolve().then(operation);asyncOps.push(promise);promise.catch(()=>{});}});
+    config,runAsync:operation=>{const promise=Promise.resolve().then(operation);asyncOps.push(promise);promise.catch(()=>{});}});
   return{job,jobs,runtime,cardClient,executor,creates,patches,asyncOps,get nativeCalls(){return nativeCalls;},get authorization(){return authorization;}};
 }
 
@@ -99,6 +113,17 @@ test('user-input runtime authenticates exact card identity and submits once asyn
   assert.equal(f.authorization.conversationType,'p2p');
   await Promise.allSettled(f.asyncOps);assert.equal(f.nativeCalls,1);assert.equal(f.job.result.userInput.status,'submitted');assert.equal(f.patches.length,1);
   assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答已提交');assert.equal(f.nativeCalls,1);
+  await f.runtime.close();
+});
+
+test('user-input runtime reloads card text for its creation and terminal update',async()=>{
+  let calls=0;const f=fixture({config:{displayName:'默认名称',cardTextProvider:async()=>{calls++;return{title:`机器人 ${calls}`,inputSubmit:`提交 ${calls}`,inputSummary:'摘要 {title}',inputTitle:'标题 {title}',inputSubmitted:`完成 ${calls}`};}}});
+  const request={messageId:'source',threadId:'thread',turnId:'turn',itemId:'item',requestId:'copy',requestKey:'string:"copy"',questions:[{id:'q',header:'填写',question:'内容',options:[],isOther:false}]};
+  await f.runtime.open(request);
+  const created=JSON.parse(f.creates[0].data.content);assert.equal(created.header.title.content,'标题 机器人 1');assert.equal(created.config.summary.content,'摘要 机器人 1');assert.equal(created.body.elements[0].elements.at(-1).text.content,'提交 1');
+  const payload={operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'string:"copy"',itemId:'item'},form_value:{q_0_other:'answer'}}};
+  await f.runtime.handleCardAction(payload);await Promise.allSettled(f.asyncOps);
+  const patched=JSON.parse(f.patches[0].data.content);assert.equal(calls,2);assert.equal(patched.header.title.content,'标题 机器人 2');assert.equal(patched.body.elements[0].content,'**完成 2**');
   await f.runtime.close();
 });
 
