@@ -18,6 +18,7 @@ import { createOutboundMedia } from './channels/feishu/outbound-media.mjs';
 import { createProcessingTyping } from './channels/feishu/typing.mjs';
 import { createForwardRuntime } from './core/forward-runtime.mjs';
 import { createCommunicationRuntime } from './core/communication-runtime.mjs';
+import { createCardTextProvider } from './channels/feishu/card-text.mjs';
 import { createExecutionFeedback } from './channels/feishu/execution-feedback.mjs';
 import { createUserInputRuntime } from './channels/feishu/user-input-runtime.mjs';
 import { createFeishuReplies } from './channels/feishu/replies.mjs';
@@ -59,6 +60,7 @@ export async function startService({ config, configPath, env = process.env, log,
   const root = dirname(resolve(configPath));
   const cwd = resolve(root, config.codex.cwd);
   const bin = resolve(root, config.codex.bin);
+  const cardTextProvider = createCardTextProvider({ file: config.feishu.cardTextFile ? resolve(cwd, config.feishu.cardTextFile) : undefined, root: cwd, log });
   try {
     const [workspace, executable] = await Promise.all([stat(cwd), stat(bin)]);
     if (!workspace.isDirectory() || !executable.isFile() || (workspace.mode & 0o002) || (executable.mode & 0o002)
@@ -174,6 +176,7 @@ export async function startService({ config, configPath, env = process.env, log,
       memoryMaxRssBytes: config.codex.memoryMaxRssBytes,
       memoryMaxHeapUsedBytes: config.codex.memoryMaxHeapUsedBytes,
       maxOutputChars: config.feishu.maxOutputChars,
+      cardTextFile: config.feishu.cardTextFile,
       outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
     };
@@ -207,7 +210,7 @@ export async function startService({ config, configPath, env = process.env, log,
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
       emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
     const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,workspace:cwd,
-      runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName},log});
+      runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName,cardTextProvider},log});
     forward=factories.forward({config:{
       steering:config.codex.steering,
       pollMs:config.codex.jobPollMs,

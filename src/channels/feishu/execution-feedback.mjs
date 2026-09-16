@@ -34,7 +34,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     if (unconfirmedCard(saved)) return null;
     return new ExecutionCard({
       client: cardClient, chatId: job.chatId, jobId: job.id, messageId: job.messageId,
-      displayName: config.displayName, uuid: stable(`execution-card:${job.messageId}`),
+      displayName: config.displayName, cardTextProvider: config.cardTextProvider, uuid: stable(`execution-card:${job.messageId}`),
       intervalMs: config.executionCardIntervalMs || 1000,
       persist: persistCard ? value => persist(job, state, 'executionCard', value) : async () => {},
       audit: event => sessions?.saveCodexRealtimeEvent?.({

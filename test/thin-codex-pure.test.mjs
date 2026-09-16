@@ -113,3 +113,13 @@ test('shared home rejects conflicting inherited state and owned close escalates 
     assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+
+test('card editing instructions reach continued turns only when enabled', () => {
+  const input = { binding: { feishuOpenId: 'human', chatId: 'private', chatType: 'p2p', created: false }, prompt: 'customize my card' };
+  assert.doesNotMatch(buildInitialPrompt(input), /本机器人执行卡片文案/);
+  const result = buildInitialPrompt({ ...input, cardTextFile: '.agent-chat-bridge/bot3-card-text.json' });
+  assert.match(result, /文案文件（相对项目目录）：.agent-chat-bridge\/bot3-card-text.json/);
+  assert.match(result, /无需重启/);
+  assert.match(result, /customize my card$/);
+});

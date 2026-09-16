@@ -138,10 +138,16 @@ function validateRuntime(raw) {
   if (![memoryMaxRssMb, memoryMaxHeapUsedMb].every(value => Number.isFinite(value) && value >= 0)) throw new ConfigError('invalid_codex_memory_limit');
   codex.memoryMaxRssBytes = Math.round(memoryMaxRssMb * 1024 * 1024);
   codex.memoryMaxHeapUsedBytes = Math.round(memoryMaxHeapUsedMb * 1024 * 1024);
-  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaUnsupportedReply'], 'invalid_feishu_fields');
+  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'cardTextFile', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaUnsupportedReply'], 'invalid_feishu_fields');
   if (raw.feishu.catchup !== undefined && typeof raw.feishu.catchup !== 'boolean') throw new ConfigError('invalid_catchup_flag');
   const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };
   feishu.displayName = raw.feishu.displayName === undefined ? 'agent-chat-bridge' : identifier(raw.feishu.displayName, 80);
+  if (raw.feishu.cardTextFile !== undefined) {
+    const path = raw.feishu.cardTextFile;
+    if (typeof path !== 'string' || !path.trim() || path.length > 512 || path.startsWith('/')
+      || /[\\\u0000-\u001f\u007f]/u.test(path) || path.split('/').some(part => !part || part === '..' || part === '.')) throw new ConfigError('invalid_card_text_path');
+    feishu.cardTextFile = path;
+  }
   feishu.replyAsPost = raw.feishu.replyAsPost ?? true;
   if (typeof feishu.replyAsPost !== 'boolean') throw new ConfigError('invalid_feishu_reply_mode');
   feishu.maxOutputChars = raw.feishu.maxOutputChars ?? 3500;

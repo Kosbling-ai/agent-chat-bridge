@@ -1,18 +1,23 @@
+import { DEFAULT_CARD_TEXT } from './card-text.mjs';
 import { publicText } from '../../shared/public-progress.mjs';
 
+const escapeMarkdown = text => text.replace(/[\\`*_{}[\]()<>!#|~]/g, '\\$&');
 const statuses = { running: '执行中', completed: '已完成', failed: '执行失败', interrupted: '已中断', retrying: '连接恢复中', deferred: '补充已转达' };
 const panel = (id, title, elements) => ({ tag: 'collapsible_panel', element_id: id, expanded: false, header: { title: { tag: 'plain_text', content: title }, icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' }, icon_position: 'follow_text', icon_expanded_angle: -180 }, elements });
 const md = (content, textSize) => ({ tag: 'markdown', content, ...(textSize ? { text_size: textSize } : {}) });
 const progressText = (content) => ({ tag: 'div', text: { tag: 'plain_text', content, text_size: 'normal', text_color: 'grey' } });
 const answerMd = (content) => md(content, 'heading');
-export function renderExecutionCard(state, answer = '', displayName = 'agent-chat-bridge') {
+export function renderExecutionCard(state, answer = '', displayName = 'agent-chat-bridge', cardText = DEFAULT_CARD_TEXT) {
+  const copy = { ...DEFAULT_CARD_TEXT, ...cardText };
+  const title = copy.title || displayName;
+  const statusText = copy[state.status] || copy.running;
   const entries = (state.entries || []).slice(-24);
   const elements = [];
   let group = [];
   const flush = () => {
     if (!group.length) return;
     const running = group.filter((x) => x.status === 'running').length;
-    elements.push(panel(`group_${elements.length}`, `${group.length} 个工具调用 · ${running ? `${running} 个执行中` : '已结束'}`, group.map((x, i) => panel(`tool_${elements.length}_${i}`, `${x.title} · ${statuses[x.status] || '已结束'}`, [progressText(x.summary || statuses[x.status] || '已结束')]))));
+    elements.push(panel(`group_${elements.length}`, `${group.length} 个工具调用 · ${running ? `${running} 个执行中` : '已结束'}`, group.map((x, i) => panel(`tool_${elements.length}_${i}`, `${x.title} · ${copy[x.status] || '已结束'}`, [progressText(x.summary || copy[x.status] || '已结束')]))));
     group = [];
   };
   for (const entry of entries) {
@@ -20,21 +25,22 @@ export function renderExecutionCard(state, answer = '', displayName = 'agent-cha
     else { flush(); elements.push(progressText(publicText(entry.text, 800))); }
   }
   flush();
-  if (state.omitted) elements.unshift(progressText('较早的执行过程已收起，仅展示最近进度。'));
+  if (state.omitted) elements.unshift(progressText(copy.omitted));
   if (answer) elements.push(answerMd(answer));
-  if (!elements.length) elements.push(progressText('已收到，正在处理你的请求。'));
-  elements.push(md(`**${statuses[state.status] || '执行中'}**${state.delivery === 'fallback' ? ' · 结果将通过普通消息送达' : ''}`));
-  if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: '停止执行' }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
-  if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: '保留历史并新建会话' }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
-  let card = { schema: '2.0', config: { update_multi: true, summary: { content: `${displayName} · ${statuses[state.status] || '执行中'}` } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: displayName } }, body: { elements } };
+  if (!elements.length) elements.push(progressText(copy.received));
+  elements.push(md(`**${escapeMarkdown(statusText)}**${state.delivery === 'fallback' ? ` · ${escapeMarkdown(copy.fallback)}` : ''}`));
+  if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.stopButton }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
+  if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.forkButton }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
+  let card = { schema: '2.0', config: { update_multi: true, summary: { content: `${title} · ${statusText}` } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: title } }, body: { elements } };
   // IM cards are limited to 30 KB, including UTF-8 and JSON scaffolding.
   while (Buffer.byteLength(JSON.stringify(card)) > 28000 && card.body.elements.length > (answer ? 2 : 1)) card.body.elements.shift();
   if (Buffer.byteLength(JSON.stringify(card)) > 28000) throw new Error('card final answer exceeds budget');
   return card;
 }
 export class ExecutionCard {
-  constructor({ client, chatId, uuid, saved, persist = async () => {}, audit = async () => {}, intervalMs = 1000, logger = console, jobId = '', messageId = '', displayName = 'agent-chat-bridge' }) {
+  constructor({ client, chatId, uuid, saved, persist = async () => {}, audit = async () => {}, intervalMs = 1000, logger = console, jobId = '', messageId = '', displayName = 'agent-chat-bridge', cardTextProvider = async () => DEFAULT_CARD_TEXT }) {
     this.client = client; this.chatId = chatId; this.uuid = uuid; this.persist = persist; this.audit = audit; this.logger = logger; this.jobId = String(jobId).slice(0, 64); this.messageId = String(messageId).slice(0, 80);
+    this.cardTextProvider = cardTextProvider;
     this.intervalMs = Math.max(1000, Number(intervalMs) || 1000); this.displayName = displayName;
     this.state = { status: 'running', entries: [], jobId: this.jobId, ...saved };
     this.chain = Promise.resolve(); this.timer = null; this.closed = false; this.dirty = false;
@@ -83,7 +89,7 @@ export class ExecutionCard {
   }
   async update(answer = '') {
     const snapshot = this.snapshot();
-    const card = renderExecutionCard(snapshot, answer, this.displayName);
+    const card = renderExecutionCard(snapshot, answer, this.displayName, await this.cardTextProvider());
     if (!this.state.messageId) {
       // Deterministic UUID handles an ambiguous create response or a crash before persistence.
       const response = await this.client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: this.chatId, msg_type: 'interactive', content: JSON.stringify(card), uuid: this.uuid } });

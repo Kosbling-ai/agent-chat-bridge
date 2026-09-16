@@ -313,3 +313,13 @@ test('service close drains an accepted busy fork callback before closing its dep
   assert.match(rejected.toast.content, /服务正在关闭/);
   assert.equal(events.filter(event => event === 'get-run').length, 1);
 });
+
+
+test('card text file is opt-in and scoped to a workspace relative path', () => {
+  assert.equal(validateConfig(config).feishu.cardTextFile, undefined);
+  const withPath = path => ({ ...config, feishu: { ...config.feishu, cardTextFile: path } });
+  assert.equal(validateConfig(withPath('.agent-chat-bridge/bot3-card-text.json')).feishu.cardTextFile, '.agent-chat-bridge/bot3-card-text.json');
+  for (const path of ['', null, 1, '/tmp/card.json', '../card.json', 'a/../card.json', 'a\\b', 'a\nfile', './card.json']) {
+    assert.throws(() => validateConfig(withPath(path)), /invalid_card_text_path/);
+  }
+});
