@@ -26,7 +26,7 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
 
-`feishu.cardTextFile` 是 bridge 自己的展示配置：执行卡和提问卡会在下一次创建或更新时热加载该文件，但 bridge 不会把文件路径、字段清单或编辑规则注入 Codex prompt。管理员或已获文件写入权限的 Agent 仍可在明确拿到路径后直接修改文件。该配置不改变执行状态、按钮动作、模型最终回答或普通回复的 Markdown 转换。
+`feishu.cardTextFile` 是 bridge 自己的展示配置：管理员修改已配置的 JSON 文件后，执行卡和提问卡会在下一次创建或更新时热加载，但 bridge 不会把文件路径、字段清单或编辑规则注入 Codex prompt。该配置不改变执行状态、按钮动作、模型最终回答或普通回复的 Markdown 转换。
 
 私聊支持单图和 post 内图片，下载路径按原格式追加到文字 prompt；群聊只保留文字，忽略媒体。`mediaMaxBytes` 是原实现下载后的告警阈值，不会拒绝图片。bridge 模式直接投递 executor 返回的路径：私聊允许，群聊沿现有 bridge/API 会话 allowlist；单文件上限 28 MiB，成功后删除，单件失败保留文件且不阻断文字或其他附件。旧未确认附件 intent 不重放。
 
