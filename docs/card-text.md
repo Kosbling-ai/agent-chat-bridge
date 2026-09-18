@@ -23,7 +23,7 @@ Example text file:
 
 The provider reads the file on each execution-card create/update. Changes affect the next update, including an active card; completed historical cards are not proactively rewritten. Write to a temporary file and atomically rename it into place. A missing file or `{}` restores default wording. Omitted keys use defaults; invalid JSON, unknown fields, invalid strings or oversized files keep the last valid snapshot (or defaults after a process restart). One warning is emitted until a valid file is read. File size is limited to 16 KiB.
 
-Supported fields and placeholders are listed below. Values are nonempty, single-line plain text. Templates and the longer notices (`received`, `omitted`, `fallback`, `inputSubmitted`, `inputUnknown`, `inputExpired`) accept up to 200 Unicode code points; other labels accept up to 80. Omit `title` to use `feishu.displayName`. Templates accept only their listed placeholders, which are substituted once without evaluating code or interpreting inserted values as templates.
+Supported fields and placeholders are listed below. Values are nonempty, single-line plain text. Templates and the longer notices (`received`, `omitted`, `fallback`, `progressUnavailable`, `inputSubmitted`, `inputUnknown`, `inputExpired`) accept up to 200 Unicode code points; other labels accept up to 80. Omit `title` to use `feishu.displayName`. Templates accept only their listed placeholders, which are substituted once without evaluating code or interpreting inserted values as templates.
 
 Card text is presentation configuration owned by the bridge. Enabling it does not add the file path, field list or editing rules to Codex prompts. Edit the configured JSON file directly; the bridge hot-loads the result on the next card update. The text applies to all conversations of that bot. Separate files isolate presentation settings, not OS permissions between agents sharing one macOS account.
 
@@ -59,6 +59,7 @@ Example: change only these fields in your bot's existing text file:
 | `forkButton` | 保留历史并新建会话 | — |
 | `omitted` | 较早的执行过程已收起，仅展示最近进度。 | — |
 | `fallback` | 结果将通过普通消息送达 | — |
+| `progressUnavailable` | 进度暂不可用，任务仍在后台执行。 | — |
 | `toolGroup` | {count} 个工具调用 · {activity} | `{count}`, `{running}`, `{activity}` |
 | `toolGroupRunning` | {running} 个执行中 | `{running}` |
 | `toolGroupFinished` | 已结束 | — |

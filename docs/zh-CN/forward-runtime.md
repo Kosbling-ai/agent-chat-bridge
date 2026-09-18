@@ -24,7 +24,7 @@ hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lar
 
 忙碌排队例外只授予配置中显式启用 `queueIfBusy` 的认证客户端：已持久化且非空的 `executionNamespace` 必须与认证 `callerId` 派生出并匹配该 run 保存的 system binding。请求 payload、sender/messageId/prompt 字符串或关闭 steering 都不能冒充。等待期间复用同一张 retrying 卡片并保持 Typing 关闭；恢复流程不再添加 Typing。
 
-执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份；已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
+执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份。进度读取遇到瞬时错误时会保留 cursor，以最长 8 倍轮询间隔做指数退避且不重放 Codex turn；连续失败 3 次后，运行卡提示进度暂不可用，读取恢复后移除提示。租约丢失、runtime 停止和显式取消会终止观察，最终答案投递仍走独立路径。已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
 
 `feishu.cardTextFile` 是 bridge 自己的展示配置：管理员修改已配置的 JSON 文件后，执行卡和提问卡会在下一次创建或更新时热加载，但 bridge 不会把文件路径、字段清单或编辑规则注入 Codex prompt。该配置不改变执行状态、按钮动作、模型最终回答或普通回复的 Markdown 转换。
 

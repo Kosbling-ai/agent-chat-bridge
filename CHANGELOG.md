@@ -2,6 +2,8 @@
 
 ## [0.2.5] — Unreleased
 
+- Recover execution-card progress polling after transient read failures with bounded backoff, safe failure/recovery logs and a temporary degraded-state notice. Lease loss and shutdown still stop observation, while final-answer delivery remains independent.
+
 - Extend per-bot card copy to tool-group/count templates, safe tool details and user-input forms. Validated placeholders are rendered without code evaluation; active tool labels hot-load from sanitized metadata. Existing saved tool entries and default output remain compatible.
 
 - Add opt-in `feishu.cardTextFile`: per-instance execution-card text is hot-loaded from a workspace JSON file, with last-valid fallback for invalid edits. This presentation setting does not alter Codex prompts; card actions, delivery and colors are unchanged.

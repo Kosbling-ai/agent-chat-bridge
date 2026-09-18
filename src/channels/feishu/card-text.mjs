@@ -9,6 +9,7 @@ export const DEFAULT_CARD_TEXT = Object.freeze({
   retrying: '连接恢复中', deferred: '补充已转达',
   stopButton: '停止执行', forkButton: '保留历史并新建会话',
   omitted: '较早的执行过程已收起，仅展示最近进度。', fallback: '结果将通过普通消息送达',
+  progressUnavailable: '进度暂不可用，任务仍在后台执行。',
   toolGroup: '{count} 个工具调用 · {activity}', toolGroupRunning: '{running} 个执行中',
   toolGroupFinished: '已结束', toolItem: '{title} · {status}', toolUnknownStatus: '已结束',
   cardSummary: '{title} · {status}', statusFooter: '{status}', fallbackSuffix: ' · {fallback}',
@@ -26,7 +27,7 @@ export const CARD_TEXT_TEMPLATES = Object.freeze({
   skillReadTemplate: ['action', 'skill', 'skillLabel'], actionTargetTemplate: ['action', 'target'],
   durationTemplate: ['label', 'seconds', 'unit'],
 });
-const longFields = new Set(['received', 'omitted', 'fallback', 'inputSubmitted', 'inputUnknown', 'inputExpired', ...Object.keys(CARD_TEXT_TEMPLATES)]);
+const longFields = new Set(['received', 'omitted', 'fallback', 'progressUnavailable', 'inputSubmitted', 'inputUnknown', 'inputExpired', ...Object.keys(CARD_TEXT_TEMPLATES)]);
 const MAX_BYTES = 16 * 1024;
 function validate(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_card_text');
