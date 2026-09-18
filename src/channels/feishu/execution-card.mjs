@@ -166,7 +166,7 @@ export function observeExecutionCard({ card, load, since, intervalMs = 1000, set
   let pending = null;
   let consecutiveFailures = 0;
   let retryAt = 0;
-  let degraded = false;
+  let degraded = card.snapshot?.().progressUnavailable === true;
   let timer;
   const inactive = () => cancelled || terminal;
   const clearTimer = () => { if (timer) clearIntervalFn(timer); timer = null; };
@@ -201,7 +201,7 @@ export function observeExecutionCard({ card, load, since, intervalMs = 1000, set
     await safeLog('retrying', 'warn', { operation: 'read_progress', stage: 'load', error_code: code, consecutive_failures: consecutiveFailures, retry_delay_ms: retryDelayMs });
   };
   const recover = async () => {
-    if (!consecutiveFailures || inactive()) return;
+    if ((!consecutiveFailures && !degraded) || inactive()) return;
     const recoveredFailures = consecutiveFailures;
     consecutiveFailures = 0;
     retryAt = 0;

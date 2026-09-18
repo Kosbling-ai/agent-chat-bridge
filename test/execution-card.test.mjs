@@ -193,6 +193,19 @@ test('observer retries transient reads with backoff and clears degraded state af
   assert.equal(clock.cleared, true);
 });
 
+test('observer clears a saved degraded notice on its first successful read', async () => {
+  for (const rows of [[], [{ id: 1, created_at: 101, progress_json: { kind: 'commentary', id: 'restored', text: '恢复后的进度' } }]]) {
+    const events = []; const logger = { info: line => events.push(JSON.parse(line)), warn: line => events.push(JSON.parse(line)) };
+    const { card } = fixture({ messageId: 'om_card', progressUnavailable: true, entries: [] }, {}, { logger });
+    const observer = observeExecutionCard({ card, since: 100, load: async () => rows });
+    await tick(); await card.chain;
+    assert.equal(card.snapshot().progressUnavailable, undefined);
+    assert.equal(card.snapshot().entries.length, rows.length);
+    assert.ok(events.some(event => event.operation === 'read_progress' && event.status === 'recovered' && event.consecutive_failures === 0));
+    observer.cancel();
+  }
+});
+
 test('persistent observer failures cap backoff at eight intervals without stopping forever', async () => {
   const events = []; const logger = { info: line => events.push(JSON.parse(line)), warn: line => events.push(JSON.parse(line)) };
   const { card } = fixture({ messageId: 'om_card', entries: [] }, {}, { logger });
