@@ -115,11 +115,10 @@ test('shared home rejects conflicting inherited state and owned close escalates 
 });
 
 
-test('card editing instructions reach continued turns only when enabled', () => {
+test('card text configuration does not change the Codex prompt', () => {
   const input = { binding: { feishuOpenId: 'human', chatId: 'private', chatType: 'p2p', created: false }, prompt: 'customize my card' };
-  assert.doesNotMatch(buildInitialPrompt(input), /本机器人执行卡片文案/);
-  const result = buildInitialPrompt({ ...input, cardTextFile: '.agent-chat-bridge/bot3-card-text.json' });
-  assert.match(result, /文案文件（相对项目目录）：.agent-chat-bridge\/bot3-card-text.json/);
-  assert.match(result, /无需重启/);
+  const result = buildInitialPrompt(input);
+  assert.equal(buildInitialPrompt({ ...input, cardTextFile: '.agent-chat-bridge/bot3-card-text.json' }), result);
+  assert.doesNotMatch(result, /本机器人执行卡片文案|bot3-card-text\.json|无需重启/);
   assert.match(result, /customize my card$/);
 });

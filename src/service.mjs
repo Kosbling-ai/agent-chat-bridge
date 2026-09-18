@@ -176,7 +176,6 @@ export async function startService({ config, configPath, env = process.env, log,
       memoryMaxRssBytes: config.codex.memoryMaxRssBytes,
       memoryMaxHeapUsedBytes: config.codex.memoryMaxHeapUsedBytes,
       maxOutputChars: config.feishu.maxOutputChars,
-      cardTextFile: config.feishu.cardTextFile,
       outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
     };

@@ -3,17 +3,27 @@ import assert from 'node:assert/strict';
 import { ExecutionCard, renderExecutionCard, observeExecutionCard } from '../src/channels/feishu/execution-card.mjs';
 const quiet = { info() {}, warn() {} };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
-function fixture(saved, overrides = {}) {
+function fixture(saved, overrides = {}, options = {}) {
   const calls = []; const persisted = [];
   const message = {
     async create(payload) { calls.push({ method: 'create', payload }); return { code: 0, data: { message_id: 'om_card' } }; },
     async patch(payload) { calls.push({ method: 'patch', payload }); return { code: 0 }; },
     ...overrides,
   };
-  const card = new ExecutionCard({ client: { im: { v1: { message } } }, chatId: 'chat', uuid: 'stable-create', saved, logger: quiet, persist: async (value) => persisted.push(value) });
+  const card = new ExecutionCard({ client: { im: { v1: { message } } }, chatId: 'chat', uuid: 'stable-create', saved, logger: options.logger || quiet, persist: async (value) => persisted.push(value) });
   return { card, calls, persisted };
 }
 const tool = (id, status = 'running') => ({ kind: 'tool', id, title: '读取信息', status, summary: '正在处理' });
+function manualPollClock() {
+  let callback; let time = 0; let cleared = false;
+  return {
+    now: () => time,
+    setIntervalFn(fn) { callback = fn; return { unref() {} }; },
+    clearIntervalFn() { cleared = true; },
+    async run(at) { time = at; await callback(); await tick(); },
+    get cleared() { return cleared; },
+  };
+}
 
 test('one message has commentary, nested tools and final answer; replay patches same id', async () => {
   const { card, calls, persisted } = fixture();
@@ -46,6 +56,14 @@ test('progress uses normal grey plain text while final Markdown stays intact and
   assert.deepEqual(card.body.elements[0], { tag: 'div', text: { tag: 'plain_text', content: commentary, text_size: 'normal', text_color: 'grey' } });
   assert.deepEqual(card.body.elements[1], { tag: 'markdown', content: answer, text_size: 'heading' });
   assert.deepEqual(card.body.elements[2], { tag: 'markdown', content: '**已完成**' });
+});
+
+test('temporary progress-unavailable state is visible only while running', () => {
+  const running = renderExecutionCard({ status: 'running', progressUnavailable: true, entries: [] });
+  assert.equal(running.body.elements[0].text.content, '进度暂不可用，任务仍在后台执行。');
+  const completed = renderExecutionCard({ status: 'completed', progressUnavailable: true, entries: [] }, '# 最终答案');
+  assert.doesNotMatch(JSON.stringify(completed), /进度暂不可用/);
+  assert.ok(JSON.stringify(completed).includes('# 最终答案'));
 });
 
 test('slow SDK keeps only one request in flight and final waits for it once', async () => {
@@ -141,6 +159,127 @@ test('final patch failure closes the original card and selects normal-message fa
   assert.equal(patches, 2);
 });
 
+test('observer retries transient reads with backoff and clears degraded state after recovery', async () => {
+  const events = []; const logger = { info: line => events.push(JSON.parse(line)), warn: line => events.push(JSON.parse(line)) };
+  const { card } = fixture({ messageId: 'om_card', entries: [] }, {}, { logger });
+  const clock = manualPollClock(); let reads = 0;
+  const observer = observeExecutionCard({ card, since: 100, intervalMs: 1000, now: clock.now,
+    setIntervalFn: clock.setIntervalFn, clearIntervalFn: clock.clearIntervalFn,
+    load: async () => {
+      reads += 1;
+      if (reads <= 3) throw Object.assign(new Error('temporary failure'), { code: 'ECONNRESET' });
+      return [{ id: 1, created_at: 101, progress_json: { kind: 'commentary', id: 'recovered', text: '恢复后的进度' } }];
+    } });
+  await tick();
+  assert.equal(reads, 1);
+  await clock.run(999); assert.equal(reads, 1);
+  await clock.run(1000); assert.equal(reads, 2);
+  await clock.run(2999); assert.equal(reads, 2);
+  await clock.run(3000); assert.equal(reads, 3);
+  await card.chain;
+  assert.equal(card.snapshot().progressUnavailable, true);
+  assert.match(JSON.stringify(renderExecutionCard(card.snapshot())), /进度暂不可用/);
+  await clock.run(6999); assert.equal(reads, 3);
+  await clock.run(7000); assert.equal(reads, 4);
+  await card.chain;
+  assert.equal(card.snapshot().progressUnavailable, undefined);
+  assert.equal(card.snapshot().entries[0].id, 'recovered');
+  const retryLogs = events.filter(event => event.operation === 'read_progress' && event.status === 'retrying');
+  assert.deepEqual(retryLogs.map(event => [event.stage, event.error_code, event.consecutive_failures, event.retry_delay_ms]), [
+    ['load', 'ECONNRESET', 1, 1000], ['load', 'ECONNRESET', 2, 2000], ['load', 'ECONNRESET', 3, 4000],
+  ]);
+  assert.equal(events.find(event => event.operation === 'read_progress' && event.status === 'recovered').consecutive_failures, 3);
+  await observer.stop();
+  assert.equal(clock.cleared, true);
+});
+
+test('observer clears a saved degraded notice on its first successful read', async () => {
+  for (const rows of [[], [{ id: 1, created_at: 101, progress_json: { kind: 'commentary', id: 'restored', text: '恢复后的进度' } }]]) {
+    const events = []; const logger = { info: line => events.push(JSON.parse(line)), warn: line => events.push(JSON.parse(line)) };
+    const { card } = fixture({ messageId: 'om_card', progressUnavailable: true, entries: [] }, {}, { logger });
+    const observer = observeExecutionCard({ card, since: 100, load: async () => rows });
+    await tick(); await card.chain;
+    assert.equal(card.snapshot().progressUnavailable, undefined);
+    assert.equal(card.snapshot().entries.length, rows.length);
+    assert.ok(events.some(event => event.operation === 'read_progress' && event.status === 'recovered' && event.consecutive_failures === 0));
+    observer.cancel();
+  }
+});
+
+test('persistent observer failures cap backoff at eight intervals without stopping forever', async () => {
+  const events = []; const logger = { info: line => events.push(JSON.parse(line)), warn: line => events.push(JSON.parse(line)) };
+  const { card } = fixture({ messageId: 'om_card', entries: [] }, {}, { logger });
+  const clock = manualPollClock(); let reads = 0;
+  const observer = observeExecutionCard({ card, since: 100, intervalMs: 1000, now: clock.now,
+    setIntervalFn: clock.setIntervalFn, clearIntervalFn: clock.clearIntervalFn,
+    load: async () => { reads += 1; throw Object.assign(new Error('hidden details'), { code: 'POOL_BUSY' }); } });
+  await tick();
+  for (const at of [1000, 3000, 7000, 15000]) await clock.run(at);
+  assert.equal(reads, 5);
+  const retryLogs = events.filter(event => event.operation === 'read_progress' && event.status === 'retrying');
+  assert.deepEqual(retryLogs.map(event => event.retry_delay_ms), [1000, 2000, 4000, 8000, 8000]);
+  assert.ok(retryLogs.every(event => event.stage === 'load' && event.error_code === 'POOL_BUSY' && !JSON.stringify(event).includes('hidden details')));
+  await clock.run(22999); assert.equal(reads, 5);
+  await clock.run(23000); assert.equal(reads, 6);
+  observer.cancel();
+  await clock.run(99999); assert.equal(reads, 6);
+  assert.equal(clock.cleared, true);
+});
+
+test('lease loss and runtime shutdown terminate observation without retry', async () => {
+  for (const code of ['forward_lease_lost', 'forward_runtime_stopping']) {
+    const events = []; const logger = { info: line => events.push(JSON.parse(line)), warn: line => events.push(JSON.parse(line)) };
+    const { card } = fixture({ messageId: 'om_card', entries: [] }, {}, { logger });
+    const clock = manualPollClock(); let reads = 0;
+    const observer = observeExecutionCard({ card, since: 100, now: clock.now,
+      setIntervalFn: clock.setIntervalFn, clearIntervalFn: clock.clearIntervalFn,
+      load: async () => { reads += 1; throw Object.assign(new Error('private detail'), { code }); } });
+    await tick(); await clock.run(100000); await observer.stop();
+    assert.equal(reads, 1);
+    assert.equal(clock.cleared, true);
+    assert.ok(events.some(event => event.operation === 'read_progress' && event.status === 'stopped' && event.stage === 'load' && event.error_code === code));
+    assert.doesNotMatch(JSON.stringify(events), /private detail/);
+  }
+});
+
+test('lease loss raised while applying an event terminates instead of being skipped', async () => {
+  const logs = []; const clock = manualPollClock(); let reads = 0;
+  const card = {
+    chain: Promise.resolve(),
+    push() { throw Object.assign(new Error('private lease detail'), { code: 'forward_lease_lost' }); },
+    log(status, _level, extra) { logs.push({ status, ...extra }); return Promise.resolve(); },
+    stop() {}, snapshot() { return {}; },
+  };
+  const observer = observeExecutionCard({ card, since: 100, now: clock.now,
+    setIntervalFn: clock.setIntervalFn, clearIntervalFn: clock.clearIntervalFn,
+    load: async () => { reads += 1; return [{ id: 1, created_at: 101, progress_json: { kind: 'commentary', id: 'c', text: 'hidden' } }]; } });
+  await tick(); await clock.run(100000); await observer.stop();
+  assert.equal(reads, 1);
+  assert.equal(clock.cleared, true);
+  assert.deepEqual(logs.map(event => [event.status, event.stage, event.error_code]), [['stopped', 'event', 'forward_lease_lost']]);
+  assert.doesNotMatch(JSON.stringify(logs), /private lease detail|hidden/);
+});
+
+test('one corrupt progress event is skipped without replaying or hiding later events', async () => {
+  const pushed = []; const logs = [];
+  const card = {
+    chain: Promise.resolve(),
+    push(event) { if (event.id === 'throws') throw Object.assign(new Error('private event'), { code: 'BAD_EVENT' }); pushed.push(event.id); },
+    log(status, _level, extra) { logs.push({ status, ...extra }); return Promise.resolve(); },
+    stop() {}, snapshot() { return { pushed }; },
+  };
+  let reads = 0;
+  const observer = observeExecutionCard({ card, since: 100, load: async () => reads++ ? [] : [
+    { id: 1, created_at: 101, progress_json: '{broken' },
+    { id: 2, created_at: 102, progress_json: { kind: 'commentary', id: 'throws', text: 'do not expose' } },
+    { id: 3, created_at: 103, progress_json: { kind: 'commentary', id: 'visible', text: 'ok' } },
+  ] });
+  await tick(); await observer.stop();
+  assert.deepEqual(pushed, ['visible']);
+  assert.deepEqual(logs.filter(event => event.stage === 'event').map(event => [event.status, event.error_code]), [['skipped', 'BAD_EVENT']]);
+  assert.doesNotMatch(JSON.stringify(logs), /private event|do not expose/);
+});
+
 test('observer read failure cannot reject final delivery', async () => {
   const { card } = fixture(); let reads = 0;
   const observer = observeExecutionCard({ card, since: 100, load: async () => { reads++; throw new Error('database unavailable'); } });
@@ -162,6 +301,34 @@ test('observer cancel releases its timer without a final poll', async () => {
   await scheduled();
   assert.equal(cleared, true);
   assert.equal(reads, 1);
+});
+
+test('observer cancel suppresses a pending load result and later card side effects', async () => {
+  const { card } = fixture({ messageId: 'om_card', entries: [] });
+  let release; let scheduled;
+  const observer = observeExecutionCard({ card, since: 100,
+    load: async () => new Promise(resolve => { release = resolve; }),
+    setIntervalFn(callback) { scheduled = callback; return { unref() {} }; }, clearIntervalFn() {} });
+  await tick();
+  observer.cancel();
+  release([{ id: 1, created_at: 101, progress_json: { kind: 'commentary', id: 'late', text: 'late' } }]);
+  await tick(); await scheduled(); await tick();
+  assert.equal(card.snapshot().entries.length, 0);
+  assert.equal(card.snapshot().progressUnavailable, undefined);
+});
+
+test('observer stop waits for an in-flight load without another poll or card patch', async () => {
+  const { card, calls } = fixture({ messageId: 'om_card', entries: [] });
+  let release; let reads = 0;
+  const observer = observeExecutionCard({ card, since: 100,
+    load: async () => { reads += 1; return new Promise(resolve => { release = resolve; }); } });
+  await tick();
+  const stopping = observer.stop();
+  release([{ id: 1, created_at: 101, progress_json: { kind: 'commentary', id: 'late', text: 'late' } }]);
+  await stopping;
+  assert.equal(reads, 1);
+  assert.equal(calls.length, 0);
+  assert.equal(card.snapshot().entries.length, 0);
 });
 
 test('metadata failure after a confirmed patch remains observational', async () => {

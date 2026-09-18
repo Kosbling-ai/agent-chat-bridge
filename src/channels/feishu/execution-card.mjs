@@ -29,6 +29,7 @@ export function renderExecutionCard(state, answer = '', displayName = 'agent-cha
     else { flush(); elements.push(progressText(publicText(entry.text, 800))); }
   }
   flush();
+  if (state.status === 'running' && state.progressUnavailable) elements.unshift(progressText(copy.progressUnavailable));
   if (state.omitted) elements.unshift(progressText(copy.omitted));
   if (answer) elements.push(answerMd(answer));
   if (!elements.length) elements.push(progressText(copy.received));
@@ -59,6 +60,15 @@ export class ExecutionCard {
   }
   snapshot() { return structuredClone(this.state); }
   setForkSource(threadId) { this.state.forkSourceThreadId = String(threadId || ''); }
+  setProgressUnavailable(value) {
+    if (this.closed || this.state.delivery === 'fallback') return;
+    const next = value === true;
+    if (Boolean(this.state.progressUnavailable) === next) return;
+    if (next) this.state.progressUnavailable = true;
+    else delete this.state.progressUnavailable;
+    this.dirty = true;
+    this.enqueue();
+  }
   push(event) {
     if (this.closed || this.state.delivery === 'fallback' || !event) return;
     if (event.kind === 'started') { this.state.status = 'running'; if (event.turnId) this.state.turnId = event.turnId; }
@@ -144,43 +154,105 @@ function checkResponse(response) {
 }
 
 // A bounded, read-only sidecar. It cannot cancel/steer or retry a Codex turn.
-export function observeExecutionCard({ card, load, since, intervalMs = 1000, setIntervalFn = setInterval, clearIntervalFn = clearInterval }) {
+export function observeExecutionCard({ card, load, since, intervalMs = 1000, setIntervalFn = setInterval, clearIntervalFn = clearInterval, now = Date.now }) {
+  const baseDelayMs = Math.max(1000, Number(intervalMs) || 1000);
+  const terminalCodes = new Set(['forward_lease_lost', 'forward_runtime_stopping']);
   let cursor = { at: since, id: 0 };
   let highWater = since;
   const seen = new Set();
-  let stopped = false;
+  let cancelled = false;
+  let stopping = false;
+  let terminal = false;
   let pending = null;
-  let failed = false;
-  const poll = () => {
-    if (stopped || pending || failed) return pending;
+  let consecutiveFailures = 0;
+  let retryAt = 0;
+  let degraded = card.snapshot?.().progressUnavailable === true;
+  let timer;
+  const inactive = () => cancelled || terminal;
+  const clearTimer = () => { if (timer) clearIntervalFn(timer); timer = null; };
+  const safeLog = (status, level, extra) => Promise.resolve().then(() => card.log(status, level, extra)).catch(() => {});
+  const setDegraded = (value) => {
+    if (degraded === value || inactive()) return;
+    degraded = value;
+    try { card.setProgressUnavailable?.(value); } catch (error) {
+      safeLog('skipped', 'warn', { operation: 'read_progress', stage: 'card_state', error_code: errorCode(error), consecutive_failures: consecutiveFailures });
+    }
+  };
+  const stopForError = async (error, stage) => {
+    terminal = true;
+    clearTimer();
+    await safeLog('stopped', 'warn', { operation: 'read_progress', stage, error_code: errorCode(error), consecutive_failures: consecutiveFailures });
+  };
+  const failLoad = async (error, force) => {
+    if (inactive()) return;
+    const code = errorCode(error);
+    if (terminalCodes.has(code)) {
+      await stopForError(error, 'load');
+      return;
+    }
+    if (stopping) {
+      if (force) await safeLog('stopped', 'warn', { operation: 'read_progress', stage: 'load', error_code: code, consecutive_failures: consecutiveFailures });
+      return;
+    }
+    consecutiveFailures += 1;
+    const retryDelayMs = baseDelayMs * Math.min(8, 2 ** (consecutiveFailures - 1));
+    retryAt = now() + retryDelayMs;
+    if (consecutiveFailures >= 3) setDegraded(true);
+    await safeLog('retrying', 'warn', { operation: 'read_progress', stage: 'load', error_code: code, consecutive_failures: consecutiveFailures, retry_delay_ms: retryDelayMs });
+  };
+  const recover = async () => {
+    if ((!consecutiveFailures && !degraded) || inactive()) return;
+    const recoveredFailures = consecutiveFailures;
+    consecutiveFailures = 0;
+    retryAt = 0;
+    setDegraded(false);
+    await safeLog('recovered', 'info', { operation: 'read_progress', stage: 'load', consecutive_failures: recoveredFailures });
+  };
+  const poll = ({ force = false } = {}) => {
+    if (inactive() || pending || (stopping && !force) || (!force && now() < retryAt)) return pending;
     pending = (async () => {
-      const rows = await load(cursor);
+      let rows;
+      try { rows = await load(cursor); } catch (error) { await failLoad(error, force); return; }
+      if (inactive() || (stopping && !force)) return;
+      await recover();
       for (const row of rows) {
-        cursor = { at: Number(row.created_at), id: Number(row.id) };
-        highWater = Math.max(highWater, cursor.at);
-        if (!row.progress_json || seen.has(String(row.id))) continue;
-        seen.add(String(row.id));
-        if (seen.size > 500) seen.delete(seen.values().next().value);
-        let event;
-        try { event = typeof row.progress_json === 'string' ? JSON.parse(row.progress_json) : row.progress_json; } catch { continue; }
-        if (['started', 'commentary', 'tool'].includes(event?.kind)) card.push(event);
+        if (inactive() || (stopping && !force)) return;
+        try {
+          cursor = { at: Number(row.created_at), id: Number(row.id) };
+          highWater = Math.max(highWater, cursor.at);
+          if (!row.progress_json || seen.has(String(row.id))) continue;
+          seen.add(String(row.id));
+          if (seen.size > 500) seen.delete(seen.values().next().value);
+          let event;
+          try { event = typeof row.progress_json === 'string' ? JSON.parse(row.progress_json) : row.progress_json; } catch { continue; }
+          if (['started', 'commentary', 'tool'].includes(event?.kind)) card.push(event);
+        } catch (error) {
+          if (terminalCodes.has(errorCode(error))) { await stopForError(error, 'event'); return; }
+          await safeLog('skipped', 'warn', { operation: 'read_progress', stage: 'event', error_code: errorCode(error), consecutive_failures: 0 });
+        }
       }
       // Replay a bounded overlap for asynchronously committed events. Full pages
       // continue keyset paging first, so a busy chat cannot starve later rows.
       if (rows.length < 100) cursor = { at: Math.max(since, highWater - 10000), id: 0 };
-    })().catch(async () => { failed = true; await card.log('fallback', 'warn', { operation: 'read_progress' }).catch(() => {}); }).finally(() => { pending = null; });
+    })().finally(() => { pending = null; });
     return pending;
   };
-  const timer = setIntervalFn(poll, Math.max(1000, intervalMs)); timer.unref?.();
+  timer = setIntervalFn(poll, baseDelayMs); timer.unref?.();
   poll();
   return { card, async stop() {
-    clearIntervalFn(timer);
-    if (!stopped) { await pending; await poll(); stopped = true; }
+    stopping = true;
+    const active = pending;
+    clearTimer();
+    if (!inactive()) {
+      if (active) await active;
+      else await poll({ force: true });
+      terminal = true;
+    } else await active;
     card.stop(); await card.chain;
     return card.snapshot();
   }, cancel() {
-    stopped = true;
-    clearIntervalFn(timer);
+    cancelled = true;
+    clearTimer();
     card.stop();
   } };
 }
