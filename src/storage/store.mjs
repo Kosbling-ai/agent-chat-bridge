@@ -21,14 +21,16 @@ function limit(value = 50) { if (!Number.isInteger(value) || value < 1 || value 
 function scope(input) { return [text(input.connectionId, 128), text(input.conversationId)]; }
 function lease(input) { text(input.id, 36); text(input.leaseToken, 36); }
 
-export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, onWriterLost, now = Date.now }) {
+export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, onWriterLost, now = Date.now,
+  writerProbeIntervalMs, writerProbeTimeoutMs, writerProbeMaxMisses, log }) {
   text(connectionId, 128);
   await assertSchemaCurrent(pool);
   const activeConnections = new Set();
   const writer = await acquireWriter(pool, (error) => {
     for(const connection of activeConnections)connection.destroy();
     try { Promise.resolve(onWriterLost?.(error)).catch(() => {}); } catch { /* Host callback cannot revive the writer. */ }
-  }, { timeoutMs: operationTimeoutMs, connectionId });
+  }, { timeoutMs: operationTimeoutMs, connectionId, probeIntervalMs: writerProbeIntervalMs,
+    probeTimeoutMs: writerProbeTimeoutMs, probeMaxMisses: writerProbeMaxMisses, log });
   const read = (fn) => withConnection(pool, fn, { timeoutMs: operationTimeoutMs });
   const write = async (fn) => {
     writer.assert();
@@ -37,9 +39,7 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
       return await withConnection(pool, async (connection) => {
         active = connection;
         activeConnections.add(connection);
-        await writer.verify();
         const result = await fn(connection);
-        await writer.verify();
         return result;
       }, { timeoutMs: operationTimeoutMs, transaction: true });
     } finally {

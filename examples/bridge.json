@@ -1,9 +1,11 @@
 {
   "schemaVersion": 1,
   "listen": { "host": "127.0.0.1", "port": 18830 },
+  "runtime": { "unhealthyExitMs": 30000 },
   "storage": {
     "hostEnv": "BRIDGE_DB_HOST", "portEnv": "BRIDGE_DB_PORT", "userEnv": "BRIDGE_DB_USER",
-    "passwordEnv": "BRIDGE_DB_PASSWORD", "databaseEnv": "BRIDGE_DB_DATABASE"
+    "passwordEnv": "BRIDGE_DB_PASSWORD", "databaseEnv": "BRIDGE_DB_DATABASE",
+    "writer": { "probeIntervalMs": 500, "probeTimeoutMs": 5000, "probeMaxMisses": 2, "lostShutdownMs": 10000 }
   },
   "codex": {
     "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"],

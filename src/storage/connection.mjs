@@ -1,8 +1,15 @@
 import mysql from 'mysql2/promise';
 import { StoreError, databaseError } from './errors.mjs';
 
+const STORAGE_REFERENCE_FIELDS = ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'];
+
+export function storageConnectionReferences(storage) {
+  if (!storage || typeof storage !== 'object' || Array.isArray(storage)) throw new StoreError('invalid_storage_config');
+  return Object.fromEntries(STORAGE_REFERENCE_FIELDS.map(field => [field, storage[field]]));
+}
+
 export function createPoolFromEnvironment(references, env = process.env) {
-  const fields = ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'];
+  const fields = STORAGE_REFERENCE_FIELDS;
   if (!references || typeof references !== 'object' || Array.isArray(references)
       || Object.keys(references).some((key) => !fields.includes(key))) throw new StoreError('invalid_storage_config');
   const values = {};
