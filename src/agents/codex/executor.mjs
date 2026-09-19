@@ -1,3 +1,4 @@
+import { codexTurnError } from './turn-error.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -280,7 +281,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }
     if (key.startsWith('error:')) {
       const detail = parseDetail(event);
-      return { failed: true, turnStatus: detail.turnStatus === 'interrupted' ? 'interrupted' : 'failed', deferred: false, duplicate: true, reason: 'duplicate_error', threadId: binding.codexSessionId, turnId, answer: limitText(`Codex 会话失败：${trim(event.text) || '未知错误'}`, config.maxOutputChars || 3500) };
+      return { failed: true, errorCode: detail.errorCode === 'CODEX_USAGE_LIMIT_EXCEEDED' ? detail.errorCode : 'CODEX_TURN_FAILED', turnStatus: detail.turnStatus === 'interrupted' ? 'interrupted' : 'failed', deferred: false, duplicate: true, reason: 'duplicate_error', threadId: binding.codexSessionId, turnId, answer: 'Codex 会话失败。' };
     }
     return { deferred: true, accepted: key.startsWith('user-steer-confirmed:'), duplicate: true, reason: 'duplicate_message', threadId: binding.codexSessionId, turnId };
   }
@@ -348,7 +349,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         if (!ended || ended.status === 'inProgress') throw coded('steer rejection could not be reconciled', 'CODEX_STEER_UNCONFIRMED', { outcome: 'unknown' });
         if (!active.settled) {
           if (ended.status === 'completed') active.resolve({ turn: ended });
-          else active.reject(coded(ended.error?.message || `Codex turn ${ended.status}`, ended.status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED'));
+          else active.reject(codexTurnError(ended.error, ended.status));
         }
         await active.completed.catch(() => {});
         while (activeByBinding.get(bindingKey(active.binding)) === active) await new Promise((resolvePromise) => setImmediate(resolvePromise));
@@ -510,7 +511,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         eventType: 'error', role: 'activity',
         title: '执行失败',
         text: error.message, createdAt: now(),
-        detail: { turnId: state.turnId, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
+        detail: { errorCode: error.code, turnId: state.turnId, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
       };
       try { await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent); }
       catch { logObservationPersistenceFailure(state, 'event'); }
@@ -692,7 +693,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     const state = createTurnState(binding, input, resume.turnId, Number(resume.startedAt));
     await registerState(state);
     if (snapshot.status === 'completed') state.resolve({ turn: snapshot.turn });
-    else if (snapshot.status !== 'inProgress') state.reject(coded(snapshot.turn?.error?.message || `Codex turn ${snapshot.status}`, snapshot.status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED'));
+    else if (snapshot.status !== 'inProgress') state.reject(codexTurnError(snapshot.turn?.error, snapshot.status));
     return state;
   }
 
@@ -713,7 +714,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (takeover && messageId && messageId !== state.messageId) {
         await sessionStore.saveCodexRealtimeEvent(state.binding, {
           messageId, eventKey: `error:${messageId}`, eventType: 'error', role: 'activity', title: '执行失败',
-          text: error.message, createdAt: now(), detail: { turnId: state.turnId, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
+          text: error.message, createdAt: now(), detail: { errorCode: error.code, turnId: state.turnId, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
         }).catch(() => {});
         await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: error.message }).catch(() => {});
       }
@@ -820,12 +821,12 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     } else if (method === 'item/completed' && params.item) {
       await persistCompletedItem(state, params.item).catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_item', status: 'failed', threadId: state.threadId, turnId }));
     }
-    else if (method === 'error' && params.willRetry !== true) state.reject(coded(params.error?.message || 'Codex turn failed', 'CODEX_TURN_FAILED'));
+    else if (method === 'error' && params.willRetry !== true) state.reject(codexTurnError(params.error));
     else if (method === 'turn/completed') {
       for (const item of params.turn?.items || []) {
         await persistCompletedItem(state, item).catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_item', status: 'failed', threadId: state.threadId, turnId }));
       }
-      if (params.turn?.status === 'failed' || params.turn?.status === 'interrupted') state.reject(coded(params.turn?.error?.message || `Codex turn ${params.turn.status}`, params.turn.status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED'));
+      if (params.turn?.status === 'failed' || params.turn?.status === 'interrupted') state.reject(codexTurnError(params.turn?.error, params.turn.status));
       else state.resolve({ turn: params.turn });
     }
   }

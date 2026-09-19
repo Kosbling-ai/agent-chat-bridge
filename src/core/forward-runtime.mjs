@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { deriveExecutionScope, codexBindingOpenId } from '../agents/codex/thread-scope.mjs';
 
-const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED'].includes(error?.code);
+const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED', 'CODEX_USAGE_LIMIT_EXCEEDED'].includes(error?.code);
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
 const retryableError = error => {
   if (isBusy(error)) return false;
@@ -166,7 +166,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       lease.assertOwned();
       if (result.failed === true || ['failed','interrupted'].includes(result.turnStatus)) {
         throw Object.assign(new Error('codex_turn_failed'), {
-          code: result.turnStatus === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED',
+          code: result.turnStatus === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : result.errorCode === 'CODEX_USAGE_LIMIT_EXCEEDED' ? result.errorCode : 'CODEX_TURN_FAILED',
         });
       }
       execution = { ...execution, bindingOpenId: input.bindingOpenId, threadId: result.threadId || result.sessionId || '',
@@ -210,7 +210,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         if (current?.codexSessionId) busyFork = { sourceThreadId: current.codexSessionId, bindingOpenId: scopedBindingOpenId, chatId: job.chatId };
       }
       const failed = { failed: true, turnStatus: execution.terminal,
-        answer: error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : isBusy(error) ? '会话被其他客户端占用，请释放后重试。原会话绑定保持不变。' : '执行未完成，请稍后重试。',
+        answer: error.code === 'CODEX_USAGE_LIMIT_EXCEEDED' ? 'Codex 额度不足，本次执行已停止。请在额度恢复后再继续；不会自动重试此任务。' : error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : isBusy(error) ? '会话被其他客户端占用，请释放后重试。原会话绑定保持不变。' : '执行未完成，请稍后重试。',
         rawAnswer: '', attachments: [], execution, ...(busyFork ? { busyFork } : {}) };
       await feedback?.prepare?.(job, failed, state);
       await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result: failed, errorCode: error.code || 'forward_execution_failed' });

@@ -673,3 +673,22 @@ test('every claim batch gets a distinct lease identity', async () => {
   assert.equal(new Set(owners).size, owners.length);
   assert(owners.every(owner => owner.startsWith('process-worker:')));
 });
+
+test('usage exhaustion sends one failed reply and never automatically replays, including recovered results', async () => {
+  for (const recovered of [false, true]) {
+    const jobs = memoryJobs({ status: 'pending', attempts: 0, deliveryMode: 'bridge', senderOpenId: 'human', chatType: 'p2p' });
+    let executions = 0, deliveries = 0, storedCode;
+    const markReplyPending = jobs.markReplyPending;
+    jobs.markReplyPending = async input => { storedCode = input.errorCode; return markReplyPending(input); };
+    const runtime = createForwardRuntime({ config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
+      executor: { async execute() { executions++; if (recovered) return { failed: true, turnStatus: 'failed', errorCode: 'CODEX_USAGE_LIMIT_EXCEEDED' }; throw Object.assign(new Error('SECRET network timeout'), { code: 'CODEX_USAGE_LIMIT_EXCEEDED' }); } },
+      replies: { async prepare(_job, result) { return result; }, async deliver() { deliveries++; return { status: 'sent' }; } }, authorize: async () => true });
+    runtime.start(); await flush(); await runtime.stop();
+    assert.equal(executions, 1); assert.equal(deliveries, 1);
+    assert.equal(jobs.job.status, 'failed');
+    assert.equal(storedCode, 'CODEX_USAGE_LIMIT_EXCEEDED');
+    assert.match(jobs.job.result.answer, /Codex 额度不足/);
+    assert.doesNotMatch(jobs.job.result.answer, /SECRET|稍后重试/);
+    assert.equal(jobs.calls.filter(([name]) => name === 'retry').length, 0);
+  }
+});
