@@ -7,7 +7,7 @@ const chatKey = (value) => String(value || 'unknown').replace(/[^A-Za-z0-9_-]/g,
 const scopeHash = (value) => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 
 export function buildBusinessEventPrompt(event) {
-  const references = Object.entries(event.refIds || {}).sort(([left], [right]) => left.localeCompare(right));
+  const references = Object.keys(event.refIds || {}).sort().map(key => [key, event.refIds[key]]);
   const lines = [
     '【业务事件】',
     `type：${event.type}`,

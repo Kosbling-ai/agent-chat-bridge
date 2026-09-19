@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { deriveExecutionScope, codexBindingOpenId } from '../agents/codex/thread-scope.mjs';
 import { buildBusinessEventPrompt } from '../agents/codex/prompt.mjs';
 
@@ -12,6 +12,8 @@ const retryableError = error => {
   return /\b(?:AbortError|TimeoutError|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)\b/i.test(value)
     || /steer delivery unconfirmed|timed out|timeout|network|socket hang up|fetch failed|aborted|stream disconnected before completion|error sending request/i.test(value);
 };
+const eventIdempotencyKey = (producerId, eventId) => `event\0${producerId}\0${eventId}`;
+const eventMessageId = (producerId, eventId) => `event:${createHash('sha256').update(`${producerId}\0${eventId}`).digest('hex')}`;
 
 export function createForwardRuntime({ config = {}, jobs, sessions, inbound, media, executor, feedback, replies,
   authorize = async () => true, log = () => {}, now = Date.now } = {}) {
@@ -80,12 +82,13 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
 
   async function registerEvent(input) {
     const bindingOpenId = deriveExecutionScope(input.producerId, input.scope);
+    const messageId = eventMessageId(input.producerId, input.eventId);
     const registered = await jobs.upsert({
       callerId: input.producerId,
-      idempotencyKey: input.eventId,
+      idempotencyKey: eventIdempotencyKey(input.producerId, input.eventId),
       requestHash: input.requestHash,
-      conversationId: input.targetChatId,
-      messageId: `event:${input.producerId}:${input.eventId}`,
+      conversationId: input.chatId,
+      messageId,
       sourceMessageId: null,
       bindingOpenId,
       chatType: 'group',
@@ -104,7 +107,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         refIds: input.refIds,
       } },
     });
-    if (registered.messageId !== `event:${input.producerId}:${input.eventId}`
+    if (registered.messageId !== messageId
       || registered.callerId !== input.producerId || registered.executionNamespace !== input.scope) {
       throw Object.assign(new Error('job_conflict'), { code: 'job_conflict' });
     }
@@ -114,8 +117,9 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   }
 
   async function getEvent({ producerId, eventId }) {
-    const job = await jobs.getByIdempotencyKey({ callerId: producerId, idempotencyKey: eventId });
-    return job?.messageId === `event:${producerId}:${eventId}`
+    const messageId = eventMessageId(producerId, eventId);
+    const job = await jobs.getByIdempotencyKey({ callerId: producerId, idempotencyKey: eventIdempotencyKey(producerId, eventId) });
+    return job?.messageId === messageId
       ? { jobId: job.id, status: job.status, updatedAt: job.updatedAt } : null;
   }
 

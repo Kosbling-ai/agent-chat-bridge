@@ -5,8 +5,11 @@ import { safeObserver } from './logger.mjs';
 export const EVENTS_BODY_MAX_BYTES = 64 * 1024;
 const EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const SCOPE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const CORRELATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const REF_ID_KEY = /^[A-Za-z0-9_.-]{1,64}$/;
+const CONTROL_CHARACTER = /\p{Cc}/u;
 const EVENT_TYPES = new Set(['mail.inbound', 'wait.due', 'wait.resolved']);
-const EVENT_FIELDS = new Set(['event_id', 'producer_id', 'scope', 'type', 'correlation_id', 'occurred_at', 'ref_ids', 'prompt', 'target_chat_id']);
+const EVENT_FIELDS = new Set(['event_id', 'producer_id', 'scope', 'type', 'correlation_id', 'occurred_at', 'ref_ids', 'prompt']);
 
 class HttpError extends Error {
   constructor(status, code) { super(code); this.status = status; this.code = code; }
@@ -49,9 +52,9 @@ async function readJson(request) {
   catch { throw new HttpError(400, 'invalid_json'); }
 }
 
-function normalizeEvent(body, hook) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)
-    || Object.keys(body).some(key => !EVENT_FIELDS.has(key))) throw new HttpError(400, 'invalid_request');
+function normalizeEvent(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'invalid_request');
+  if (Object.keys(body).some(key => !EVENT_FIELDS.has(key))) throw new HttpError(400, 'unknown_field');
   const eventId = string(body.event_id, 128);
   if (!EVENT_ID.test(eventId)) throw new HttpError(400, 'invalid_event_id');
   const producerId = string(body.producer_id, 128);
@@ -59,7 +62,9 @@ function normalizeEvent(body, hook) {
   if (!SCOPE.test(scope)) throw new HttpError(400, 'invalid_scope');
   const type = string(body.type, 64);
   if (!EVENT_TYPES.has(type)) throw new HttpError(400, 'invalid_event_type');
-  if (typeof body.correlation_id !== 'string') throw new HttpError(400, 'invalid_correlation_id');
+  if (typeof body.correlation_id !== 'string' || !CORRELATION_ID.test(body.correlation_id)) {
+    throw new HttpError(400, 'invalid_correlation_id');
+  }
   const correlationId = body.correlation_id;
   if (typeof body.occurred_at !== 'string') throw new HttpError(400, 'invalid_occurred_at');
   const occurredAt = body.occurred_at;
@@ -68,19 +73,26 @@ function normalizeEvent(body, hook) {
   }
   if (!body.ref_ids || typeof body.ref_ids !== 'object' || Array.isArray(body.ref_ids)
     || Object.keys(body.ref_ids).length > 16) throw new HttpError(400, 'invalid_ref_ids');
-  const refIds = Object.fromEntries(Object.entries(body.ref_ids).sort(([left], [right]) => left.localeCompare(right)).map(([key, value]) => {
-    if (typeof value !== 'string') throw new HttpError(400, 'invalid_ref_ids');
+  const refIds = Object.fromEntries(Object.keys(body.ref_ids).sort().map(key => {
+    const value = body.ref_ids[key];
+    if (!REF_ID_KEY.test(key) || typeof value !== 'string' || value.length > 256 || CONTROL_CHARACTER.test(value)) {
+      throw new HttpError(400, 'invalid_ref_ids');
+    }
     return [key, value];
   }));
   if (typeof body.prompt !== 'string') throw new HttpError(400, 'invalid_prompt');
   if (body.prompt.length > 8000) throw new HttpError(413, 'payload_too_large');
-  const targetChatId = body.target_chat_id === undefined
-    ? hook.inbound.defaultChatId : string(body.target_chat_id, 191, 'invalid_target_chat_id');
-  return { eventId, producerId, scope, type, correlationId, occurredAt, refIds, prompt: body.prompt, targetChatId };
+  return { eventId, producerId, scope, type, correlationId, occurredAt, refIds, prompt: body.prompt };
 }
 
-function eventRequestHash(event) {
-  return createHash('sha256').update(JSON.stringify(event)).digest('hex');
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])]));
+}
+
+export function canonicalJsonHash(value) {
+  return createHash('sha256').update(JSON.stringify(canonicalize(value))).digest('hex');
 }
 
 export async function startServer({ config, log, readiness, eventRuntime, inboundTokens = {} }) {
@@ -103,7 +115,7 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
       const eventMatch = /^\/v1\/events\/([^/]+)$/.exec(url.pathname);
       if (request.method === 'POST' && url.pathname === '/v1/events') {
         const authenticated = authenticate(request, inboundHooks);
-        const event = normalizeEvent(await readJson(request), authenticated.hook);
+        const event = normalizeEvent(await readJson(request));
         eventLog = { hookId: authenticated.hook.id, eventId: event.eventId, type: event.type };
         if (event.producerId !== authenticated.hook.id) throw new HttpError(403, 'producer_forbidden');
         const scopePrefix = authenticated.hook.inbound.scopePrefixes.find(prefix => event.scope.startsWith(prefix));
@@ -111,7 +123,8 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
         eventLog.scopePrefix = scopePrefix;
         if (!eventRuntime?.registerEvent) throw new HttpError(503, 'service_unavailable');
         let result;
-        try { result = await eventRuntime.registerEvent({ ...event, requestHash: eventRequestHash(event) }); }
+        try { result = await eventRuntime.registerEvent({ ...event, chatId: authenticated.hook.inbound.defaultChatId,
+          requestHash: canonicalJsonHash(event) }); }
         catch (error) {
           if (error?.code === 'job_conflict') throw new HttpError(409, 'event_conflict');
           throw error;
@@ -152,17 +165,18 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
       if (response.headersSent || response.destroyed) { response.destroy(); return; }
       responseStatus = error instanceof HttpError ? error.status : 503;
       const code = error instanceof HttpError ? error.code : 'service_unavailable';
-      if (!(error instanceof HttpError)) log('error', 'http_request', 'failed', { code });
+      eventLog = { ...eventLog, errorClass: code };
       reply(response, responseStatus, { error: code });
     } finally {
       if (request.url?.startsWith('/v1/events')) {
         log(responseStatus >= 500 ? 'error' : responseStatus >= 400 ? 'warning' : 'info', 'events_api', 'completed', {
-          code: `http_${responseStatus || 503}`,
-          reason: eventLog?.hookId,
-          operationId: eventLog?.eventId,
-          stage: eventLog?.type,
-          rpcMethod: eventLog?.scopePrefix,
-          runId: eventLog?.jobId,
+          hookId: eventLog?.hookId,
+          eventId: eventLog?.eventId,
+          eventType: eventLog?.type,
+          scopePrefix: eventLog?.scopePrefix,
+          statusCode: responseStatus || 503,
+          jobId: eventLog?.jobId,
+          errorClass: eventLog?.errorClass || 'none',
         });
       }
     }
