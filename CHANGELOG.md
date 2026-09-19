@@ -2,9 +2,9 @@
 
 ## [0.2.9] — Unreleased
 
-- Forward every authorized private Feishu message type to Codex with ordered attachment metadata. Stream downloadable images, files, audio, and video into the inbox with an isolated 120-second deadline and a hard 32-MiB cap; preserve individual failures in the prompt without blocking the turn.
+- Forward every authorized private Feishu message type to Codex with ordered attachment metadata. Stream downloadable images, files, audio, and video into the inbox with a configurable deadline (120 seconds by default) and a hard 32-MiB cap; preserve individual failures in the prompt without blocking the turn.
 - Supply downloaded images as Codex `localImage` items while keeping text first. Persist prepared attachment records for recovery so a claimed job does not download the same inbound resource twice. Audio remains a text-path attachment because the 2026-09-19 local probe accepted `localAudio` at the protocol layer but the model could not read the valid PCM WAV content.
-- Remove bridge-owned unsupported/download-failure replies and the former `feishu.mediaUnsupportedReply` configuration. Group media behavior remains unchanged for the follow-up group-context work.
+- Remove bridge-owned unsupported/download-failure replies and the former `feishu.mediaUnsupportedReply` configuration. Group attachments are not yet downloaded or added to attachment blocks: media with no text or pending context is filtered at ingress, while pending context can still reach Codex.
 - No database migration.
 
 ## [0.2.8] — Unreleased

@@ -30,15 +30,6 @@ function walkPost(node, visit) {
   if (node.content) walkPost(node.content, visit);
   if (node.post) walkPost(node.post, visit);
 }
-export function extractPostImageKeys(event) {
-  if (event.message?.kind !== 'post') return [];
-  const content = safeJson(event.message.content);
-  const out = [];
-  walkPost(content.post || content.content || content, node => {
-    if (node.tag === 'img' && typeof node.image_key === 'string' && node.image_key && !out.includes(node.image_key)) out.push(node.image_key);
-  });
-  return out;
-}
 export function stringifyPostContent(value) {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) { const rows = value.map(item => stringifyPostContent(item)).filter(Boolean); return value.some(Array.isArray) ? rows.join('\n') : rows.join(''); }
@@ -112,7 +103,7 @@ function formatBytes(bytes) {
 function renderAttachment(attachment, total) {
   let line = `【附件 ${attachment.index}/${total}】${labels[attachment.kind]}`;
   if (attachment.fileName) line += ` ${attachment.fileName}`;
-  line += ` （类型 ${attachment.messageType}`;
+  line += `${attachment.fileName ? '' : ' '}（类型 ${attachment.messageType}`;
   if (attachment.durationMs !== null) line += `，时长 ${attachment.durationMs / 1000} 秒`;
   if (attachment.refId) line += `，${attachment.refId}`;
   if (attachment.status === 'downloaded') line += `，${formatBytes(attachment.bytes)}，已下载：${attachment.path}`;
@@ -148,7 +139,7 @@ export async function sendOutboundAttachment({ client, chatId, filePath, uuid = 
 
 export async function createFeishuMedia({ chat, inboxDir, enabled = true, maxBytes = 32 * 1024 * 1024, downloadTimeoutMs = 120000, log = () => {} } = {}) {
   if (!chat?.downloadResource || !isAbsolute(inboxDir || '') || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024
-    || !Number.isSafeInteger(downloadTimeoutMs) || downloadTimeoutMs < 1 || downloadTimeoutMs > 120000) throw new Error('invalid_media_config');
+    || !Number.isSafeInteger(downloadTimeoutMs) || downloadTimeoutMs < 1) throw new Error('invalid_media_config');
   async function download(event, attachment, runId) {
     const dir = join(inboxDir, safeSegment(event.conversationId, 'chat'), safeSegment(event.messageId, 'msg'));
     await mkdir(dir, { recursive: true });

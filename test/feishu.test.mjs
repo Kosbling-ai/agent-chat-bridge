@@ -217,6 +217,39 @@ test('download rejection preserves the sanitized Feishu platform code', async ()
     error => error.code === 'feishu_api_rejected' && error.platformCode === 234009 && !error.message.includes('secret'));
 });
 
+test('real SDK resource streams preserve JSON platform errors and pass normal HTTP 200 bytes', async () => {
+  const sdk = await import('@larksuiteoapi/node-sdk');
+  const { default: axios } = await import('axios');
+  const makeChat = (resourceResponse) => {
+    const http = axios.create({ timeout: 1000, adapter: async (config) => {
+      if (config.url.includes('/auth/')) return { status:200,statusText:'OK',headers:{},config,data:{code:0,tenant_access_token:'offline-token',expire:7200} };
+      return { ...resourceResponse, statusText:resourceResponse.status===200?'OK':'Bad Request', config,
+        data:Readable.from([Buffer.from(resourceResponse.body)]) };
+    } });
+    http.interceptors.response.use(response => response.config.$return_headers ? { data:response.data,headers:response.headers } : response.data);
+    const client = new sdk.Client({ appId:'offline-http-app',appSecret:'offline-value',httpInstance:http,
+      logger:{error(){},warn(){},info(){},debug(){},trace(){}},loggerLevel:sdk.LoggerLevel.fatal });
+    return createFeishuChatClient({client});
+  };
+
+  const rejected=makeChat({status:400,headers:{'content-type':'application/json'},body:'{"code":234040,"msg":"provider secret"}'});
+  await assert.rejects(rejected.downloadResource({messageId:'m',fileKey:'bad',type:'file'}),
+    error=>error.code==='feishu_api_rejected'&&error.platformCode===234040&&!error.message.includes('secret'));
+
+  const acceptedBody='{"code":7,"data":"valid attachment content"}';
+  const accepted=makeChat({status:200,headers:{'content-type':'application/json','content-length':String(Buffer.byteLength(acceptedBody))},body:acceptedBody});
+  const resource=await accepted.downloadResource({messageId:'m',fileKey:'good',type:'file',timeoutMs:120001});
+  let body='';for await(const chunk of resource.stream)body+=chunk.toString();
+  assert.equal(body,acceptedBody);assert.equal(resource.size,Buffer.byteLength(acceptedBody));
+});
+
+test('all transport error response streams are released even when the body is not JSON', async () => {
+  const source=Readable.from(['gateway failure']);
+  const {chat}=fakeChat(()=>{throw{response:{headers:{'content-type':'text/plain'},data:source}};});
+  await assert.rejects(chat.downloadResource({messageId:'m',fileKey:'bad',type:'file'}),{code:'feishu_transport_error'});
+  assert.equal(source.destroyed,true);
+});
+
 test('hung download has a wall clock limit', async () => {
   const source = new Readable({ read() {} });
   const { chat } = fakeChat(() => ({ getReadableStream: () => source, headers: {} }), { timeoutMs: 100 });

@@ -1,5 +1,7 @@
 import { Readable } from 'node:stream';
 
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
+
 export class FeishuChatError extends Error {
   constructor(code, outcome, platformCode) {
     super(code); this.code = code; this.outcome = outcome;
@@ -13,6 +15,55 @@ function required(value) {
 function page({ pageSize = 50, pageToken } = {}) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new FeishuChatError('invalid_page_size', 'failed');
   return { page_size: pageSize, ...(pageToken ? { page_token: required(pageToken) } : {}) };
+}
+
+function headerValue(headers, name) {
+  if (typeof headers?.get === 'function') return headers.get(name);
+  const key = Object.keys(headers || {}).find(candidate => candidate.toLowerCase() === name);
+  return key ? headers[key] : undefined;
+}
+
+async function inspectJsonErrorStream(source, { requireErrorShape = false } = {}) {
+  if (!source?.[Symbol.asyncIterator]) return { source, platformCode: null };
+  const iterator = source[Symbol.asyncIterator]();
+  const chunks = [];
+  let bytes = 0;
+  while (true) {
+    const step = await iterator.next();
+    if (step.done) break;
+    const chunk = Buffer.isBuffer(step.value) ? step.value : Buffer.from(step.value);
+    chunks.push(chunk); bytes += chunk.length;
+    if (bytes > MAX_ERROR_BODY_BYTES) {
+      const replay = Readable.from((async function* () {
+        yield* chunks;
+        while (true) { const next = await iterator.next(); if (next.done) break; yield next.value; }
+      })());
+      replay.once('close', () => source.destroy?.());
+      source.on?.('error', () => {});
+      return { source: replay, platformCode: null };
+    }
+  }
+  const body = Buffer.concat(chunks);
+  let parsed;
+  try { parsed = JSON.parse(body.toString('utf8')); } catch { /* A JSON content type alone is not an API rejection. */ }
+  const platformCode = Number.isInteger(parsed?.code) && parsed.code !== 0
+    && (!requireErrorShape || typeof parsed.msg === 'string') ? parsed.code : null;
+  return { source: Readable.from([body]), platformCode };
+}
+
+async function platformCodeFromTransport(error) {
+  const response = error?.response;
+  const source = response?.data;
+  try {
+    const direct = Number.isInteger(error?.code) ? error.code : response?.data?.code;
+    if (Number.isInteger(direct) && direct !== 0) return direct;
+    const contentType = String(headerValue(response?.headers, 'content-type') || '').toLowerCase();
+    if (!source?.[Symbol.asyncIterator]) return null;
+    if (!contentType.includes('application/json')) return null;
+    return (await inspectJsonErrorStream(source)).platformCode;
+  }
+  catch { return null; }
+  finally { source.destroy?.(); }
 }
 
 // Exactly one SDK call per operation: the core owns retry and effect ledgers.
@@ -48,7 +99,8 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
       return result.data;
     } catch (error) {
       if (error instanceof FeishuChatError) throw error;
-      const platformCode = Number.isInteger(error?.code) ? error.code : error?.response?.data?.code;
+      const platformCode = binary ? await platformCodeFromTransport(error)
+        : (Number.isInteger(error?.code) ? error.code : error?.response?.data?.code);
       if (Number.isInteger(platformCode) && platformCode !== 0) throw new FeishuChatError('feishu_api_rejected', 'failed', platformCode);
       // A connection loss or timeout does not prove a write failed remotely.
       throw new FeishuChatError('feishu_transport_error', write ? 'unknown' : 'failed');
@@ -108,14 +160,26 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
     async downloadResource({ messageId, fileKey, type, maxBytes = maxMediaBytes, timeoutMs: downloadTimeoutMs = timeoutMs }) {
       if (!['image', 'file'].includes(type)) throw new FeishuChatError('invalid_resource_type', 'failed');
       if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024
-        || !Number.isSafeInteger(downloadTimeoutMs) || downloadTimeoutMs < 1 || downloadTimeoutMs > 120000) throw new FeishuChatError('invalid_resource_limits', 'failed');
+        || !Number.isSafeInteger(downloadTimeoutMs) || downloadTimeoutMs < 1) throw new FeishuChatError('invalid_resource_limits', 'failed');
       const resource = await call('messageResource', 'get', { path: { message_id: required(messageId), file_key: required(fileKey) }, params: { type } }, false, true, undefined, downloadTimeoutMs);
-      const source = resource?.getReadableStream?.();
+      let source = resource?.getReadableStream?.();
       if (!source?.[Symbol.asyncIterator] || typeof source.destroy !== 'function') throw new FeishuChatError('invalid_resource_stream', 'failed');
-      const size = Number(resource.headers?.['content-length']);
-      if (size > maxBytes) { source.destroy(); throw new FeishuChatError('media_too_large', 'failed'); }
-      // Stream with a byte cap and wall-clock deadline, never buffer unbounded data.
+      source.on('error', () => {});
       const timer = setTimeout(() => source.destroy(new FeishuChatError('media_timeout', 'failed')), downloadTimeoutMs);
+      const contentType = String(headerValue(resource.headers, 'content-type') || 'application/octet-stream');
+      if (contentType.toLowerCase().includes('application/json')) {
+        let inspected;
+        try { inspected = await inspectJsonErrorStream(source, { requireErrorShape: true }); }
+        catch (error) {
+          clearTimeout(timer); source.destroy();
+          throw error instanceof FeishuChatError ? error : new FeishuChatError('media_read_failed', 'failed');
+        }
+        source = inspected.source; source.on('error', () => {});
+        if (Number.isInteger(inspected.platformCode)) { clearTimeout(timer); source.destroy(); throw new FeishuChatError('feishu_api_rejected', 'failed', inspected.platformCode); }
+      }
+      const size = Number(headerValue(resource.headers, 'content-length'));
+      if (size > maxBytes) { clearTimeout(timer); source.destroy(); throw new FeishuChatError('media_too_large', 'failed'); }
+      // Stream with a byte cap and wall-clock deadline, never buffer unbounded data.
       const stream = Readable.from((async function* () {
         let total = 0;
         try {
@@ -129,9 +193,7 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
         } finally { clearTimeout(timer); source.destroy(); }
       })());
       stream.once('close', () => { clearTimeout(timer); source.destroy(); });
-      // Attach a listener immediately; consumers still receive stream failures.
-      source.on('error', () => {});
-      return { stream, contentType: String(resource.headers?.['content-type'] || 'application/octet-stream'),
+      return { stream, contentType,
         ...(Number.isFinite(size) && size >= 0 ? { size } : {}) };
     },
   };

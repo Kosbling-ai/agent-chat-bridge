@@ -6,7 +6,7 @@ Downloads use `messageResource`: images use `type=image`; files, audio, and vide
 
 Downloaded images are supplied to Codex as `localImage` input items after the leading text item. Other files remain absolute paths in the text attachment block because the app-server has no general local-file input item. A 2026-09-19 local probe found that app-server accepted a `localAudio` item, but the model could not read the valid PCM WAV content, so audio is intentionally not wired as `localAudio` and remains a local path in the attachment block: “app-server 接受 localAudio item 但模型未能读出内容，故暂不接线”。
 
-This change is limited to the P2P inbound path. Group posts still keep only their text and group media remains ignored until the group-context follow-up change. Inbound files stay under the two-level inbox layout and are not scanned by the direct-child outbound scanner.
+This change is limited to the P2P inbound path. Group-message attachments are not downloaded or added to the attachment block. A group media message with neither text nor pending context is filtered at ingress; when pending context exists, that context can still be sent to Codex. The follow-up group-context change will align group attachment handling. Inbound files stay under the two-level inbox layout and are not scanned by the direct-child outbound scanner.
 
 Bridge output remains separate: executor-produced attachment paths are sent from the outbox. P2P delivery is allowed, while groups must enable the `bridge` capability. Each outbound file is capped at 28 MiB. Images use Feishu image upload; other extensions use file upload. Successful sends delete the local source. A failed file remains and does not stop the text reply or another attachment.
 

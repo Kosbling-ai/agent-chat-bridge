@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { validateConfig } from '../src/config.mjs';
 import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 import { renderExecutionCard } from '../src/channels/feishu/execution-card.mjs';
-import { buildTurnInput } from '../src/agents/codex/executor.mjs';
+import { createCodexExecutor } from '../src/agents/codex/executor.mjs';
 
 const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},hooks:[]};
 const flush=()=>new Promise(resolve=>setTimeout(resolve,20));
@@ -369,13 +370,47 @@ test('prepared media prompt and attachments are reused without downloading again
   assert.match(prompt, /safe\/image\.png/);
 });
 
-test('Codex turn input keeps text first and adds only downloaded images', () => {
-  assert.deepEqual(buildTurnInput('prompt', [
-    { kind:'file',status:'downloaded',path:'/tmp/report.pdf' },
-    { kind:'image',status:'failed',path:null },
-    { kind:'image',status:'downloaded',path:'/tmp/image.png' },
-    { kind:'audio',status:'downloaded',path:'/tmp/audio.wav' },
-  ]), [{type:'text',text:'prompt',text_elements:[]},{type:'localImage',path:'/tmp/image.png'}]);
+test('actual turn/start and steer requests keep text first and add only downloaded images', async () => {
+  class Stream extends EventEmitter { setEncoding() {} }
+  class Child extends EventEmitter {
+    constructor(handler){super();this.exitCode=null;this.stdout=new Stream();this.stderr=new Stream();this.stderr.resume=()=>{};this.stdin=new Stream();this.stdin.writable=true;this.stdin.writableLength=0;
+      this.stdin.write=line=>{handler(JSON.parse(line),this);return true;};this.stdin.end=()=>{this.stdin.writable=false;setImmediate(()=>{this.exitCode=0;this.emit('exit',0,null);});};this.kill=signal=>setImmediate(()=>this.emit('exit',null,signal));}
+    send(value){this.stdout.emit('data',`${JSON.stringify(value)}\n`);}
+  }
+  const calls=[];let child;
+  const spawnImpl=()=>{child=new Child((message,instance)=>{calls.push(message);const reply=result=>setImmediate(()=>instance.send({id:message.id,result}));
+    if(message.method==='initialize')reply({});
+    else if(message.method==='thread/start')reply({thread:{id:'thread-1'}});
+    else if(message.method==='turn/start')reply({turn:{id:'turn-1'}});
+    else if(message.method==='thread/read')reply({thread:{id:'thread-1',turns:[{id:'turn-1',status:'inProgress',items:[]}]}});
+    else if(message.method==='turn/steer'||message.method==='turn/interrupt')reply({});
+  });return child;};
+  const bindings=new Map();const events=[];
+  const sessions={
+    async loadBinding(identity){return bindings.get(`${identity.feishuOpenId}:${identity.chatId}`)||null;},
+    async saveCodexBinding(binding){bindings.set(`${binding.feishuOpenId}:${binding.chatId}`,{...binding,created:false});},
+    async touchCodexBinding(binding){bindings.set(`${binding.feishuOpenId}:${binding.chatId}`,{...binding,created:false});},
+    async saveCodexRealtimeEvent(binding,event){events.push({...event,event_key:event.eventKey,detail_json:JSON.stringify(event.detail||{}),binding});},
+    async findAcceptedMessageEvent(){return null;},async loadSteerEvents(){return[];},async readPublicProgress(){return[];},
+  };
+  const executor=createCodexExecutor({config:{bin:'/synthetic/codex',cwd:'/tmp',sharedHome:'/tmp',rpcTimeoutMs:1000,turnTimeoutMs:1000,closeGraceMs:20,idleCloseMs:0,
+    networkAccess:false,sandbox:'workspace-write',approvalPolicy:'auto',approvalsReviewer:'auto_review',allowedGroupChatIds:new Set()},sessionStore:sessions,spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:''})});
+  const attachments=[
+    {kind:'file',status:'downloaded',path:'/tmp/report.pdf'},
+    {kind:'image',status:'failed',path:null},
+    {kind:'image',status:'downloaded',path:'/tmp/image.png'},
+    {kind:'audio',status:'downloaded',path:'/tmp/audio.wav'},
+  ];
+  const first=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'first',prompt:'first prompt',attachments});
+  while(!calls.some(call=>call.method==='turn/start'))await new Promise(resolve=>setImmediate(resolve));
+  await executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'second',prompt:'second prompt',attachments});
+  const start=calls.find(call=>call.method==='turn/start').params.input;
+  const steer=calls.find(call=>call.method==='turn/steer').params.input;
+  assert.deepEqual(start,[{type:'text',text:'【飞书私聊会话】\nchat_id：chat\n对方 open_id：human\n回发文件目录：data/feishu-outbox/chat\n说明：需要回发本机图片或文件时，必须复制或写入该目录；只在 Markdown 中引用本机路径不会上传。\n\nfirst prompt',text_elements:[]},{type:'localImage',path:'/tmp/image.png'}]);
+  assert.deepEqual(steer,[{type:'text',text:'second prompt',text_elements:[]},{type:'localImage',path:'/tmp/image.png'}]);
+  child.send({method:'turn/completed',params:{threadId:'thread-1',turnId:'turn-1',turn:{id:'turn-1',status:'completed',items:[{type:'agentMessage',phase:'final_answer',text:'done'}]}}});
+  await first;await executor.close();
 });
 
 test('ordinary live busy failures deliver on the first attempt without retrying', async () => {

@@ -155,7 +155,7 @@ function validateRuntime(raw) {
   feishu.mediaMaxBytes = raw.feishu.mediaMaxBytes ?? 32 * 1024 * 1024;
   if (!Number.isSafeInteger(feishu.mediaMaxBytes) || feishu.mediaMaxBytes < 1 || feishu.mediaMaxBytes > 32 * 1024 * 1024) throw new ConfigError('invalid_media_max_bytes');
   feishu.mediaDownloadTimeoutMs = raw.feishu.mediaDownloadTimeoutMs ?? 120000;
-  if (!Number.isSafeInteger(feishu.mediaDownloadTimeoutMs) || feishu.mediaDownloadTimeoutMs < 1 || feishu.mediaDownloadTimeoutMs > 120000) throw new ConfigError('invalid_media_download_timeout');
+  if (!Number.isSafeInteger(feishu.mediaDownloadTimeoutMs) || feishu.mediaDownloadTimeoutMs < 1) throw new ConfigError('invalid_media_download_timeout');
   feishu.catchup = raw.feishu.catchup ?? true;
   if (raw.feishu.mediaBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.mediaBudgetBytes) || raw.feishu.mediaBudgetBytes < 20 * 1024 * 1024 || raw.feishu.mediaBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_media_budget');
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
