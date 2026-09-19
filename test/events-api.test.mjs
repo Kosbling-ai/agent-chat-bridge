@@ -85,10 +85,32 @@ test('events api dedups same event_id', async t => {
   assert.equal(statusLog.status_code, 200);
 });
 
+test('events api accepts dotted business event types', async t => {
+  const { url, registrations } = await fixture(t);
+  const types = ['mail.inbound', 'wait.due', 'wait.resolved', 'form.inbound'];
+  for (const type of types) {
+    const response = await post(url, { ...event, event_id: type.replace('.', ':'), type });
+    assert.equal(response.status, 202, type);
+  }
+  assert.deepEqual(registrations.map(registration => registration.type), types);
+});
+
+test('events api rejects malformed event types', async t => {
+  const { url, registrations } = await fixture(t);
+  for (const type of ['Mail.Inbound', 'mail']) {
+    const response = await post(url, { ...event, type });
+    assert.equal(response.status, 400, type);
+    assert.deepEqual(await response.json(), { error: 'invalid_event_type' });
+  }
+  const tooLong = `a${'.b'.repeat(32)}`;
+  assert.ok(tooLong.length > 64);
+  assert.equal((await post(url, { ...event, type: tooLong })).status, 400);
+  assert.equal(registrations.length, 0, 'invalid event types never reach forward registration');
+});
+
 test('events api validates bodies, limits payloads, and returns missing status', async t => {
   const { url, registrations } = await fixture(t);
   assert.equal((await post(url, '{')).status, 400);
-  assert.equal((await post(url, { ...event, type: 'unknown' })).status, 400);
   const unknown = await post(url, { ...event, target_chat_id: 'not-accepted' });
   assert.equal(unknown.status, 400);
   assert.deepEqual(await unknown.json(), { error: 'unknown_field' });

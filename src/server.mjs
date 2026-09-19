@@ -8,7 +8,7 @@ const SCOPE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const CORRELATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REF_ID_KEY = /^[A-Za-z0-9_.-]{1,64}$/;
 const CONTROL_CHARACTER = /\p{Cc}/u;
-const EVENT_TYPES = new Set(['mail.inbound', 'wait.due', 'wait.resolved']);
+const EVENT_TYPE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*){1,3}$/;
 const EVENT_FIELDS = new Set(['event_id', 'producer_id', 'scope', 'type', 'correlation_id', 'occurred_at', 'ref_ids', 'prompt']);
 
 class HttpError extends Error {
@@ -61,7 +61,7 @@ function normalizeEvent(body) {
   const scope = string(body.scope, 128);
   if (!SCOPE.test(scope)) throw new HttpError(400, 'invalid_scope');
   const type = string(body.type, 64);
-  if (!EVENT_TYPES.has(type)) throw new HttpError(400, 'invalid_event_type');
+  if (!EVENT_TYPE.test(type)) throw new HttpError(400, 'invalid_event_type');
   if (typeof body.correlation_id !== 'string' || !CORRELATION_ID.test(body.correlation_id)) {
     throw new HttpError(400, 'invalid_correlation_id');
   }
