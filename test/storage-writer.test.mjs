@@ -172,6 +172,7 @@ function serviceDependencies(events, options = {}) {
   let onWriterLost;
   let readiness;
   let workerHealthy = true;
+  let codexHealthy = true;
   let outboundEnteredResolve, outboundRelease;
   let serverEnteredResolve, serverRelease;
   const outboundEntered = new Promise(resolve => { outboundEnteredResolve = resolve; });
@@ -187,7 +188,7 @@ function serviceDependencies(events, options = {}) {
   return {
     controls: {
       get onWriterLost() { return onWriterLost; }, get readiness() { return readiness; },
-      setWorkerHealthy(value) { workerHealthy = value; }, outboundEntered, serverEntered,
+      setWorkerHealthy(value) { workerHealthy = value; }, setCodexHealthy(value) { codexHealthy = value; }, outboundEntered, serverEntered,
       releaseOutbound(value = { async close() { events.push('outbound-close'); } }) { outboundRelease?.(value); },
       releaseServer(value = { server: {}, async close() { events.push('server-close'); } }) { serverRelease?.(value); },
     },
@@ -199,7 +200,7 @@ function serviceDependencies(events, options = {}) {
         return { async assertCurrent() {}, async close() { events.push('store-close'); } };
       },
       sessions: () => ({}), jobs: () => ({}), inbound: () => ({}),
-      executor: () => ({ status: () => ({ closing: false, restartPending: null, fault: null }), async close() { events.push('executor-close'); } }),
+      executor: () => ({ status: () => ({ closing: !codexHealthy, restartPending: codexHealthy ? null : 'pending', fault: null }), async close() { events.push('executor-close'); } }),
       feedback: () => ({ handleCardAction() {} }), userInput: () => ({ async close() {}, handleCardAction() {} }),
       replies: () => ({}), typing: () => ({}), communication: () => communication, forward: () => forward,
       media: async () => ({ async release() { events.push('media-release'); } }),
@@ -280,7 +281,7 @@ test('writer-loss cleanup deadline forces the non-zero exit request', async t =>
   assert.deepEqual(exits, [{ reason: 'writer_lost:connection_end', code: 1 }]);
 });
 
-test('persistent unhealthy workers request one non-zero exit', async t => {
+test('watchdog ignores persistent Codex restart state but exits for unhealthy workers', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-unhealthy-worker-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const events = [];
@@ -291,6 +292,9 @@ test('persistent unhealthy workers request one non-zero exit', async t => {
   config.storage.writer.probeIntervalMs = 5;
   await startService({ config: validateConfig(config), configPath: join(directory, 'bridge.json'), env,
     dependencies: fixture.dependencies, onRestartRequired: async (reason, code) => exits.push({ reason, code }) });
+  fixture.controls.setCodexHealthy(false);
+  await delay(55);
+  assert.deepEqual(exits, []);
   fixture.controls.setWorkerHealthy(false);
   await delay(55);
   assert.deepEqual(exits, [{ reason: 'unhealthy:workers', code: 1 }]);
@@ -314,6 +318,28 @@ test('writer loss while outbound initializes closes the late component and start
   assert.equal(events.some(event => event.endsWith('-start')), false);
   assert.equal(events.includes('server-factory'), false);
   assert.deepEqual(exits, [{ reason: 'writer_lost:connection_end', code: 1 }]);
+});
+
+test('a late outbound close that never returns cannot delay the writer-loss exit window', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-writer-late-close-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events = [];
+  const logs = [];
+  const fixture = serviceDependencies(events, { hangOutbound: true });
+  const exits = [];
+  const starting = startService({ config: validateConfig(rawConfig(directory)), configPath: join(directory, 'bridge.json'), env,
+    dependencies: fixture.dependencies, log: (...entry) => logs.push(entry),
+    onRestartRequired: async (reason, code) => exits.push({ reason, code }) });
+  await fixture.controls.outboundEntered;
+  const lostAt = Date.now();
+  fixture.controls.onWriterLost(lostError('connection_end'));
+  fixture.controls.releaseOutbound({ async close() { events.push('outbound-close-start'); await new Promise(() => {}); } });
+  await assert.rejects(starting, { code: 'writer_lock_lost' });
+  assert.ok(Date.now() - lostAt < 80);
+  assert.deepEqual(exits, [{ reason: 'writer_lost:connection_end', code: 1 }]);
+  assert.ok(events.includes('outbound-close-start'));
+  assert.ok(logs.some(([, operation, status, fields]) => operation === 'late_component_cleanup'
+    && status === 'timeout' && fields.reason === 'outbound'));
 });
 
 test('writer loss while server initializes closes the late server and starts no ingress', async t => {
@@ -407,6 +433,60 @@ test('write path does not wait for a three-second in-flight writer probe', { tim
   await delay(3_050);
   assert.equal(lost, 0);
   assert.ok(probeQueries >= 1);
+  await store.close();
+});
+
+test('writer loss while waiting for a transaction connection fences the late write', async () => {
+  const events = [];
+  let transactionRequestedResolve, releaseTransaction;
+  const transactionRequested = new Promise(resolve => { transactionRequestedResolve = resolve; });
+  const schemaConnection = {
+    async query(sql) {
+      if (sql.includes('bridge_schema_migrations')) return [migrationRows];
+      return [[]];
+    },
+    release() {}, destroy() {},
+  };
+  const writerConnection = {
+    connection: new EventEmitter(),
+    async query(sql) {
+      if (sql.includes('DATABASE')) return [[{ name: 'fixture' }]];
+      if (sql.includes('GET_LOCK')) return [[{ acquired: 1 }]];
+      return [[{ held: 1 }]];
+    },
+    release() {}, destroy() {},
+  };
+  const transactionConnection = {
+    destroyed: false,
+    async query() { return [[]]; },
+    async beginTransaction() { events.push('begin'); },
+    async execute() { events.push('write'); return [{ affectedRows: 1 }]; },
+    async commit() { events.push('commit'); },
+    async rollback() { events.push('rollback'); },
+    destroy() { this.destroyed = true; events.push('destroy'); },
+    release() {},
+  };
+  let connectionCall = 0;
+  const pool = {
+    async getConnection() {
+      connectionCall += 1;
+      if (connectionCall === 1) return schemaConnection;
+      if (connectionCall === 2) return writerConnection;
+      transactionRequestedResolve();
+      return new Promise(resolve => { releaseTransaction = resolve; });
+    },
+    async end() {},
+  };
+  const store = await createMysqlStore({ pool, connectionId: 'fixture', writerProbeIntervalMs: 10_000,
+    onWriterLost: () => events.push('writer-lost') });
+  const writing = store.setCursor({ connectionId: 'fixture', key: 'late-connection', expectedVersion: 0, value: { ok: true } });
+  await transactionRequested;
+  writerConnection.connection.emit('end');
+  releaseTransaction(transactionConnection);
+  await assert.rejects(writing, { code: 'writer_lock_lost' });
+  assert.deepEqual(events, ['writer-lost', 'begin', 'destroy', 'rollback']);
+  assert.equal(transactionConnection.destroyed, true);
+  console.log(`LATE_CONNECTION_EVENTS ${JSON.stringify(events)}`);
   await store.close();
 });
 

@@ -39,6 +39,15 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
       return await withConnection(pool, async (connection) => {
         active = connection;
         activeConnections.add(connection);
+        try {
+          // The writer may be lost while the pool is still waiting for this
+          // transaction connection. Recheck only the local fail-closed state;
+          // never wait for the background probe on the write path.
+          writer.assert();
+        } catch (error) {
+          connection.destroy();
+          throw error;
+        }
         const result = await fn(connection);
         return result;
       }, { timeoutMs: operationTimeoutMs, transaction: true });

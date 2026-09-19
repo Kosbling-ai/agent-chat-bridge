@@ -100,6 +100,7 @@ export async function startService({ config, configPath, env = process.env, log,
   let stopping = false;
   let closing;
   let fatalShutdown;
+  let fatalShutdownDeadlineAt;
   let healthWatchdog;
   let healthChecking = false;
   let resolveWriterLost;
@@ -150,12 +151,29 @@ export async function startService({ config, configPath, env = process.env, log,
   const ensureWriterHealthy = () => {
     if (!writerHealthy) throw Object.assign(new StoreError('writer_lock_lost'), { reason: 'writer_lost' });
   };
+  const cleanupLateComponent = async (component, operation) => {
+    const remainingMs = fatalShutdownDeadlineAt === undefined
+      ? config.storage.writer.lostShutdownMs
+      : Math.max(0, fatalShutdownDeadlineAt - Date.now());
+    let timer;
+    let timedOut = false;
+    const cleanup = Promise.resolve().then(operation).catch(() => {
+      log('warning', 'late_component_cleanup', 'failed', { code: 'cleanup_failed', reason: component });
+    });
+    const timeout = new Promise(resolve => {
+      timer = setTimeout(() => { timedOut = true; resolve(); }, remainingMs);
+    });
+    await Promise.race([cleanup, timeout]);
+    clearTimeout(timer);
+    if (timedOut) log('warning', 'late_component_cleanup', 'timeout', { code: 'cleanup_timeout', reason: component, durationMs: remainingMs });
+  };
   const requestFatalShutdown = ({ reason, code, operation, durationMs = 0, consecutiveMisses = 0, restartReason }) => {
     if (fatalShutdown) {
       log('warning', operation, 'duplicate', { code, reason, consecutiveMisses, durationMs });
       return fatalShutdown;
     }
     stopping = true;
+    fatalShutdownDeadlineAt = Date.now() + config.storage.writer.lostShutdownMs;
     log('error', operation, 'failed', { code, reason, consecutiveMisses, durationMs });
     const shutdown = async () => {
       let forced = false;
@@ -249,14 +267,20 @@ export async function startService({ config, configPath, env = process.env, log,
     const createdMedia = await factories.media({ client, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
       enabled: config.feishu.mediaEnabled, maxBytes: config.feishu.mediaMaxBytes,
       unsupportedReplyText: config.feishu.mediaUnsupportedReply, log });
-    if (stopping) { await createdMedia?.release?.(); throw stoppedError(); }
+    if (stopping) {
+      await cleanupLateComponent('media', () => createdMedia?.release?.());
+      throw stoppedError();
+    }
     media = createdMedia;
     const createdOutbound = await factories.outbound({ chat, workspace: cwd,
       outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'),
       bindingOutboxDir: resolve(cwd, 'data/feishu-outbox'),
       spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'),
       allowedGroupChatIds, maxTotalBytes: config.feishu.outputBudgetBytes, log });
-    if (stopping) { await createdOutbound?.close?.(); throw stoppedError(); }
+    if (stopping) {
+      await cleanupLateComponent('outbound', () => createdOutbound?.close?.());
+      throw stoppedError();
+    }
     outbound = createdOutbound;
     checkCancelled();
     const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,
@@ -289,7 +313,10 @@ export async function startService({ config, configPath, env = process.env, log,
       return { ready: !stopping && Object.values(components).every(Boolean), components };
     };
     const createdHttp = await factories.server({ config, log, readiness });
-    if (stopping) { await createdHttp?.close?.(); throw stoppedError(); }
+    if (stopping) {
+      await cleanupLateComponent('server', () => createdHttp?.close?.());
+      throw stoppedError();
+    }
     http = createdHttp;
     await Promise.race([feishu.start(), cancelled, writerLost]);
     ensureWriterHealthy();
@@ -306,7 +333,8 @@ export async function startService({ config, configPath, env = process.env, log,
       try {
         const { components } = await readiness();
         const checkedAt = Date.now();
-        for (const [component, healthy] of Object.entries(components)) {
+        for (const component of ['store', 'workers']) {
+          const healthy = components[component];
           if (healthy) unhealthySince.delete(component);
           else if (!unhealthySince.has(component)) unhealthySince.set(component, checkedAt);
         }
