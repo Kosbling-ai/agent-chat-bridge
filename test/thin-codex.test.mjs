@@ -1094,3 +1094,31 @@ test('rules, idle, and archived rollover preserve distinct production text and d
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });
+
+for (const path of ['error', 'turn/completed', 'resume']) {
+  test(`usage limit classification survives ${path} without raw provider text or turn replay`, async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-limit-'));
+    const binding = { feishuOpenId: 'ou', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', created: false };
+    const upstream = { message: 'SECRET token=private usage details', codexErrorInfo: 'usageLimitExceeded', additionalDetails: 'SECRET' };
+    const runtime = fakeRuntime({ completeStarts: false, readTurns: path === 'resume' ? [{ id: 'known', status: 'failed', error: upstream }] : [], resumeTurns: path === 'resume' ? [{ id: 'known', status: 'failed', error: upstream }] : [] });
+    const store = memoryStore([binding]);
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    try {
+      const input = { bindingOpenId: 'ou', chatId: 'chat', chatType: 'p2p', messageId: 'limit-job', prompt: 'work' };
+      const running = executor.execute(input, path === 'resume' ? { resume: { threadId: 'thread-existing', turnId: 'known', startedAt: 10 } } : {});
+      const rejected = assert.rejects(running, error => error.code === 'CODEX_USAGE_LIMIT_EXCEEDED' && !error.message.includes('SECRET'));
+      if (path !== 'resume') {
+        while (!runtime.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setTimeout(resolve, 10));
+        runtime.children[0].send({ method: path, params: { threadId: runtime.calls.find(call => call.method === 'turn/start').params.threadId, turnId: 'turn-1', willRetry: false, error: upstream, turn: { id: 'turn-1', status: 'failed', error: upstream } } });
+      }
+      await rejected;
+      const duplicate = await executor.execute(input);
+      assert.equal(duplicate.failed, true);
+      assert.equal(duplicate.errorCode, 'CODEX_USAGE_LIMIT_EXCEEDED');
+      assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, path === 'resume' ? 0 : 1);
+      assert.equal(JSON.stringify(duplicate).includes('SECRET'), false);
+      assert.equal(JSON.stringify(store.events).includes('SECRET'), false);
+    } finally { await executor.close(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+}

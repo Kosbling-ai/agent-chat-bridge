@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.8] — Unreleased
+
+- Preserve structured Codex usage-limit failures across live notifications and recovery. Show a safe quota-specific Feishu reply without replaying the failed turn; persist the stable error classification without raw provider messages.
+- No database or configuration migration.
+
 ## [0.2.7] — Unreleased
 
 - Integrate the hook-only business boundary with card-copy prompt isolation and recoverable execution-card progress polling. Card text remains a bridge presentation setting; transient progress-read failures no longer permanently stop card updates.
