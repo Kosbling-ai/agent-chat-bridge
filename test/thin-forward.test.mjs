@@ -33,9 +33,66 @@ async function communicationDeliveryFailure(error) {
 }
 
 test('group capabilities default to both and allow either side or neither',()=>{
-  assert.deepEqual(validateConfig(base).routing.groups[0].capabilities,['bridge','hook']);
+  const defaults=validateConfig(base);
+  assert.deepEqual(defaults.routing.groups[0].capabilities,['bridge','hook']);
+  assert.equal(defaults.codex.groupContextMessageLimit,50);
+  assert.equal(defaults.codex.groupContextHours,24);
+  assert.equal(defaults.codex.groupContextAttachmentLimit,10);
   for(const capabilities of [['bridge'],['hook'],[]])assert.deepEqual(validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],capabilities}]}}).routing.groups[0].capabilities,capabilities);
   assert.throws(()=>validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],capabilities:['unknown']}]}}),{code:'invalid_group_capabilities'});
+});
+
+test('group file trigger all reaches forwarding while unauthorized and hook-only groups stay closed',async()=>{
+  for (const [capabilities,userIds,expected] of [[['bridge'],undefined,1],[['hook'],undefined,0],[['bridge'],['other'],0]]) {
+    const forwarded=[];
+    const config=validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],trigger:'all',capabilities,...(userIds?{userIds}:{})}]}});
+    const runtime=createCommunicationRuntime({config,store:{acceptInbound:async()=>({duplicate:false})},
+      forward:{handleMessage:async input=>{forwarded.push(input);return{execution:{terminal:'completed'}};}},chat:{}});
+    await runtime.ingest({connectionId:'test',source:'live',eventKey:`file-${capabilities[0]}-${userIds?.[0]||'all'}`,type:'message.received',
+      conversationId:'chat',conversationType:'group',messageId:`file-${capabilities[0]}-${userIds?.[0]||'all'}`,occurredAt:Date.now(),
+      actor:{type:'user',openId:'human',name:'Human'},message:{kind:'file',content:'{"file_key":"group-file","file_name":"report.pdf"}',mentions:[]}});
+    await new Promise(setImmediate);
+    assert.equal(forwarded.length,expected);
+    if(expected){assert.equal(forwarded[0].message.type,'file');assert.equal(forwarded[0].message.contextAttachmentLimit,10);}
+  }
+});
+
+test('passive group attachment metadata is stored without download and carried into a later mention',async()=>{
+  const accepted=[];const forwarded=[];
+  const config=validateConfig(base);
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async input=>{accepted.push(input);return{duplicate:false};}},
+    inbound:{async loadRecentGroupContext(){const stored=accepted[0].inboundMessage;return[{messageId:'passive-file',senderOpenId:'alice',senderName:'Alice',
+      prompt:'',createdAt:1000,attachments:stored.content.attachments,event:{conversationId:'chat',messageId:'passive-file',conversationType:'group',
+        message:{kind:'file',content:''}},source:'persisted_group_context'}];}},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{execution:{terminal:'completed'}};}},chat:{},now:()=>2500});
+  await runtime.ingest({connectionId:'test',source:'live',eventKey:'passive-file',type:'message.received',conversationId:'chat',conversationType:'group',
+    messageId:'passive-file',occurredAt:1000,actor:{type:'user',openId:'alice',name:'Alice'},
+    message:{kind:'file',content:'{"file_key":"context-file","file_name":"context.pdf"}',mentions:[]}});
+  await runtime.ingest({connectionId:'test',source:'live',eventKey:'mention',type:'message.received',conversationId:'chat',conversationType:'group',
+    messageId:'mention',occurredAt:2000,actor:{type:'user',openId:'human',name:'Human'},
+    message:{kind:'text',content:'{"text":"<at>bot</at> inspect"}',mentions:[{openId:'bot',key:'<at>bot</at>'}]}});
+  await new Promise(setImmediate);
+  assert.equal(accepted[0].passiveContext,true);
+  assert.deepEqual(accepted[0].inboundMessage.content.attachments.map(item=>[item.fileKey,item.fileName,item.status]),
+    [['context-file','context.pdf','skipped']]);
+  assert.equal(forwarded.length,1);
+  assert.equal(forwarded[0].context[0].attachments[0].fileKey,'context-file');
+  assert.equal(forwarded[0].context[0].event.messageId,'passive-file');
+});
+
+test('zero group context count disables in-memory attachment context',async()=>{
+  const forwarded=[];
+  const config=validateConfig({...base,codex:{...base.codex,groupContextMessageLimit:0}});
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async()=>({duplicate:false})},
+    inbound:{async loadRecentGroupContext(){throw new Error('context_disabled');}},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{execution:{terminal:'completed'}};}},chat:{}});
+  const groupEvent=(id,message)=>({connectionId:'test',source:'live',eventKey:id,type:'message.received',conversationId:'chat',conversationType:'group',
+    messageId:id,occurredAt:Date.now(),actor:{type:'user',openId:'human',name:'Human'},message});
+  await runtime.ingest(groupEvent('passive',{kind:'image',content:'{"image_key":"image"}',mentions:[]}));
+  await runtime.ingest(groupEvent('mention',{kind:'text',content:'{"text":"<at>bot</at> inspect"}',mentions:[{openId:'bot',key:'<at>bot</at>'}]}));
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,1);
+  assert.deepEqual(forwarded[0].context,[]);
 });
 
 test('private allow-all is opt-in and accepts only a boolean',()=>{
@@ -346,6 +403,24 @@ test('media preparation feeds a durable image addendum to executor input', async
   assert.equal(jobs.calls.filter(([name]) => name === 'prepared')[0][1].inputStatus, 'ready');
 });
 
+test('forward preparation passes persisted context attachment metadata to media', async () => {
+  const contextEntries=[{messageId:'prior',senderName:'Alice',prompt:'',createdAt:1,
+    attachments:[{index:1,kind:'image',messageType:'image',fileKey:'context-image',status:'skipped',reason:'not_downloadable'}],
+    event:{conversationId:'chat',messageId:'prior',conversationType:'group',message:{kind:'image',content:''}},source:'persisted_group_context'}];
+  const jobs=memoryJobs({status:'pending',prompt:'inspect',contextEntries,
+    result:{inputEvent:{conversationId:'chat',messageId:'current',conversationType:'group',message:{kind:'text',content:'{"text":"inspect"}'}},contextAttachmentLimit:10}});
+  let preparedOptions;
+  const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions:{},
+    media:{async prepare(_event,options){preparedOptions=options;return{status:'ready',text:'inspect',addendum:'context ready',
+      attachments:[{index:1,kind:'image',status:'downloaded',path:'/safe/context.png'}]};}},
+    executor:{async execute(input){assert.match(input.prompt,/context ready/);return{threadId:'thread',turnId:'turn',answer:'done',rawAnswer:'done',attachments:[]};}},
+    replies:{readResource:async()=>null},authorize:async()=>true});
+  runtime.start();await flush();await runtime.stop();
+  assert.deepEqual(preparedOptions.contextEntries,contextEntries);
+  assert.equal(preparedOptions.contextAttachmentLimit,10);
+  assert.equal(jobs.job.result.execution.attachments[0].path,'/safe/context.png');
+});
+
 test('live replay lets the existing forward row decide terminal duplication',async()=>{
   const existing={id:'existing',status:'completed',messageId:'same',chatId:'chat',chatType:'p2p',deliveryMode:'bridge',result:{answer:'done',execution:{terminal:'completed'}}};
   let upserts=0;let claims=0;
@@ -354,9 +429,10 @@ test('live replay lets the existing forward row decide terminal duplication',asy
   assert.equal(result.answer,'done');assert.equal(upserts,0);assert.equal(claims,1);
 });
 
-test('prepared media prompt and attachments are reused without downloading again', async () => {
+test('prepared context media prompt and attachments are reused without downloading again', async () => {
   const attachments=[{index:1,kind:'image',status:'downloaded',path:'/safe/image.png'}];
-  const jobs = memoryJobs({ status: 'pending', result: { inputEvent: { messageId: 'message', message: { kind: 'image' } }, execution: { inputStatus: 'ready', preparedPrompt: 'User：\n\n【附件 1/1】图片 （类型 image，1 B，已下载：/safe/image.png）', attachments } } });
+  const jobs = memoryJobs({ status: 'pending', contextEntries:[{messageId:'prior',attachments:[{fileKey:'image'}]}],
+    result: { inputEvent: { messageId: 'message', message: { kind: 'text' } }, execution: { inputStatus: 'ready', preparedPrompt: 'User：\n\n【上下文 1/1 来自 Alice】【附件 1/1】图片 （类型 image，1 B，已下载：/safe/image.png）', attachments } } });
   let preparations = 0;
   let prompt;
   const runtime = createForwardRuntime({

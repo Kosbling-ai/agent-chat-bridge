@@ -72,7 +72,7 @@ function validateRuntime(raw) {
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
   object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
-  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
   if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
   if (raw.codex.proxyEnv !== undefined) {
@@ -108,10 +108,13 @@ function validateRuntime(raw) {
   if (!Number.isSafeInteger(codex.jobPollMs) || codex.jobPollMs < 5_000 || codex.jobPollMs > 600_000) throw new ConfigError('invalid_codex_job_poll');
   codex.maxEventAgeMs = raw.codex.maxEventAgeMs ?? 10 * 60 * 1000;
   if (!Number.isSafeInteger(codex.maxEventAgeMs) || codex.maxEventAgeMs < 0 || codex.maxEventAgeMs > 7 * 24 * 60 * 60 * 1000) throw new ConfigError('invalid_codex_event_age');
-  codex.groupContextMessageLimit = raw.codex.groupContextMessageLimit ?? 10;
+  codex.groupContextMessageLimit = raw.codex.groupContextMessageLimit ?? 50;
   if (!Number.isInteger(codex.groupContextMessageLimit) || codex.groupContextMessageLimit < 0 || codex.groupContextMessageLimit > 100) throw new ConfigError('invalid_group_context_limit');
-  codex.groupContextHours = raw.codex.groupContextHours ?? 2;
+  codex.groupContextHours = raw.codex.groupContextHours ?? 24;
   if (!Number.isFinite(codex.groupContextHours) || codex.groupContextHours < 0 || codex.groupContextHours > 168) throw new ConfigError('invalid_group_context_hours');
+  codex.groupContextAttachmentLimit = raw.codex.groupContextAttachmentLimit ?? 10;
+  if (!Number.isInteger(codex.groupContextAttachmentLimit) || codex.groupContextAttachmentLimit < 0
+    || codex.groupContextAttachmentLimit > 100) throw new ConfigError('invalid_group_context_attachment_limit');
   codex.idleCloseMs = raw.codex.idleCloseMs ?? 60_000;
   if (!Number.isSafeInteger(codex.idleCloseMs) || codex.idleCloseMs < 0 || codex.idleCloseMs > 24 * 60 * 60 * 1000) throw new ConfigError('invalid_codex_idle_close');
   codex.rolloverIdleMs = raw.codex.rolloverIdleMs ?? 5 * 24 * 60 * 60 * 1000;

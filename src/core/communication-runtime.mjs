@@ -1,10 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
+import { extractAttachments } from '../channels/feishu/media.mjs';
 import { buildCodexForwardPrompt, createRecentMentionPrompts, isBotJoinNotice,
-  mergeGroupContextPrompts, mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
+  mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
 const sleep=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+function mergeContextEntries(...groups) {
+  const seen=new Set();
+  return groups.flat().map(entry=>({...entry,prompt:String(entry?.prompt??entry?.text??'').trim()}))
+    .filter(entry=>entry.prompt||entry.attachments?.length)
+    .filter(entry=>{const key=entry.messageId||JSON.stringify([entry.senderOpenId||'',entry.createdAt||'',entry.prompt,
+      (entry.attachments||[]).map(item=>item.fileKey)]);if(seen.has(key))return false;seen.add(key);return true;})
+    .sort((left,right)=>(Number(left.createdAt)||0)-(Number(right.createdAt)||0));
+}
 function deliveryErrorCode(error) {
   if (error?.outcome !== 'failed') return 'chat_delivery_unconfirmed';
   if (error?.code === 'feishu_api_rejected') return 'feishu_api_rejected';
@@ -15,11 +24,13 @@ function deliveryErrorCode(error) {
 export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
   let started=false,stopping=false,healthy=true,worker; const active=new Set(); const processing=new Set();
-  const recent=createRecentMentionPrompts({now});
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
   const maxEventAgeMs=Number(config.codex.maxEventAgeMs??10*60*1000);
-  const contextLimit=Number(config.codex.groupContextMessageLimit??10);
-  const contextWindowMs=Number(config.codex.groupContextHours??2)*60*60*1000;
+  const contextLimit=Number(config.codex.groupContextMessageLimit??50);
+  const contextWindowMs=Number(config.codex.groupContextHours??24)*60*60*1000;
+  const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
+  const contextEnabled=contextLimit>0&&contextWindowMs>0;
+  const recent=createRecentMentionPrompts({now,ttlMs:contextWindowMs,limit:contextLimit});
   function humanAllowed(event,group) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
     if(event.conversationType==='p2p')return (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId)));
@@ -44,6 +55,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const agentAllowed=humanAllowed(event,group);
     const mentioned=event.message?.mentions?.some(mention=>mention.openId===config.feishu.botOpenId);
     const normalized=normalizeFeishuInput(event,{botOpenId:config.feishu.botOpenId});
+    const attachmentMetadata=extractAttachments(event);
     const ignoredByAgent=isBotJoinNotice(normalized)||stale(event,normalized.createdAt);
     const triggerEligible=event.type==='message.received'&&!ignoredByAgent
       &&(event.conversationType==='p2p'||group?.trigger==='all'||mentioned);
@@ -52,27 +64,29 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     // deliberately independent from Agent authorization and routing outcomes.
     const hookAllowed=event.conversationType==='p2p'||Boolean(capabilities(group).includes('hook'));
     const hooks=config.hooks.filter(hook=>hookAllowed&&hook.conversationIds.includes(event.conversationId)&&!event.isSelf&&!event.isApp).map(hook=>({hookId:hook.id,payload:event}));
-    const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&group?.passiveContext&&event.type==='message.received'&&normalized.rawText.trim());
+    const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&group?.passiveContext&&event.type==='message.received'
+      &&(normalized.rawText.trim()||attachmentMetadata.length));
     const receipt=await store.acceptInbound({connectionId,conversationId:event.conversationId,source:event.source,conversationType:event.conversationType,eventKey:event.eventKey,eventType:event.type,messageId:event.messageId,...(event.type==='message.recalled'?{recalledMessageId:event.messageId}:{}),revision:event.revision,occurredAt:event.occurredAt,payload:event,semanticPayload:feishuEventIdentity(event),policyVersion:config.routing.version,passiveContext:contextCandidate,
-      inboundMessage:{...normalized,content:{text:normalized.rawText},groupContextCandidate:contextCandidate},
+      inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata},groupContextCandidate:contextCandidate},
       hooks});
     if(contextCandidate&&!receipt.duplicate)recent.remember({chatId:normalized.chatId,messageId:normalized.messageId,prompt:normalized.rawText,
       senderOpenId:normalized.senderOpenId,senderName:normalized.senderName});
     if(!triggered||!forward)return receipt;
     launchForward((async()=>{
-      const memoryEntries=event.conversationType==='group'?recent.take(normalized.chatId):[];
-      const persistedEntries=event.conversationType==='group'&&group?.passiveContext&&inbound
+      const memoryEntries=event.conversationType==='group'&&contextEnabled?recent.take(normalized.chatId):[];
+      const persistedEntries=event.conversationType==='group'&&group?.passiveContext&&contextEnabled&&inbound
         ? await inbound.loadRecentGroupContext({connectionId,chatId:normalized.chatId,beforeMs:normalized.createdAt,windowMs:contextWindowMs,
-          limit:contextLimit,excludeMessageIds:[normalized.messageId,...memoryEntries.map(entry=>entry.messageId)]}) : [];
-      const contextEntries=mergeGroupContextPrompts(persistedEntries,memoryEntries);
-      const mediaResolvable=normalized.chatType==='p2p'&&normalized.messageType!=='text';
+          limit:contextLimit,excludeMessageIds:[normalized.messageId]}) : [];
+      const contextEntries=contextEnabled?mergeContextEntries(persistedEntries,memoryEntries).slice(-contextLimit):[];
+      const mediaResolvable=normalized.messageType!=='text';
       if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;
       const mergedPrompt=normalized.chatType==='p2p'?normalized.text:mergeMentionPrompts(contextEntries,normalized.text);
       const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
         mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId});
       const result=await forward.handleMessage({
         source:'live',callerId:'live',idempotencyKey:`live:${connectionId}:${normalized.chatId}:${normalized.messageId}`,
-        message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,type:normalized.messageType,event},
+        message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,
+          type:normalized.messageType,event,contextAttachmentLimit},
         actor:{openId:normalized.senderOpenId,name:normalized.senderName},prompt,context:contextEntries,
         groupChatContext:normalized.chatType==='group'?{chatId:normalized.chatId,name:group?.name||'',description:group?.description||''}:null,
         deliveryMode:'bridge',

@@ -72,7 +72,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       executionNamespace: '', deliveryMode: 'bridge',
       prompt: input.prompt || input.message?.text || '', groupChatContext: input.groupChatContext || null,
       contextEntries: input.context || [], nextAttemptAt: input.notBefore,
-      initialResult: { inputEvent: input.message?.event ?? null },
+      initialResult: { inputEvent: input.message?.event ?? null,
+        contextAttachmentLimit: input.message?.contextAttachmentLimit ?? 10 },
     });
   }
 
@@ -81,7 +82,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     if (!job || execution.inputStatus || !media || !job.result?.inputEvent) return job;
     if (preparations.has(job.id)) return preparations.get(job.id);
     const operation = (async () => {
-      const prepared = await media.prepare(job.result.inputEvent, { runId: job.id });
+      const prepared = await media.prepare(job.result.inputEvent, { runId: job.id,
+        contextEntries: job.contextEntries || [], contextAttachmentLimit: job.result.contextAttachmentLimit ?? 10 });
       const preparedExecution = {
         ...execution,
         inputStatus: prepared.status,

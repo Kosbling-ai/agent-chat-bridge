@@ -80,13 +80,55 @@ test('post file and mixed attachments preserve node order', async () => {
   } finally { await f.close(); }
 });
 
-test('group media remains outside the private attachment path', async () => {
+test('group media uses the same attachment path as private messages', async () => {
   const f=await fixture();
   try {
     const post=await f.media.prepare(event('post',{content:[[{tag:'text',text:'caption'},{tag:'img',image_key:'one'}]]},'group'));
-    assert.equal(post.status,'ready'); assert.equal(post.text,'caption'); assert.deepEqual(post.attachments,[]); assert.equal(post.addendum,'');
-    assert.deepEqual((await f.media.prepare(event('file',{file_key:'one'},'group'))).attachments,[]);
-    assert.equal(f.calls.length,0);
+    assert.equal(post.status,'ready'); assert.equal(post.text,'caption'); assert.equal(post.attachments[0].status,'downloaded');
+    assert.match(post.addendum,/【附件 1\/1】图片/);
+    const file=await f.media.prepare(event('file',{file_key:'two',file_name:'group.pdf'},'group'));
+    assert.equal(file.attachments[0].kind,'file'); assert.match(file.addendum,/group\.pdf/);
+    assert.deepEqual(f.calls.map(call=>call.fileKey),['one','two']);
+  } finally { await f.close(); }
+});
+
+test('a group mention downloads context image and file in source order before the current message', async () => {
+  const f=await fixture();
+  try {
+    const contextEntries=[
+      {messageId:'image-message',senderName:'Alice',attachments:[{index:1,kind:'image',messageType:'image',fileKey:'context-image',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:event('image',{image_key:'context-image'},'group')},
+      {messageId:'file-message',senderName:'Bob',attachments:[{index:1,kind:'file',messageType:'file',fileKey:'context-file',fileName:'context.pdf',durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:{...event('file',{file_key:'context-file',file_name:'context.pdf'},'group'),messageId:'file-message'}},
+    ];
+    contextEntries[0].event.messageId='image-message';
+    const prepared=await f.media.prepare(event('text',{text:'<at>bot</at> inspect'},'group'),
+      {runId:'context-run',contextEntries,contextAttachmentLimit:10});
+    assert.deepEqual(f.calls.map(call=>[call.messageId,call.fileKey]),[
+      ['image-message','context-image'],['file-message','context-file'],
+    ]);
+    assert.deepEqual(prepared.attachments.map(item=>[item.index,item.fileKey,item.status,item.reason]),[
+      [1,'context-image','downloaded',null],
+      [2,'context-file','downloaded',null],
+    ]);
+    assert.match(prepared.addendum,/【上下文 1\/2 来自 Alice】【附件 1\/2】/);
+    assert.match(prepared.addendum,/【上下文 2\/2 来自 Bob】【附件 2\/2】文件 context\.pdf/);
+  } finally { await f.close(); }
+});
+
+test('context attachment guard leaves excess metadata without blocking current downloads', async () => {
+  const f=await fixture();
+  try {
+    const contextEntries=[
+      {senderName:'Alice',attachments:[{index:1,kind:'image',messageType:'image',fileKey:'one',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:{...event('image',{image_key:'one'},'group'),messageId:'one-message'}},
+      {senderName:'Bob',attachments:[{index:1,kind:'file',messageType:'file',fileKey:'two',fileName:'two.pdf',durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:{...event('file',{file_key:'two'},'group'),messageId:'two-message'}},
+    ];
+    const prepared=await f.media.prepare(event('file',{file_key:'current',file_name:'current.pdf'},'group'),
+      {runId:'limited-context',contextEntries,contextAttachmentLimit:1});
+    assert.deepEqual(f.calls.map(call=>call.fileKey),['one','current']);
+    assert.deepEqual(prepared.attachments.map(item=>[item.fileKey,item.status,item.reason]),[
+      ['one','downloaded',null],['two','skipped','context_attachment_limit'],['current','downloaded',null],
+    ]);
+    assert.match(prepared.addendum,/【上下文 2\/2 来自 Bob】【附件 2\/3】.*超过本次群上下文附件下载上限/);
+    assert.match(prepared.addendum,/【附件 3\/3】文件 current\.pdf/);
   } finally { await f.close(); }
 });
 
@@ -99,6 +141,21 @@ test('media disabled keeps metadata and skips all downloadable attachments', asy
       {index:2,kind:'image',messageType:'img',fileKey:'two',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'media_disabled'},
     ]);
     assert.equal(prepared.addendum,'【附件 1/2】文件 one.pdf（类型 file，未能下载：媒体下载已关闭）\n【附件 2/2】图片 （类型 img，未能下载：媒体下载已关闭）'); assert.equal(f.calls.length,0);
+  } finally { await f.close(); }
+});
+
+test('media disabled takes precedence over the context attachment guard', async () => {
+  const f=await fixture({enabled:false});
+  try {
+    const contextEntries=[{senderName:'Alice',attachments:[
+      {index:1,kind:'image',messageType:'image',fileKey:'one',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'},
+      {index:2,kind:'file',messageType:'file',fileKey:'two',fileName:'two.pdf',durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'},
+    ],event:{...event('post',{},'group'),messageId:'context'}}];
+    const prepared=await f.media.prepare(event('text',{text:'inspect'},'group'),{contextEntries,contextAttachmentLimit:0});
+    assert.deepEqual(prepared.attachments.map(item=>[item.status,item.reason]),[
+      ['skipped','media_disabled'],['skipped','media_disabled'],
+    ]);
+    assert.equal(f.calls.length,0);
   } finally { await f.close(); }
 });
 

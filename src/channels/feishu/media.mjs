@@ -12,6 +12,7 @@ const extensions = {
 const reasons = {
   over_limit: '超过 32 MiB 下载上限', sticker_not_downloadable: '表情包无法下载',
   download_error: '下载失败', media_disabled: '媒体下载已关闭', not_downloadable: '该附件无可下载的资源',
+  context_attachment_limit: '超过本次群上下文附件下载上限',
 };
 const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 const fileTypes = { '.pdf': 'pdf', '.doc': 'doc', '.xls': 'xls', '.ppt': 'ppt', '.mp4': 'mp4', '.opus': 'opus' };
@@ -83,6 +84,10 @@ function postAttachments(event, content) {
   });
   return attachments;
 }
+export function extractAttachments(event) {
+  const content = safeJson(event?.message?.content);
+  return event?.message?.kind === 'post' ? postAttachments(event, content) : directAttachments(event, content);
+}
 function downloadType(attachment) { return attachment.kind === 'image' ? 'image' : 'file'; }
 function isDownloadable(attachment) { return ['image', 'file', 'audio', 'video'].includes(attachment.kind) && Boolean(attachment.fileKey); }
 function failureReason(error) {
@@ -101,7 +106,10 @@ function formatBytes(bytes) {
   return `${bytes} B`;
 }
 function renderAttachment(attachment, total) {
-  let line = `【附件 ${attachment.index}/${total}】${labels[attachment.kind]}`;
+  const contextPrefix = attachment.contextOrder
+    ? `【上下文 ${attachment.contextOrder}/${attachment.contextTotal} 来自 ${attachment.contextSender}】`
+    : '';
+  let line = `${contextPrefix}【附件 ${attachment.index}/${total}】${labels[attachment.kind]}`;
   if (attachment.fileName) line += ` ${attachment.fileName}`;
   line += `${attachment.fileName ? '' : ' '}（类型 ${attachment.messageType}`;
   if (attachment.durationMs !== null) line += `，时长 ${attachment.durationMs / 1000} 秒`;
@@ -160,17 +168,38 @@ export async function createFeishuMedia({ chat, inboxDir, enabled = true, maxByt
     } catch (error) { await rm(temporary, { force: true }); throw error; }
   }
   return Object.freeze({
-    async prepare(event, { runId = 'run' } = {}) {
+    async prepare(event, { runId = 'run', contextEntries = [], contextAttachmentLimit = 10 } = {}) {
       const text = extractMessageText(event);
-      const content = safeJson(event.message?.content);
-      let attachments = event.message?.kind === 'post' ? postAttachments(event, content) : directAttachments(event, content);
-      if (event.conversationType !== 'p2p') attachments = [];
+      const context = contextEntries.map((entry, contextIndex) => ({
+        entry,
+        attachments: Array.isArray(entry.attachments) ? entry.attachments : [],
+        contextIndex,
+      }));
+      const contextTotal = contextEntries.length;
+      let contextDownloadCount = 0;
+      let attachments = context.flatMap(({ entry, attachments: items, contextIndex }) => items.map(item => {
+        const downloadable = isDownloadable(item);
+        contextDownloadCount += downloadable ? 1 : 0;
+        return {
+          ...item,
+          ...(enabled && downloadable && contextDownloadCount > contextAttachmentLimit
+            ? { status: 'skipped', path: null, bytes: null, reason: 'context_attachment_limit', contextLimited: true }
+            : {}),
+          sourceEvent: entry.event,
+          contextOrder: contextIndex + 1,
+          contextTotal,
+          contextSender: entry.senderName || entry.senderOpenId || '未知用户',
+        };
+      }));
+      attachments.push(...extractAttachments(event).map(item => ({ ...item, sourceEvent: event })));
+      attachments = attachments.map((item, index) => ({ ...item, index: index + 1 }));
       const prepared = [];
       for (const attachment of attachments) {
-        if (!isDownloadable(attachment)) prepared.push(attachment);
+        const sourceEvent = attachment.sourceEvent || event;
+        if (attachment.contextLimited || !isDownloadable(attachment)) prepared.push(attachment);
         else if (!enabled) prepared.push({ ...attachment, status: 'skipped', reason: 'media_disabled' });
         else {
-          try { prepared.push(await download(event, attachment, runId)); }
+          try { prepared.push(await download(sourceEvent, attachment, runId)); }
           catch (error) {
             const reason = failureReason(error);
             log('warning', 'media_prepare', 'failed', { code: reason, attachmentIndex: attachment.index });
@@ -178,8 +207,10 @@ export async function createFeishuMedia({ chat, inboxDir, enabled = true, maxByt
           }
         }
       }
-      attachments = prepared;
-      return { status: 'ready', text, addendum: attachments.map(item => renderAttachment(item, attachments.length)).join('\n'), attachments };
+      const addendum = prepared.map(item => renderAttachment(item, prepared.length)).join('\n');
+      attachments = prepared.map(({ sourceEvent, contextLimited, contextOrder, contextTotal: ignoredTotal,
+        contextSender, ...attachment }) => attachment);
+      return { status: 'ready', text, addendum, attachments };
     },
     async release() {},
   });
