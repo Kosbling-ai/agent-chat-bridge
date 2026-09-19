@@ -17,6 +17,8 @@ const config = {
 };
 test('runtime configuration is explicit and rejects scope/secret overrides', () => {
   assert.equal(validateConfig(config).feishu.connectionId, 'test');
+  assert.equal(validateConfig(config).runtime.unhealthyExitMs, 30_000);
+  assert.deepEqual(validateConfig(config).storage.writer, { probeIntervalMs: 500, probeTimeoutMs: 5_000, probeMaxMisses: 2, lostShutdownMs: 10_000 });
   assert.equal(validateConfig(config).feishu.catchup, true);
   assert.equal(validateConfig(config).feishu.replyAsPost, true);
   assert.equal(validateConfig(config).feishu.maxOutputChars, 3500);

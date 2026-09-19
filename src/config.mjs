@@ -9,6 +9,8 @@ export class ConfigError extends Error {
   }
 }
 
+const MAX_TIMER_MS = 2_147_483_647;
+
 function object(value, keys, code) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
       || Object.keys(value).some((key) => !keys.includes(key))) {
@@ -21,7 +23,7 @@ export function isLoopback(host) {
 }
 
 export function validateConfig(raw) {
-  object(raw, ['schemaVersion', 'listen', 'storage', 'codex', 'feishu', 'routing', 'hooks', 'errorReporting'], 'invalid_config_fields');
+  object(raw, ['schemaVersion', 'listen', 'runtime', 'storage', 'codex', 'feishu', 'routing', 'hooks', 'errorReporting'], 'invalid_config_fields');
   if (raw.schemaVersion !== 1) throw new ConfigError('unsupported_config_version');
   const listen = raw.listen === undefined ? {} : raw.listen;
   object(listen, ['host', 'port', 'allowRemote'], 'invalid_listen_fields');
@@ -64,14 +66,35 @@ function identifier(value, max) {
   return result;
 }
 function validateRuntime(raw) {
-  const enabled = ['storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
+  const enabled = ['runtime', 'storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
     if (raw.hooks !== undefined || raw.errorReporting !== undefined) throw new ConfigError('runtime_components_required');
     return { components: {} };
   }
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
-  object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'], 'invalid_storage_fields');
+  object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv', 'writer'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
+  const rawWriter = raw.storage.writer ?? {};
+  object(rawWriter, ['probeIntervalMs', 'probeTimeoutMs', 'probeMaxMisses', 'lostShutdownMs'], 'invalid_storage_writer_fields');
+  const writer = {
+    probeIntervalMs: rawWriter.probeIntervalMs ?? 500,
+    probeTimeoutMs: rawWriter.probeTimeoutMs ?? 5_000,
+    probeMaxMisses: rawWriter.probeMaxMisses ?? 2,
+    lostShutdownMs: rawWriter.lostShutdownMs ?? 10_000,
+  };
+  for (const [field, code] of [
+    ['probeIntervalMs', 'invalid_storage_writer_probe_interval'],
+    ['probeTimeoutMs', 'invalid_storage_writer_probe_timeout'],
+    ['lostShutdownMs', 'invalid_storage_writer_lost_shutdown'],
+  ]) {
+    if (!Number.isSafeInteger(writer[field]) || writer[field] <= 0 || writer[field] > MAX_TIMER_MS) throw new ConfigError(code);
+  }
+  if (!Number.isSafeInteger(writer.probeMaxMisses) || writer.probeMaxMisses <= 0) throw new ConfigError('invalid_storage_writer_probe_max_misses');
+  storage.writer = Object.freeze(writer);
+  const rawRuntime = raw.runtime ?? {};
+  object(rawRuntime, ['unhealthyExitMs'], 'invalid_runtime_fields');
+  const runtime = { unhealthyExitMs: rawRuntime.unhealthyExitMs ?? 30_000 };
+  if (!Number.isSafeInteger(runtime.unhealthyExitMs) || runtime.unhealthyExitMs <= 0 || runtime.unhealthyExitMs > MAX_TIMER_MS) throw new ConfigError('invalid_runtime_unhealthy_exit');
   object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
   if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
@@ -196,7 +219,7 @@ function validateRuntime(raw) {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_error_reporting');
     errorReporting = { url: url.href, tokenEnv: reference(raw.errorReporting.tokenEnv) };
   }
-  return { components: { storage, codex, feishu, routing, hooks, ...(errorReporting ? { errorReporting } : {}) } };
+  return { components: { runtime, storage, codex, feishu, routing, hooks, ...(errorReporting ? { errorReporting } : {}) } };
 }
 
 export async function loadConfig(path) {

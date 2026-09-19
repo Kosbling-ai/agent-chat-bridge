@@ -4,8 +4,9 @@ import { dirname, resolve } from 'node:path';
 import * as sdk from '@larksuiteoapi/node-sdk';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { ConfigError } from './config.mjs';
-import { createPoolFromEnvironment } from './storage/connection.mjs';
+import { createPoolFromEnvironment, storageConnectionReferences } from './storage/connection.mjs';
 import { createMysqlStore } from './storage/store.mjs';
+import { StoreError } from './storage/errors.mjs';
 import { migrate } from './storage/migrations.mjs';
 import { createCodexExecutor } from './agents/codex/executor.mjs';
 import { createCodexSessionStore } from './storage/codex-sessions.mjs';
@@ -34,7 +35,7 @@ function secret(env, key) {
 }
 export async function migrateService({ config, env = process.env, legacyConnectionId }) {
   if (!config.storage) throw new ConfigError('storage_unconfigured');
-  const pool = createPoolFromEnvironment(config.storage, env);
+  const pool = createPoolFromEnvironment(storageConnectionReferences(config.storage), env);
   try { return await migrate(pool, { legacyConnectionId }); } finally { await pool.end(); }
 }
 export function createFeishuProxyAgent(value, options) {
@@ -82,9 +83,9 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
-  const pool = factories.pool(config.storage, env);
-  let store, executor, userInput, feishu, communication, forward, catchup, http;
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
+  const pool = factories.pool(storageConnectionReferences(config.storage), env);
+  let store, executor, userInput, feishu, communication, forward, catchup, http, media, outbound;
   const cardOperations = new Set();
   let acceptCardOperations = true;
   const runCardOperation = operation => {
@@ -98,28 +99,41 @@ export async function startService({ config, configPath, env = process.env, log,
     return runCardOperation(operation);
   };
   let writerHealthy = true;
+  let stopping = false;
   let closing;
+  let fatalShutdown;
+  let fatalShutdownDeadlineAt;
+  let healthWatchdog;
+  let healthChecking = false;
+  let resolveWriterLost;
+  const writerLost = new Promise(resolve => { resolveWriterLost = resolve; });
   let rejectCancelled;
   const cancelled = new Promise((_, reject) => { rejectCancelled = reject; });
   cancelled.catch(() => {});
   const abort = () => {
+    stopping = true;
     rejectCancelled(new ConfigError('startup_cancelled'));
     safeObserver(() => feishu?.stop())();
     safeObserver(() => executor?.close())();
   };
   const checkCancelled = () => { if (signal?.aborted) throw new ConfigError('startup_cancelled'); };
+  const stoppedError = () => writerHealthy
+    ? new ConfigError('startup_cancelled')
+    : Object.assign(new StoreError('writer_lock_lost'), { reason: 'writer_lost' });
   signal?.addEventListener('abort', abort, { once: true });
   const close = () => closing ??= (async () => {
+    stopping = true;
+    clearInterval(healthWatchdog);
     signal?.removeEventListener('abort', abort);
     acceptCardOperations = false;
     const failures = [];
-    for (const operation of [() => http?.close(), () => feishu?.stop()]) {
-      try { await operation(); } catch { failures.push(true); }
-    }
     forward?.beginStop?.();
-    for (const operation of [() => catchup?.stop(), () => communication?.stop()]) {
-      try { await operation(); } catch { failures.push(true); }
-    }
+    // Invoke every ingress/claim stop synchronously before awaiting drains so a
+    // slow listener cannot leave another worker accepting new work.
+    const ingressClosing = [() => http?.close(), () => feishu?.stop(), () => catchup?.stop(), () => communication?.stop()]
+      .map(operation => { try { return Promise.resolve(operation()); } catch (error) { return Promise.reject(error); } });
+    const ingressResults = await Promise.allSettled(ingressClosing);
+    if (ingressResults.some(result => result.status === 'rejected')) failures.push(true);
     try { await userInput?.close(); } catch { failures.push(true); }
     while (cardOperations.size) {
       const cardResults = await Promise.allSettled([...cardOperations]);
@@ -128,13 +142,76 @@ export async function startService({ config, configPath, env = process.env, log,
     const executorClosing = Promise.resolve().then(() => executor?.close());
     try { await forward?.stop(); } catch { failures.push(true); }
     try { await executorClosing; } catch { failures.push(true); }
+    for (const operation of [() => media?.release?.(), () => outbound?.close?.()]) {
+      try { await operation(); } catch { failures.push(true); }
+    }
     for (const operation of [() => store ? store.close() : pool.end(), () => reporter?.close()]) {
       try { await operation(); } catch { failures.push(true); }
     }
     if (failures.length) throw new Error('service_shutdown_failed');
   })();
+  const ensureWriterHealthy = () => {
+    if (!writerHealthy) throw Object.assign(new StoreError('writer_lock_lost'), { reason: 'writer_lost' });
+  };
+  const cleanupLateComponent = async (component, operation) => {
+    const remainingMs = fatalShutdownDeadlineAt === undefined
+      ? config.storage.writer.lostShutdownMs
+      : Math.max(0, fatalShutdownDeadlineAt - Date.now());
+    let timer;
+    let timedOut = false;
+    const cleanup = Promise.resolve().then(operation).catch(() => {
+      log('warning', 'late_component_cleanup', 'failed', { code: 'cleanup_failed', reason: component });
+    });
+    const timeout = new Promise(resolve => {
+      timer = setTimeout(() => { timedOut = true; resolve(); }, remainingMs);
+    });
+    await Promise.race([cleanup, timeout]);
+    clearTimeout(timer);
+    if (timedOut) log('warning', 'late_component_cleanup', 'timeout', { code: 'cleanup_timeout', reason: component, durationMs: remainingMs });
+  };
+  const requestFatalShutdown = ({ reason, code, operation, durationMs = 0, consecutiveMisses = 0, restartReason }) => {
+    if (fatalShutdown) {
+      log('warning', operation, 'duplicate', { code, reason, consecutiveMisses, durationMs });
+      return fatalShutdown;
+    }
+    stopping = true;
+    fatalShutdownDeadlineAt = Date.now() + config.storage.writer.lostShutdownMs;
+    log('error', operation, 'failed', { code, reason, consecutiveMisses, durationMs });
+    const shutdown = async () => {
+      let forced = false;
+      let deadline;
+      const timeout = new Promise(resolve => {
+        deadline = setTimeout(() => { forced = true; resolve(); }, config.storage.writer.lostShutdownMs);
+        deadline.unref?.();
+      });
+      await Promise.race([
+        close().catch(() => log('error', 'service_shutdown', 'failed', { code: 'shutdown_failed', reason })),
+        timeout,
+      ]);
+      clearTimeout(deadline);
+      if (forced) log('error', 'service_shutdown', 'forced', { code: 'shutdown_timeout', reason, durationMs: config.storage.writer.lostShutdownMs });
+      await onRestartRequired(restartReason, 1);
+    };
+    fatalShutdown = store ? shutdown() : new Promise(resolve => setImmediate(resolve)).then(shutdown);
+    fatalShutdown.catch(() => {});
+    return fatalShutdown;
+  };
+  const onWriterLost = error => {
+    writerHealthy = false;
+    resolveWriterLost();
+    const reason = error?.reason ?? 'lock_not_held';
+    const durationMs = Number.isSafeInteger(error?.durationMs) ? error.durationMs : 0;
+    const consecutiveMisses = Number.isSafeInteger(error?.consecutiveMisses) ? error.consecutiveMisses : 0;
+    requestFatalShutdown({ reason, code: 'writer_lost', operation: 'store_writer', durationMs, consecutiveMisses,
+      restartReason: `writer_lost:${reason}` });
+  };
   try {
-    store = await factories.store({ pool, connectionId: config.feishu.connectionId, onWriterLost: () => { writerHealthy = false; log('error', 'store_writer', 'failed', { code: 'writer_lost' }); } });
+    store = await factories.store({ pool, connectionId: config.feishu.connectionId, onWriterLost,
+      writerProbeIntervalMs: config.storage.writer.probeIntervalMs,
+      writerProbeTimeoutMs: config.storage.writer.probeTimeoutMs,
+      writerProbeMaxMisses: config.storage.writer.probeMaxMisses,
+      log });
+    ensureWriterHealthy();
     checkCancelled();
     // The default pool has already validated this reference. Dependency-injected
     // unit stores may omit database credentials and use this inert identifier.
@@ -190,14 +267,24 @@ export async function startService({ config, configPath, env = process.env, log,
       mediaDownloadTimeoutMs: config.feishu.mediaDownloadTimeoutMs });
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
     const chat = factories.chat({ client, maxMediaBytes: 28 * 1024 * 1024 });
-    const media = await factories.media({ chat, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
+    const createdMedia = await factories.media({ chat, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
       enabled: config.feishu.mediaEnabled, maxBytes: config.feishu.mediaMaxBytes,
       downloadTimeoutMs: config.feishu.mediaDownloadTimeoutMs, log });
-    const outbound = await factories.outbound({ chat, workspace: cwd,
+    if (stopping) {
+      await cleanupLateComponent('media', () => createdMedia?.release?.());
+      throw stoppedError();
+    }
+    media = createdMedia;
+    const createdOutbound = await factories.outbound({ chat, workspace: cwd,
       outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'),
       bindingOutboxDir: resolve(cwd, 'data/feishu-outbox'),
       spoolDir: resolve(cwd, '.agent-chat-bridge/outbound-spool'),
       allowedGroupChatIds, maxTotalBytes: config.feishu.outputBudgetBytes, log });
+    if (stopping) {
+      await cleanupLateComponent('outbound', () => createdOutbound?.close?.());
+      throw stoppedError();
+    }
+    outbound = createdOutbound;
     checkCancelled();
     const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,
       sendAttachment: input => sendOutboundAttachment({ client, ...input }),
@@ -221,23 +308,56 @@ export async function startService({ config, configPath, env = process.env, log,
       onCardAction: payload => handleCardOperation(async()=>{
         const answered=await userInput.handleCardAction(payload); return answered??feedback.handleCardAction(payload);
       }), log });
-    await Promise.race([feishu.start(), cancelled]);
-    checkCancelled();
-    if (config.feishu.catchup !== false) catchup = factories.catchup({ connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, chat, store, onEvent: communication.ingest, listConversations: () => listCatchupConversations({ config, store }), log });
-    forward.start();
-    communication.start();
-    catchup?.start();
-    http = await startServer({ config, log, readiness: async () => {
+    const readiness = async () => {
       let storeReady = writerHealthy;
       try { await store.assertCurrent(); } catch { storeReady = false; }
       const executorStatus=executor.status();
       const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending&&!executorStatus.fault, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
-      return { ready: Object.values(components).every(Boolean), components };
-    } });
+      return { ready: !stopping && Object.values(components).every(Boolean), components };
+    };
+    const createdHttp = await factories.server({ config, log, readiness });
+    if (stopping) {
+      await cleanupLateComponent('server', () => createdHttp?.close?.());
+      throw stoppedError();
+    }
+    http = createdHttp;
+    await Promise.race([feishu.start(), cancelled, writerLost]);
+    ensureWriterHealthy();
     checkCancelled();
+    if (stopping) throw stoppedError();
+    if (config.feishu.catchup !== false) catchup = factories.catchup({ connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, chat, store, onEvent: communication.ingest, listConversations: () => listCatchupConversations({ config, store }), log });
+    forward.start();
+    communication.start();
+    catchup?.start();
+    const unhealthySince = new Map();
+    const checkHealth = async () => {
+      if (stopping || healthChecking) return;
+      healthChecking = true;
+      try {
+        const { components } = await readiness();
+        const checkedAt = Date.now();
+        for (const component of ['store', 'workers']) {
+          const healthy = components[component];
+          if (healthy) unhealthySince.delete(component);
+          else if (!unhealthySince.has(component)) unhealthySince.set(component, checkedAt);
+        }
+        const failed = [...unhealthySince].find(([, since]) => checkedAt - since >= config.runtime.unhealthyExitMs);
+        if (failed) requestFatalShutdown({ reason: failed[0], code: 'runtime_unhealthy', operation: 'service_health',
+          durationMs: checkedAt - failed[1], restartReason: `unhealthy:${failed[0]}` });
+      } finally { healthChecking = false; }
+    };
+    const healthIntervalMs = Math.min(config.runtime.unhealthyExitMs, config.storage.writer.probeIntervalMs);
+    healthWatchdog = setInterval(() => { Promise.resolve(checkHealth()).catch(() => {}); }, healthIntervalMs);
+    healthWatchdog.unref?.();
+    await checkHealth();
+    if (stopping) throw stoppedError();
     signal?.removeEventListener('abort', abort);
     return { server: http.server, close };
   } catch (error) {
+    if (fatalShutdown) {
+      await fatalShutdown.catch(() => {});
+      throw error;
+    }
     await close().catch(() => {});
     throw error;
   }
