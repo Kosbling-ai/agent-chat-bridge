@@ -102,7 +102,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     if(stopping)throw new Error('ingress_stopped');
     return store.acceptInbound({connectionId,conversationId:chatId,source:'live',conversationType:'group',
       eventKey:`card_action:${eventId}`,eventType:'card.action',messageId,
-      ...(event.event.occurredAt?{occurredAt:Date.parse(event.event.occurredAt)}:{}),
+      ...(event.occurredAt?{occurredAt:Date.parse(event.occurredAt)}:{}),
       payload:event,semanticPayload:event,policyVersion:config.routing.version,passiveContext:false,
       hooks:[{hookId,payload:event}]});
   }

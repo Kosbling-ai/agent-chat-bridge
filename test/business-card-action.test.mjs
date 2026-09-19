@@ -63,6 +63,11 @@ async function eventually(predicate) {
   throw new Error('condition_timeout');
 }
 
+function acceptedByBusinessReceiver(body, connectionId) {
+  if (body?.event?.connectionId !== connectionId) return false;
+  return body?.event?.schemaVersion === 1 && body.event.channel === 'feishu';
+}
+
 test('business card action forwards to hook', async () => {
   const fixture = harness(); fixture.communication.start();
   const wsClient = { async start() {}, close() {} };
@@ -76,16 +81,27 @@ test('business card action forwards to hook', async () => {
   assert.equal(delivered.request.headers.authorization, 'Bearer synthetic');
   assert.deepEqual(delivered.body.event, {
     schemaVersion: 1, channel: 'feishu', type: 'card.action',
-    event: {
-      connectionId: 'fixture', eventId: 'event-1', chatId: 'chat-1', messageId: 'message-1',
-      operatorOpenId: 'operator-1', operatorName: 'Operator', value: payload.action.value,
-      occurredAt: '2023-11-14T22:13:20.000Z',
-    },
+    connectionId: 'fixture', eventId: 'event-1', chatId: 'chat-1', messageId: 'message-1',
+    operatorOpenId: 'operator-1', operatorName: 'Operator', value: payload.action.value,
+    occurredAt: '2023-11-14T22:13:20.000Z',
   });
+  assert.equal(acceptedByBusinessReceiver(delivered.body, 'fixture'), true);
   assert(fixture.rows.has('card_action:event-1'));
   assert.deepEqual(fixture.logs, [['info', 'receive', 'accepted', {
     component: 'card_action', hookId: 'orders', eventId: 'event-1', chatId: 'chat-1', messageId: 'message-1', kind: 'approve',
   }]]);
+  await fixture.communication.stop();
+});
+
+test('business card action wrapper passes business receiver contract', async () => {
+  const fixture = harness(); fixture.communication.start();
+  await fixture.action.handleCardAction(payload);
+  await Promise.all(fixture.operations);
+  await eventually(() => fixture.deliveries.length === 1);
+  const body = fixture.deliveries[0].body;
+  assert.equal(acceptedByBusinessReceiver(body, 'fixture'), true);
+  assert.equal(body.event.type, 'card.action');
+  assert.equal(body.event.event, undefined);
   await fixture.communication.stop();
 });
 
@@ -127,7 +143,7 @@ test('business card action dedups replay without a valid timestamp', async () =>
   assert.equal(first.toast.type, 'info'); assert.equal(second.toast.type, 'info');
   assert.equal(fixture.rows.size, 1); assert.equal(fixture.logs.at(-1)[2], 'duplicate');
   const [{ job }] = [...fixture.rows.values()];
-  assert.equal(JSON.parse(job.payload).event.occurredAt, null);
+  assert.equal(JSON.parse(job.payload).occurredAt, null);
 });
 
 test('business card action returns before slow registration and retains job', async () => {
@@ -161,4 +177,21 @@ test('business card action reports failed registration once', async () => {
     error_code: 'store_unavailable',
   });
   assert.deepEqual(reports[0], events[0]);
+});
+
+test('business card action reports registration failure after toast', async () => {
+  const events = []; const reports = []; const operations = []; let rejectRegistration;
+  const registration = new Promise((_, reject) => { rejectRegistration = reject; });
+  const log = createLogger({ write: line => events.push(JSON.parse(line)) }, { reportError: event => reports.push(event) });
+  const action = createBusinessCardAction({ hooks: [hook], connectionId: 'fixture', registrationTimeoutMs: 10,
+    ingest: () => registration,
+    runAsync(operation) { const pending = Promise.resolve().then(operation); operations.push(pending); pending.catch(() => {}); }, log });
+  const response = await action.handleCardAction(payload);
+  assert.equal(response.toast.content, '已收到，处理结果稍后更新在卡片上');
+  assert.equal(events.length, 0); assert.equal(reports.length, 0);
+  rejectRegistration(Object.assign(new Error('private detail'), { code: 'store_unavailable' }));
+  await Promise.all(operations);
+  assert.equal(events.length, 1); assert.equal(events[0].level, 'error');
+  assert.equal(events[0].error_code, 'store_unavailable');
+  assert.equal(reports.length, 1); assert.deepEqual(reports[0], events[0]);
 });

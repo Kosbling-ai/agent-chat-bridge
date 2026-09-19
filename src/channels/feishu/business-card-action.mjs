@@ -71,10 +71,8 @@ export function createBusinessCardAction({ hooks = [], connectionId, ingest,
 
     const event = {
       schemaVersion: 1, channel: 'feishu', type: 'card.action',
-      event: {
-        connectionId, eventId, chatId, messageId, operatorOpenId,
-        ...(operatorName ? { operatorName } : {}), value, occurredAt: occurredAt(actionTime),
-      },
+      connectionId, eventId, chatId, messageId, operatorOpenId,
+      ...(operatorName ? { operatorName } : {}), value, occurredAt: occurredAt(actionTime),
     };
     const registration = Promise.resolve().then(() => ingest({ hookId, eventId, chatId, messageId, event }));
     const observed = registration.then(receipt => {
