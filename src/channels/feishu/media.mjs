@@ -182,6 +182,7 @@ export async function createFeishuMedia({ chat, inboxDir, enabled = true, maxByt
         contextDownloadCount += downloadable ? 1 : 0;
         return {
           ...item,
+          messageId: entry.messageId || entry.event?.messageId || null,
           ...(enabled && downloadable && contextDownloadCount > contextAttachmentLimit
             ? { status: 'skipped', path: null, bytes: null, reason: 'context_attachment_limit', contextLimited: true }
             : {}),

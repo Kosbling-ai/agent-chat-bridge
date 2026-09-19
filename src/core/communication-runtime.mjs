@@ -30,7 +30,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextWindowMs=Number(config.codex.groupContextHours??24)*60*60*1000;
   const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
   const contextEnabled=contextLimit>0&&contextWindowMs>0;
-  const recent=createRecentMentionPrompts({now,ttlMs:contextWindowMs,limit:contextLimit});
+  const recent=createRecentMentionPrompts({now});
   function humanAllowed(event,group) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
     if(event.conversationType==='p2p')return (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId)));

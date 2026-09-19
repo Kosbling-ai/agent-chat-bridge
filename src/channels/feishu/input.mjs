@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { extractMessageText } from './media.mjs';
 
 const DEFAULT_RECENT_TTL_MS = 2 * 60 * 1000;
@@ -67,19 +66,6 @@ export function createRecentMentionPrompts({ now = Date.now, ttlMs = DEFAULT_REC
       prune();
     },
   });
-}
-
-export function mergeGroupContextPrompts(...groups) {
-  const seen = new Set();
-  return groups.flat().filter(entry => optionalText(entry?.prompt ?? entry?.text))
-    .map(entry => ({ ...entry, prompt: optionalText(entry.prompt ?? entry.text) }))
-    .sort((left, right) => (Number(left.createdAt) || 0) - (Number(right.createdAt) || 0))
-    .filter(entry => {
-      const key = entry.messageId || createHash('sha256').update(JSON.stringify([entry.senderOpenId || '', entry.createdAt || '', entry.prompt])).digest('hex');
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    }).slice(-DEFAULT_RECENT_LIMIT);
 }
 
 export function mergeMentionPrompts(recentPrompts = [], currentPrompt = '') {

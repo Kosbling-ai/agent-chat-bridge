@@ -1,12 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { validateConfig } from '../src/config.mjs';
 import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
+import { createFeishuMedia } from '../src/channels/feishu/media.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 import { renderExecutionCard } from '../src/channels/feishu/execution-card.mjs';
 import { createCodexExecutor } from '../src/agents/codex/executor.mjs';
+import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
 
 const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},hooks:[]};
 const flush=()=>new Promise(resolve=>setTimeout(resolve,20));
@@ -78,6 +84,36 @@ test('passive group attachment metadata is stored without download and carried i
   assert.equal(forwarded.length,1);
   assert.equal(forwarded[0].context[0].attachments[0].fileKey,'context-file');
   assert.equal(forwarded[0].context[0].event.messageId,'passive-file');
+});
+
+test('expired in-memory group context is supplied only by the 24-hour database window',async()=>{
+  let clock=1_700_000_000_000;const forwarded=[];let databaseReads=0;
+  const config=validateConfig(base);
+  const persisted={inboundId:1,messageId:'persisted',senderOpenId:'alice',senderName:'Alice',prompt:'database context',
+    createdAt:clock,attachments:[],source:'persisted_group_context'};
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async()=>({duplicate:false})},
+    inbound:{async loadRecentGroupContext(){databaseReads+=1;return[persisted];}},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{execution:{terminal:'completed'}};}},chat:{},now:()=>clock});
+  const event=(id,text,mentioned=false)=>({connectionId:'test',source:'live',eventKey:id,type:'message.received',conversationId:'chat',conversationType:'group',
+    messageId:id,occurredAt:clock,actor:{type:'user',openId:'alice',name:'Alice'},message:{kind:'text',content:JSON.stringify({text:mentioned?`<at>bot</at> ${text}`:text}),
+      mentions:mentioned?[{openId:'bot',key:'<at>bot</at>'}]:[]}});
+  await runtime.ingest(event('persisted','database context'));
+  clock+=2*60*1000+1;
+  await runtime.ingest(event('mention','inspect',true));
+  await new Promise(setImmediate);
+  assert.equal(databaseReads,1);
+  assert.equal(forwarded.length,1);
+  assert.deepEqual(forwarded[0].context,[persisted]);
+});
+
+test('legacy persisted group context without attachment metadata maps to an empty array',async()=>{
+  const row={id:1,message_id:'legacy',chat_id:'chat',chat_type:'group',message_type:'text',sender_open_id:'alice',sender_name:'Alice',
+    content_text:'legacy context',content_json:'{"text":"legacy context"}',message_created_at:1000};
+  const connection={async query(){},async execute(sql){assert.match(sql,/SELECT m\.id/);return[[row]];},release(){},destroy(){}};
+  const inbound=createInboundMessageStore({pool:{async getConnection(){return connection;}},connectionId:'test'});
+  const entries=await inbound.loadRecentGroupContext({connectionId:'test',chatId:'chat',beforeMs:2000,windowMs:24*60*60*1000,limit:50});
+  assert.equal(entries.length,1);
+  assert.deepEqual(entries[0].attachments,[]);
 });
 
 test('zero group context count disables in-memory attachment context',async()=>{
@@ -219,6 +255,101 @@ function memoryJobs(initial){
     markRetry:async input=>{calls.push(['retry',input]);job={...job,status:input.held?'held':input.terminal?'failed':'pending',last_error:input.errorCode,nextAttemptAt:input.nextAttemptAt,leaseOwner:''};},
     getRun:async()=>job,readEvents:async()=>[]};
 }
+
+test('group attachment flows through communication, persisted mapping, forward, media, and executor once',async t=>{
+  const workspace=await mkdtemp(join(tmpdir(),'bridge-group-context-composite-'));
+  t.after(()=>rm(workspace,{recursive:true,force:true}));
+  const rows=[];let nextInboundId=1;
+  const connection={
+    async query(){},async beginTransaction(){},async commit(){},async rollback(){},release(){},destroy(){},
+    async execute(sql,values){
+      if(sql.includes('SELECT m.id')){
+        const [,chatId,after,before]=values;
+        const selected=rows.filter(row=>row.chat_id===chatId&&row.group_context_candidate===1
+          &&row.codex_context_forwarded_at==null&&row.message_created_at>=after&&row.message_created_at<=before)
+          .sort((left,right)=>right.message_created_at-left.message_created_at||right.id-left.id);
+        return[selected];
+      }
+      if(sql.includes('UPDATE assistant_inbound_messages SET codex_context')){
+        let affectedRows=0;
+        for(const row of rows){
+          if(row.group_context_candidate===1&&row.codex_context_forwarded_at==null
+            &&values.some(value=>String(value)===String(row.id)||String(value)===row.message_id)){
+            row.codex_context_forwarded_at=values[2];affectedRows+=1;
+          }
+        }
+        return[{affectedRows}];
+      }
+      throw new Error(`unexpected inbound SQL: ${sql}`);
+    },
+  };
+  const inbound=createInboundMessageStore({pool:{async getConnection(){return connection;}},connectionId:'test',now:()=>1_700_000_010_000});
+  const ingressStore={async acceptInbound(input){
+    const message=input.inboundMessage;
+    rows.push({id:nextInboundId++,message_id:message.messageId,chat_id:message.chatId,chat_type:message.chatType,
+      message_type:message.messageType,sender_open_id:message.senderOpenId,sender_name:message.senderName,
+      content_text:message.rawText,content_json:JSON.stringify(message.content),message_created_at:message.createdAt,
+      bot_mentioned:message.botMentioned?1:0,group_context_candidate:message.groupContextCandidate?1:0,codex_context_forwarded_at:null});
+    return{duplicate:false};
+  }};
+  const jobsById=new Map();
+  const jobs={
+    async getByMessageId(){return null;},
+    async upsert(input){const id=`run-${input.messageId}`;const job={id,status:'pending',attempts:0,leaseOwner:'',callerId:input.callerId,
+      chatId:input.conversationId,chatType:input.chatType,messageId:input.messageId,sourceMessageId:input.sourceMessageId,
+      bindingOpenId:input.bindingOpenId,senderOpenId:input.senderOpenId,senderName:input.senderName,executionNamespace:input.executionNamespace,
+      deliveryMode:input.deliveryMode,prompt:input.prompt,groupChatContext:input.groupChatContext,contextEntries:input.contextEntries,
+      result:structuredClone(input.initialResult)};jobsById.set(id,job);return{...job,duplicate:false};},
+    async getRun({id}){return jobsById.get(id)||null;},
+    async patchPreparedInput({id,execution}){const job=jobsById.get(id);job.result={...job.result,execution};return job;},
+    async claimById({id,owner}){const job=jobsById.get(id);if(job?.status!=='pending')return null;job.status='running';job.leaseOwner=owner;job.attempts+=1;return job;},
+    async claimReplyById(){return null;},async renew(){return{renewed:true};},
+    async markFinishedWithoutReply({id,status,result}){const job=jobsById.get(id);job.status=status;job.result=result;},
+    async markRetry(){throw new Error('composite forward must not retry');},
+  };
+  const downloads=[];const executions=[];
+  const media=await createFeishuMedia({inboxDir:join(workspace,'inbox'),chat:{async downloadResource(input){downloads.push(input);
+    return{stream:Readable.from([Buffer.from('pdf')]),contentType:'application/pdf'};}}});
+  const forward=createForwardRuntime({config:{owner:'composite',pollMs:1},jobs,sessions:{},inbound,media,
+    executor:{async execute(input){executions.push(structuredClone(input));return{deferred:true,accepted:true,threadId:'thread',turnId:`turn-${executions.length}`};}},
+    replies:{},authorize:async()=>true});
+  const config=validateConfig(base);const communicationLogs=[];
+  const communication=createCommunicationRuntime({config,store:ingressStore,inbound,forward,chat:{},now:()=>1_700_000_010_000,
+    log:(...entry)=>communicationLogs.push(entry)});
+  const waitForExecutions=async count=>{
+    const deadline=Date.now()+5000;
+    while(executions.length<count&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,5));
+  };
+  const event=(id,occurredAt,message,actor={type:'user',openId:'human',name:'Human'})=>({connectionId:'test',source:'live',eventKey:id,
+    type:'message.received',conversationId:'chat',conversationType:'group',messageId:id,occurredAt,actor,message});
+  await communication.ingest(event('passive-file',1_700_000_000_000,
+    {kind:'file',content:'{"file_key":"context-file","file_name":"context.pdf"}',mentions:[]},
+    {type:'user',openId:'alice',name:'Alice'}));
+  await communication.ingest(event('mention-one',1_700_000_001_000,
+    {kind:'text',content:'{"text":"<at>bot</at> inspect"}',mentions:[{openId:'bot',key:'<at>bot</at>'}]}));
+  await waitForExecutions(1);
+  assert.deepEqual(communicationLogs,[]);
+  assert.equal(executions.length,1);
+  const first=executions[0];
+  t.diagnostic(`executor prompt: ${JSON.stringify(first.prompt)}`);
+  assert.match(first.prompt,/【上下文 1\/1 来自 Alice】【附件 1\/1】文件 context\.pdf/);
+  assert.equal(first.attachments.length,1);
+  assert.equal(first.attachments[0].messageId,'passive-file');
+  assert.equal(first.attachments[0].fileKey,'context-file');
+  assert.equal(first.attachments[0].path,join(workspace,'inbox','chat','passive-file','context-file.pdf'));
+  assert.deepEqual(downloads.map(({messageId,fileKey,type})=>({messageId,fileKey,type})),
+    [{messageId:'passive-file',fileKey:'context-file',type:'file'}]);
+  assert.ok(rows.find(row=>row.message_id==='passive-file').codex_context_forwarded_at);
+
+  await communication.ingest(event('mention-two',1_700_000_002_000,
+    {kind:'text',content:'{"text":"<at>bot</at> again"}',mentions:[{openId:'bot',key:'<at>bot</at>'}]}));
+  await waitForExecutions(2);
+  assert.deepEqual(communicationLogs,[]);
+  assert.equal(executions.length,2);
+  assert.doesNotMatch(executions[1].prompt,/context\.pdf|上下文/);
+  assert.deepEqual(executions[1].attachments,[]);
+  assert.equal(downloads.length,1);
+});
 
 const bridgeInput={source:'live',callerId:'live',idempotencyKey:'message',conversationId:'chat',chatType:'p2p',actor:{openId:'human'},prompt:'work'};
 const bridgeJob=()=>({status:'pending',callerId:'live',executionNamespace:null,deliveryMode:'bridge',sourceMessageId:'message',senderOpenId:'human',chatType:'p2p'});
