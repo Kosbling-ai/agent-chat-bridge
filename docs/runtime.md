@@ -46,7 +46,37 @@ Bridge delivery consumes the executor's attachment paths directly. P2P is allowe
 
 ## HTTP contract
 
-The HTTP listener exposes only `GET /health/live` and `GET /health/ready`. Unknown GET paths, including every former `/v1` run, event, resource, recovery and delivery path, return 404; non-GET requests return 405. Business systems integrate through configured outbound hooks and keep their own SDK, Codex, scheduling and message-delivery paths. The former top-level `auth` block, including an empty block, is no longer valid configuration. Hook authentication remains configured per hook with `hooks[].tokenEnv`.
+The HTTP listener exposes `GET /health/live`, `GET /health/ready`, and the authenticated Events API below. Other GET paths, including former `/v1` run, resource, recovery and delivery paths, return 404; unsupported non-GET requests return 405. The former top-level `auth` block, including an empty block, remains invalid configuration.
+
+## Events API
+
+A hook may opt into inbound events without changing its existing outbound behavior:
+
+```json
+{
+  "id": "business-producer",
+  "url": "https://producer.invalid/bridge-hook",
+  "tokenEnv": "BRIDGE_OUTBOUND_TOKEN",
+  "conversationIds": [],
+  "inbound": {
+    "tokenEnv": "BRIDGE_INBOUND_TOKEN",
+    "scopePrefixes": ["custom-order:customer:"],
+    "defaultChatId": "configured-group-id"
+  }
+}
+```
+
+Both token fields are environment-variable references; they are separate credentials. The inbound reference is resolved and required at startup, and inbound token values must be unique because the bearer identifies the producer. `scopePrefixes` contains one to 100 distinct namespace prefixes, each at most 64 characters and matching `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$`. Hooks without `inbound` retain their prior behavior and cannot authenticate to this API. Existing `url` and outbound `tokenEnv` fields remain required.
+
+`POST /v1/events` requires `Authorization: Bearer <token>` and a JSON body with `event_id`, `producer_id`, `scope`, `type`, `correlation_id`, `occurred_at`, `ref_ids`, `prompt`, and optional `target_chat_id`. `event_id` is at most 128 characters and matches `^[A-Za-z0-9][A-Za-z0-9._:-]*$`; `scope` is at most 128 characters and matches `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`. The authenticated hook ID must equal `producer_id`, and `scope` must start with one configured prefix. `type` is one of `mail.inbound`, `wait.due`, or `wait.resolved`. `occurred_at` is ISO 8601. `ref_ids` has at most 16 string entries. `prompt` is at most 8,000 characters and must describe the event without including customer mail text. `target_chat_id` defaults to the hook's `inbound.defaultChatId`.
+
+The entire encoded request body is capped at 65,536 bytes, which leaves bounded room for metadata around the 8,000-character prompt. The listener retains its five-second request and header timeouts. Invalid fields return 400, missing or incorrect bearer credentials return 401, a producer mismatch or disallowed scope returns 403, an existing event ID with different normalized content returns 409, and an oversized prompt or request returns 413.
+
+Accepted requests return `202 {"job_id":"...","binding_open_id":"system:...","deduplicated":false}`. Identity is `(producer_id,event_id)` inside the current bot connection. Repeating the same normalized request returns the same job with `deduplicated:true`; `ref_ids` key order does not affect the hash, and an omitted default chat is normalized to the configured chat. The job binds by `(producer_id,scope)`, uses `delivery_mode='caller'`, and never creates an execution card, sends a final chat reply, or otherwise performs automatic event output. When the binding already has an active turn, the event follows `codex.steering`; an unconfirmed steer stays in durable forward recovery rather than turning the accepted HTTP request into a later delivery error.
+
+The Codex input retains the existing `【独立系统任务】` preamble, followed by a `【业务事件】` block containing type, event ID, correlation ID, occurrence time and reference IDs, then the producer prompt. The bridge does not load business documents or inject customer content.
+
+`GET /v1/events/:event_id` uses the same bearer token; the producer identity comes from that token. It returns `{"job_id":"...","status":"pending","updated_at":...}` using the forward job's existing status literals, or 404 when that hook does not own the event. Event-request logs contain only bounded hook/event/type/scope-prefix/result/job identifiers and never the prompt or full payload.
 
 Internal bridge delivery status is `waiting`, `pending`, `sent`, `failed`, or `unknown`. A known delivery failure or ambiguity does not rerun the completed model turn. A confirmed non-zero Feishu response is recorded as a rejection, while malformed responses, thrown transport errors and timeouts remain unknown and are not resent automatically.
 

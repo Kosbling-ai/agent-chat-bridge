@@ -70,6 +70,37 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
 test('media download timeout accepts positive integers above the default', () => {
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, mediaDownloadTimeoutMs: 120001 } }).feishu.mediaDownloadTimeoutMs, 120001);
 });
+test('hook inbound event configuration validates references, prefixes, and default chat', () => {
+  const inboundHook = { id: 'h', url: 'https://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: [],
+    inbound: { tokenEnv: 'TEST_INBOUND', scopePrefixes: ['custom-order:customer:'], defaultChatId: 'synthetic-chat' } };
+  assert.deepEqual(validateConfig({ ...config, hooks: [inboundHook] }).hooks[0].inbound,
+    { tokenEnv: 'TEST_INBOUND', scopePrefixes: ['custom-order:customer:'], defaultChatId: 'synthetic-chat' });
+  const invalid = (inbound, code) => assert.throws(
+    () => validateConfig({ ...config, hooks: [{ ...inboundHook, inbound }] }), { code });
+  invalid({ ...inboundHook.inbound, extra: true }, 'invalid_hook_inbound_fields');
+  invalid({ ...inboundHook.inbound, tokenEnv: 'not-an-env' }, 'invalid_environment_reference');
+  invalid({ ...inboundHook.inbound, scopePrefixes: [] }, 'invalid_hook_inbound_scope_prefixes');
+  invalid({ ...inboundHook.inbound, scopePrefixes: ['bad prefix'] }, 'invalid_hook_inbound_scope_prefix');
+  invalid({ ...inboundHook.inbound, defaultChatId: '' }, 'invalid_hook_inbound_default_chat_id');
+});
+test('service requires configured inbound hook token environment', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-inbound-env-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const inboundHook = { id: 'h', url: 'https://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: [],
+    inbound: { tokenEnv: 'TEST_INBOUND', scopePrefixes: ['custom-order:customer:'], defaultChatId: 'synthetic-chat' } };
+  const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 },
+    codex: { bin: process.execPath, cwd: directory, envNames: [] }, hooks: [inboundHook] });
+  await assert.rejects(startService({ config: runtimeConfig, configPath: join(directory, 'config.json'),
+    env: { TEST_HOOK: 'synthetic-outbound', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' },
+    dependencies: { pool() { throw new Error('pool must not be reached'); } } }), { code: 'required_environment_missing' });
+  const duplicateConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 },
+    codex: { bin: process.execPath, cwd: directory, envNames: [] }, hooks: [inboundHook,
+      { ...inboundHook, id: 'h2', tokenEnv: 'TEST_HOOK_2', inbound: { ...inboundHook.inbound, tokenEnv: 'TEST_INBOUND_2' } }] });
+  await assert.rejects(startService({ config: duplicateConfig, configPath: join(directory, 'config.json'),
+    env: { TEST_HOOK: 'outbound-one', TEST_HOOK_2: 'outbound-two', TEST_INBOUND: 'shared-inbound', TEST_INBOUND_2: 'shared-inbound',
+      TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, dependencies: { pool() { throw new Error('pool must not be reached'); } } }),
+  { code: 'duplicate_inbound_token' });
+});
 test('history identity needed for allowlist/mention routing cannot consume canonical receipt', async () => {
   let accepted = 0;
   const groups = [{ conversationId: 'group', trigger: 'all', passiveContext: true }];
@@ -203,7 +234,7 @@ test('startup cancellation closes an idle executor while Feishu start is pending
   let executorClosed = false, storeClosed = false, socketStopped = false, enter;
   const entered = new Promise(resolve => { enter = resolve; });
   const controller = new AbortController();
-  const runtimeConfig = validateConfig({ ...config, codex: { bin: process.execPath, cwd: directory, envNames: [] } });
+  const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 }, codex: { bin: process.execPath, cwd: directory, envNames: [] } });
   const started = startService({ config: runtimeConfig, configPath: join(directory, 'config.json'), env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, signal: controller.signal, log: async () => { throw new Error('synthetic log'); }, dependencies: {
     pool: () => ({}), store: async () => ({ close: async () => { storeClosed = true; } }),
     executor: () => ({status:()=>({closing:false,restartPending:null}),close:async()=>{executorClosed=true;}}),

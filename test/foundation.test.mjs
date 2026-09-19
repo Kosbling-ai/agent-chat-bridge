@@ -182,6 +182,8 @@ test('real local process is live but never integration-ready, without any creden
     const unavailable = await fetch(`${url}${path}`, { method: 'POST', headers: { authorization: `Bearer ${sentinel}` }, body: '{}' });
     assert.equal(unavailable.status, 405, path);
   }
+  const eventPost = await fetch(`${url}/v1/events`, { method: 'POST', body: '{}' });
+  assert.equal(eventPost.status, 401);
   const post = await fetch(`${url}/health/live`, { method: 'POST', body: sentinel });
   assert.equal(post.status, 405);
   app.child.kill('SIGTERM');
@@ -191,7 +193,7 @@ test('real local process is live but never integration-ready, without any creden
   assert.equal(result.stdout.includes(sentinel), false);
   assert.equal(result.stderr, '');
   assert.deepEqual(result.lines.map((line) => `${line.operation}:${line.status}`), [
-    'listen:succeeded', 'shutdown:started', 'shutdown:succeeded',
+    'listen:succeeded', 'events_api:completed', 'shutdown:started', 'shutdown:succeeded',
   ]);
 });
 

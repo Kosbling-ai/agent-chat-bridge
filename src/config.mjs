@@ -203,13 +203,33 @@ function validateRuntime(raw) {
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups };
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
-    object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds'], 'invalid_hook_fields');
+    object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds', 'inbound'], 'invalid_hook_fields');
     let url; try { url = new URL(hook.url); } catch { throw new ConfigError('invalid_hook_url'); }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_hook_url');
     const conversationIds = strings(hook.conversationIds).map(id => identifier(id, 255));
     const catchupGroupIds = strings(hook.catchupGroupIds ?? []).map(id => identifier(id, 255));
     if (catchupGroupIds.some(id => !conversationIds.includes(id))) throw new ConfigError('invalid_hook_catchup_scope');
-    return { id: identifier(hook.id, 128), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds, catchupGroupIds };
+    let inbound;
+    if (hook.inbound !== undefined) {
+      object(hook.inbound, ['tokenEnv', 'scopePrefixes', 'defaultChatId'], 'invalid_hook_inbound_fields');
+      if (!Array.isArray(hook.inbound.scopePrefixes) || hook.inbound.scopePrefixes.length < 1
+        || hook.inbound.scopePrefixes.length > 100) throw new ConfigError('invalid_hook_inbound_scope_prefixes');
+      const scopePrefixes = [...new Set(hook.inbound.scopePrefixes.map(prefix => {
+        if (typeof prefix !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(prefix)) {
+          throw new ConfigError('invalid_hook_inbound_scope_prefix');
+        }
+        return prefix;
+      }))];
+      if (typeof hook.inbound.defaultChatId !== 'string' || !hook.inbound.defaultChatId
+        || hook.inbound.defaultChatId.length > 191) throw new ConfigError('invalid_hook_inbound_default_chat_id');
+      inbound = Object.freeze({
+        tokenEnv: reference(hook.inbound.tokenEnv),
+        scopePrefixes: Object.freeze(scopePrefixes),
+        defaultChatId: hook.inbound.defaultChatId,
+      });
+    }
+    return { id: identifier(hook.id, 128), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds, catchupGroupIds,
+      ...(inbound ? { inbound } : {}) };
   });
   if (new Set(hooks.map(h => h.id)).size !== hooks.length) throw new ConfigError('duplicate_hook');
   let errorReporting;

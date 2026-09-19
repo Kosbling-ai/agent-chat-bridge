@@ -2,7 +2,7 @@
 
 Application version: `0.2.10`
 
-Version 0.2.10 does not add a database migration.
+Version 0.2.10 does not add a database migration. The Events API reuses the existing forward-job request key and request hash for hook-scoped idempotency.
 
 Version 0.2.9 does not add a database migration.
 

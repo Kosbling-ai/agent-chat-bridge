@@ -9,6 +9,7 @@ import { startService } from '../src/service.mjs';
 const proxyNames = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'];
 const base = {
   schemaVersion: 1,
+  listen: { host: '127.0.0.1', port: 0 },
   storage: Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `TEST_${key.toUpperCase()}`])),
   codex: { bin: '/synthetic/codex', cwd: '/synthetic/workspace', envNames: ['PATH', 'HOME'] },
   feishu: { connectionId: 'proxy-test', appIdEnv: 'TEST_APP', appSecretEnv: 'TEST_SECRET', botOpenId: 'bot', catchup: false },

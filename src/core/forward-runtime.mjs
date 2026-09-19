@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { deriveExecutionScope, codexBindingOpenId } from '../agents/codex/thread-scope.mjs';
+import { buildBusinessEventPrompt } from '../agents/codex/prompt.mjs';
 
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED', 'CODEX_USAGE_LIMIT_EXCEEDED'].includes(error?.code);
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
@@ -77,6 +78,47 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     });
   }
 
+  async function registerEvent(input) {
+    const bindingOpenId = deriveExecutionScope(input.producerId, input.scope);
+    const registered = await jobs.upsert({
+      callerId: input.producerId,
+      idempotencyKey: input.eventId,
+      requestHash: input.requestHash,
+      conversationId: input.targetChatId,
+      messageId: `event:${input.producerId}:${input.eventId}`,
+      sourceMessageId: null,
+      bindingOpenId,
+      chatType: 'group',
+      messageType: 'event',
+      senderOpenId: `system:${input.producerId}`,
+      senderName: input.producerId,
+      executionNamespace: input.scope,
+      deliveryMode: 'caller',
+      prompt: buildBusinessEventPrompt(input),
+      contextEntries: [],
+      initialResult: { businessEvent: {
+        eventId: input.eventId,
+        type: input.type,
+        correlationId: input.correlationId,
+        occurredAt: input.occurredAt,
+        refIds: input.refIds,
+      } },
+    });
+    if (registered.messageId !== `event:${input.producerId}:${input.eventId}`
+      || registered.callerId !== input.producerId || registered.executionNamespace !== input.scope) {
+      throw Object.assign(new Error('job_conflict'), { code: 'job_conflict' });
+    }
+    if (!registered.duplicate && running && !stopping) track(processRegistered(registered.id));
+    wakeWorker?.();
+    return { jobId: registered.id, bindingOpenId, deduplicated: Boolean(registered.duplicate) };
+  }
+
+  async function getEvent({ producerId, eventId }) {
+    const job = await jobs.getByIdempotencyKey({ callerId: producerId, idempotencyKey: eventId });
+    return job?.messageId === `event:${producerId}:${eventId}`
+      ? { jobId: job.id, status: job.status, updatedAt: job.updatedAt } : null;
+  }
+
   async function prepareRegistered(job) {
     const execution = job?.result?.execution || {};
     if (!job || execution.inputStatus || !media || !job.result?.inputEvent) return job;
@@ -134,7 +176,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
           : (execution.bindingOpenId || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType })),
         chatId: job.chatId, chatType: job.chatType, messageId: job.messageId,
         senderOpenId: job.senderOpenId, senderName: job.senderName, prompt, attachments: execution.attachments || [], groupChatContext: job.groupChatContext,
-        busyPolicy: job.executionNamespace || config.steering === false ? 'reject' : 'steer',
+        busyPolicy: config.steering === false || (job.executionNamespace && !job.result?.businessEvent) ? 'reject' : 'steer',
       };
       state = job.deliveryMode === 'bridge'
         ? await (job.recovered ? feedback?.restore?.(job, lease) : feedback?.start?.(job, lease)) : null;
@@ -311,7 +353,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     for (const controller of leaseControllers) controller.abort();
   }
   return Object.freeze({
-    handleMessage, recover,
+    handleMessage, registerEvent, getEvent, recover,
     start() { if (running) throw new Error('forward_runtime_already_started'); running = true; worker = loop(); },
     beginStop,
     async stop() { beginStop(); await worker; await Promise.allSettled(active); },

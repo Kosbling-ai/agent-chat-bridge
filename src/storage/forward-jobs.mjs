@@ -103,6 +103,10 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
     },
     getRun: ({ id }) => getBy('public_run_id', required(id,36)),
     getByMessageId: ({ messageId }) => getBy('message_id', required(messageId,191)),
+    getByIdempotencyKey({ callerId, idempotencyKey }) {
+      const keyHash = hash(`${required(callerId, 128)}\0${required(idempotencyKey, 255)}`);
+      return getBy('request_key_hash', keyHash);
+    },
     loadRecoverable(input = {}) {
       const take = Math.max(1, Math.min(5, Number(input.limit || 1)));
       return read(async connection => {

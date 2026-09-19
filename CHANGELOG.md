@@ -2,6 +2,11 @@
 
 ## [0.2.10] — Unreleased
 
+- Add authenticated `POST /v1/events` and `GET /v1/events/:event_id` endpoints for hook-owned business events. Event jobs are idempotent per hook and event ID, use caller delivery with no automatic Feishu card or reply, and steer an active customer-scoped Codex turn when steering is enabled.
+- Extend hook configuration with optional inbound bearer, scope-prefix and default-chat references. Business-event prompts retain the independent-system preamble and add a structured event block without embedding request bodies in logs.
+
+No database migration is needed: the existing connection-scoped forward-job request key and request hash provide event identity and conflict detection.
+
 - Forward every authorized private Feishu message type to Codex with ordered attachment metadata. Stream downloadable images, files, audio, and video into the inbox with a configurable deadline (120 seconds by default) and a hard 32-MiB cap; preserve individual failures in the prompt without blocking the turn.
 - Supply downloaded images as Codex `localImage` items while keeping text first. Persist prepared attachment records for recovery so a claimed job does not download the same inbound resource twice. Audio remains a text-path attachment because the 2026-09-19 local probe accepted `localAudio` at the protocol layer but the model could not read the valid PCM WAV content.
 - Remove bridge-owned unsupported/download-failure replies and the former `feishu.mediaUnsupportedReply` configuration.

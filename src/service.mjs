@@ -80,6 +80,11 @@ export async function startService({ config, configPath, env = process.env, log,
     home: env.HOME,
   });
   const hookTokens = Object.fromEntries(config.hooks.map(hook => [hook.id, secret(env, hook.tokenEnv)]));
+  const inboundTokens = Object.fromEntries(config.hooks.filter(hook => hook.inbound)
+    .map(hook => [hook.id, secret(env, hook.inbound.tokenEnv)]));
+  if (new Set(Object.values(inboundTokens)).size !== Object.keys(inboundTokens).length) {
+    throw new ConfigError('duplicate_inbound_token');
+  }
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
@@ -315,7 +320,7 @@ export async function startService({ config, configPath, env = process.env, log,
       const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending&&!executorStatus.fault, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
       return { ready: !stopping && Object.values(components).every(Boolean), components };
     };
-    const createdHttp = await factories.server({ config, log, readiness });
+    const createdHttp = await factories.server({ config, log, readiness, eventRuntime: forward, inboundTokens });
     if (stopping) {
       await cleanupLateComponent('server', () => createdHttp?.close?.());
       throw stoppedError();

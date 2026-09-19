@@ -86,6 +86,7 @@ test('real Store core: immediate completion, independent hook, closed public API
     assert.equal((await fetch(`${url}/v1/runs/${accepted.agentJobId}`)).status, 404);
     assert.equal((await fetch(`${url}/v1/runs`, { method: 'POST', body: '{}' })).status, 405);
     assert.equal((await fetch(`${url}/v1/deliveries`, { method: 'POST', body: '{}' })).status, 405);
+    assert.equal((await fetch(`${url}/v1/events`, { method: 'POST', body: '{}' })).status, 401);
     const before = turns;
     await runtime.stop();
     const recovery = await store.enqueueJob({ kind: 'agent', connectionId: 'fixture', conversationId: 'recovered', idempotencyKey: 'recovered', payload: { text: 'already admitted' } });
