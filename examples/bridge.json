@@ -21,7 +21,6 @@
     "privateUserIds": ["replace_with_allowed_open_id"],
     "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "passiveContext": true, "capabilities": ["bridge", "hook"] }]
   },
-  "auth": { "clients": [{ "id": "application", "tokenEnv": "BRIDGE_API_TOKEN", "conversationIds": ["replace_with_chat_id"], "admin": false }] },
   "hooks": [],
   "errorReporting": { "url": "http://127.0.0.1:18831/errors", "tokenEnv": "BRIDGE_ERROR_TOKEN" }
 }

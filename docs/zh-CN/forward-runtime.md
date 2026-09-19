@@ -12,6 +12,8 @@
 
 提交只接受一次。“已提交”表示 bridge 已接受表单并尝试交给仍存活的 native 请求，不表示 Codex 已经消费答案。native 已解决、停止执行、turn 完成或失败、app-server 断线、服务关闭都会让旧卡失效。bridge 不伪造超时答案，不在重启后恢复旧 RPC，也不重放 prompt 或答案。
 
+私聊 Agent 消息缺省仍要求发送者出现在 `routing.privateUserIds`。显式设置 `routing.allowAllPrivateUsers:true` 后，bridge 会接受飞书应用权限范围内任何身份明确的人类私聊发送者；该选项缺省为 `false`，不会放行 bot/self 消息、未登记群聊，也不改变 hook 认证或 Codex 执行审批。私聊执行卡片动作仍只允许原消息发送者操作。
+
 群授权必须显式出现在 `routing.groups`。`capabilities` 只允许 `bridge`、`hook`，缺省两者都开，`[]` 表示两者都关。`bridge` 仍继续检查 @/all trigger 和可选 `userIds`；`hook` 只按自己的群授权与订阅过滤，不参加 Agent 路由、执行或回复。旧配置中只写在 `hooks[].conversationIds` 的群，需要补入 `routing.groups`，纯 hook 群可写 `capabilities:["hook"]`。
 
 hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lark-cli 等自身查询接口为数据真源，并保留业务轮询兜底及双入口 messageId 去重；bridge 不迁入业务回补、历史同步、缓存或 cron，也不让业务另建飞书 WebSocket。
