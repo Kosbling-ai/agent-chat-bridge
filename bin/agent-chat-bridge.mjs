@@ -56,7 +56,8 @@ try {
       process.on('SIGTERM', shutdown);
       process.on('SIGINT', shutdown);
       try {
-        service = await startService({ config, configPath: path, log, signal: controller.signal, onRestartRequired: () => exitAfterShutdown(0) });
+        service = await startService({ config, configPath: path, log, signal: controller.signal,
+          onRestartRequired: (_reason, exitCode = 0) => exitAfterShutdown(exitCode) });
         if (controller.signal.aborted) shutdown();
       } catch (error) {
         if (!controller.signal.aborted) throw error;

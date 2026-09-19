@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.9] — Unreleased
+
+- Recover from a lost MySQL writer lock by distinguishing definitive connection/query failures from consecutive probe timeouts, keeping writes independent from slow probes, and requesting a bounded non-zero supervisor restart without clearing or replaying queued work. Persistently unhealthy readiness components use the same fail-closed restart path.
+- No database migration.
+
 ## [0.2.8] — Unreleased
 
 - Preserve structured Codex usage-limit failures across live notifications and recovery. Show a safe quota-specific Feishu reply without replaying the failed turn; persist the stable error classification without raw provider messages.
