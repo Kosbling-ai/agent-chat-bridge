@@ -2,7 +2,7 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.5`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.6`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
 
 0.2.5 的版本化迁移 004 让五张 assistant 运行时表以 `connection_id` 隔离，并为唯一键、恢复、历史和群上下文查询增加连接前缀索引；bridge 表保留原有归属，只调整必要的 claim 索引。配置 `schemaVersion` 仍为 1。一个进程仍只运行一个飞书 bot 和一个 Codex executor；升级后可让多个不同连接的进程使用同一个专用 bridge schema。
 
@@ -16,8 +16,8 @@
 
 迁移 002–003 只用于 bridge 自己的 MySQL schema：002 增加 Codex binding/event 表，003 增加 forward job、入站消息和消息事件表及所需索引/收据字段。表结构虽来源于冻结生产实现，但这不是 Kosbling 生产/P 原库的原地转换，也不是透明升级。
 
-新开发实例应使用空的独立 schema，并显式运行 migrate；普通启动只校验迁移账本，不执行 DDL。已有 0.1.1 bridge 试用实例升级前，要先停唯一 writer，并把数据库与 workspace/outbox 一起备份。`schemaVersion` 仍为 1，但要复核 `routing.groups[].capabilities`、API 的执行/投递状态拆分、十进制字符串事件游标和管理接口 `409`。
+新开发实例应使用空的独立 schema，并显式运行 migrate；普通启动只校验迁移账本，不执行 DDL。已有 0.1.1 bridge 试用实例升级前，要先停唯一 writer，并把数据库与 workspace/outbox 一起备份。`schemaVersion` 仍为 1，但启动 0.2.6 前必须删除旧的整个顶层 `auth` 配置（包括空对象），否则严格校验会拒绝；不要删除仍用于 outbound hook 凭证的 `hooks[].tokenEnv`。公开 `/v1` run、event、resource、recovery、delivery 和 upload 接口已移除。本次不增加数据库迁移，也不自动清理历史 API/system 行。
 
 应用 002–003 后，0.1.1 的严格 schema 校验不会接受新账本。回退必须先停 writer，再恢复升级前的 bridge 数据库及匹配文件快照，或让 0.1.1 使用另一份兼容 schema。不能删除迁移记录、指向生产/P 原库或重放未知外部效果来假装降级。
 
-0.2.4 没有打 tag 或发布；现有 P 实例未改动。业务 producer 的定时提交、caller 结果消费和 hook 后 lark-cli 查询仍需另行评审与实现。
+0.2.6 没有打 tag 或发布；现有 P 实例未改动。业务 producer 保留自己的调度、Codex 与投递链路，只消费 bridge hook。

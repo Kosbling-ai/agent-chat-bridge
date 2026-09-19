@@ -159,12 +159,20 @@ test('send/reply preserve stable UUID and SDK targets, no automatic retry', asyn
   assert.throws(() => chat.sendMessage({ ...send, kind: 'audio' }));
 });
 
-test('write uncertainty survives timeout/network/platform error and never leaks payload', async () => {
-  for (const handler of [() => { throw new Error('token secret'); }, () => new Promise(() => {}), () => ({ code: 999 })]) {
+test('write uncertainty survives timeout, thrown errors and malformed responses without leaking payload', async () => {
+  for (const handler of [() => { throw new Error('token secret'); }, () => new Promise(() => {}),
+    () => null, () => ({}), () => ({ code: '999' })]) {
     const { chat, calls } = fakeChat(handler, { timeoutMs: 10 });
     await assert.rejects(chat.sendMessage(send), (error) => error.outcome === 'unknown' && !error.message.includes('secret'));
     assert.equal(calls.length, 1);
   }
+});
+
+test('a returned non-zero Feishu API code is a definite sanitized rejection', async () => {
+  const { chat, calls } = fakeChat(() => ({ code: 999, msg: 'provider secret' }));
+  await assert.rejects(chat.sendMessage(send), error => error.code === 'feishu_api_rejected'
+    && error.outcome === 'failed' && error.platformCode === 999 && !error.message.includes('secret'));
+  assert.equal(calls.length, 1);
 });
 
 test('internal history reads and reaction writes stay scoped and bounded', async () => {

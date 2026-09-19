@@ -1,13 +1,8 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { deriveExecutionScope, codexBindingOpenId } from '../agents/codex/thread-scope.mjs';
-import { publicAttachments } from '../channels/feishu/replies.mjs';
 
-const terminal = new Set(['completed', 'failed', 'deferred']);
-const stableMessageId = value => `api:${createHash('sha256').update(value).digest('hex')}`;
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED'].includes(error?.code);
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
-const preAdmissionBusy = error => isBusy(error)
-  && (error?.phase === 'pre_admission' || error?.outcome === 'rejected');
 const retryableError = error => {
   if (isBusy(error)) return false;
   if (terminalTurnError(error)) return false;
@@ -17,48 +12,8 @@ const retryableError = error => {
     || /steer delivery unconfirmed|timed out|timeout|network|socket hang up|fetch failed|aborted|stream disconnected before completion|error sending request/i.test(value);
 };
 
-function trustedBusyQueue(job) {
-  if (job.result?.policy?.queueIfBusy !== true || !job.executionNamespace || !job.callerId) return false;
-  try {
-    return deriveExecutionScope(job.callerId, job.executionNamespace) === job.result?.execution?.bindingOpenId;
-  } catch { return false; }
-}
-
-export function publicRun(job) {
-  const execution = job.result?.execution || {};
-  const executionFailed = job.result?.failed === true || ['failed', 'interrupted'].includes(job.result?.turnStatus || execution.terminal);
-  const deliveryFacts = job.result?.delivery || {};
-  const deliveryStates = [deliveryFacts.text?.items || [], deliveryFacts.attachments || []].flat().map(item => item.status);
-  const recordedDelivery = deliveryStates.some(status => status === 'unknown') ? 'unknown'
-    : deliveryStates.some(status => status === 'failed') ? 'failed'
-    : deliveryStates.length && deliveryStates.every(status => ['sent', 'cleaned'].includes(status)) ? 'sent' : null;
-  const delivery = job.deliveryMode === 'caller'
-    ? { mode: 'caller', status: terminal.has(job.status) ? 'not_requested' : 'pending' }
-    : { mode: 'bridge', status: recordedDelivery || (job.replySentAt ? 'sent' : job.status === 'reply_pending' ? 'pending' : job.status === 'failed' ? 'failed' : 'waiting') };
-  return {
-    id: job.id, conversationId: job.chatId, status: job.status,
-    executionStatus: job.status === 'pending' ? 'pending' : job.status === 'held' ? 'held' : terminal.has(job.status)
-      ? (job.status === 'failed' ? 'failed' : 'completed')
-      : job.status === 'reply_pending' ? (executionFailed ? 'failed' : 'completed') : 'running',
-    deliveryStatus: delivery.status, deliveryMode: delivery.mode, executionNamespace: job.executionNamespace,
-    answer: job.result?.answer ?? null, rawAnswer: job.result?.rawAnswer ?? null,
-    attachments: publicAttachments(job.result?.attachments),
-    native: { threadId: execution.threadId || job.result?.threadId || null, turnId: execution.turnId || job.result?.turnId || null, status: execution.terminal || execution.status || null },
-    held: job.status === 'held' ? { reason: job.last_error || execution.heldReason || 'native_outcome_unknown' } : null,
-    result: {
-      answer: job.result?.answer ?? null, rawAnswer: job.result?.rawAnswer ?? null,
-      attachments: publicAttachments(job.result?.attachments), deferred: job.result?.deferred === true,
-      failed: job.result?.failed === true, turnStatus: job.result?.turnStatus || execution.terminal || null,
-      native: { threadId: execution.threadId || job.result?.threadId || null, turnId: execution.turnId || job.result?.turnId || null, status: execution.terminal || execution.status || null },
-      held: job.status === 'held' ? { reason: job.last_error || execution.heldReason || 'native_outcome_unknown' } : null,
-      delivery,
-    },
-    errorCode: job.last_error || null, createdAt: job.createdAt, updatedAt: job.updatedAt,
-  };
-}
-
 export function createForwardRuntime({ config = {}, jobs, sessions, inbound, media, executor, feedback, replies,
-  authorize = async () => true, allowBusyQueue = async () => false, log = () => {}, now = Date.now } = {}) {
+  authorize = async () => true, log = () => {}, now = Date.now } = {}) {
   if (!jobs || !sessions || !executor) throw new Error('invalid_forward_runtime_dependencies');
   const owner = config.owner || randomUUID();
   const leaseMs = Number(config.leaseMs || 60_000);
@@ -94,7 +49,6 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     return promise;
   }
   function identity(input) {
-    if (input.executionNamespace) return deriveExecutionScope(input.callerId, input.executionNamespace);
     return codexBindingOpenId({ feishuOpenId: input.actor?.openId || input.senderOpenId,
       chatId: input.message?.conversationId || input.conversationId,
       chatType: input.message?.conversationType || input.chatType });
@@ -105,8 +59,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       throw Object.assign(new Error('forbidden'), { code: 'forbidden' });
     }
     const bindingOpenId = identity(input);
-    const messageId = input.message?.messageId || stableMessageId(`${input.callerId}\0${input.idempotencyKey}`);
-    if (input.message?.messageId && jobs.getByMessageId) {
+    const messageId = input.message?.messageId;
+    if (jobs.getByMessageId) {
       const existing = await jobs.getByMessageId({ messageId });
       if (existing) return { ...existing, duplicate: true };
     }
@@ -115,10 +69,10 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       sourceMessageId: input.message?.messageId || null, bindingOpenId,
       chatType: input.message?.conversationType || input.chatType || 'group', messageType: input.message?.type || 'text',
       senderOpenId: input.actor?.openId || input.senderOpenId || bindingOpenId, senderName: input.actor?.name || input.senderName || '',
-      executionNamespace: input.executionNamespace || '', deliveryMode: input.deliveryMode || input.delivery?.mode || 'bridge',
-      prompt: input.prompt || input.message?.text || '', groupChatContext: input.executionNamespace ? null : (input.groupChatContext || null),
-      contextEntries: input.executionNamespace ? [] : (input.context || []), nextAttemptAt: input.notBefore,
-      initialResult: { inputEvent: input.message?.event ?? null, policy: { queueIfBusy: input.queueIfBusy === true } },
+      executionNamespace: '', deliveryMode: 'bridge',
+      prompt: input.prompt || input.message?.text || '', groupChatContext: input.groupChatContext || null,
+      contextEntries: input.context || [], nextAttemptAt: input.notBefore,
+      initialResult: { inputEvent: input.message?.event ?? null },
     });
   }
 
@@ -174,9 +128,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     let execution = { ...(job.result?.execution || {}) };
     let state;
     let needsDelivery = false;
-    let queueIfBusy = false;
     try {
-      queueIfBusy = trustedBusyQueue(job) && await allowBusyQueue({ callerId: job.callerId, conversationId: job.chatId });
       if (execution.inputStatus && execution.inputStatus !== 'ready') {
         const result = { inputStatus: execution.inputStatus,
           errorCode: execution.inputReason || `input_${execution.inputStatus}`,
@@ -198,7 +150,6 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         chatId: job.chatId, chatType: job.chatType, messageId: job.messageId,
         senderOpenId: job.senderOpenId, senderName: job.senderName, prompt, groupChatContext: job.groupChatContext,
         busyPolicy: job.executionNamespace || config.steering === false ? 'reject' : 'steer',
-        queueIfBusy,
       };
       state = job.deliveryMode === 'bridge'
         ? await (job.recovered ? feedback?.restore?.(job, lease) : feedback?.start?.(job, lease)) : null;
@@ -238,13 +189,12 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         throw error;
       }
       lease.assertOwned();
-      const queueBusy = preAdmissionBusy(error) && queueIfBusy;
-      if (queueBusy || (retryableError(error) && job.attempts < maxAttempts)) {
+      if (retryableError(error) && job.attempts < maxAttempts) {
         const nextRetryAt = now() + retryDelayMs;
         await feedback?.wait?.(job, state).catch(() => {});
-        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, preserveAttempt: queueBusy,
+        await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner,
           errorCode: error.code || 'forward_execution_failed', nextAttemptAt: nextRetryAt });
-        log('warning', 'forward_execution', queueBusy ? 'waiting' : 'retrying', {
+        log('warning', 'forward_execution', 'retrying', {
           code: error.code || 'forward_execution_failed', runId: job.id, attempt: job.attempts, maxAttempts, nextRetryAt,
         });
         return;
@@ -339,11 +289,6 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     if (reply) await deliverJob(reply, reaction);
     return jobs.getRun({ id });
   }
-  async function submit(input) {
-    const registered = await register(input);
-    track(processRegistered(registered.id));
-    return registered;
-  }
   async function handleMessage(input) {
     const registered = await register(input);
     const result = await processRegistered(registered.id);
@@ -381,10 +326,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     for (const controller of leaseControllers) controller.abort();
   }
   return Object.freeze({
-    submit, handleMessage, recover,
-    getRun: async ({ id }) => { const job = await jobs.getRun({ id }); return job ? publicRun(job) : null; },
-    readRunEvents: async input => { const items = await jobs.readEvents(input); return { items, nextCursor: items.at(-1)?.sequence ?? String(input.after ?? '0') }; },
-    getResource: async ({ id, index }) => { const job = await jobs.getRun({ id }); return job ? replies.readResource(job, index) : null; },
+    handleMessage, recover,
     start() { if (running) throw new Error('forward_runtime_already_started'); running = true; worker = loop(); },
     beginStop,
     async stop() { beginStop(); await worker; await Promise.allSettled(active); },

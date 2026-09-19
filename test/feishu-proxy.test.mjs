@@ -148,7 +148,6 @@ test('config references one proxy env and service injects the same agent into SD
     feishu: { connectionId: 'proxy', appIdEnv: 'TEST_APP', appSecretEnv: 'TEST_SECRET', botOpenId: 'bot', catchup: false,
       httpProxyEnv: 'BRIDGE_FEISHU_PROXY_URL' },
     routing: { version: '1', privateUserIds: [], groups: [] },
-    auth: { clients: [{ id: 'test', tokenEnv: 'TEST_TOKEN', conversationIds: [], admin: false }] },
   };
   assert.equal(validateConfig(raw).feishu.httpProxyEnv, 'BRIDGE_FEISHU_PROXY_URL');
   for (const value of ['http://inline.invalid', 'lowercase', 3]) {

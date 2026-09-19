@@ -1,16 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Readable } from 'node:stream';
 import { validateConfig } from '../src/config.mjs';
-import { createForwardRuntime, publicRun } from '../src/core/forward-runtime.mjs';
+import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 import { renderExecutionCard } from '../src/channels/feishu/execution-card.mjs';
-import { createApi } from '../src/core/api.mjs';
-import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
 
-const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},auth:{clients:[{id:'caller',tokenEnv:'TEST_TOKEN',conversationIds:['chat'],admin:true}]},hooks:[]};
+const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},hooks:[]};
 const flush=()=>new Promise(resolve=>setTimeout(resolve,20));
+
+async function communicationDeliveryFailure(error) {
+  let claimed = false;
+  let settlement;
+  const logs = [];
+  const row = { id: 'effect', kind: 'create', payload: { kind: 'interactive', content: { schema: '2.0' } },
+    platformUuid: 'uuid', conversationId: 'chat', leaseToken: 'lease' };
+  const store = {
+    async claimJobs() { return []; },
+    async claimOutbox() { if (claimed) return []; claimed = true; return [row]; },
+    async settleOutbox(value) { settlement = value; },
+    async getOutbox() { return null; },
+  };
+  const runtime = createCommunicationRuntime({ config: validateConfig(base), store,
+    chat: { async sendMessage() { throw error; } }, log: (...entry) => logs.push(entry) });
+  runtime.start();
+  for (let attempt = 0; attempt < 20 && !settlement; attempt += 1) await flush();
+  await runtime.stop();
+  assert.ok(settlement);
+  return { settlement, logs };
+}
 
 test('group capabilities default to both and allow either side or neither',()=>{
   assert.deepEqual(validateConfig(base).routing.groups[0].capabilities,['bridge','hook']);
@@ -43,6 +61,20 @@ test('private allow-all admits human direct messages only and keeps groups close
   await new Promise(setImmediate);
   assert.equal(forwarded.length,1);
   assert.equal(forwarded[0].message.messageId,'human');
+});
+
+test('delivery persists definite Feishu rejection separately from write uncertainty', async () => {
+  for (const [error, status, code] of [
+    [Object.assign(new Error('provider secret'), { code: 'feishu_api_rejected', outcome: 'failed' }), 'failed', 'feishu_api_rejected'],
+    [Object.assign(new Error('local detail'), { code: 'invalid_message_content', outcome: 'failed' }), 'failed', 'invalid_content'],
+    [Object.assign(new Error('other detail'), { code: 'other_failure', outcome: 'failed' }), 'failed', 'chat_delivery_failed'],
+    [Object.assign(new Error('network secret'), { code: 'feishu_transport_error', outcome: 'unknown' }), 'unknown', 'chat_delivery_unconfirmed'],
+  ]) {
+    const { settlement, logs } = await communicationDeliveryFailure(error);
+    assert.equal(settlement.status, status);
+    assert.equal(settlement.errorCode, code);
+    assert.equal(JSON.stringify(logs).includes('secret'), false);
+  }
 });
 
 test('group mention can register forward and hook branches without either consuming the other',async()=>{
@@ -208,7 +240,7 @@ test('original transport network errors retain the bounded retry classification'
   ]) {
     const jobs=memoryJobs({status:'pending',attempts:0});
     const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1},jobs,sessions:{},executor:{execute:async()=>{throw error;}},replies:{readResource:async()=>null},authorize:async()=>true});
-    await runtime.handleMessage({source:'api',callerId:'caller',idempotencyKey:'network',conversationId:'chat',executionNamespace:'daily',deliveryMode:'caller',prompt:'work'});
+    await runtime.handleMessage({source:'live',callerId:'live',idempotencyKey:'network',message:{messageId:'network',conversationId:'chat',conversationType:'p2p',type:'text'},actor:{openId:'human'},prompt:'work'});
     await runtime.stop();
     assert.equal(jobs.job.status,'pending',`${error.code||error.message} should retry`);
     assert.equal(jobs.calls.filter(([name])=>name==='retry').length,1);
@@ -225,38 +257,6 @@ test('bridge delivery cleans Typing after replies and cleanup failure does not u
     replies:{async prepare(_job,result){return result;},async deliver(){effects.push('reply');return{status:'sent'};},async readResource(){return null;}},authorize:async()=>true});
   runtime.start();await flush();await runtime.stop();
   assert.equal(job.status,'completed');assert.deepEqual(effects,['card','reply','finished','typing:cleanup']);
-});
-
-test('run API freezes namespace/delivery mode and rejects ledger management after scope checks',async()=>{
-  const token='synthetic-token-at-least-24-characters';const submitted=[];const current={id:'run',conversationId:'chat',status:'completed'};const forwardRuntime={submit:async input=>{submitted.push(input);return{id:'run',duplicate:false};},getRun:async()=>current,readRunEvents:async()=>({items:[{sequence:'9007199254740993',payload:{type:'progress'}}],nextCursor:'9007199254740993'}),getResource:async({index})=>index===0?{fileName:'answer.txt',kind:'file',size:6,base64:'YW5zd2Vy'}:null};const api=createApi({config:validateConfig(base),store:{getRecovery:async()=>({id:'recovery',connectionId:'test',conversationId:'chat',status:'applied'})},chat:{},tokens:{caller:token},forwardRuntime});
-  const request=(method,url,value)=>Object.assign(Readable.from(value?[Buffer.from(JSON.stringify(value))]:[]),{method,url,headers:{authorization:`Bearer ${token}`}});
-  assert.equal((await api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'daily:1',text:'prompt',executionNamespace:'daily',deliveryMode:'caller'}))).status,202);assert.equal(submitted[0].deliveryMode,'caller');
-  assert.equal(submitted[0].message.messageId,undefined);
-  await assert.rejects(api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'long',text:'prompt',executionNamespace:'a'.repeat(129)})),{status:400,code:'invalid_execution_namespace'});
-  assert.equal((await api(request('POST','/v1/runs',{conversationId:'chat',idempotencyKey:'slash',text:'prompt',executionNamespace:'team/daily'}))).status,202);
-  const events=await api(request('GET','/v1/runs/run/events?after=9007199254740992'));
-  assert.equal(events.body.events[0].sequence,'9007199254740993');assert.equal(events.body.nextCursor,'9007199254740993');
-  assert.equal((await api(request('GET','/v1/runs/run/resources/0'))).body.fileName,'answer.txt');
-  assert.equal((await api(request('GET','/v1/recoveries/recovery'))).body.status,'applied');
-  await assert.rejects(api(request('GET','/v1/runs/run/attempt')),{status:409,code:'unsupported_execution_model'});
-  await assert.rejects(api(request('POST','/v1/recoveries',{runId:'run'})),{status:409,code:'unsupported_execution_model'});
-  await assert.rejects(api(request('POST','/v1/sessions/reset',{conversationId:'chat'})),{status:409,code:'unsupported_execution_model'});
-});
-
-test('public run keeps result contract and separates execution from delivery status', () => {
-  const pending = publicRun({ id:'run',chatId:'chat',status:'pending',deliveryMode:'bridge',executionNamespace:'daily',result:{},createdAt:1,updatedAt:1 });
-  assert.equal(pending.executionStatus,'pending');
-  assert.equal(pending.result.delivery.status,'waiting');
-  const failed = publicRun({ id:'run',chatId:'chat',status:'reply_pending',deliveryMode:'bridge',executionNamespace:'daily',last_error:'CODEX_TURN_FAILED',result:{failed:true,turnStatus:'failed',answer:'failed'},createdAt:1,updatedAt:2 });
-  assert.equal(failed.executionStatus,'failed');
-  assert.equal(failed.result.answer,'failed');
-  assert.equal(failed.errorCode,'CODEX_TURN_FAILED');
-  const withResource = publicRun({
-    id: 'resource-run', chatId: 'chat', status: 'completed', deliveryMode: 'caller',
-    result: { attachments: [{ ref: { artifactId: 'internal-secret' }, fileName: 'answer.txt', size: 6, kind: 'file' }] },
-    createdAt: 1, updatedAt: 2,
-  });
-  assert.deepEqual(withResource.attachments, [{ id: '0', fileName: 'answer.txt', size: 6, kind: 'file' }]);
 });
 
 test('unknown reply stays pending and a failed reply never records a successful inbound answer', async () => {
@@ -344,17 +344,6 @@ test('media preparation feeds a durable image addendum to executor input', async
   assert.equal(jobs.calls.filter(([name]) => name === 'prepared')[0][1].inputStatus, 'ready');
 });
 
-test('API registration returns before its internal execute waiter completes',async()=>{
-  const jobs=memoryJobs({status:'pending'});let release;
-  const runtime=createForwardRuntime({config:{owner:'owner',pollMs:30_000},jobs,sessions:{},
-    executor:{execute:async()=>new Promise(resolve=>{release=()=>resolve({threadId:'thread',turnId:'turn',answer:'done',rawAnswer:'done',attachments:[]});})},
-    replies:{},authorize:async()=>true});
-  const registered=await runtime.submit({source:'api',callerId:'caller',idempotencyKey:'one',conversationId:'chat',executionNamespace:'daily',deliveryMode:'caller',prompt:'work'});
-  assert.equal(registered.id,'run');
-  await new Promise(setImmediate);assert.equal(typeof release,'function');
-  release();await flush();await runtime.stop();
-});
-
 test('live replay lets the existing forward row decide terminal duplication',async()=>{
   const existing={id:'existing',status:'completed',messageId:'same',chatId:'chat',chatType:'p2p',deliveryMode:'bridge',result:{answer:'done',execution:{terminal:'completed'}}};
   let upserts=0;let claims=0;
@@ -378,14 +367,13 @@ test('prepared media prompt is reused without downloading again', async () => {
   assert.match(prompt, /safe\/image\.png/);
 });
 
-test('ordinary live and API busy failures deliver on the first attempt without retrying', async () => {
-  for (const [callerId, facts] of [
-    ['live', { outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' }],
-    ['api', { outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' }],
-    ['live', { outcome: 'unknown', phase: 'turn_start', rpcMethod: 'turn/start' }],
-    ['api', {}],
+test('ordinary live busy failures deliver on the first attempt without retrying', async () => {
+  for (const facts of [
+    { outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' },
+    { outcome: 'unknown', phase: 'turn_start', rpcMethod: 'turn/start' },
+    {},
   ]) {
-    const jobs = memoryJobs({ status: 'pending', attempts: 0, callerId, executionNamespace: null, deliveryMode: 'bridge',
+    const jobs = memoryJobs({ status: 'pending', attempts: 0, callerId: 'live', executionNamespace: null, deliveryMode: 'bridge',
       sourceMessageId: 'message', senderOpenId: 'human', chatType: 'p2p', result: {} });
     let admissions = 0;
     let deliveries = 0;
@@ -397,7 +385,7 @@ test('ordinary live and API busy failures deliver on the first attempt without r
       replies: { async prepare(_job, result) { return result; }, async deliver() { deliveries += 1; return { status: 'sent' }; } }, authorize: async () => true,
     });
     runtime.start(); await flush(); await runtime.stop();
-    assert.equal(admissions, 1, callerId);
+    assert.equal(admissions, 1);
     assert.equal(jobs.job.attempts, 1);
     assert.equal(jobs.calls.filter(([name]) => name === 'retry').length, 0);
     assert.equal(jobs.calls.filter(([name]) => name === 'reply_pending').length, 1);
@@ -535,79 +523,6 @@ test('ordinary busy finishes the real feedback card and stops its observer and l
     assert.equal(timers.size,0);
   } finally {
     globalThis.setInterval=originalSetInterval;globalThis.clearInterval=originalClearInterval;
-  }
-});
-
-test('only a persisted caller-derived system binding gets the 60-second wait policy', async () => {
-  let clock = 100_000;
-  const bindingOpenId = deriveExecutionScope('caller', 'daily');
-  const job = {
-    id: 'run', callerId: 'caller', chatId: 'chat', chatType: 'group', messageId: 'message',
-    senderOpenId: bindingOpenId, senderName: 'Caller', deliveryMode: 'caller', executionNamespace: 'daily',
-    prompt: 'work', attempts: 0, status: 'pending', result: { execution: { bindingOpenId }, policy: { queueIfBusy: true } },
-    createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
-  };
-  const calls = [];
-  const jobs = {
-    async claimReplyPending({ owner }) {
-      if (job.status !== 'reply_pending') return [];
-      Object.assign(job, { leaseOwner: owner });
-      return [{ ...job, result: structuredClone(job.result) }];
-    },
-    async loadRecoverable() { return job.status==='pending'&&job.nextAttemptAt<=clock?[{...job,result:structuredClone(job.result)}]:[]; },
-    async claimById({ owner }) {
-      if (job.status !== 'pending' || job.nextAttemptAt > clock) return null;
-      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
-      return { ...job, result: structuredClone(job.result) };
-    },
-    async claim({owner}) { const value=await this.claimById({owner});return value?[value]:[]; },
-    async claimReplyById(){return null;},async getRun(){return job;},
-    async renew() {},
-    async patchExecution({ execution }) {
-      job.result = { ...job.result, execution };
-      calls.push(['execution', structuredClone(execution)]);
-    },
-    async patchFeedback() {},
-    async markRetry(input) {
-      calls.push(['retry', input]);
-      if (input.preserveAttempt) job.attempts = Math.max(0, job.attempts - 1);
-      Object.assign(job, { status: input.held ? 'held' : 'pending', last_error: input.errorCode, nextAttemptAt: input.nextAttemptAt, leaseOwner: '' });
-    },
-    async markReplyPending({ result }) { Object.assign(job, { status: 'reply_pending', result }); },
-    async markFinishedWithoutReply({ status, result }) { Object.assign(job, { status, result }); },
-    async markFinished({ status, result }) { Object.assign(job, { status, result }); },
-  };
-  let admissions = 0;
-  const executor = { async execute(_input, options) {
-    admissions += 1;
-    if (admissions < 3) throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission', rpcMethod: 'thread/resume' });
-    return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] };
-  } };
-  const runtime = createForwardRuntime({ config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000 }, jobs, sessions: {}, executor, feedback: { async prepare() {} }, replies: {}, allowBusyQueue:async()=>true,now: () => clock });
-  const settled = async () => {
-    for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
-  };
-  runtime.start(); await flush(); await settled();
-  assert.equal(admissions, 1); assert.equal(job.nextAttemptAt, 160_000); assert.equal(job.attempts, 0);
-  clock = 160_000; await flush(); await settled();
-  assert.equal(admissions, 2); assert.equal(job.nextAttemptAt, 220_000); assert.equal(job.attempts, 0);
-  clock = 220_000; await flush(); await settled();
-  for (let count = 0; count < 100 && job.status === 'reply_pending'; count += 1) await new Promise(resolve => setImmediate(resolve));
-  await runtime.stop();
-  assert.equal(admissions, 3); assert.equal(job.status, 'completed');
-  assert(calls.filter(([name]) => name === 'retry').every(([, input]) => input.preserveAttempt === true));
-
-  for(const spoof of [
-    { executionNamespace: '', senderOpenId: 'system:pretend', result: { execution: { bindingOpenId: 'system:pretend' },policy:{queueIfBusy:true} } },
-    { executionNamespace: 'daily', senderOpenId: bindingOpenId, result: { execution: { bindingOpenId: 'system:mismatch' },policy:{queueIfBusy:true} } },
-    { executionNamespace: 'daily', senderOpenId: bindingOpenId, result: { execution: { bindingOpenId },policy:{queueIfBusy:true} }, busyFacts: { outcome: 'unknown', phase: 'turn_start' } },
-  ]) {
-    const spoofJobs = memoryJobs({ status: 'pending', deliveryMode: 'caller', ...spoof });
-    const one = createForwardRuntime({ config: { owner: 'owner', pollMs: 1 }, jobs: spoofJobs, sessions: {}, executor: { async execute() { throw Object.assign(new Error('busy'), { code: 'CODEX_THREAD_BUSY', retryable: true, outcome: 'rejected', phase: 'pre_admission', ...spoof.busyFacts }); } }, replies: {},allowBusyQueue:async()=>true });
-    one.start(); await flush(); await one.stop();
-    assert.equal(spoofJobs.calls.filter(([name]) => name === 'retry').length, 0);
-    assert.equal(spoofJobs.job.status, 'failed');
-    assert.match(spoofJobs.job.result.answer, /会话被其他客户端占用/);
   }
 });
 
