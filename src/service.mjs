@@ -22,6 +22,7 @@ import { createCommunicationRuntime } from './core/communication-runtime.mjs';
 import { createCardTextProvider } from './channels/feishu/card-text.mjs';
 import { createExecutionFeedback } from './channels/feishu/execution-feedback.mjs';
 import { createUserInputRuntime } from './channels/feishu/user-input-runtime.mjs';
+import { createBusinessCardAction } from './channels/feishu/business-card-action.mjs';
 import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
@@ -88,9 +89,9 @@ export async function startService({ config, configPath, env = process.env, log,
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, businessCardAction: createBusinessCardAction, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
   const pool = factories.pool(storageConnectionReferences(config.storage), env);
-  let store, executor, userInput, feishu, communication, forward, catchup, http, media, outbound;
+  let store, executor, userInput, businessCardAction, feishu, communication, forward, catchup, http, media, outbound;
   const cardOperations = new Set();
   let acceptCardOperations = true;
   const runCardOperation = operation => {
@@ -309,8 +310,11 @@ export async function startService({ config, configPath, env = process.env, log,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
     communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
+    businessCardAction=factories.businessCardAction({hooks:config.hooks,ingest:communication.ingestCardAction,
+      runAsync:runCardOperation,log});
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest,
       onCardAction: payload => handleCardOperation(async()=>{
+        const business=businessCardAction.handleCardAction(payload);if(business)return business;
         const answered=await userInput.handleCardAction(payload); return answered??feedback.handleCardAction(payload);
       }), log });
     const readiness = async () => {

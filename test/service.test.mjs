@@ -255,7 +255,7 @@ test('memory restart callback runs only after the service has completed ordered 
   t.after(() => rm(directory, { recursive: true, force: true }));
   const events = []; let requestRestart;
   const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 }, codex: { bin: process.execPath, cwd: directory, envNames: [] }, feishu: { ...config.feishu, catchup: false } });
-  const worker = { start() {}, beginStop() { events.push('forward-stop-ingress'); }, async stop() { events.push('worker-stop'); }, status: () => ({ running: true }) };
+  const worker = { start() {}, beginStop() { events.push('forward-stop-ingress'); }, async ingestCardAction() {}, async stop() { events.push('worker-stop'); }, status: () => ({ running: true }) };
   const service = await startService({
     config: runtimeConfig, configPath: join(directory, 'config.json'),
     env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' },
@@ -289,7 +289,7 @@ test('service close drains an accepted busy fork callback before closing its dep
     messageId: 'message', senderOpenId: 'human', status: 'failed', last_error: 'CODEX_THREAD_BUSY',
     result: { busyFork: { sourceThreadId: 'source', bindingOpenId: 'human', chatId: 'chat' },
       executionCard: { messageId: 'card', status: 'failed', entries: [], forkSourceThreadId: 'source' } } };
-  const worker = { start() {}, beginStop() {}, async stop() {}, status: () => ({ running: true }) };
+  const worker = { start() {}, beginStop() {}, async ingestCardAction() {}, async stop() {}, status: () => ({ running: true }) };
   const service = await startService({ config: runtimeConfig, configPath: join(directory, 'config.json'),
     env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, dependencies: {
       pool: () => ({}), store: async () => ({ async assertCurrent() {}, async close() { storeClosed = true; events.push('store-close'); } }),

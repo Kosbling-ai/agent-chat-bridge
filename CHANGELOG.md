@@ -4,6 +4,7 @@
 
 - Add authenticated `POST /v1/events` and `GET /v1/events/:event_id` endpoints for hook-owned business events. Event jobs use domain-separated request keys and fixed-length hashed message IDs, are idempotent per hook and event ID, use caller delivery with no automatic Feishu card or reply, and steer an active customer-scoped Codex turn when steering is enabled.
 - Extend hook configuration with optional inbound bearer, scope-prefix and default-chat references. Business-event prompts retain the independent-system preamble and add a structured event block without embedding request bodies in logs.
+- Forward authorized Feishu business-card callbacks directly to the selected durable hook with event-ID deduplication and an immediate acknowledgement toast, without creating a Codex job or changing the hook configuration schema.
 
 No database migration is needed: the existing connection-scoped forward-job request key and request hash provide event identity and conflict detection.
 

@@ -108,3 +108,11 @@ True lock loss immediately makes `/health/ready` return not ready and stops HTTP
 Restart does not clear queues, replay ambiguous deliveries, change leases, or bypass existing idempotency. The normal durable claim, lease, and deduplication rules decide what work is eligible after the supervisor starts a replacement process.
 
 Hook delivery still requires a durable consumer acknowledgement before it returns 204. Internal reply/reaction authorization, byte limits and unknown-write recovery remain enforced. The connected media and outbox components retain their current constraints in [input media](media.md) and [outbound media](outbound-media.md). [Catchup](catchup.md) describes the earlier generation implementation and is historical for the current forward execution path.
+
+## Business card actions
+
+An interactive-card callback whose `value.action` is `business` is routed directly to the hook named by `value.hook_id` when the callback chat is listed in that hook's `conversationIds`. It does not create a Codex job or enter a Codex thread. Unknown hooks and callbacks from chats outside the configured hook scope are acknowledged with `此群未接入该业务` and are not delivered.
+
+The matching hook receives the existing authenticated delivery envelope with an `event` whose `kind` is `card_action`. The event contains `event_id`, `operator_open_id`, optional `operator_name`, `chat_id`, `message_id`, the original card `value` object, and ISO-8601 `occurred_at`. The bridge treats business fields inside `value` as opaque. The Feishu event ID is used when present; otherwise the bridge derives a stable SHA-256 ID from the card message, operator, value and action time.
+
+The callback immediately returns `已收到，处理结果稍后更新在卡片上`. Delivery is persisted under `card_action:<event_id>` in the existing inbox and hook queue, so callback replays do not create another delivery and transient hook failures use the existing durable retry policy.

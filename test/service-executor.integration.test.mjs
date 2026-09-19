@@ -82,7 +82,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     async markFinished({status,result}){Object.assign(forwardJob,{status,result});},async markFinishedWithoutReply({status,result}){Object.assign(forwardJob,{status,result});},
     async markRetry(){forwardJob.status='pending';},async getRun(){return structuredClone(forwardJob);},async readEvents(){return[];},
   };
-  const inertWorker = { start() {}, beginStop() {}, async stop() {}, status: () => ({ running: true }) };
+  const inertWorker = { start() {}, beginStop() {}, async ingestCardAction() {}, async stop() {}, status: () => ({ running: true }) };
   service = await startService({ config: validateConfig(raw), configPath: join(directory, 'bridge.json'), env,
     log: createLogger({ write(value) { logEvents.push(JSON.parse(value)); } }), dependencies: {
     pool: () => ({ async query() {}, async end() {} }),
