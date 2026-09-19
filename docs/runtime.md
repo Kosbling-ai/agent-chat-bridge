@@ -76,7 +76,7 @@ Accepted requests return `202 {"job_id":"...","binding_open_id":"system:...","de
 
 The Codex input retains the existing `【独立系统任务】` preamble, followed by a `【业务事件】` block containing type, event ID, correlation ID, occurrence time and reference IDs, then the producer prompt. The bridge does not load business documents or inject customer content.
 
-`GET /v1/events/:event_id` uses the same bearer token and the same domain-separated request-key derivation; the producer identity comes from that token. It returns `{"job_id":"...","status":"pending","updated_at":...}` using the forward job's existing status literals, or 404 when that hook does not own the event. Each Events API request emits exactly one terminal structured log with `hook_id`, `event_id`, `type`, `scope_prefix`, `status_code`, `job_id`, and `error_class` when known. Logs never contain the prompt or full payload.
+`GET /v1/events/:event_id` uses the same bearer token and the same domain-separated request-key derivation; the producer identity comes from that token. It returns `{"job_id":"...","status":"pending","updated_at":...}` using the forward job's existing status literals, or 404 when that hook does not own the event. Each Events API request emits exactly one terminal structured log with `hook_id`, `event_id`, `type`, `scope_prefix`, `status_code`, `job_id`, and `error_class`. Logs never contain the prompt or full payload.
 
 Internal bridge delivery status is `waiting`, `pending`, `sent`, `failed`, or `unknown`. A known delivery failure or ambiguity does not rerun the completed model turn. A confirmed non-zero Feishu response is recorded as a rejection, while malformed responses, thrown transport errors and timeouts remain unknown and are not resent automatically.
 

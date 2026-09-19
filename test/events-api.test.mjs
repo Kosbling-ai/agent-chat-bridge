@@ -14,7 +14,7 @@ const event = {
   ref_ids: { message_id: 'mail-one', inquiry_id: 'inquiry-one' }, prompt: 'Read the referenced mail.',
 };
 
-async function fixture(t, { registerEvent } = {}) {
+async function fixture(t, { registerEvent, reportError } = {}) {
   const rows = new Map();
   const registrations = [];
   const logs = [];
@@ -27,15 +27,17 @@ async function fixture(t, { registerEvent } = {}) {
       if (existing && existing.hash !== input.requestHash) throw Object.assign(new Error('conflict'), { code: 'job_conflict' });
       if (existing) return { ...existing.result, deduplicated: true };
       const result = { jobId: `00000000-0000-4000-8000-${String(rows.size + 1).padStart(12, '0')}`, bindingOpenId: 'system:synthetic', deduplicated: false };
-      rows.set(key, { hash: input.requestHash, result, status: 'pending', updatedAt: 1234 });
+      rows.set(key, { hash: input.requestHash, result, status: 'pending', updatedAt: 1234, type: input.type, scope: input.scope });
       return result;
     },
     async getEvent({ producerId, eventId }) {
       const row = rows.get(`${producerId}\0${eventId}`);
-      return row ? { jobId: row.result.jobId, status: row.status, updatedAt: row.updatedAt } : null;
+      return row ? {
+        jobId: row.result.jobId, status: row.status, updatedAt: row.updatedAt, type: row.type, scope: row.scope,
+      } : null;
     },
   };
-  const log = createLogger({ write(value) { logs.push(JSON.parse(value)); } });
+  const log = createLogger({ write(value) { logs.push(JSON.parse(value)); } }, { reportError });
   const server = await startServer({
     config: { listen: { host: '127.0.0.1', port: 0 }, hooks: [hook] }, log, eventRuntime: runtime,
     inboundTokens: { 'custom-order': token },
@@ -62,7 +64,7 @@ test('events api rejects scope outside prefixes', async t => {
 });
 
 test('events api dedups same event_id', async t => {
-  const { url, registrations } = await fixture(t);
+  const { url, registrations, logs } = await fixture(t);
   const first = await post(url, event);
   assert.equal(first.status, 202);
   assert.deepEqual(await first.json(), {
@@ -76,6 +78,11 @@ test('events api dedups same event_id', async t => {
   const status = await fetch(`${url}/v1/events/mail%3Aone`, { headers: { authorization: `Bearer ${token}` } });
   assert.equal(status.status, 200);
   assert.deepEqual(await status.json(), { job_id: '00000000-0000-4000-8000-000000000001', status: 'pending', updated_at: 1234 });
+  const statusLog = logs.at(-1);
+  assert.equal(statusLog.operation, 'events_api');
+  assert.equal(statusLog.type, 'mail.inbound');
+  assert.equal(statusLog.scope_prefix, 'custom-order:customer:');
+  assert.equal(statusLog.status_code, 200);
 });
 
 test('events api validates bodies, limits payloads, and returns missing status', async t => {
@@ -98,8 +105,10 @@ test('events api validates bodies, limits payloads, and returns missing status',
 test('events api canonical hash uses code-unit key order without unicode normalization', () => {
   const composed = { z: 'last', 'é': 'value' };
   const decomposed = { 'é': 'value', z: 'last' };
+  const combined = { z: 'last', 'é': 'composed', 'é': 'decomposed' };
   assert.equal(canonicalJsonHash(composed), canonicalJsonHash({ 'é': 'value', z: 'last' }));
   assert.equal(canonicalJsonHash(decomposed), canonicalJsonHash({ z: 'last', 'é': 'value' }));
+  assert.equal(canonicalJsonHash(combined), canonicalJsonHash({ 'é': 'decomposed', z: 'last', 'é': 'composed' }));
   assert.notEqual(canonicalJsonHash(composed), canonicalJsonHash(decomposed));
 });
 
@@ -113,11 +122,39 @@ test('events api writes one terminal structured log', async t => {
     hook_id: 'custom-order', event_id: 'mail:one', type: 'mail.inbound', scope_prefix: 'custom-order:customer:', status_code: 202,
     job_id: '00000000-0000-4000-8000-000000000001', error_class: 'none',
   });
-  const failed = await fixture(t, { registerEvent: async () => { throw Object.assign(new Error('private failure'), { code: 'synthetic_internal' }); } });
+  let reports = 0;
+  const failed = await fixture(t, {
+    registerEvent: async () => { throw Object.assign(new Error('private failure'), { code: 'synthetic_internal' }); },
+    reportError() { reports += 1; },
+  });
   assert.equal((await post(failed.url, event)).status, 503);
   const failedLogs = failed.logs.filter(entry => entry.operation === 'events_api');
   assert.equal(failedLogs.length, 1);
+  assert.equal(failed.logs.filter(entry => entry.level === 'error').length, 1);
+  assert.equal(reports, 1);
   assert.equal(failedLogs[0].level, 'error');
   assert.equal(failedLogs[0].status_code, 503);
   assert.equal(failedLogs[0].error_class, 'service_unavailable');
+});
+
+test('readiness failure keeps existing error log and reporter path', async t => {
+  const logs = [];
+  let reports = 0;
+  const log = createLogger({ write(value) { logs.push(JSON.parse(value)); } }, {
+    reportError() { reports += 1; },
+  });
+  const server = await startServer({
+    config: { listen: { host: '127.0.0.1', port: 0 }, hooks: [] },
+    log,
+    readiness: async () => { throw new Error('synthetic readiness failure'); },
+  });
+  t.after(() => server.close());
+  const url = `http://127.0.0.1:${server.server.address().port}`;
+  assert.equal((await fetch(`${url}/health/ready`)).status, 503);
+  const errors = logs.filter(entry => entry.level === 'error');
+  assert.equal(errors.length, 1);
+  assert.equal(reports, 1);
+  assert.equal(errors[0].operation, 'http_health');
+  assert.equal(errors[0].status, 'failed');
+  assert.equal(errors[0].code, 'service_unavailable');
 });

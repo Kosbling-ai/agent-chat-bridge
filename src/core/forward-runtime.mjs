@@ -120,7 +120,13 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     const messageId = eventMessageId(producerId, eventId);
     const job = await jobs.getByIdempotencyKey({ callerId: producerId, idempotencyKey: eventIdempotencyKey(producerId, eventId) });
     return job?.messageId === messageId
-      ? { jobId: job.id, status: job.status, updatedAt: job.updatedAt } : null;
+      ? {
+          jobId: job.id,
+          status: job.status,
+          updatedAt: job.updatedAt,
+          type: job.result?.businessEvent?.type,
+          scope: job.executionNamespace,
+        } : null;
   }
 
   async function prepareRegistered(job) {

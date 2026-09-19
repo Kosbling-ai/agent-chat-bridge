@@ -142,6 +142,8 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
         const result = await eventRuntime.getEvent({ producerId: authenticated.hook.id, eventId });
         if (!result) throw new HttpError(404, 'not_found');
         eventLog.jobId = result.jobId;
+        eventLog.type = result.type;
+        eventLog.scopePrefix = authenticated.hook.inbound.scopePrefixes.find(prefix => result.scope?.startsWith(prefix));
         responseStatus = 200;
         reply(response, 200, { job_id: result.jobId, status: result.status, updated_at: result.updatedAt });
       } else if (request.method !== 'GET') {
@@ -166,6 +168,9 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
       responseStatus = error instanceof HttpError ? error.status : 503;
       const code = error instanceof HttpError ? error.code : 'service_unavailable';
       eventLog = { ...eventLog, errorClass: code };
+      if (!request.url?.startsWith('/v1/events')) {
+        log('error', 'http_health', 'failed', { code: 'service_unavailable' });
+      }
       reply(response, responseStatus, { error: code });
     } finally {
       if (request.url?.startsWith('/v1/events')) {
