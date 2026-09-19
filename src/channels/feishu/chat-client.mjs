@@ -23,32 +23,18 @@ function headerValue(headers, name) {
   return key ? headers[key] : undefined;
 }
 
-async function inspectJsonErrorStream(source, { requireErrorShape = false } = {}) {
-  if (!source?.[Symbol.asyncIterator]) return { source, platformCode: null };
-  const iterator = source[Symbol.asyncIterator]();
+async function inspectJsonErrorStream(source) {
+  if (!source?.[Symbol.asyncIterator]) return null;
   const chunks = [];
   let bytes = 0;
-  while (true) {
-    const step = await iterator.next();
-    if (step.done) break;
-    const chunk = Buffer.isBuffer(step.value) ? step.value : Buffer.from(step.value);
+  for await (const value of source) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     chunks.push(chunk); bytes += chunk.length;
-    if (bytes > MAX_ERROR_BODY_BYTES) {
-      const replay = Readable.from((async function* () {
-        yield* chunks;
-        while (true) { const next = await iterator.next(); if (next.done) break; yield next.value; }
-      })());
-      replay.once('close', () => source.destroy?.());
-      source.on?.('error', () => {});
-      return { source: replay, platformCode: null };
-    }
+    if (bytes > MAX_ERROR_BODY_BYTES) throw new FeishuChatError('feishu_transport_error', 'failed');
   }
-  const body = Buffer.concat(chunks);
   let parsed;
-  try { parsed = JSON.parse(body.toString('utf8')); } catch { /* A JSON content type alone is not an API rejection. */ }
-  const platformCode = Number.isInteger(parsed?.code) && parsed.code !== 0
-    && (!requireErrorShape || typeof parsed.msg === 'string') ? parsed.code : null;
-  return { source: Readable.from([body]), platformCode };
+  try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return null; }
+  return Number.isInteger(parsed?.code) && parsed.code !== 0 ? parsed.code : null;
 }
 
 async function platformCodeFromTransport(error) {
@@ -60,10 +46,10 @@ async function platformCodeFromTransport(error) {
     const contentType = String(headerValue(response?.headers, 'content-type') || '').toLowerCase();
     if (!source?.[Symbol.asyncIterator]) return null;
     if (!contentType.includes('application/json')) return null;
-    return (await inspectJsonErrorStream(source)).platformCode;
+    return await inspectJsonErrorStream(source);
   }
   catch { return null; }
-  finally { source.destroy?.(); }
+  finally { source?.destroy?.(); }
 }
 
 // Exactly one SDK call per operation: the core owns retry and effect ledgers.
@@ -72,21 +58,13 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
   if (!client?.im?.v1 || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120000
     || !Number.isSafeInteger(maxMediaBytes) || maxMediaBytes < 1 || maxMediaBytes > 100 * 1024 * 1024) throw new Error('invalid_feishu_chat_dependencies');
   const im = client.im.v1;
-  async function call(resource, method, request, write = false, binary = false, uploadKey, operationTimeoutMs = timeoutMs) {
+  async function call(resource, method, request, write = false, uploadKey, operationTimeoutMs = timeoutMs) {
     let timer;
-    let expired = false;
     try {
       const result = await Promise.race([
-        Promise.resolve().then(() => im[resource][method](request)).then((result) => {
-          if (expired && binary) result?.getReadableStream?.()?.destroy?.();
-          return result;
-        }),
-        new Promise((_, reject) => { timer = setTimeout(() => { expired = true; reject(new Error('timeout')); }, operationTimeoutMs); }),
+        Promise.resolve().then(() => im[resource][method](request)),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), operationTimeoutMs); }),
       ]);
-      if (binary) {
-        if (Number.isInteger(result?.code) && result.code !== 0) throw new FeishuChatError('feishu_api_rejected', 'failed', result.code);
-        return result;
-      }
       // SDK upload methods already unwrap `res.data`, unlike message methods.
       if (uploadKey) {
         if (typeof result?.[uploadKey] !== 'string' || !result[uploadKey]) throw new FeishuChatError('feishu_upload_unconfirmed', 'unknown');
@@ -99,8 +77,7 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
       return result.data;
     } catch (error) {
       if (error instanceof FeishuChatError) throw error;
-      const platformCode = binary ? await platformCodeFromTransport(error)
-        : (Number.isInteger(error?.code) ? error.code : error?.response?.data?.code);
+      const platformCode = Number.isInteger(error?.code) ? error.code : error?.response?.data?.code;
       if (Number.isInteger(platformCode) && platformCode !== 0) throw new FeishuChatError('feishu_api_rejected', 'failed', platformCode);
       // A connection loss or timeout does not prove a write failed remotely.
       throw new FeishuChatError('feishu_transport_error', write ? 'unknown' : 'failed');
@@ -148,53 +125,77 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
     },
     uploadImage({ bytes }) {
       if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > Math.min(maxMediaBytes, 10 * 1024 * 1024)) throw new FeishuChatError('invalid_media_bytes', 'failed');
-      return call('image', 'create', { data: { image_type: 'message', image: bytes } }, true, false, 'image_key');
+      return call('image', 'create', { data: { image_type: 'message', image: bytes } }, true, 'image_key');
     },
     uploadFile({ bytes, fileName, fileType = 'stream' }) {
       if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > Math.min(maxMediaBytes, 30 * 1024 * 1024)) throw new FeishuChatError('invalid_media_bytes', 'failed');
       required(fileName);
       if (/[\\/\x00-\x1f]/.test(fileName)) throw new FeishuChatError('invalid_file_name', 'failed');
       if (!['stream', 'pdf', 'doc', 'xls', 'ppt', 'mp4', 'opus'].includes(fileType)) throw new FeishuChatError('invalid_file_type', 'failed');
-      return call('file', 'create', { data: { file_type: fileType, file_name: fileName, file: bytes } }, true, false, 'file_key');
+      return call('file', 'create', { data: { file_type: fileType, file_name: fileName, file: bytes } }, true, 'file_key');
     },
     async downloadResource({ messageId, fileKey, type, maxBytes = maxMediaBytes, timeoutMs: downloadTimeoutMs = timeoutMs }) {
       if (!['image', 'file'].includes(type)) throw new FeishuChatError('invalid_resource_type', 'failed');
       if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024
         || !Number.isSafeInteger(downloadTimeoutMs) || downloadTimeoutMs < 1) throw new FeishuChatError('invalid_resource_limits', 'failed');
-      const resource = await call('messageResource', 'get', { path: { message_id: required(messageId), file_key: required(fileKey) }, params: { type } }, false, true, undefined, downloadTimeoutMs);
-      let source = resource?.getReadableStream?.();
-      if (!source?.[Symbol.asyncIterator] || typeof source.destroy !== 'function') throw new FeishuChatError('invalid_resource_stream', 'failed');
-      source.on('error', () => {});
-      const timer = setTimeout(() => source.destroy(new FeishuChatError('media_timeout', 'failed')), downloadTimeoutMs);
-      const contentType = String(headerValue(resource.headers, 'content-type') || 'application/octet-stream');
-      if (contentType.toLowerCase().includes('application/json')) {
-        let inspected;
-        try { inspected = await inspectJsonErrorStream(source, { requireErrorShape: true }); }
-        catch (error) {
-          clearTimeout(timer); source.destroy();
-          throw error instanceof FeishuChatError ? error : new FeishuChatError('media_read_failed', 'failed');
-        }
-        source = inspected.source; source.on('error', () => {});
-        if (Number.isInteger(inspected.platformCode)) { clearTimeout(timer); source.destroy(); throw new FeishuChatError('feishu_api_rejected', 'failed', inspected.platformCode); }
-      }
-      const size = Number(headerValue(resource.headers, 'content-length'));
-      if (size > maxBytes) { clearTimeout(timer); source.destroy(); throw new FeishuChatError('media_too_large', 'failed'); }
-      // Stream with a byte cap and wall-clock deadline, never buffer unbounded data.
-      const stream = Readable.from((async function* () {
-        let total = 0;
+      let source; let stream; let expired = false; let rejectDeadline;
+      const deadline = new Promise((_, reject) => { rejectDeadline = reject; });
+      const timer = setTimeout(() => {
+        expired = true;
+        const error = new FeishuChatError(source ? 'media_timeout' : 'feishu_transport_error', 'failed');
+        source?.destroy?.(error); stream?.destroy?.(error); rejectDeadline(error);
+      }, downloadTimeoutMs);
+      const prepare = async () => {
+        let resource;
         try {
-          for await (const chunk of source) {
-            total += Buffer.byteLength(chunk);
-            if (total > maxBytes) throw new FeishuChatError('media_too_large', 'failed');
-            yield chunk;
-          }
+          resource = await im.messageResource.get({ path: { message_id: required(messageId), file_key: required(fileKey) }, params: { type } });
         } catch (error) {
-          throw error instanceof FeishuChatError ? error : new FeishuChatError('media_read_failed', 'failed');
-        } finally { clearTimeout(timer); source.destroy(); }
-      })());
-      stream.once('close', () => { clearTimeout(timer); source.destroy(); });
-      return { stream, contentType,
-        ...(Number.isFinite(size) && size >= 0 ? { size } : {}) };
+          source = error?.response?.data?.[Symbol.asyncIterator] ? error.response.data : undefined;
+          source?.on?.('error', () => {});
+          if (expired) { source?.destroy?.(); throw new FeishuChatError('media_timeout', 'failed'); }
+          const platformCode = await platformCodeFromTransport(error);
+          if (expired) throw new FeishuChatError('media_timeout', 'failed');
+          if (Number.isInteger(platformCode) && platformCode !== 0) throw new FeishuChatError('feishu_api_rejected', 'failed', platformCode);
+          throw new FeishuChatError('feishu_transport_error', 'failed');
+        }
+        if (Number.isInteger(resource?.code) && resource.code !== 0) throw new FeishuChatError('feishu_api_rejected', 'failed', resource.code);
+        source = resource?.getReadableStream?.();
+        if (expired) { source?.destroy?.(); throw new FeishuChatError('feishu_transport_error', 'failed'); }
+        if (!source?.[Symbol.asyncIterator] || typeof source.destroy !== 'function') throw new FeishuChatError('invalid_resource_stream', 'failed');
+        source.on('error', () => {});
+        const contentType = String(headerValue(resource.headers, 'content-type') || 'application/octet-stream');
+        const disposition = String(headerValue(resource.headers, 'content-disposition') || '').trim().toLowerCase();
+        if (contentType.toLowerCase().includes('application/json') && !disposition.startsWith('attachment')) {
+          let platformCode;
+          try { platformCode = await inspectJsonErrorStream(source); }
+          catch (error) {
+            if (expired) throw new FeishuChatError('media_timeout', 'failed');
+            throw error instanceof FeishuChatError ? error : new FeishuChatError('media_read_failed', 'failed');
+          } finally { source.destroy(); }
+          if (Number.isInteger(platformCode)) throw new FeishuChatError('feishu_api_rejected', 'failed', platformCode);
+          throw new FeishuChatError('feishu_transport_error', 'failed');
+        }
+        const size = Number(headerValue(resource.headers, 'content-length'));
+        if (size > maxBytes) { source.destroy(); throw new FeishuChatError('media_too_large', 'failed'); }
+        // Stream with a byte cap under the same wall-clock deadline as retrieval and error inspection.
+        stream = Readable.from((async function* () {
+          let total = 0;
+          try {
+            for await (const chunk of source) {
+              total += Buffer.byteLength(chunk);
+              if (total > maxBytes) throw new FeishuChatError('media_too_large', 'failed');
+              yield chunk;
+            }
+          } catch (error) {
+            throw error instanceof FeishuChatError ? error : new FeishuChatError('media_read_failed', 'failed');
+          } finally { clearTimeout(timer); source.destroy(); }
+        })());
+        stream.once('close', () => { clearTimeout(timer); source.destroy(); });
+        stream.on('error', () => {});
+        return { stream, contentType, ...(Number.isFinite(size) && size >= 0 ? { size } : {}) };
+      };
+      try { return await Promise.race([prepare(), deadline]); }
+      catch (error) { clearTimeout(timer); source?.destroy?.(); throw error; }
     },
   };
 }
