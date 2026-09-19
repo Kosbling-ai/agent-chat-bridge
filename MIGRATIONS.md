@@ -1,6 +1,6 @@
 # Versions and migrations
 
-Application version: `0.2.8`
+Application version: `0.2.9`
 
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
@@ -9,6 +9,10 @@ Application versions, config `schemaVersion` and numbered database migrations ar
 ## Branch promotion
 
 Development changes are integrated and tested on `staging` before a `staging` to `main` promotion pull request. `main` remains the default branch. Moving source to either branch does not automatically run a migration, deploy an instance, publish npm, create or move a tag, or declare a release. See the [staging workflow](docs/staging-workflow.md).
+
+## 0.2.9 Feishu inbound attachments
+
+Version 0.2.9 adds no database migration. Private inbound attachment metadata and prepared prompts are stored in the existing forward-job execution JSON. Existing configurations may add `feishu.mediaDownloadTimeoutMs`; it defaults to 120000. `feishu.mediaMaxBytes` now defaults to 33554432 and is validated as a hard limit from 1 through 33554432 bytes. Remove the former `feishu.mediaUnsupportedReply` key because strict configuration validation rejects it.
 
 A schema change must reach `staging` with its immutable forward migration and rollback plan. Apply it only to a dedicated staging database through the explicit migrate command after an authorized backup and writer stop. Promotion to `main` preserves that reviewed migration history; production migration remains a separate, authorized operation.
 
