@@ -49,7 +49,7 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
       schemaVersion: 1, storage: refs, codex: { bin: './codex', cwd: './workspace', envNames: [] },
       feishu: { connectionId: 'original-bot', appIdEnv: 'TEST_APP', appSecretEnv: 'TEST_SECRET', botOpenId: 'bot' },
       routing: { version: '1', privateUserIds: [], groups: [] },
-      auth: { clients: [{ id: 'caller', tokenEnv: 'TEST_TOKEN', conversationIds: [], admin: true }] }, hooks: [],
+      hooks: [],
     }));
     await install003(pool);
     await pool.execute("INSERT INTO assistant_codex_sessions (id,feishu_open_id,chat_id,chat_type,codex_session_id,thread_name,created_at,updated_at,last_message_id,last_message_at,last_error) VALUES (91,'actor','chat','group','thread-91','original',101,202,'message-91',203,'') ");

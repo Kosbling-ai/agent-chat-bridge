@@ -1,6 +1,6 @@
 # Versions and migrations
 
-Application version: `0.2.5`
+Application version: `0.2.7`
 
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
@@ -42,11 +42,11 @@ Version 0.2.0 is unreleased. Migrations `002-codex-sessions.sql` and `003-forwar
 
 Do not point this build at the Kosbling production/P database and do not treat the similarly named production-derived tables as an in-place conversion. The bridge schema also contains migration 001 communication tables and has its own checksum ledger. For a new development instance, create an empty dedicated schema and run the explicit migrate command. For an existing 0.1.1 bridge trial, stop its only writer, preserve the database and workspace/outbox together, review the new configuration and run the same explicit migration once. Startup itself never applies DDL.
 
-Configuration `schemaVersion` stays 1. Add every authorized group to `routing.groups`. Omitted `capabilities` means `['bridge','hook']`; use `['bridge']`, `['hook']`, or `[]` deliberately. A group listed only in `hooks[].conversationIds` is no longer sufficient. Keep one Feishu bot/WebSocket and one Codex app-server/executor for the instance. Existing API clients must account for `deliveryMode`, the run execution/delivery split, decimal-string event cursors, controlled resource indexes and `409 unsupported_execution_model` on generation-ledger management writes.
+Configuration `schemaVersion` stays 1. Add every authorized group to `routing.groups`. Omitted `capabilities` means `['bridge','hook']`; use `['bridge']`, `['hook']`, or `[]` deliberately. A group listed only in `hooks[].conversationIds` is no longer sufficient. Keep one Feishu bot/WebSocket and one Codex app-server/executor for the instance. Before starting 0.2.6, remove the entire former top-level `auth` block, including an empty `auth` object; strict validation now rejects it. Do not remove `hooks[].tokenEnv`, which still supplies each outbound hook credential. The public `/v1` run, event, resource, recovery, delivery and upload endpoints are removed. No database migration or automatic cleanup of historical API/system rows is performed.
 
 Rollback after applying migrations 002–003 requires stopping the writer and restoring the pre-migration bridge database and matching workspace/outbox, or starting 0.1.1 against a separate compatible schema. Version 0.1.1's strict schema assertion does not accept the later ledger. Do not delete later ledger rows, replay unknown external effects or reuse the Kosbling production database as a rollback shortcut.
 
-No current P instance, production data, credentials or real provider was touched to prepare this migration. The Kosbling business producer still needs a separately reviewed change for scheduled submissions, caller-mode result consumption and hook-triggered lark-cli reads before any production replacement can be considered.
+No current P instance, production data, credentials or real provider was touched to prepare this migration. The Kosbling business producer keeps its native scheduling, Codex and delivery path and consumes the bridge hook.
 
 ## 0.1.1 upgrade
 

@@ -21,7 +21,7 @@ export function isLoopback(host) {
 }
 
 export function validateConfig(raw) {
-  object(raw, ['schemaVersion', 'listen', 'auth', 'storage', 'codex', 'feishu', 'routing', 'hooks', 'errorReporting'], 'invalid_config_fields');
+  object(raw, ['schemaVersion', 'listen', 'storage', 'codex', 'feishu', 'routing', 'hooks', 'errorReporting'], 'invalid_config_fields');
   if (raw.schemaVersion !== 1) throw new ConfigError('unsupported_config_version');
   const listen = raw.listen === undefined ? {} : raw.listen;
   object(listen, ['host', 'port', 'allowRemote'], 'invalid_listen_fields');
@@ -31,19 +31,10 @@ export function validateConfig(raw) {
   if (typeof allowRemote !== 'boolean') throw new ConfigError('invalid_remote_flag');
   if (!isLoopback(host) && !allowRemote) throw new ConfigError('remote_listen_not_allowed');
 
-  let tokenEnv;
-  if (raw.auth !== undefined) {
-    object(raw.auth, ['tokenEnv', 'clients'], 'invalid_auth_fields');
-    tokenEnv = raw.auth.tokenEnv;
-    if (tokenEnv !== undefined && (typeof tokenEnv !== 'string' || !/^[A-Z_][A-Z0-9_]{0,127}$/.test(tokenEnv))) {
-      throw new ConfigError('invalid_token_env_reference');
-    }
-  }
   const runtime = validateRuntime(raw);
   return Object.freeze({
     schemaVersion: 1,
     listen: Object.freeze({ host, port, allowRemote }),
-    auth: raw.auth ? Object.freeze({ ...(tokenEnv ? { tokenEnv } : {}), ...(runtime.auth ?? {}) }) : undefined,
     ...runtime.components,
   });
 }
@@ -75,7 +66,7 @@ function identifier(value, max) {
 function validateRuntime(raw) {
   const enabled = ['storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
-    if (raw.hooks !== undefined || raw.auth?.clients !== undefined || raw.errorReporting !== undefined) throw new ConfigError('runtime_components_required');
+    if (raw.hooks !== undefined || raw.errorReporting !== undefined) throw new ConfigError('runtime_components_required');
     return { components: {} };
   }
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
@@ -183,14 +174,6 @@ function validateRuntime(raw) {
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
   if (typeof allowAllPrivateUsers !== 'boolean' || raw.routing.allowAllPrivateUsers === null) throw new ConfigError('invalid_private_access_policy');
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups };
-  if (!Array.isArray(raw.auth?.clients) || !raw.auth.clients.length || raw.auth.clients.length > 100 || raw.auth.tokenEnv !== undefined) throw new ConfigError('runtime_auth_clients_required');
-  const clients = raw.auth.clients.map(client => {
-    object(client, ['id', 'tokenEnv', 'conversationIds', 'admin', 'queueIfBusy'], 'invalid_client_fields');
-    if (typeof client.admin !== 'boolean') throw new ConfigError('invalid_client_admin');
-    if (client.queueIfBusy !== undefined && typeof client.queueIfBusy !== 'boolean') throw new ConfigError('invalid_client_queue_if_busy');
-    return { id: identifier(client.id, 128), tokenEnv: reference(client.tokenEnv), conversationIds: strings(client.conversationIds).map(id => identifier(id, 255)), admin: client.admin, queueIfBusy: client.queueIfBusy === true };
-  });
-  if (new Set(clients.map(c => c.id)).size !== clients.length) throw new ConfigError('duplicate_client');
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
     object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds'], 'invalid_hook_fields');
@@ -209,7 +192,7 @@ function validateRuntime(raw) {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_error_reporting');
     errorReporting = { url: url.href, tokenEnv: reference(raw.errorReporting.tokenEnv) };
   }
-  return { auth: { clients }, components: { storage, codex, feishu, routing, hooks, ...(errorReporting ? { errorReporting } : {}) } };
+  return { components: { storage, codex, feishu, routing, hooks, ...(errorReporting ? { errorReporting } : {}) } };
 }
 
 export async function loadConfig(path) {
