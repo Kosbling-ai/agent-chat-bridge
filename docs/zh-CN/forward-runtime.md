@@ -28,7 +28,7 @@ HTTP 监听器只公开 `GET /health/live` 和 `GET /health/ready`。原 `/v1` r
 
 `feishu.cardTextFile` 是 bridge 自己的展示配置：管理员修改已配置的 JSON 文件后，执行卡和提问卡会在下一次创建或更新时热加载，但 bridge 不会把文件路径、字段清单或编辑规则注入 Codex prompt。该配置不改变执行状态、按钮动作、模型最终回答或普通回复的 Markdown 转换。
 
-私聊支持单图和 post 内图片，下载路径按原格式追加到文字 prompt；群聊只保留文字，忽略媒体。`mediaMaxBytes` 是原实现下载后的告警阈值，不会拒绝图片。bridge 直接投递 executor 返回的路径：私聊允许，群聊必须启用 `bridge` capability；单文件上限 28 MiB，成功后删除，单件失败保留文件且不阻断文字或其他附件。旧未确认附件 intent 不重放。
+私聊的 text、post、image、file、audio、media、sticker、share 以及未知消息类型都会进入 Codex；post 内 `img` / `file` / `media` 节点按原顺序生成附件块。可下载资源逐个流式落盘，单件失败不阻断其他附件或 Codex；`mediaMaxBytes` 默认且最大为 32 MiB 硬上限，`mediaDownloadTimeoutMs` 默认 120000 ms。图片除文字路径外还以 `localImage` 交付；2026-09-19 实测 app-server 接受 `localAudio` 但模型未能读出有效 PCM WAV 内容，因此音频暂不接 `localAudio`，只在附件块中提供本地路径。群聊本票仍保持文字传递、媒体忽略，待后续群上下文改动。出站仍直接投递 executor 返回的路径：私聊允许，群聊必须启用 `bridge` capability；单文件上限 28 MiB，成功后删除，单件失败保留文件且不阻断文字或其他附件。旧未确认附件 intent 不重放。
 
 bridge 内部投递状态包括 `waiting`、`pending`、`sent`、`failed`、`unknown`。投递失败或未知不会重跑已经完成的模型 turn。飞书明确返回非零 API 码时记为确认拒绝；返回格式异常、SDK 传输异常或超时仍记为未知，不自动重发另一条消息。
 

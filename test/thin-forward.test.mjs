@@ -5,6 +5,7 @@ import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createExecutionFeedback } from '../src/channels/feishu/execution-feedback.mjs';
 import { renderExecutionCard } from '../src/channels/feishu/execution-card.mjs';
+import { buildTurnInput } from '../src/agents/codex/executor.mjs';
 
 const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},hooks:[]};
 const flush=()=>new Promise(resolve=>setTimeout(resolve,20));
@@ -334,8 +335,8 @@ test('media preparation feeds a durable image addendum to executor input', async
   const claimById=jobs.claimById.bind(jobs);jobs.claimById=async input=>{order.push('claim');return claimById(input);};
   const runtime = createForwardRuntime({
     config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
-    media: { async prepare() { return { status: 'ready', text: '', addendum: '（图片路径：safe/image.png）' }; } },
-    executor: { async execute(input) { prompt = input.prompt; return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
+    media: { async prepare() { return { status: 'ready', text: '', addendum: '【附件 1/1】图片 （类型 image，1 B，已下载：/safe/image.png）', attachments: [{ index:1,kind:'image',status:'downloaded',path:'/safe/image.png' }] }; } },
+    executor: { async execute(input) { prompt = input.prompt; assert.equal(input.attachments[0].path,'/safe/image.png'); return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
     replies: { readResource: async () => null }, authorize: async () => true,
   });
   runtime.start(); await flush(); await runtime.stop();
@@ -352,19 +353,29 @@ test('live replay lets the existing forward row decide terminal duplication',asy
   assert.equal(result.answer,'done');assert.equal(upserts,0);assert.equal(claims,1);
 });
 
-test('prepared media prompt is reused without downloading again', async () => {
-  const jobs = memoryJobs({ status: 'pending', result: { inputEvent: { messageId: 'message', message: { kind: 'image' } }, execution: { inputStatus: 'ready', preparedPrompt: 'User：\n\n（图片路径：safe/image.png）' } } });
+test('prepared media prompt and attachments are reused without downloading again', async () => {
+  const attachments=[{index:1,kind:'image',status:'downloaded',path:'/safe/image.png'}];
+  const jobs = memoryJobs({ status: 'pending', result: { inputEvent: { messageId: 'message', message: { kind: 'image' } }, execution: { inputStatus: 'ready', preparedPrompt: 'User：\n\n【附件 1/1】图片 （类型 image，1 B，已下载：/safe/image.png）', attachments } } });
   let preparations = 0;
   let prompt;
   const runtime = createForwardRuntime({
     config: { owner: 'owner', pollMs: 1 }, jobs, sessions: {},
     media: { async prepare() { preparations += 1; throw new Error('must_not_prepare_again'); } },
-    executor: { async execute(input) { prompt = input.prompt; return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
+    executor: { async execute(input) { prompt = input.prompt; assert.deepEqual(input.attachments,attachments); return { threadId: 'thread', turnId: 'turn', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
     replies: {}, authorize: async () => true,
   });
   runtime.start(); await flush(); await runtime.stop();
   assert.equal(preparations, 0);
   assert.match(prompt, /safe\/image\.png/);
+});
+
+test('Codex turn input keeps text first and adds only downloaded images', () => {
+  assert.deepEqual(buildTurnInput('prompt', [
+    { kind:'file',status:'downloaded',path:'/tmp/report.pdf' },
+    { kind:'image',status:'failed',path:null },
+    { kind:'image',status:'downloaded',path:'/tmp/image.png' },
+    { kind:'audio',status:'downloaded',path:'/tmp/audio.wav' },
+  ]), [{type:'text',text:'prompt',text_elements:[]},{type:'localImage',path:'/tmp/image.png'}]);
 });
 
 test('ordinary live busy failures deliver on the first attempt without retrying', async () => {

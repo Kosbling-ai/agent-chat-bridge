@@ -44,12 +44,14 @@ export function createFeishuProxyAgent(value, options) {
     return new HttpsProxyAgent(url, options);
   } catch { throw new ConfigError('invalid_feishu_proxy'); }
 }
-export function boundedFeishuHttp(base, { proxyAgent } = {}) {
-  const options = value => ({ ...value, timeout: 10000, maxContentLength: 32 * 1024 * 1024, maxBodyLength: 32 * 1024 * 1024, maxRedirects: 0,
+export function boundedFeishuHttp(base, { proxyAgent, mediaDownloadTimeoutMs = 120000 } = {}) {
+  const options = (value, url = value?.url) => ({ ...value,
+    timeout: String(url || '').includes('/im/v1/messages/') && String(url || '').includes('/resources/') ? mediaDownloadTimeoutMs : 10000,
+    maxContentLength: 32 * 1024 * 1024, maxBodyLength: 32 * 1024 * 1024, maxRedirects: 0,
     ...(proxyAgent ? { proxy: false, httpAgent: proxyAgent, httpsAgent: proxyAgent } : {}) });
   const http = { request: value => base.request(options(value)) };
-  for (const method of ['get', 'delete', 'head', 'options']) http[method] = (url, value) => base[method](url, options(value));
-  for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value));
+  for (const method of ['get', 'delete', 'head', 'options']) http[method] = (url, value) => base[method](url, options(value, url));
+  for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value, url));
   return http;
 }
 export async function startService({ config, configPath, env = process.env, log, signal, onRestartRequired = async () => {}, dependencies = {} }) {
@@ -184,12 +186,13 @@ export async function startService({ config, configPath, env = process.env, log,
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
     const proxyAgent = config.feishu.httpProxyEnv ? factories.feishuProxyAgent(secret(env, config.feishu.httpProxyEnv)) : undefined;
-    const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance, { proxyAgent });
+    const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance, { proxyAgent,
+      mediaDownloadTimeoutMs: config.feishu.mediaDownloadTimeoutMs });
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
     const chat = factories.chat({ client, maxMediaBytes: 28 * 1024 * 1024 });
-    const media = await factories.media({ client, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
+    const media = await factories.media({ chat, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
       enabled: config.feishu.mediaEnabled, maxBytes: config.feishu.mediaMaxBytes,
-      unsupportedReplyText: config.feishu.mediaUnsupportedReply, log });
+      downloadTimeoutMs: config.feishu.mediaDownloadTimeoutMs, log });
     const outbound = await factories.outbound({ chat, workspace: cwd,
       outboxDir: resolve(cwd, '.agent-chat-bridge/outbox'),
       bindingOutboxDir: resolve(cwd, 'data/feishu-outbox'),

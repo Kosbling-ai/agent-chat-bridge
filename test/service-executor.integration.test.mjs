@@ -134,7 +134,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(repliesConfig.replyAsPost, true);
   assert.equal(repliesConfig.maxOutputChars, 3500);
   assert.equal(mediaConfig.enabled, true);
-  assert.equal(mediaConfig.maxBytes, 20 * 1024 * 1024);
+  assert.equal(mediaConfig.maxBytes, 32 * 1024 * 1024);
   assert.equal(typingConfig.enabled, true);
   assert.equal(typingConfig.emoji, 'Typing');
   assert.equal(typingConfig.fallbackText, '收到，正在查询。');

@@ -24,7 +24,10 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).feishu.processingReactionEmoji, 'Typing');
   assert.equal(validateConfig(config).feishu.processingFallbackText, '收到，正在查询。');
   assert.equal(validateConfig(config).feishu.mediaEnabled, true);
-  assert.equal(validateConfig(config).feishu.mediaMaxBytes, 20 * 1024 * 1024);
+  assert.equal(validateConfig(config).feishu.mediaMaxBytes, 32 * 1024 * 1024);
+  assert.equal(validateConfig(config).feishu.mediaDownloadTimeoutMs, 120000);
+  const removedMediaKey = ['media', 'Unsupported', 'Reply'].join('');
+  assert.throws(() => validateConfig({ ...config, feishu: { ...config.feishu, [removedMediaKey]: 'old' } }), { code: 'invalid_feishu_fields' });
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, replyAsPost: false, maxOutputChars: 7000 } }).feishu.replyAsPost, false);
   assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
   assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
@@ -52,6 +55,8 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, feishu: { ...config.feishu, maxOutputChars: 0 } },
     { ...config, feishu: { ...config.feishu, processingReaction: 'yes' } },
     { ...config, feishu: { ...config.feishu, mediaMaxBytes: -1 } },
+    { ...config, feishu: { ...config.feishu, mediaMaxBytes: 32 * 1024 * 1024 + 1 } },
+    { ...config, feishu: { ...config.feishu, mediaDownloadTimeoutMs: 120001 } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
     { ...config, auth: { clients: [{ id: 'caller', tokenEnv: 'TEST_TOKEN', conversationIds: ['chat'], admin: true }] } },
     { ...config, auth: {} },
@@ -125,10 +130,12 @@ test('structured retry logs retain only bounded safe execution facts', () => {
   assert.equal(JSON.stringify(output).includes('SYNTHETIC_SECRET'), false);
 });
 test('SDK request wrapper enforces time, redirects and size without retries', async () => {
-  let calls = 0;
-  const client = boundedFeishuHttp({ request: async options => { calls++; assert.equal(options.timeout, 10000); assert.equal(options.maxRedirects, 0); return {}; } });
+  const observed = [];
+  const client = boundedFeishuHttp({ request: async options => { observed.push(options); return {}; } }, { mediaDownloadTimeoutMs: 120000 });
   await client.request({ timeout: 0, maxRedirects: 5 });
-  assert.equal(calls, 1);
+  await client.request({ url: '/open-apis/im/v1/messages/message/resources/file', timeout: 0 });
+  assert.equal(observed[0].timeout, 10000); assert.equal(observed[0].maxRedirects, 0);
+  assert.equal(observed[1].timeout, 120000); assert.equal(observed.length, 2);
 });
 test('service rejects configured and inherited Codex homes that differ', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-service-home-'));

@@ -129,7 +129,7 @@ function validateRuntime(raw) {
   if (![memoryMaxRssMb, memoryMaxHeapUsedMb].every(value => Number.isFinite(value) && value >= 0)) throw new ConfigError('invalid_codex_memory_limit');
   codex.memoryMaxRssBytes = Math.round(memoryMaxRssMb * 1024 * 1024);
   codex.memoryMaxHeapUsedBytes = Math.round(memoryMaxHeapUsedMb * 1024 * 1024);
-  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'cardTextFile', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaUnsupportedReply'], 'invalid_feishu_fields');
+  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'cardTextFile', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaDownloadTimeoutMs'], 'invalid_feishu_fields');
   if (raw.feishu.catchup !== undefined && typeof raw.feishu.catchup !== 'boolean') throw new ConfigError('invalid_catchup_flag');
   const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };
   feishu.displayName = raw.feishu.displayName === undefined ? 'agent-chat-bridge' : identifier(raw.feishu.displayName, 80);
@@ -152,9 +152,10 @@ function validateRuntime(raw) {
   feishu.mediaEnabled = raw.feishu.mediaEnabled ?? true;
   if (typeof feishu.mediaEnabled !== 'boolean') throw new ConfigError('invalid_media_enabled');
   if (raw.feishu.mediaInboxDir !== undefined) feishu.mediaInboxDir = string(raw.feishu.mediaInboxDir);
-  feishu.mediaMaxBytes = raw.feishu.mediaMaxBytes ?? 20 * 1024 * 1024;
-  if (!Number.isSafeInteger(feishu.mediaMaxBytes) || feishu.mediaMaxBytes < 0 || feishu.mediaMaxBytes > 1024 * 1024 * 1024) throw new ConfigError('invalid_media_max_bytes');
-  feishu.mediaUnsupportedReply = raw.feishu.mediaUnsupportedReply === undefined ? '暂不支持处理「{{type}}」类型的附件，请改用文字、图片或飞书云文档链接。' : string(raw.feishu.mediaUnsupportedReply);
+  feishu.mediaMaxBytes = raw.feishu.mediaMaxBytes ?? 32 * 1024 * 1024;
+  if (!Number.isSafeInteger(feishu.mediaMaxBytes) || feishu.mediaMaxBytes < 1 || feishu.mediaMaxBytes > 32 * 1024 * 1024) throw new ConfigError('invalid_media_max_bytes');
+  feishu.mediaDownloadTimeoutMs = raw.feishu.mediaDownloadTimeoutMs ?? 120000;
+  if (!Number.isSafeInteger(feishu.mediaDownloadTimeoutMs) || feishu.mediaDownloadTimeoutMs < 1 || feishu.mediaDownloadTimeoutMs > 120000) throw new ConfigError('invalid_media_download_timeout');
   feishu.catchup = raw.feishu.catchup ?? true;
   if (raw.feishu.mediaBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.mediaBudgetBytes) || raw.feishu.mediaBudgetBytes < 20 * 1024 * 1024 || raw.feishu.mediaBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_media_budget');
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;

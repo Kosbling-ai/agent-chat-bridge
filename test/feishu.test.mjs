@@ -201,17 +201,26 @@ test('uploads accept bounded bytes only, never arbitrary filesystem paths', asyn
 });
 
 test('downloads stream within byte cap and fail oversize without buffering whole media', async () => {
-  const { chat, calls } = fakeChat(() => ({ getReadableStream: () => Readable.from([Buffer.from('abc'), Buffer.from('de')]), headers: {} }), { maxMediaBytes: 4 });
-  const { stream } = await chat.downloadResource({ messageId: 'm', fileKey: 'key', type: 'image' });
+  const { chat, calls } = fakeChat(() => ({ getReadableStream: () => Readable.from([Buffer.from('abc'), Buffer.from('de')]), headers: {} }), { maxMediaBytes: 32 });
+  const { stream } = await chat.downloadResource({ messageId: 'm', fileKey: 'key', type: 'image', maxBytes: 4 });
   await assert.rejects(async () => { for await (const _ of stream) {} }, { code: 'media_too_large' });
   assert.deepEqual(calls[0].request.path, { message_id: 'm', file_key: 'key' });
   await assert.rejects(chat.downloadResource({ messageId: 'm', fileKey: 'key', type: 'url' }));
 });
 
+test('download rejection preserves the sanitized Feishu platform code', async () => {
+  const returned = fakeChat(() => ({ code: 234040, msg: 'provider secret' }));
+  await assert.rejects(returned.chat.downloadResource({ messageId: 'm', fileKey: 'key', type: 'file' }),
+    error => error.code === 'feishu_api_rejected' && error.platformCode === 234040 && !error.message.includes('secret'));
+  const thrown = fakeChat(() => { throw { response: { data: { code: 234009, msg: 'provider secret' } } }; });
+  await assert.rejects(thrown.chat.downloadResource({ messageId: 'm', fileKey: 'key', type: 'file' }),
+    error => error.code === 'feishu_api_rejected' && error.platformCode === 234009 && !error.message.includes('secret'));
+});
+
 test('hung download has a wall clock limit', async () => {
   const source = new Readable({ read() {} });
-  const { chat } = fakeChat(() => ({ getReadableStream: () => source, headers: {} }), { timeoutMs: 10 });
-  const { stream } = await chat.downloadResource({ messageId: 'm', fileKey: 'key', type: 'file' });
+  const { chat } = fakeChat(() => ({ getReadableStream: () => source, headers: {} }), { timeoutMs: 100 });
+  const { stream } = await chat.downloadResource({ messageId: 'm', fileKey: 'key', type: 'file', timeoutMs: 10 });
   await assert.rejects(async () => { for await (const _ of stream) {} }, { code: 'media_timeout' });
   assert.equal(source.destroyed, true);
 });

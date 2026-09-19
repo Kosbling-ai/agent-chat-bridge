@@ -85,12 +85,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       const preparedExecution = {
         ...execution,
         inputStatus: prepared.status,
-        ...(prepared.status === 'ready' ? {
-          preparedPrompt: [job.prompt, prepared.addendum].filter(Boolean).join('\n\n'),
-        } : {
-          inputReason: prepared.reason || `input_${prepared.status}`,
-          inputReplyText: prepared.replyText || '',
-        }),
+        preparedPrompt: [job.prompt, prepared.addendum].filter(Boolean).join('\n\n'),
+        attachments: prepared.attachments,
       };
       return jobs.patchPreparedInput
         ? await jobs.patchPreparedInput({ id: job.id, execution: preparedExecution })
@@ -129,26 +125,13 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     let state;
     let needsDelivery = false;
     try {
-      if (execution.inputStatus && execution.inputStatus !== 'ready') {
-        const result = { inputStatus: execution.inputStatus,
-          errorCode: execution.inputReason || `input_${execution.inputStatus}`,
-          answer: execution.inputReplyText || '', rawAnswer: '', attachments: [], execution };
-        if (execution.inputStatus === 'ignored') {
-          await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: job.leaseOwner, status: 'completed', result });
-        } else {
-          await feedback?.prepare?.(job, result, null);
-          await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result, errorCode: result.errorCode });
-          needsDelivery = true;
-        }
-        return;
-      }
       const prompt = execution.inputStatus === 'ready' && typeof execution.preparedPrompt === 'string'
         ? execution.preparedPrompt : job.prompt;
       const input = {
         bindingOpenId: job.executionNamespace ? deriveExecutionScope(job.callerId, job.executionNamespace)
           : (execution.bindingOpenId || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType })),
         chatId: job.chatId, chatType: job.chatType, messageId: job.messageId,
-        senderOpenId: job.senderOpenId, senderName: job.senderName, prompt, groupChatContext: job.groupChatContext,
+        senderOpenId: job.senderOpenId, senderName: job.senderName, prompt, attachments: execution.attachments || [], groupChatContext: job.groupChatContext,
         busyPolicy: job.executionNamespace || config.steering === false ? 'reject' : 'steer',
       };
       state = job.deliveryMode === 'bridge'
