@@ -95,11 +95,18 @@ test('events api validates bodies, limits payloads, and returns missing status',
   assert.equal((await post(url, { ...event, correlation_id: 'inquiry\ninjected' })).status, 400);
   assert.equal((await post(url, { ...event, ref_ids: { 'bad:key': 'value' } })).status, 400);
   assert.equal((await post(url, { ...event, ref_ids: { valid: 'line\nbreak' } })).status, 400);
-  assert.equal((await post(url, { ...event, ref_ids: { valid: 'x'.repeat(257) } })).status, 400);
+  assert.equal((await post(url, { ...event, ref_ids: { valid: 'x'.repeat(2049) } })).status, 400);
   assert.equal((await post(url, { ...event, prompt: 'x'.repeat(8001) })).status, 413);
   assert.equal((await post(url, 'x'.repeat(EVENTS_BODY_MAX_BYTES + 1))).status, 413);
   assert.equal((await fetch(`${url}/v1/events/missing`, { headers: { authorization: `Bearer ${token}` } })).status, 404);
   assert.equal(registrations.length, 0, 'invalid fields never reach forward registration');
+});
+
+test('events api accepts opaque ref ids up to 2048 characters', async t => {
+  const { url, registrations } = await fixture(t);
+  const response = await post(url, { ...event, event_id: 'opaque-ref', ref_ids: { message_ref: 'x'.repeat(2048) } });
+  assert.equal(response.status, 202);
+  assert.equal(registrations[0].refIds.message_ref.length, 2048);
 });
 
 test('events api canonical hash uses code-unit key order without unicode normalization', () => {

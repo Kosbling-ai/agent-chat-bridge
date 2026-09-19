@@ -310,7 +310,8 @@ export async function startService({ config, configPath, env = process.env, log,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
     communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
-    businessCardAction=factories.businessCardAction({hooks:config.hooks,ingest:communication.ingestCardAction,
+    businessCardAction=factories.businessCardAction({hooks:config.hooks,connectionId:config.feishu.connectionId,
+      ingest:communication.ingestCardAction,
       runAsync:runCardOperation,log});
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest,
       onCardAction: payload => handleCardOperation(async()=>{

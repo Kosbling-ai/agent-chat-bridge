@@ -101,7 +101,8 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   async function ingestCardAction({hookId,eventId,chatId,messageId,event}) {
     if(stopping)throw new Error('ingress_stopped');
     return store.acceptInbound({connectionId,conversationId:chatId,source:'live',conversationType:'group',
-      eventKey:`card_action:${eventId}`,eventType:'card_action',messageId,occurredAt:Date.parse(event.occurred_at),
+      eventKey:`card_action:${eventId}`,eventType:'card.action',messageId,
+      ...(event.event.occurredAt?{occurredAt:Date.parse(event.event.occurredAt)}:{}),
       payload:event,semanticPayload:event,policyVersion:config.routing.version,passiveContext:false,
       hooks:[{hookId,payload:event}]});
   }

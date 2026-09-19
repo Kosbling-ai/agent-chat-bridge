@@ -75,7 +75,7 @@ function normalizeEvent(body) {
     || Object.keys(body.ref_ids).length > 16) throw new HttpError(400, 'invalid_ref_ids');
   const refIds = Object.fromEntries(Object.keys(body.ref_ids).sort().map(key => {
     const value = body.ref_ids[key];
-    if (!REF_ID_KEY.test(key) || typeof value !== 'string' || value.length > 256 || CONTROL_CHARACTER.test(value)) {
+    if (!REF_ID_KEY.test(key) || typeof value !== 'string' || value.length > 2048 || CONTROL_CHARACTER.test(value)) {
       throw new HttpError(400, 'invalid_ref_ids');
     }
     return [key, value];
