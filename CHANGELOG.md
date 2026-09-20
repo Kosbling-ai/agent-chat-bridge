@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.11] — Unreleased
+
+### Fixed
+
+- Extract top-level `files[]` entries from rich-post messages after embedded attachment nodes, deduplicate files already present as nodes, and retain folders as non-downloadable metadata.
+
 ## [0.2.10] — Unreleased
 
 - Allow authenticated business events to use bounded dotted type names, so producers can add external event categories such as `form.inbound` without a bridge release.

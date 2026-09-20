@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.10`
+Application version: `0.2.11`
+
+Version 0.2.11 does not add a database migration. Rich-post attachment extraction changes no configuration or stored schema.
 
 Version 0.2.10 does not add a database migration. The Events API reuses the existing forward-job request key and request hash for hook-scoped idempotency.
 
