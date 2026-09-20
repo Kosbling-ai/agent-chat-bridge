@@ -12,6 +12,7 @@ const extensions = {
 const reasons = {
   over_limit: '超过 32 MiB 下载上限', sticker_not_downloadable: '表情包无法下载',
   download_error: '下载失败', media_disabled: '媒体下载已关闭', not_downloadable: '该附件无可下载的资源',
+  folder_not_downloadable: '文件夹不支持下载',
   context_attachment_limit: '超过本次群上下文附件下载上限',
 };
 const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
@@ -75,13 +76,29 @@ function directAttachments(event, content) {
 }
 function postAttachments(event, content) {
   const attachments = [];
+  const nodeFileKeys = new Set();
   walkPost(content.post || content.content || content, node => {
+    if (node.file_key) nodeFileKeys.add(node.file_key);
     const index = attachments.length + 1;
     if (node.tag === 'img') attachments.push(baseAttachment(index, 'image', 'img', { fileKey: node.image_key || null, fileName: node.file_name || null }));
-    if (node.tag === 'file') attachments.push(baseAttachment(index, 'file', 'file', { fileKey: node.file_key || null, fileName: node.file_name || null }));
+    if (node.tag === 'file') {
+      const fileKey = node.file_key || null;
+      attachments.push(baseAttachment(index, 'file', 'file', { fileKey, fileName: node.file_name || null }));
+    }
     if (node.tag === 'media') attachments.push(baseAttachment(index, 'video', 'media', { fileKey: node.file_key || null, fileName: node.file_name || null,
       durationMs: nullableNumber(node.duration) }));
   });
+  for (const file of Array.isArray(content.files) ? content.files : []) {
+    if (!file || typeof file !== 'object') continue;
+    const fileKey = file.file_key;
+    if (typeof fileKey !== 'string' || !fileKey || nodeFileKeys.has(fileKey)) continue;
+    attachments.push(baseAttachment(attachments.length + 1, 'file', 'file', {
+      fileKey,
+      fileName: file.file_name || null,
+      ...(file.is_folder === true ? { reason: 'folder_not_downloadable' } : {}),
+    }));
+    nodeFileKeys.add(fileKey);
+  }
   return attachments;
 }
 export function extractAttachments(event) {
@@ -89,7 +106,10 @@ export function extractAttachments(event) {
   return event?.message?.kind === 'post' ? postAttachments(event, content) : directAttachments(event, content);
 }
 function downloadType(attachment) { return attachment.kind === 'image' ? 'image' : 'file'; }
-function isDownloadable(attachment) { return ['image', 'file', 'audio', 'video'].includes(attachment.kind) && Boolean(attachment.fileKey); }
+function isDownloadable(attachment) {
+  return attachment.reason !== 'folder_not_downloadable'
+    && ['image', 'file', 'audio', 'video'].includes(attachment.kind) && Boolean(attachment.fileKey);
+}
 function failureReason(error) {
   if (error?.code === 'media_too_large') return 'over_limit';
   if (Number.isInteger(error?.platformCode)) return `feishu_${error.platformCode}`;

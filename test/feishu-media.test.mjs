@@ -5,7 +5,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFeishuChatClient } from '../src/channels/feishu/chat-client.mjs';
-import { createFeishuMedia, extractMessageText, sendOutboundAttachment } from '../src/channels/feishu/media.mjs';
+import { createFeishuMedia, extractAttachments, extractMessageText, sendOutboundAttachment } from '../src/channels/feishu/media.mjs';
 
 const event = (kind, content, conversationType = 'p2p') => ({ conversationId:'chat', messageId:'message', conversationType, message:{kind,content:JSON.stringify(content)} });
 async function fixture(options = {}) {
@@ -26,6 +26,122 @@ test('production text extraction keeps raw malformed content and ignores a title
   malformed.message.content = 'plain text from an invalid JSON envelope';
   assert.equal(extractMessageText(malformed), 'plain text from an invalid JSON envelope');
   assert.equal(extractMessageText(event('post', { title: 'title only' })), '');
+});
+
+test('rich post extraction includes top-level files from the observed Feishu shape', () => {
+  const source = event('post', {
+    title: '',
+    content: [[{ tag: 'text', text: '能帮我计算下…', style: [] }]],
+    content_v2: [[{ tag: 'text', text: '能帮我计算下…', style: [] }]],
+    files: [{ file_key: 'file_v3_0015n_example', file_name: '2026年09月信用卡账单.pdf', is_folder: false }],
+  });
+  assert.deepEqual(extractAttachments(source), [{
+    index: 1, kind: 'file', messageType: 'file', fileKey: 'file_v3_0015n_example', fileName: '2026年09月信用卡账单.pdf',
+    durationMs: null, refId: null, raw: null, status: 'skipped', path: null, bytes: null, reason: 'not_downloadable',
+  }]);
+});
+
+test('rich post node attachments precede top-level files with continuous indexes and node-key deduplication', () => {
+  const attachments = extractAttachments(event('post', {
+    content: [[
+      { tag: 'img', image_key: 'image-node' },
+      { tag: 'file', file_key: 'duplicate', file_name: 'node.pdf' },
+    ]],
+    files: [
+      { file_key: 'duplicate', file_name: 'top-duplicate.pdf', is_folder: false },
+      { file_key: 'top-file', file_name: 'top.pdf', is_folder: false },
+    ],
+  }));
+  assert.deepEqual(attachments.map(item => [item.index, item.kind, item.fileKey, item.fileName]), [
+    [1, 'image', 'image-node', null],
+    [2, 'file', 'duplicate', 'node.pdf'],
+    [3, 'file', 'top-file', 'top.pdf'],
+  ]);
+});
+
+test('rich post top-level files skip invalid entries without consuming attachment indexes', () => {
+  const attachments = extractAttachments(event('post', {
+    content: [[{ tag: 'img', image_key: 'node-image' }]],
+    files: [
+      {},
+      [],
+      { file_key: '', file_name: 'empty.pdf' },
+      { file_key: 123, file_name: 'numeric.pdf' },
+      { file_name: 'folder-without-key', is_folder: true },
+      null,
+      'not-an-object',
+      { file_key: 'valid-file', file_name: 'valid.pdf' },
+    ],
+  }));
+  assert.deepEqual(attachments.map(item => [item.index, item.kind, item.fileKey, item.fileName]), [
+    [1, 'image', 'node-image', null],
+    [2, 'file', 'valid-file', 'valid.pdf'],
+  ]);
+});
+
+test('rich post top-level files keep only the first entry for a repeated file key', () => {
+  const attachments = extractAttachments(event('post', {
+    content: [[{ tag: 'text', text: 'duplicate files' }]],
+    files: [
+      { file_key: 'duplicate', file_name: 'first.pdf' },
+      { file_key: 'duplicate', file_name: 'second.pdf' },
+      { file_key: 'unique', file_name: 'unique.pdf' },
+    ],
+  }));
+  assert.deepEqual(attachments.map(item => [item.index, item.fileKey, item.fileName]), [
+    [1, 'duplicate', 'first.pdf'],
+    [2, 'unique', 'unique.pdf'],
+  ]);
+});
+
+test('rich post top-level folders remain skipped metadata with an explicit attachment message', async () => {
+  const f = await fixture();
+  try {
+    const prepared = await f.media.prepare(event('post', {
+      content: [[{ tag: 'text', text: '文件夹' }]],
+      files: [{ file_key: 'folder-key', file_name: '账单文件夹', is_folder: true }],
+    }));
+    assert.deepEqual(prepared.attachments, [{
+      index: 1, kind: 'file', messageType: 'file', fileKey: 'folder-key', fileName: '账单文件夹', durationMs: null,
+      refId: null, raw: null, status: 'skipped', path: null, bytes: null, reason: 'folder_not_downloadable',
+    }]);
+    assert.equal(prepared.addendum, '【附件 1/1】文件 账单文件夹（类型 file，未能下载：文件夹不支持下载）');
+    assert.equal(f.calls.length, 0);
+  } finally { await f.close(); }
+});
+
+test('rich post top-level folders and files keep continuous indexes while only files download', async () => {
+  const f = await fixture();
+  try {
+    const prepared = await f.media.prepare(event('post', {
+      content: [[{ tag: 'text', text: '混合附件' }]],
+      files: [
+        { file_key: 'folder-key', file_name: '账单文件夹', is_folder: true },
+        { file_key: 'file-key', file_name: '账单.pdf', is_folder: false },
+      ],
+    }));
+    assert.deepEqual(prepared.attachments.map(item => [item.index, item.fileKey, item.status, item.reason]), [
+      [1, 'folder-key', 'skipped', 'folder_not_downloadable'],
+      [2, 'file-key', 'downloaded', null],
+    ]);
+    assert.deepEqual(f.calls.map(call => call.fileKey), ['file-key']);
+    assert.match(prepared.addendum, /^【附件 1\/2】文件 账单文件夹（类型 file，未能下载：文件夹不支持下载）\n【附件 2\/2】文件 账单\.pdf（类型 file，5 B，已下载：/);
+  } finally { await f.close(); }
+});
+
+test('media prepare downloads a rich post top-level file and renders its attachment line', async () => {
+  const f = await fixture();
+  try {
+    const prepared = await f.media.prepare(event('post', {
+      content: [[{ tag: 'text', text: '查看账单' }]],
+      files: [{ file_key: 'statement', file_name: 'statement.pdf', is_folder: false }],
+    }));
+    const path = join(f.root, 'inbox', 'chat', 'message', 'statement.pdf');
+    assert.deepEqual(f.calls, [{ messageId: 'message', fileKey: 'statement', type: 'file', maxBytes: 32 * 1024 * 1024, timeoutMs: 120000 }]);
+    assert.equal(prepared.attachments[0].status, 'downloaded');
+    assert.equal(prepared.attachments[0].path, path);
+    assert.equal(prepared.addendum, `【附件 1/1】文件 statement.pdf（类型 file，5 B，已下载：${path}）`);
+  } finally { await f.close(); }
 });
 
 test('every direct message type has the complete attachment record and attachment block', async () => {
