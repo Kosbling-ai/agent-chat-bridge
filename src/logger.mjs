@@ -6,8 +6,8 @@ export function safeObserver(callback = () => {}) {
   };
 }
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
-  return (level, operation, status, { code, reason, consecutiveMisses, durationMs, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
-    hookId, eventId, eventType, scopePrefix, statusCode, jobId, errorClass, chatId, messageId, kind, errorCode,
+  return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, durationMsSnake, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
+    hookId, eventId, eventType, scopePrefix, statusCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
     component: eventComponent } = {}) => {
     const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
     const boundedInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
@@ -17,7 +17,9 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       ...(identifier(code, 64) !== undefined ? { code } : {}),
       ...(identifier(reason, 64) !== undefined ? { reason } : {}),
       ...(boundedInteger(consecutiveMisses, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { consecutive_misses: consecutiveMisses } : {}),
-      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(boundedInteger(consecutiveFailures, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { consecutive_failures: consecutiveFailures } : {}),
+      ...(boundedInteger(durationMs, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { durationMs } : {}),
+      ...(boundedInteger(durationMsSnake, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { duration_ms: durationMsSnake } : {}),
       ...(port !== undefined ? { port } : {}),
       ...(identifier(rpcMethod, 64) !== undefined ? { rpc_method: rpcMethod } : {}),
       ...(identifier(stage, 64) !== undefined ? { stage } : {}),
@@ -33,6 +35,9 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       ...(boundedInteger(statusCode, 100, 599) !== undefined ? { status_code: statusCode } : {}),
       ...(identifier(jobId, 64) !== undefined ? { job_id: jobId } : {}),
       ...(identifier(errorClass, 64) !== undefined ? { error_class: errorClass } : {}),
+      ...(boundedInteger(errno, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { errno } : {}),
+      ...(identifier(sqlState, 16) !== undefined ? { sql_state: sqlState } : {}),
+      ...(typeof willRetry === 'boolean' ? { will_retry: willRetry } : {}),
       ...(identifier(chatId, 128) !== undefined ? { chat_id: chatId } : {}),
       ...(identifier(messageId, 128) !== undefined ? { message_id: messageId } : {}),
       ...(identifier(kind, 64) !== undefined ? { kind } : {}),

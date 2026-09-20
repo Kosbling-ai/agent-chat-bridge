@@ -24,7 +24,7 @@ export function createPoolFromEnvironment(references, env = process.env) {
     throw new StoreError('invalid_storage_environment');
   }
   return mysql.createPool({
-    ...values, port, connectionLimit: 6, waitForConnections: false,
+    ...values, port, connectionLimit: 6, waitForConnections: true, queueLimit: 64,
     connectTimeout: 1000, multipleStatements: false, charset: 'utf8mb4',
     supportBigNumbers: true, bigNumberStrings: true,
   });

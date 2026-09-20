@@ -500,5 +500,7 @@ test('validated storage config creates a real pool from connection references wi
   const pool = createPoolFromEnvironment(references, {
     TEST_HOST: '127.0.0.1', TEST_PORT: '3306', TEST_USER: 'fixture', TEST_PASSWORD: 'fixture', TEST_DATABASE: 'bridge_test',
   });
+  assert.equal(pool.pool.config.waitForConnections, true);
+  assert.equal(pool.pool.config.queueLimit, 64);
   await pool.end();
 });

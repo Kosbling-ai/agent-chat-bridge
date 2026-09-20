@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.11] — Unreleased
+
+- Coalesce streaming assistant-delta persistence per turn item, bound MySQL pool queuing, preserve safe storage error diagnostics, and retry transient communication-store polling failures with bounded backoff before the existing fail-closed watchdog takes over.
+
+No database migration is needed.
+
 ## [0.2.10] — Unreleased
 
 - Allow authenticated business events to use bounded dotted type names, so producers can add external event categories such as `form.inbound` without a bridge release.
