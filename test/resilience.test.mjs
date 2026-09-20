@@ -66,6 +66,20 @@ test('delta coalescer retries the latest pending value after a write failure', a
   assert.deepEqual(errors, ['ER_LOCK_WAIT_TIMEOUT']);
 });
 
+test('delta coalescer survives a synchronous first writer failure', async () => {
+  const writes = [];
+  const persist = createDeltaCoalescer({
+    write(value) {
+      writes.push(value);
+      if (writes.length === 1) throw new Error('synthetic synchronous failure');
+    },
+  });
+  await persist('turn:item', 'a');
+  await persist('turn:item', 'ab');
+  await persist('turn:item', 'abc');
+  assert.deepEqual(writes, ['a', 'ab', 'abc']);
+});
+
 test('delta coalescer keeps interleaved items independent', async () => {
   const writes = { first: [], second: [] };
   const releases = {};

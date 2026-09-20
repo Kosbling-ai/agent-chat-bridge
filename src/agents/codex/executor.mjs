@@ -30,6 +30,7 @@ export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now
       return current.promise;
     }
     const entry = { value, pending: false, promise: null };
+    entries.set(key, entry);
     entry.promise = (async () => {
       while (true) {
         entry.pending = false;
@@ -45,7 +46,6 @@ export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now
         return;
       }
     })();
-    entries.set(key, entry);
     return entry.promise;
   };
 }
