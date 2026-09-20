@@ -22,6 +22,7 @@ import { createCommunicationRuntime } from './core/communication-runtime.mjs';
 import { createCardTextProvider } from './channels/feishu/card-text.mjs';
 import { createExecutionFeedback } from './channels/feishu/execution-feedback.mjs';
 import { createUserInputRuntime } from './channels/feishu/user-input-runtime.mjs';
+import { createBusinessCardAction } from './channels/feishu/business-card-action.mjs';
 import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
@@ -45,12 +46,14 @@ export function createFeishuProxyAgent(value, options) {
     return new HttpsProxyAgent(url, options);
   } catch { throw new ConfigError('invalid_feishu_proxy'); }
 }
-export function boundedFeishuHttp(base, { proxyAgent } = {}) {
-  const options = value => ({ ...value, timeout: 10000, maxContentLength: 32 * 1024 * 1024, maxBodyLength: 32 * 1024 * 1024, maxRedirects: 0,
+export function boundedFeishuHttp(base, { proxyAgent, mediaDownloadTimeoutMs = 120000 } = {}) {
+  const options = (value, url = value?.url) => ({ ...value,
+    timeout: String(url || '').includes('/im/v1/messages/') && String(url || '').includes('/resources/') ? mediaDownloadTimeoutMs : 10000,
+    maxContentLength: 32 * 1024 * 1024, maxBodyLength: 32 * 1024 * 1024, maxRedirects: 0,
     ...(proxyAgent ? { proxy: false, httpAgent: proxyAgent, httpsAgent: proxyAgent } : {}) });
   const http = { request: value => base.request(options(value)) };
-  for (const method of ['get', 'delete', 'head', 'options']) http[method] = (url, value) => base[method](url, options(value));
-  for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value));
+  for (const method of ['get', 'delete', 'head', 'options']) http[method] = (url, value) => base[method](url, options(value, url));
+  for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value, url));
   return http;
 }
 export async function startService({ config, configPath, env = process.env, log, signal, onRestartRequired = async () => {}, dependencies = {} }) {
@@ -78,12 +81,17 @@ export async function startService({ config, configPath, env = process.env, log,
     home: env.HOME,
   });
   const hookTokens = Object.fromEntries(config.hooks.map(hook => [hook.id, secret(env, hook.tokenEnv)]));
+  const inboundTokens = Object.fromEntries(config.hooks.filter(hook => hook.inbound)
+    .map(hook => [hook.id, secret(env, hook.inbound.tokenEnv)]));
+  if (new Set(Object.values(inboundTokens)).size !== Object.keys(inboundTokens).length) {
+    throw new ConfigError('duplicate_inbound_token');
+  }
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, businessCardAction: createBusinessCardAction, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
   const pool = factories.pool(storageConnectionReferences(config.storage), env);
-  let store, executor, userInput, feishu, communication, forward, catchup, http, media, outbound;
+  let store, executor, userInput, businessCardAction, feishu, communication, forward, catchup, http, media, outbound;
   const cardOperations = new Set();
   let acceptCardOperations = true;
   const runCardOperation = operation => {
@@ -261,12 +269,13 @@ export async function startService({ config, configPath, env = process.env, log,
     // Raw SDK logging can contain credentials or request content. Disable it.
     const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
     const proxyAgent = config.feishu.httpProxyEnv ? factories.feishuProxyAgent(secret(env, config.feishu.httpProxyEnv)) : undefined;
-    const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance, { proxyAgent });
+    const httpInstance = boundedFeishuHttp(factories.sdk.defaultHttpInstance, { proxyAgent,
+      mediaDownloadTimeoutMs: config.feishu.mediaDownloadTimeoutMs });
     const client = new factories.sdk.Client({ ...credentials, logger, httpInstance });
     const chat = factories.chat({ client, maxMediaBytes: 28 * 1024 * 1024 });
-    const createdMedia = await factories.media({ client, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
+    const createdMedia = await factories.media({ chat, inboxDir: resolveMediaInboxDir(config.feishu.mediaInboxDir, cwd),
       enabled: config.feishu.mediaEnabled, maxBytes: config.feishu.mediaMaxBytes,
-      unsupportedReplyText: config.feishu.mediaUnsupportedReply, log });
+      downloadTimeoutMs: config.feishu.mediaDownloadTimeoutMs, log });
     if (stopping) {
       await cleanupLateComponent('media', () => createdMedia?.release?.());
       throw stoppedError();
@@ -301,8 +310,12 @@ export async function startService({ config, configPath, env = process.env, log,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
     communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
+    businessCardAction=factories.businessCardAction({hooks:config.hooks,connectionId:config.feishu.connectionId,
+      ingest:communication.ingestCardAction,
+      runAsync:runCardOperation,log});
     feishu = factories.feishu({ sdk: factories.sdk, wsClient: new factories.sdk.WSClient({ ...credentials, logger, httpInstance, ...(proxyAgent ? { agent: proxyAgent } : {}) }), connectionId: config.feishu.connectionId, botOpenId: config.feishu.botOpenId, onEvent: communication.ingest,
       onCardAction: payload => handleCardOperation(async()=>{
+        const business=businessCardAction.handleCardAction(payload);if(business)return business;
         const answered=await userInput.handleCardAction(payload); return answered??feedback.handleCardAction(payload);
       }), log });
     const readiness = async () => {
@@ -312,7 +325,7 @@ export async function startService({ config, configPath, env = process.env, log,
       const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending&&!executorStatus.fault, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
       return { ready: !stopping && Object.values(components).every(Boolean), components };
     };
-    const createdHttp = await factories.server({ config, log, readiness });
+    const createdHttp = await factories.server({ config, log, readiness, eventRuntime: forward, inboundTokens });
     if (stopping) {
       await cleanupLateComponent('server', () => createdHttp?.close?.());
       throw stoppedError();

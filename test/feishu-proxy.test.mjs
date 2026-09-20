@@ -143,6 +143,7 @@ test('config references one proxy env and service injects the same agent into SD
   t.after(() => rm(directory, { recursive: true, force: true }));
   const raw = {
     schemaVersion: 1,
+    listen: { host: '127.0.0.1', port: 0 },
     storage: Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `TEST_${key.toUpperCase()}`])),
     codex: { bin: process.execPath, cwd: directory, envNames: ['PATH'] },
     feishu: { connectionId: 'proxy', appIdEnv: 'TEST_APP', appSecretEnv: 'TEST_SECRET', botOpenId: 'bot', catchup: false,

@@ -6,6 +6,19 @@ const clean = (value) => String(value || '').trim();
 const chatKey = (value) => String(value || 'unknown').replace(/[^A-Za-z0-9_-]/g, '') || 'unknown';
 const scopeHash = (value) => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 
+export function buildBusinessEventPrompt(event) {
+  const references = Object.keys(event.refIds || {}).sort().map(key => [key, event.refIds[key]]);
+  const lines = [
+    '【业务事件】',
+    `type：${event.type}`,
+    `event_id：${event.eventId}`,
+    `correlation_id：${event.correlationId}`,
+    `occurred_at：${event.occurredAt}`,
+    ...references.map(([key, value]) => `ref_ids.${key}：${value}`),
+  ];
+  return `${lines.join('\n')}\n\n${event.prompt}`;
+}
+
 export function outboxRelativeDirectory({ outboxRelativeRoot = 'data/feishu-outbox', chatId, bindingOpenId }) {
   return isScheduledBinding(bindingOpenId)
     ? `${outboxRelativeRoot}/system-${scopeHash(bindingOpenId)}/${chatKey(chatId)}`

@@ -113,6 +113,12 @@ function formatDurationShort(durationMs) {
   return `${Math.round(value / 1000)} 秒`;
 }
 
+export function buildTurnInput(prompt, attachments = []) {
+  return [textInput(prompt), ...attachments
+    .filter(attachment => attachment?.status === 'downloaded' && attachment.kind === 'image' && attachment.path)
+    .map(attachment => ({ type: 'localImage', path: attachment.path }))];
+}
+
 export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, spawnSyncImpl, now = Date.now, onRestartRequired = async () => {}, onUserInput = async () => {}, onUserInputClosed = async () => {}, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval } = {}) {
   if (!config || !sessionStore) throw new Error('config and sessionStore are required');
   const locks = new Map();
@@ -339,7 +345,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     await persistUser(active.binding, input, 'user-steer-attempt', input.prompt, { attemptId, turnId: active.turnId, rootMessageId: active.messageId, baselineIds });
     active.pendingSteerId = input.messageId;
     try {
-      await steerTurnWithMismatchRecovery({ request: (...args) => client.request(...args), threadId: active.threadId, expectedTurnId: active.turnId, input: [textInput(input.prompt)], shouldContinue: () => !active.settled });
+      await steerTurnWithMismatchRecovery({ request: (...args) => client.request(...args), threadId: active.threadId, expectedTurnId: active.turnId, input: buildTurnInput(input.prompt, input.attachments), shouldContinue: () => !active.settled });
     } catch (error) {
       if (isNoActiveTurnError(error) || error instanceof TurnRecoverySupersededError) {
         active.pendingSteerId = null;
@@ -589,7 +595,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       let admission = startAdmission(binding.codexSessionId, normalized.messageId);
       try {
         response = await client.request('turn/start', {
-          threadId: binding.codexSessionId, input: [textInput(prompt)], cwd: config.cwd,
+          threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
           approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy), approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
           ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
         });
@@ -603,7 +609,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           await persistUser(binding, normalized, 'user', prompt);
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
-            threadId: binding.codexSessionId, input: [textInput(prompt)], cwd: config.cwd,
+            threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
             approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy), approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
             ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
           }).catch((failure) => { startingByThread.delete(admission.threadId); admission.reject(failure); throw failure; });

@@ -1,23 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { Readable } from 'node:stream';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createFeishuMedia, extractMessageText, extractPostImageKeys, sendOutboundAttachment } from '../src/channels/feishu/media.mjs';
+import { createFeishuChatClient } from '../src/channels/feishu/chat-client.mjs';
+import { createFeishuMedia, extractAttachments, extractMessageText, sendOutboundAttachment } from '../src/channels/feishu/media.mjs';
 
 const event = (kind, content, conversationType = 'p2p') => ({ conversationId:'chat', messageId:'message', conversationType, message:{kind,content:JSON.stringify(content)} });
 async function fixture(options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'bridge-production-media-'));
   const calls = [];
-  const client = options.client || { im:{v1:{messageResource:{async get(input){calls.push(input);return{headers:{'content-type':'image/png'},async writeFile(path){await writeFile(path,'image');}};}}}}};
-  const media = await createFeishuMedia({ client, inboxDir:join(root,'inbox'), ...options });
+  const chat = options.chat || { async downloadResource(input) { calls.push(input); return { stream: Readable.from(['image']), contentType: 'image/png', size: 5 }; } };
+  const media = await createFeishuMedia({ chat, inboxDir:join(root,'inbox'), ...options });
   return { root, calls, media, close:()=>rm(root,{recursive:true,force:true}) };
 }
 
-test('production post extraction keeps text, links and unique image keys', () => {
+test('production post extraction keeps text and links', () => {
   const source=event('post',{title:'Title',content:[[{tag:'text',text:'hello '},{tag:'a',text:'site',href:'https://example.com'}],[{tag:'img',image_key:'image'},{tag:'img',image_key:'image'}]]});
   assert.equal(extractMessageText(source),'Title\nhello site (https://example.com)');
-  assert.deepEqual(extractPostImageKeys(source),['image']);
 });
 
 test('production text extraction keeps raw malformed content and ignores a title without a post body', () => {
@@ -27,36 +28,272 @@ test('production text extraction keeps raw malformed content and ignores a title
   assert.equal(extractMessageText(event('post', { title: 'title only' })), '');
 });
 
-test('private image and every private post image download to the configured inbox', async () => {
-  const f=await fixture();
+test('rich post extraction includes top-level files from the observed Feishu shape', () => {
+  const source = event('post', {
+    title: '',
+    content: [[{ tag: 'text', text: '能帮我计算下…', style: [] }]],
+    content_v2: [[{ tag: 'text', text: '能帮我计算下…', style: [] }]],
+    files: [{ file_key: 'file_v3_0015n_example', file_name: '2026年09月信用卡账单.pdf', is_folder: false }],
+  });
+  assert.deepEqual(extractAttachments(source), [{
+    index: 1, kind: 'file', messageType: 'file', fileKey: 'file_v3_0015n_example', fileName: '2026年09月信用卡账单.pdf',
+    durationMs: null, refId: null, raw: null, status: 'skipped', path: null, bytes: null, reason: 'not_downloadable',
+  }]);
+});
+
+test('rich post node attachments precede top-level files with continuous indexes and node-key deduplication', () => {
+  const attachments = extractAttachments(event('post', {
+    content: [[
+      { tag: 'img', image_key: 'image-node' },
+      { tag: 'file', file_key: 'duplicate', file_name: 'node.pdf' },
+    ]],
+    files: [
+      { file_key: 'duplicate', file_name: 'top-duplicate.pdf', is_folder: false },
+      { file_key: 'top-file', file_name: 'top.pdf', is_folder: false },
+    ],
+  }));
+  assert.deepEqual(attachments.map(item => [item.index, item.kind, item.fileKey, item.fileName]), [
+    [1, 'image', 'image-node', null],
+    [2, 'file', 'duplicate', 'node.pdf'],
+    [3, 'file', 'top-file', 'top.pdf'],
+  ]);
+});
+
+test('rich post top-level files skip invalid entries without consuming attachment indexes', () => {
+  const attachments = extractAttachments(event('post', {
+    content: [[{ tag: 'img', image_key: 'node-image' }]],
+    files: [
+      {},
+      [],
+      { file_key: '', file_name: 'empty.pdf' },
+      { file_key: 123, file_name: 'numeric.pdf' },
+      { file_name: 'folder-without-key', is_folder: true },
+      null,
+      'not-an-object',
+      { file_key: 'valid-file', file_name: 'valid.pdf' },
+    ],
+  }));
+  assert.deepEqual(attachments.map(item => [item.index, item.kind, item.fileKey, item.fileName]), [
+    [1, 'image', 'node-image', null],
+    [2, 'file', 'valid-file', 'valid.pdf'],
+  ]);
+});
+
+test('rich post top-level files keep only the first entry for a repeated file key', () => {
+  const attachments = extractAttachments(event('post', {
+    content: [[{ tag: 'text', text: 'duplicate files' }]],
+    files: [
+      { file_key: 'duplicate', file_name: 'first.pdf' },
+      { file_key: 'duplicate', file_name: 'second.pdf' },
+      { file_key: 'unique', file_name: 'unique.pdf' },
+    ],
+  }));
+  assert.deepEqual(attachments.map(item => [item.index, item.fileKey, item.fileName]), [
+    [1, 'duplicate', 'first.pdf'],
+    [2, 'unique', 'unique.pdf'],
+  ]);
+});
+
+test('rich post top-level folders remain skipped metadata with an explicit attachment message', async () => {
+  const f = await fixture();
   try {
-    const image=await f.media.prepare(event('image',{image_key:'one'}));
-    assert.equal(image.status,'ready'); assert.equal(await readFile(image.localPaths[0],'utf8'),'image');
-    const post=await f.media.prepare(event('post',{content:[[{tag:'img',image_key:'two'},{tag:'img',image_key:'three'}]]}));
-    assert.equal(post.localPaths.length,2); assert.equal(f.calls.length,3);
+    const prepared = await f.media.prepare(event('post', {
+      content: [[{ tag: 'text', text: '文件夹' }]],
+      files: [{ file_key: 'folder-key', file_name: '账单文件夹', is_folder: true }],
+    }));
+    assert.deepEqual(prepared.attachments, [{
+      index: 1, kind: 'file', messageType: 'file', fileKey: 'folder-key', fileName: '账单文件夹', durationMs: null,
+      refId: null, raw: null, status: 'skipped', path: null, bytes: null, reason: 'folder_not_downloadable',
+    }]);
+    assert.equal(prepared.addendum, '【附件 1/1】文件 账单文件夹（类型 file，未能下载：文件夹不支持下载）');
+    assert.equal(f.calls.length, 0);
   } finally { await f.close(); }
 });
 
-test('group media stays text-only and the media switch only affects private downloads', async () => {
-  const f=await fixture(); const off=await fixture({enabled:false});
+test('rich post top-level folders and files keep continuous indexes while only files download', async () => {
+  const f = await fixture();
   try {
-    const group=await f.media.prepare(event('post',{content:[[{tag:'text',text:'caption'},{tag:'img',image_key:'one'}]]},'group'));
-    assert.equal(group.status,'ready'); assert.equal(group.text,'caption'); assert.deepEqual(group.localPaths,[]);
-    assert.equal((await f.media.prepare(event('image',{image_key:'one'},'group'))).status,'ignored');
-    assert.equal((await off.media.prepare(event('image',{image_key:'one'}))).reason,'media_disabled');
-    assert.equal(f.calls.length,0); assert.equal(off.calls.length,0);
-  } finally { await f.close(); await off.close(); }
+    const prepared = await f.media.prepare(event('post', {
+      content: [[{ tag: 'text', text: '混合附件' }]],
+      files: [
+        { file_key: 'folder-key', file_name: '账单文件夹', is_folder: true },
+        { file_key: 'file-key', file_name: '账单.pdf', is_folder: false },
+      ],
+    }));
+    assert.deepEqual(prepared.attachments.map(item => [item.index, item.fileKey, item.status, item.reason]), [
+      [1, 'folder-key', 'skipped', 'folder_not_downloadable'],
+      [2, 'file-key', 'downloaded', null],
+    ]);
+    assert.deepEqual(f.calls.map(call => call.fileKey), ['file-key']);
+    assert.match(prepared.addendum, /^【附件 1\/2】文件 账单文件夹（类型 file，未能下载：文件夹不支持下载）\n【附件 2\/2】文件 账单\.pdf（类型 file，5 B，已下载：/);
+  } finally { await f.close(); }
 });
 
-test('inbound maxBytes is advisory while unsupported and failed inputs retain production replies', async () => {
-  const warnings=[]; const f=await fixture({maxBytes:1,log:(...args)=>warnings.push(args)});
+test('media prepare downloads a rich post top-level file and renders its attachment line', async () => {
+  const f = await fixture();
   try {
-    assert.equal((await f.media.prepare(event('image',{image_key:'one'}))).status,'ready');
-    assert.equal(warnings[0][2],'oversize');
-    assert.match((await f.media.prepare(event('file',{}))).replyText,/暂不支持/);
-    const failed=await fixture({client:{im:{v1:{messageResource:{async get(){throw new Error('private provider text');}}}}}});
-    try { assert.equal((await failed.media.prepare(event('image',{image_key:'one'}))).reason,'image_download_failed'); }
-    finally { await failed.close(); }
+    const prepared = await f.media.prepare(event('post', {
+      content: [[{ tag: 'text', text: '查看账单' }]],
+      files: [{ file_key: 'statement', file_name: 'statement.pdf', is_folder: false }],
+    }));
+    const path = join(f.root, 'inbox', 'chat', 'message', 'statement.pdf');
+    assert.deepEqual(f.calls, [{ messageId: 'message', fileKey: 'statement', type: 'file', maxBytes: 32 * 1024 * 1024, timeoutMs: 120000 }]);
+    assert.equal(prepared.attachments[0].status, 'downloaded');
+    assert.equal(prepared.attachments[0].path, path);
+    assert.equal(prepared.addendum, `【附件 1/1】文件 statement.pdf（类型 file，5 B，已下载：${path}）`);
+  } finally { await f.close(); }
+});
+
+test('every direct message type has the complete attachment record and attachment block', async () => {
+  const f=await fixture();
+  try {
+    const downloaded=(kind,messageType,fileKey,fileName,durationMs,path)=>({index:1,kind,messageType,fileKey,fileName,durationMs,refId:null,raw:null,
+      status:'downloaded',path,bytes:5,reason:null});
+    const skipped=(kind,messageType,values={})=>({index:1,kind,messageType,fileKey:null,fileName:null,durationMs:null,refId:null,raw:null,
+      status:'skipped',path:null,bytes:null,reason:'not_downloadable',...values});
+    const inbox=join(f.root,'inbox','chat','message');
+    const cases = [
+      ['text',{text:'hello'},[], ''],
+      ['image',{image_key:'image'},[downloaded('image','image','image',null,null,join(inbox,'image.png'))],`【附件 1/1】图片 （类型 image，5 B，已下载：${join(inbox,'image.png')}）`],
+      ['file',{file_key:'file',file_name:'report.pdf'},[downloaded('file','file','file','report.pdf',null,join(inbox,'file.pdf'))],`【附件 1/1】文件 report.pdf（类型 file，5 B，已下载：${join(inbox,'file.pdf')}）`],
+      ['audio',{file_key:'audio',duration:2500},[downloaded('audio','audio','audio',null,2500,join(inbox,'audio.png'))],`【附件 1/1】语音 （类型 audio，时长 2.5 秒，5 B，已下载：${join(inbox,'audio.png')}）`],
+      ['media',{file_key:'video',file_name:'demo.mp4',duration:12000,image_key:'cover'},[downloaded('video','media','video','demo.mp4',12000,join(inbox,'video.mp4'))],`【附件 1/1】视频 demo.mp4（类型 media，时长 12 秒，5 B，已下载：${join(inbox,'video.mp4')}）`],
+      ['sticker',{file_key:'sticker'},[skipped('sticker','sticker',{fileKey:'sticker',reason:'sticker_not_downloadable'})],'【附件 1/1】表情包 （类型 sticker，未能下载：表情包无法下载）'],
+      ['share_chat',{chat_id:'oc_shared'},[skipped('share_chat','share_chat',{refId:'oc_shared'})],'【附件 1/1】群名片 （类型 share_chat，oc_shared，未能下载：该附件无可下载的资源）'],
+      ['share_user',{open_id:'ou_shared'},[skipped('share_user','share_user',{refId:'ou_shared'})],'【附件 1/1】用户名片 （类型 share_user，ou_shared，未能下载：该附件无可下载的资源）'],
+      ['merge_forward',{message_id:'om_forward'},[skipped('other','merge_forward',{raw:'{"message_id":"om_forward"}'})],'【附件 1/1】其他消息 （类型 merge_forward，未能下载：该附件无可下载的资源）\n{"message_id":"om_forward"}'],
+      ['interactive',{schema:'2.0'},[skipped('other','interactive',{raw:'{"schema":"2.0"}'})],'【附件 1/1】其他消息 （类型 interactive，未能下载：该附件无可下载的资源）\n{"schema":"2.0"}'],
+      ['future_type',{answer:42},[skipped('other','future_type',{raw:'{"answer":42}'})],'【附件 1/1】其他消息 （类型 future_type，未能下载：该附件无可下载的资源）\n{"answer":42}'],
+    ];
+    for (const [kind,content,attachments,addendum] of cases) {
+      const prepared=await f.media.prepare(event(kind,content));
+      assert.deepEqual(prepared,{status:'ready',text:kind==='text'?'hello':'',addendum,attachments},kind);
+    }
+    assert.equal(cases.find(([kind])=>kind==='sticker')[2][0].status,'skipped');
+    assert.equal(f.calls.some(call=>call.fileKey==='cover'),false);
+  } finally { await f.close(); }
+});
+
+test('post file and mixed attachments preserve node order', async () => {
+  const f=await fixture();
+  try {
+    const prepared=await f.media.prepare(event('post',{title:'Title',content:[[{tag:'text',text:'caption'}],[
+      {tag:'file',file_key:'one',file_name:'one.pdf'},{tag:'img',image_key:'two'},{tag:'media',file_key:'three',file_name:'three.mp4',duration:9000},
+    ]]}));
+    assert.equal(prepared.text,'Title\ncaption');
+    const inbox=join(f.root,'inbox','chat','message');
+    assert.deepEqual(prepared.attachments,[
+      {index:1,kind:'file',messageType:'file',fileKey:'one',fileName:'one.pdf',durationMs:null,refId:null,raw:null,status:'downloaded',path:join(inbox,'one.pdf'),bytes:5,reason:null},
+      {index:2,kind:'image',messageType:'img',fileKey:'two',fileName:null,durationMs:null,refId:null,raw:null,status:'downloaded',path:join(inbox,'two.png'),bytes:5,reason:null},
+      {index:3,kind:'video',messageType:'media',fileKey:'three',fileName:'three.mp4',durationMs:9000,refId:null,raw:null,status:'downloaded',path:join(inbox,'three.mp4'),bytes:5,reason:null},
+    ]);
+    assert.deepEqual(f.calls.map(call=>[call.fileKey,call.type]),[['one','file'],['two','image'],['three','file']]);
+    assert.equal(prepared.addendum,[
+      `【附件 1/3】文件 one.pdf（类型 file，5 B，已下载：${join(inbox,'one.pdf')}）`,
+      `【附件 2/3】图片 （类型 img，5 B，已下载：${join(inbox,'two.png')}）`,
+      `【附件 3/3】视频 three.mp4（类型 media，时长 9 秒，5 B，已下载：${join(inbox,'three.mp4')}）`,
+    ].join('\n'));
+  } finally { await f.close(); }
+});
+
+test('group media uses the same attachment path as private messages', async () => {
+  const f=await fixture();
+  try {
+    const post=await f.media.prepare(event('post',{content:[[{tag:'text',text:'caption'},{tag:'img',image_key:'one'}]]},'group'));
+    assert.equal(post.status,'ready'); assert.equal(post.text,'caption'); assert.equal(post.attachments[0].status,'downloaded');
+    assert.match(post.addendum,/【附件 1\/1】图片/);
+    const file=await f.media.prepare(event('file',{file_key:'two',file_name:'group.pdf'},'group'));
+    assert.equal(file.attachments[0].kind,'file'); assert.match(file.addendum,/group\.pdf/);
+    assert.deepEqual(f.calls.map(call=>call.fileKey),['one','two']);
+  } finally { await f.close(); }
+});
+
+test('a group mention downloads context image and file in source order before the current message', async () => {
+  const f=await fixture();
+  try {
+    const contextEntries=[
+      {messageId:'image-message',senderName:'Alice',attachments:[{index:1,kind:'image',messageType:'image',fileKey:'context-image',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:event('image',{image_key:'context-image'},'group')},
+      {messageId:'file-message',senderName:'Bob',attachments:[{index:1,kind:'file',messageType:'file',fileKey:'context-file',fileName:'context.pdf',durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:{...event('file',{file_key:'context-file',file_name:'context.pdf'},'group'),messageId:'file-message'}},
+    ];
+    contextEntries[0].event.messageId='image-message';
+    const prepared=await f.media.prepare(event('text',{text:'<at>bot</at> inspect'},'group'),
+      {runId:'context-run',contextEntries,contextAttachmentLimit:10});
+    assert.deepEqual(f.calls.map(call=>[call.messageId,call.fileKey]),[
+      ['image-message','context-image'],['file-message','context-file'],
+    ]);
+    assert.deepEqual(prepared.attachments.map(item=>[item.index,item.fileKey,item.status,item.reason]),[
+      [1,'context-image','downloaded',null],
+      [2,'context-file','downloaded',null],
+    ]);
+    assert.match(prepared.addendum,/【上下文 1\/2 来自 Alice】【附件 1\/2】/);
+    assert.match(prepared.addendum,/【上下文 2\/2 来自 Bob】【附件 2\/2】文件 context\.pdf/);
+  } finally { await f.close(); }
+});
+
+test('context attachment guard leaves excess metadata without blocking current downloads', async () => {
+  const f=await fixture();
+  try {
+    const contextEntries=[
+      {senderName:'Alice',attachments:[{index:1,kind:'image',messageType:'image',fileKey:'one',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:{...event('image',{image_key:'one'},'group'),messageId:'one-message'}},
+      {senderName:'Bob',attachments:[{index:1,kind:'file',messageType:'file',fileKey:'two',fileName:'two.pdf',durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'}],event:{...event('file',{file_key:'two'},'group'),messageId:'two-message'}},
+    ];
+    const prepared=await f.media.prepare(event('file',{file_key:'current',file_name:'current.pdf'},'group'),
+      {runId:'limited-context',contextEntries,contextAttachmentLimit:1});
+    assert.deepEqual(f.calls.map(call=>call.fileKey),['one','current']);
+    assert.deepEqual(prepared.attachments.map(item=>[item.fileKey,item.status,item.reason]),[
+      ['one','downloaded',null],['two','skipped','context_attachment_limit'],['current','downloaded',null],
+    ]);
+    assert.match(prepared.addendum,/【上下文 2\/2 来自 Bob】【附件 2\/3】.*超过本次群上下文附件下载上限/);
+    assert.match(prepared.addendum,/【附件 3\/3】文件 current\.pdf/);
+  } finally { await f.close(); }
+});
+
+test('media disabled keeps metadata and skips all downloadable attachments', async () => {
+  const f=await fixture({enabled:false});
+  try {
+    const prepared=await f.media.prepare(event('post',{content:[[{tag:'file',file_key:'one',file_name:'one.pdf'},{tag:'img',image_key:'two'}]]}));
+    assert.deepEqual(prepared.attachments,[
+      {index:1,kind:'file',messageType:'file',fileKey:'one',fileName:'one.pdf',durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'media_disabled'},
+      {index:2,kind:'image',messageType:'img',fileKey:'two',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'media_disabled'},
+    ]);
+    assert.equal(prepared.addendum,'【附件 1/2】文件 one.pdf（类型 file，未能下载：媒体下载已关闭）\n【附件 2/2】图片 （类型 img，未能下载：媒体下载已关闭）'); assert.equal(f.calls.length,0);
+  } finally { await f.close(); }
+});
+
+test('media disabled takes precedence over the context attachment guard', async () => {
+  const f=await fixture({enabled:false});
+  try {
+    const contextEntries=[{senderName:'Alice',attachments:[
+      {index:1,kind:'image',messageType:'image',fileKey:'one',fileName:null,durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'},
+      {index:2,kind:'file',messageType:'file',fileKey:'two',fileName:'two.pdf',durationMs:null,refId:null,raw:null,status:'skipped',path:null,bytes:null,reason:'not_downloadable'},
+    ],event:{...event('post',{},'group'),messageId:'context'}}];
+    const prepared=await f.media.prepare(event('text',{text:'inspect'},'group'),{contextEntries,contextAttachmentLimit:0});
+    assert.deepEqual(prepared.attachments.map(item=>[item.status,item.reason]),[
+      ['skipped','media_disabled'],['skipped','media_disabled'],
+    ]);
+    assert.equal(f.calls.length,0);
+  } finally { await f.close(); }
+});
+
+test('over-limit stream is interrupted and its partial file is removed', async () => {
+  let destroyed=false;
+  const raw={im:{v1:{messageResource:{async get(){const source=Readable.from([Buffer.alloc(4),Buffer.alloc(4)]);const original=source.destroy.bind(source);source.destroy=(...args)=>{destroyed=true;return original(...args);};
+    return{getReadableStream:()=>source,headers:{'content-type':'application/pdf'}};}}}}};
+  const chat=createFeishuChatClient({client:raw,maxMediaBytes:32});
+  const f=await fixture({chat,maxBytes:5});
+  try {
+    const prepared=await f.media.prepare(event('file',{file_key:'large',file_name:'large.pdf'}));
+    assert.equal(prepared.attachments[0].status,'failed'); assert.equal(prepared.attachments[0].reason,'over_limit'); assert.equal(destroyed,true);
+    const dir=join(f.root,'inbox','chat','message'); assert.deepEqual(await readdir(dir),[]);
+  } finally { await f.close(); }
+});
+
+test('one attachment failure does not prevent later downloads', async () => {
+  const f=await fixture({chat:{async downloadResource({fileKey}){if(fileKey==='bad')throw Object.assign(new Error('rejected'),{platformCode:234});return{stream:Readable.from(['ok']),contentType:'image/png'};}}});
+  try {
+    const prepared=await f.media.prepare(event('post',{content:[[{tag:'file',file_key:'bad'},{tag:'img',image_key:'good'}]]}));
+    assert.deepEqual(prepared.attachments.map(item=>[item.status,item.reason]),[['failed','feishu_234'],['downloaded',null]]);
+    assert.equal(await readFile(prepared.attachments[1].path,'utf8'),'ok'); assert.match(prepared.addendum,/飞书返回错误 234/);
   } finally { await f.close(); }
 });
 

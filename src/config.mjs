@@ -95,7 +95,7 @@ function validateRuntime(raw) {
   object(rawRuntime, ['unhealthyExitMs'], 'invalid_runtime_fields');
   const runtime = { unhealthyExitMs: rawRuntime.unhealthyExitMs ?? 30_000 };
   if (!Number.isSafeInteger(runtime.unhealthyExitMs) || runtime.unhealthyExitMs <= 0 || runtime.unhealthyExitMs > MAX_TIMER_MS) throw new ConfigError('invalid_runtime_unhealthy_exit');
-  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
   if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
   if (raw.codex.proxyEnv !== undefined) {
@@ -131,10 +131,13 @@ function validateRuntime(raw) {
   if (!Number.isSafeInteger(codex.jobPollMs) || codex.jobPollMs < 5_000 || codex.jobPollMs > 600_000) throw new ConfigError('invalid_codex_job_poll');
   codex.maxEventAgeMs = raw.codex.maxEventAgeMs ?? 10 * 60 * 1000;
   if (!Number.isSafeInteger(codex.maxEventAgeMs) || codex.maxEventAgeMs < 0 || codex.maxEventAgeMs > 7 * 24 * 60 * 60 * 1000) throw new ConfigError('invalid_codex_event_age');
-  codex.groupContextMessageLimit = raw.codex.groupContextMessageLimit ?? 10;
+  codex.groupContextMessageLimit = raw.codex.groupContextMessageLimit ?? 50;
   if (!Number.isInteger(codex.groupContextMessageLimit) || codex.groupContextMessageLimit < 0 || codex.groupContextMessageLimit > 100) throw new ConfigError('invalid_group_context_limit');
-  codex.groupContextHours = raw.codex.groupContextHours ?? 2;
+  codex.groupContextHours = raw.codex.groupContextHours ?? 24;
   if (!Number.isFinite(codex.groupContextHours) || codex.groupContextHours < 0 || codex.groupContextHours > 168) throw new ConfigError('invalid_group_context_hours');
+  codex.groupContextAttachmentLimit = raw.codex.groupContextAttachmentLimit ?? 10;
+  if (!Number.isInteger(codex.groupContextAttachmentLimit) || codex.groupContextAttachmentLimit < 0
+    || codex.groupContextAttachmentLimit > 100) throw new ConfigError('invalid_group_context_attachment_limit');
   codex.idleCloseMs = raw.codex.idleCloseMs ?? 60_000;
   if (!Number.isSafeInteger(codex.idleCloseMs) || codex.idleCloseMs < 0 || codex.idleCloseMs > 24 * 60 * 60 * 1000) throw new ConfigError('invalid_codex_idle_close');
   codex.rolloverIdleMs = raw.codex.rolloverIdleMs ?? 5 * 24 * 60 * 60 * 1000;
@@ -152,7 +155,7 @@ function validateRuntime(raw) {
   if (![memoryMaxRssMb, memoryMaxHeapUsedMb].every(value => Number.isFinite(value) && value >= 0)) throw new ConfigError('invalid_codex_memory_limit');
   codex.memoryMaxRssBytes = Math.round(memoryMaxRssMb * 1024 * 1024);
   codex.memoryMaxHeapUsedBytes = Math.round(memoryMaxHeapUsedMb * 1024 * 1024);
-  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'cardTextFile', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaUnsupportedReply'], 'invalid_feishu_fields');
+  object(raw.feishu, ['connectionId', 'appIdEnv', 'appSecretEnv', 'botOpenId', 'displayName', 'cardTextFile', 'catchup', 'mediaBudgetBytes', 'outputBudgetBytes', 'httpProxyEnv', 'replyAsPost', 'maxOutputChars', 'processingReaction', 'processingReactionEmoji', 'processingFallbackText', 'mediaEnabled', 'mediaInboxDir', 'mediaMaxBytes', 'mediaDownloadTimeoutMs'], 'invalid_feishu_fields');
   if (raw.feishu.catchup !== undefined && typeof raw.feishu.catchup !== 'boolean') throw new ConfigError('invalid_catchup_flag');
   const feishu = { connectionId: identifier(raw.feishu.connectionId, 128), appIdEnv: reference(raw.feishu.appIdEnv), appSecretEnv: reference(raw.feishu.appSecretEnv), botOpenId: identifier(raw.feishu.botOpenId, 512) };
   feishu.displayName = raw.feishu.displayName === undefined ? 'agent-chat-bridge' : identifier(raw.feishu.displayName, 80);
@@ -175,9 +178,10 @@ function validateRuntime(raw) {
   feishu.mediaEnabled = raw.feishu.mediaEnabled ?? true;
   if (typeof feishu.mediaEnabled !== 'boolean') throw new ConfigError('invalid_media_enabled');
   if (raw.feishu.mediaInboxDir !== undefined) feishu.mediaInboxDir = string(raw.feishu.mediaInboxDir);
-  feishu.mediaMaxBytes = raw.feishu.mediaMaxBytes ?? 20 * 1024 * 1024;
-  if (!Number.isSafeInteger(feishu.mediaMaxBytes) || feishu.mediaMaxBytes < 0 || feishu.mediaMaxBytes > 1024 * 1024 * 1024) throw new ConfigError('invalid_media_max_bytes');
-  feishu.mediaUnsupportedReply = raw.feishu.mediaUnsupportedReply === undefined ? '暂不支持处理「{{type}}」类型的附件，请改用文字、图片或飞书云文档链接。' : string(raw.feishu.mediaUnsupportedReply);
+  feishu.mediaMaxBytes = raw.feishu.mediaMaxBytes ?? 32 * 1024 * 1024;
+  if (!Number.isSafeInteger(feishu.mediaMaxBytes) || feishu.mediaMaxBytes < 1 || feishu.mediaMaxBytes > 32 * 1024 * 1024) throw new ConfigError('invalid_media_max_bytes');
+  feishu.mediaDownloadTimeoutMs = raw.feishu.mediaDownloadTimeoutMs ?? 120000;
+  if (!Number.isSafeInteger(feishu.mediaDownloadTimeoutMs) || feishu.mediaDownloadTimeoutMs < 1) throw new ConfigError('invalid_media_download_timeout');
   feishu.catchup = raw.feishu.catchup ?? true;
   if (raw.feishu.mediaBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.mediaBudgetBytes) || raw.feishu.mediaBudgetBytes < 20 * 1024 * 1024 || raw.feishu.mediaBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_media_budget');
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
@@ -199,13 +203,33 @@ function validateRuntime(raw) {
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups };
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
-    object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds'], 'invalid_hook_fields');
+    object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds', 'inbound'], 'invalid_hook_fields');
     let url; try { url = new URL(hook.url); } catch { throw new ConfigError('invalid_hook_url'); }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_hook_url');
     const conversationIds = strings(hook.conversationIds).map(id => identifier(id, 255));
     const catchupGroupIds = strings(hook.catchupGroupIds ?? []).map(id => identifier(id, 255));
     if (catchupGroupIds.some(id => !conversationIds.includes(id))) throw new ConfigError('invalid_hook_catchup_scope');
-    return { id: identifier(hook.id, 128), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds, catchupGroupIds };
+    let inbound;
+    if (hook.inbound !== undefined) {
+      object(hook.inbound, ['tokenEnv', 'scopePrefixes', 'defaultChatId'], 'invalid_hook_inbound_fields');
+      if (!Array.isArray(hook.inbound.scopePrefixes) || hook.inbound.scopePrefixes.length < 1
+        || hook.inbound.scopePrefixes.length > 100) throw new ConfigError('invalid_hook_inbound_scope_prefixes');
+      const scopePrefixes = [...new Set(hook.inbound.scopePrefixes.map(prefix => {
+        if (typeof prefix !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(prefix)) {
+          throw new ConfigError('invalid_hook_inbound_scope_prefix');
+        }
+        return prefix;
+      }))];
+      if (typeof hook.inbound.defaultChatId !== 'string' || !hook.inbound.defaultChatId
+        || hook.inbound.defaultChatId.length > 191) throw new ConfigError('invalid_hook_inbound_default_chat_id');
+      inbound = Object.freeze({
+        tokenEnv: reference(hook.inbound.tokenEnv),
+        scopePrefixes: Object.freeze(scopePrefixes),
+        defaultChatId: hook.inbound.defaultChatId,
+      });
+    }
+    return { id: identifier(hook.id, 128), url: url.href, tokenEnv: reference(hook.tokenEnv), conversationIds, catchupGroupIds,
+      ...(inbound ? { inbound } : {}) };
   });
   if (new Set(hooks.map(h => h.id)).size !== hooks.length) throw new ConfigError('duplicate_hook');
   let errorReporting;

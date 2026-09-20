@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { collectOutboxAttachments } from '../src/agents/codex/outbound-files.mjs';
 import { outboxRelativeDirectory } from '../src/agents/codex/prompt.mjs';
 import { deriveExecutionScope } from '../src/agents/codex/thread-scope.mjs';
-import { buildCodexForwardPrompt, createRecentMentionPrompts, mergeGroupContextPrompts,
+import { buildCodexForwardPrompt, createRecentMentionPrompts,
   mergeMentionPrompts, normalizeFeishuInput, stripBotMention } from '../src/channels/feishu/input.mjs';
 
 test('authorized human and system group bindings scan their separate result directories', async t => {
@@ -49,10 +49,10 @@ test('recent group prompts use chat scope across senders and expire after two mi
 });
 
 test('group prompt keeps prior identities while current sender remains the tool identity', () => {
-  const recent = mergeGroupContextPrompts(
-    [{ inboundId: 7, messageId: 'first', prompt: 'look up order', senderName: 'One', senderOpenId: 'ou_one', createdAt: 1 }],
-    [{ messageId: 'second', text: 'and summarize it', senderName: 'Two', senderOpenId: 'ou_two', createdAt: 2 }],
-  );
+  const recent = [
+    { inboundId: 7, messageId: 'first', prompt: 'look up order', senderName: 'One', senderOpenId: 'ou_one', createdAt: 1 },
+    { messageId: 'second', prompt: 'and summarize it', senderName: 'Two', senderOpenId: 'ou_two', createdAt: 2 },
+  ];
   const merged = mergeMentionPrompts(recent, 'please do that');
   assert.match(merged, /look up order/);
   assert.match(merged, /please do that/);

@@ -26,7 +26,10 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).feishu.processingReactionEmoji, 'Typing');
   assert.equal(validateConfig(config).feishu.processingFallbackText, '收到，正在查询。');
   assert.equal(validateConfig(config).feishu.mediaEnabled, true);
-  assert.equal(validateConfig(config).feishu.mediaMaxBytes, 20 * 1024 * 1024);
+  assert.equal(validateConfig(config).feishu.mediaMaxBytes, 32 * 1024 * 1024);
+  assert.equal(validateConfig(config).feishu.mediaDownloadTimeoutMs, 120000);
+  const removedMediaKey = ['media', 'Unsupported', 'Reply'].join('');
+  assert.throws(() => validateConfig({ ...config, feishu: { ...config.feishu, [removedMediaKey]: 'old' } }), { code: 'invalid_feishu_fields' });
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, replyAsPost: false, maxOutputChars: 7000 } }).feishu.replyAsPost, false);
   assert.equal(validateConfig(config).codex.jobRetryMs, 60_000);
   assert.equal(validateConfig(config).codex.jobMaxAttempts, 3);
@@ -54,6 +57,8 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, feishu: { ...config.feishu, maxOutputChars: 0 } },
     { ...config, feishu: { ...config.feishu, processingReaction: 'yes' } },
     { ...config, feishu: { ...config.feishu, mediaMaxBytes: -1 } },
+    { ...config, feishu: { ...config.feishu, mediaMaxBytes: 32 * 1024 * 1024 + 1 } },
+    { ...config, feishu: { ...config.feishu, mediaDownloadTimeoutMs: 0 } },
     { ...config, auth: { tokenEnv: 'TEST_TOKEN' } },
     { ...config, auth: { clients: [{ id: 'caller', tokenEnv: 'TEST_TOKEN', conversationIds: ['chat'], admin: true }] } },
     { ...config, auth: {} },
@@ -61,6 +66,40 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, hooks: [{ id: 'h', url: 'https://user:synthetic@example.invalid', tokenEnv: 'TEST_HOOK', conversationIds: [] }] },
     { ...config, errorReporting: { url: 'file:///tmp/report', tokenEnv: 'TEST_REPORT' } },
   ]) assert.throws(() => validateConfig(invalid));
+});
+test('media download timeout accepts positive integers above the default', () => {
+  assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, mediaDownloadTimeoutMs: 120001 } }).feishu.mediaDownloadTimeoutMs, 120001);
+});
+test('hook inbound event configuration validates references, prefixes, and default chat', () => {
+  const inboundHook = { id: 'h', url: 'https://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: [],
+    inbound: { tokenEnv: 'TEST_INBOUND', scopePrefixes: ['custom-order:customer:'], defaultChatId: 'synthetic-chat' } };
+  assert.deepEqual(validateConfig({ ...config, hooks: [inboundHook] }).hooks[0].inbound,
+    { tokenEnv: 'TEST_INBOUND', scopePrefixes: ['custom-order:customer:'], defaultChatId: 'synthetic-chat' });
+  const invalid = (inbound, code) => assert.throws(
+    () => validateConfig({ ...config, hooks: [{ ...inboundHook, inbound }] }), { code });
+  invalid({ ...inboundHook.inbound, extra: true }, 'invalid_hook_inbound_fields');
+  invalid({ ...inboundHook.inbound, tokenEnv: 'not-an-env' }, 'invalid_environment_reference');
+  invalid({ ...inboundHook.inbound, scopePrefixes: [] }, 'invalid_hook_inbound_scope_prefixes');
+  invalid({ ...inboundHook.inbound, scopePrefixes: ['bad prefix'] }, 'invalid_hook_inbound_scope_prefix');
+  invalid({ ...inboundHook.inbound, defaultChatId: '' }, 'invalid_hook_inbound_default_chat_id');
+});
+test('service requires configured inbound hook token environment', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-inbound-env-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const inboundHook = { id: 'h', url: 'https://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: [],
+    inbound: { tokenEnv: 'TEST_INBOUND', scopePrefixes: ['custom-order:customer:'], defaultChatId: 'synthetic-chat' } };
+  const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 },
+    codex: { bin: process.execPath, cwd: directory, envNames: [] }, hooks: [inboundHook] });
+  await assert.rejects(startService({ config: runtimeConfig, configPath: join(directory, 'config.json'),
+    env: { TEST_HOOK: 'synthetic-outbound', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' },
+    dependencies: { pool() { throw new Error('pool must not be reached'); } } }), { code: 'required_environment_missing' });
+  const duplicateConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 },
+    codex: { bin: process.execPath, cwd: directory, envNames: [] }, hooks: [inboundHook,
+      { ...inboundHook, id: 'h2', tokenEnv: 'TEST_HOOK_2', inbound: { ...inboundHook.inbound, tokenEnv: 'TEST_INBOUND_2' } }] });
+  await assert.rejects(startService({ config: duplicateConfig, configPath: join(directory, 'config.json'),
+    env: { TEST_HOOK: 'outbound-one', TEST_HOOK_2: 'outbound-two', TEST_INBOUND: 'shared-inbound', TEST_INBOUND_2: 'shared-inbound',
+      TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, dependencies: { pool() { throw new Error('pool must not be reached'); } } }),
+  { code: 'duplicate_inbound_token' });
 });
 test('history identity needed for allowlist/mention routing cannot consume canonical receipt', async () => {
   let accepted = 0;
@@ -127,10 +166,12 @@ test('structured retry logs retain only bounded safe execution facts', () => {
   assert.equal(JSON.stringify(output).includes('SYNTHETIC_SECRET'), false);
 });
 test('SDK request wrapper enforces time, redirects and size without retries', async () => {
-  let calls = 0;
-  const client = boundedFeishuHttp({ request: async options => { calls++; assert.equal(options.timeout, 10000); assert.equal(options.maxRedirects, 0); return {}; } });
+  const observed = [];
+  const client = boundedFeishuHttp({ request: async options => { observed.push(options); return {}; } }, { mediaDownloadTimeoutMs: 120000 });
   await client.request({ timeout: 0, maxRedirects: 5 });
-  assert.equal(calls, 1);
+  await client.request({ url: '/open-apis/im/v1/messages/message/resources/file', timeout: 0 });
+  assert.equal(observed[0].timeout, 10000); assert.equal(observed[0].maxRedirects, 0);
+  assert.equal(observed[1].timeout, 120000); assert.equal(observed.length, 2);
 });
 test('service rejects configured and inherited Codex homes that differ', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-service-home-'));
@@ -193,7 +234,7 @@ test('startup cancellation closes an idle executor while Feishu start is pending
   let executorClosed = false, storeClosed = false, socketStopped = false, enter;
   const entered = new Promise(resolve => { enter = resolve; });
   const controller = new AbortController();
-  const runtimeConfig = validateConfig({ ...config, codex: { bin: process.execPath, cwd: directory, envNames: [] } });
+  const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 }, codex: { bin: process.execPath, cwd: directory, envNames: [] } });
   const started = startService({ config: runtimeConfig, configPath: join(directory, 'config.json'), env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, signal: controller.signal, log: async () => { throw new Error('synthetic log'); }, dependencies: {
     pool: () => ({}), store: async () => ({ close: async () => { storeClosed = true; } }),
     executor: () => ({status:()=>({closing:false,restartPending:null}),close:async()=>{executorClosed=true;}}),
@@ -214,7 +255,7 @@ test('memory restart callback runs only after the service has completed ordered 
   t.after(() => rm(directory, { recursive: true, force: true }));
   const events = []; let requestRestart;
   const runtimeConfig = validateConfig({ ...config, listen: { host: '127.0.0.1', port: 0 }, codex: { bin: process.execPath, cwd: directory, envNames: [] }, feishu: { ...config.feishu, catchup: false } });
-  const worker = { start() {}, beginStop() { events.push('forward-stop-ingress'); }, async stop() { events.push('worker-stop'); }, status: () => ({ running: true }) };
+  const worker = { start() {}, beginStop() { events.push('forward-stop-ingress'); }, async ingestCardAction() {}, async stop() { events.push('worker-stop'); }, status: () => ({ running: true }) };
   const service = await startService({
     config: runtimeConfig, configPath: join(directory, 'config.json'),
     env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' },
@@ -248,7 +289,7 @@ test('service close drains an accepted busy fork callback before closing its dep
     messageId: 'message', senderOpenId: 'human', status: 'failed', last_error: 'CODEX_THREAD_BUSY',
     result: { busyFork: { sourceThreadId: 'source', bindingOpenId: 'human', chatId: 'chat' },
       executionCard: { messageId: 'card', status: 'failed', entries: [], forkSourceThreadId: 'source' } } };
-  const worker = { start() {}, beginStop() {}, async stop() {}, status: () => ({ running: true }) };
+  const worker = { start() {}, beginStop() {}, async ingestCardAction() {}, async stop() {}, status: () => ({ running: true }) };
   const service = await startService({ config: runtimeConfig, configPath: join(directory, 'config.json'),
     env: { TEST_TOKEN: 'synthetic-token-for-service-only', TEST_APP: 'synthetic', TEST_SECRET: 'synthetic' }, dependencies: {
       pool: () => ({}), store: async () => ({ async assertCurrent() {}, async close() { storeClosed = true; events.push('store-close'); } }),

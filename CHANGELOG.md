@@ -1,6 +1,27 @@
 # Changelog
 
-## [0.2.9] — Unreleased
+## [0.2.11] — Unreleased
+
+### Fixed
+
+- Extract top-level `files[]` entries from rich-post messages after embedded attachment nodes, deduplicate files already present as nodes, and retain folders as non-downloadable metadata.
+
+## [0.2.10] — Unreleased
+
+- Allow authenticated business events to use bounded dotted type names, so producers can add external event categories such as `form.inbound` without a bridge release.
+- Add authenticated `POST /v1/events` and `GET /v1/events/:event_id` endpoints for hook-owned business events. Event jobs use domain-separated request keys and fixed-length hashed message IDs, are idempotent per hook and event ID, use caller delivery with no automatic Feishu card or reply, and steer an active customer-scoped Codex turn when steering is enabled.
+- Extend hook configuration with optional inbound bearer, scope-prefix and default-chat references. Business-event prompts retain the independent-system preamble and add a structured event block without embedding request bodies in logs.
+- Register authorized Feishu business-card callbacks before acknowledgement when possible, then forward the standard `card.action` Feishu envelope through the selected durable hook with event-ID deduplication, without creating a Codex job or changing the hook configuration schema.
+
+No database migration is needed: the existing connection-scoped forward-job request key and request hash provide event identity and conflict detection.
+
+- Forward every authorized private Feishu message type to Codex with ordered attachment metadata. Stream downloadable images, files, audio, and video into the inbox with a configurable deadline (120 seconds by default) and a hard 32-MiB cap; preserve individual failures in the prompt without blocking the turn.
+- Supply downloaded images as Codex `localImage` items while keeping text first. Persist prepared attachment records for recovery so a claimed job does not download the same inbound resource twice. Audio remains a text-path attachment because the 2026-09-19 local probe accepted `localAudio` at the protocol layer but the model could not read the valid PCM WAV content.
+- Remove bridge-owned unsupported/download-failure replies and the former `feishu.mediaUnsupportedReply` configuration.
+- Align authorized group messages with private inbound media handling. Persist passive-context attachment metadata without downloading it, prepare selected context attachments before current-message attachments at trigger time, and cap context downloads with `codex.groupContextAttachmentLimit` (default 10). Group passive context now defaults to 50 messages within 24 hours.
+- No database migration.
+
+## [0.2.9]
 
 - Recover from a lost MySQL writer lock by distinguishing definitive connection/query failures from consecutive probe timeouts, keeping writes independent from slow probes, and requesting a bounded non-zero supervisor restart without clearing or replaying queued work. Persistently unhealthy readiness components use the same fail-closed restart path.
 - No database migration.

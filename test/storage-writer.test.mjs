@@ -180,6 +180,7 @@ function serviceDependencies(events, options = {}) {
   const worker = name => ({
     start() { events.push(`${name}-start`); },
     beginStop() { events.push(`${name}-begin-stop`); },
+    async ingestCardAction() {},
     async stop() { events.push(`${name}-stop`); if (options.hangWorker === name) await new Promise(() => {}); },
     status: () => ({ running: workerHealthy }),
   });

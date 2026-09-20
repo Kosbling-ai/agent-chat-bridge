@@ -1,5 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { deriveExecutionScope, codexBindingOpenId } from '../agents/codex/thread-scope.mjs';
+import { buildBusinessEventPrompt } from '../agents/codex/prompt.mjs';
 
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED', 'CODEX_USAGE_LIMIT_EXCEEDED'].includes(error?.code);
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
@@ -11,6 +12,8 @@ const retryableError = error => {
   return /\b(?:AbortError|TimeoutError|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)\b/i.test(value)
     || /steer delivery unconfirmed|timed out|timeout|network|socket hang up|fetch failed|aborted|stream disconnected before completion|error sending request/i.test(value);
 };
+const eventIdempotencyKey = (producerId, eventId) => `event\0${producerId}\0${eventId}`;
+const eventMessageId = (producerId, eventId) => `event:${createHash('sha256').update(`${producerId}\0${eventId}`).digest('hex')}`;
 
 export function createForwardRuntime({ config = {}, jobs, sessions, inbound, media, executor, feedback, replies,
   authorize = async () => true, log = () => {}, now = Date.now } = {}) {
@@ -72,8 +75,58 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       executionNamespace: '', deliveryMode: 'bridge',
       prompt: input.prompt || input.message?.text || '', groupChatContext: input.groupChatContext || null,
       contextEntries: input.context || [], nextAttemptAt: input.notBefore,
-      initialResult: { inputEvent: input.message?.event ?? null },
+      initialResult: { inputEvent: input.message?.event ?? null,
+        contextAttachmentLimit: input.message?.contextAttachmentLimit ?? 10 },
     });
+  }
+
+  async function registerEvent(input) {
+    const bindingOpenId = deriveExecutionScope(input.producerId, input.scope);
+    const messageId = eventMessageId(input.producerId, input.eventId);
+    const registered = await jobs.upsert({
+      callerId: input.producerId,
+      idempotencyKey: eventIdempotencyKey(input.producerId, input.eventId),
+      requestHash: input.requestHash,
+      conversationId: input.chatId,
+      messageId,
+      sourceMessageId: null,
+      bindingOpenId,
+      chatType: 'group',
+      messageType: 'event',
+      senderOpenId: `system:${input.producerId}`,
+      senderName: input.producerId,
+      executionNamespace: input.scope,
+      deliveryMode: 'caller',
+      prompt: buildBusinessEventPrompt(input),
+      contextEntries: [],
+      initialResult: { businessEvent: {
+        eventId: input.eventId,
+        type: input.type,
+        correlationId: input.correlationId,
+        occurredAt: input.occurredAt,
+        refIds: input.refIds,
+      } },
+    });
+    if (registered.messageId !== messageId
+      || registered.callerId !== input.producerId || registered.executionNamespace !== input.scope) {
+      throw Object.assign(new Error('job_conflict'), { code: 'job_conflict' });
+    }
+    if (!registered.duplicate && running && !stopping) track(processRegistered(registered.id));
+    wakeWorker?.();
+    return { jobId: registered.id, bindingOpenId, deduplicated: Boolean(registered.duplicate) };
+  }
+
+  async function getEvent({ producerId, eventId }) {
+    const messageId = eventMessageId(producerId, eventId);
+    const job = await jobs.getByIdempotencyKey({ callerId: producerId, idempotencyKey: eventIdempotencyKey(producerId, eventId) });
+    return job?.messageId === messageId
+      ? {
+          jobId: job.id,
+          status: job.status,
+          updatedAt: job.updatedAt,
+          type: job.result?.businessEvent?.type,
+          scope: job.executionNamespace,
+        } : null;
   }
 
   async function prepareRegistered(job) {
@@ -81,16 +134,13 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     if (!job || execution.inputStatus || !media || !job.result?.inputEvent) return job;
     if (preparations.has(job.id)) return preparations.get(job.id);
     const operation = (async () => {
-      const prepared = await media.prepare(job.result.inputEvent, { runId: job.id });
+      const prepared = await media.prepare(job.result.inputEvent, { runId: job.id,
+        contextEntries: job.contextEntries || [], contextAttachmentLimit: job.result.contextAttachmentLimit ?? 10 });
       const preparedExecution = {
         ...execution,
         inputStatus: prepared.status,
-        ...(prepared.status === 'ready' ? {
-          preparedPrompt: [job.prompt, prepared.addendum].filter(Boolean).join('\n\n'),
-        } : {
-          inputReason: prepared.reason || `input_${prepared.status}`,
-          inputReplyText: prepared.replyText || '',
-        }),
+        preparedPrompt: [job.prompt, prepared.addendum].filter(Boolean).join('\n\n'),
+        attachments: prepared.attachments,
       };
       return jobs.patchPreparedInput
         ? await jobs.patchPreparedInput({ id: job.id, execution: preparedExecution })
@@ -129,27 +179,14 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     let state;
     let needsDelivery = false;
     try {
-      if (execution.inputStatus && execution.inputStatus !== 'ready') {
-        const result = { inputStatus: execution.inputStatus,
-          errorCode: execution.inputReason || `input_${execution.inputStatus}`,
-          answer: execution.inputReplyText || '', rawAnswer: '', attachments: [], execution };
-        if (execution.inputStatus === 'ignored') {
-          await jobs.markFinishedWithoutReply({ id: job.id, leaseOwner: job.leaseOwner, status: 'completed', result });
-        } else {
-          await feedback?.prepare?.(job, result, null);
-          await jobs.markReplyPending({ id: job.id, leaseOwner: job.leaseOwner, result, errorCode: result.errorCode });
-          needsDelivery = true;
-        }
-        return;
-      }
       const prompt = execution.inputStatus === 'ready' && typeof execution.preparedPrompt === 'string'
         ? execution.preparedPrompt : job.prompt;
       const input = {
         bindingOpenId: job.executionNamespace ? deriveExecutionScope(job.callerId, job.executionNamespace)
           : (execution.bindingOpenId || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType })),
         chatId: job.chatId, chatType: job.chatType, messageId: job.messageId,
-        senderOpenId: job.senderOpenId, senderName: job.senderName, prompt, groupChatContext: job.groupChatContext,
-        busyPolicy: job.executionNamespace || config.steering === false ? 'reject' : 'steer',
+        senderOpenId: job.senderOpenId, senderName: job.senderName, prompt, attachments: execution.attachments || [], groupChatContext: job.groupChatContext,
+        busyPolicy: config.steering === false || (job.executionNamespace && !job.result?.businessEvent) ? 'reject' : 'steer',
       };
       state = job.deliveryMode === 'bridge'
         ? await (job.recovered ? feedback?.restore?.(job, lease) : feedback?.start?.(job, lease)) : null;
@@ -326,7 +363,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     for (const controller of leaseControllers) controller.abort();
   }
   return Object.freeze({
-    handleMessage, recover,
+    handleMessage, registerEvent, getEvent, recover,
     start() { if (running) throw new Error('forward_runtime_already_started'); running = true; worker = loop(); },
     beginStop,
     async stop() { beginStop(); await worker; await Promise.allSettled(active); },

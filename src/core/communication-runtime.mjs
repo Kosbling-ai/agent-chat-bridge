@@ -1,10 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
+import { extractAttachments } from '../channels/feishu/media.mjs';
 import { buildCodexForwardPrompt, createRecentMentionPrompts, isBotJoinNotice,
-  mergeGroupContextPrompts, mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
+  mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
 const sleep=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+function mergeContextEntries(...groups) {
+  const seen=new Set();
+  return groups.flat().map(entry=>({...entry,prompt:String(entry?.prompt??entry?.text??'').trim()}))
+    .filter(entry=>entry.prompt||entry.attachments?.length)
+    .filter(entry=>{const key=entry.messageId||JSON.stringify([entry.senderOpenId||'',entry.createdAt||'',entry.prompt,
+      (entry.attachments||[]).map(item=>item.fileKey)]);if(seen.has(key))return false;seen.add(key);return true;})
+    .sort((left,right)=>(Number(left.createdAt)||0)-(Number(right.createdAt)||0));
+}
 function deliveryErrorCode(error) {
   if (error?.outcome !== 'failed') return 'chat_delivery_unconfirmed';
   if (error?.code === 'feishu_api_rejected') return 'feishu_api_rejected';
@@ -15,11 +24,13 @@ function deliveryErrorCode(error) {
 export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
   let started=false,stopping=false,healthy=true,worker; const active=new Set(); const processing=new Set();
-  const recent=createRecentMentionPrompts({now});
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
   const maxEventAgeMs=Number(config.codex.maxEventAgeMs??10*60*1000);
-  const contextLimit=Number(config.codex.groupContextMessageLimit??10);
-  const contextWindowMs=Number(config.codex.groupContextHours??2)*60*60*1000;
+  const contextLimit=Number(config.codex.groupContextMessageLimit??50);
+  const contextWindowMs=Number(config.codex.groupContextHours??24)*60*60*1000;
+  const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
+  const contextEnabled=contextLimit>0&&contextWindowMs>0;
+  const recent=createRecentMentionPrompts({now});
   function humanAllowed(event,group) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
     if(event.conversationType==='p2p')return (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId)));
@@ -44,6 +55,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const agentAllowed=humanAllowed(event,group);
     const mentioned=event.message?.mentions?.some(mention=>mention.openId===config.feishu.botOpenId);
     const normalized=normalizeFeishuInput(event,{botOpenId:config.feishu.botOpenId});
+    const attachmentMetadata=extractAttachments(event);
     const ignoredByAgent=isBotJoinNotice(normalized)||stale(event,normalized.createdAt);
     const triggerEligible=event.type==='message.received'&&!ignoredByAgent
       &&(event.conversationType==='p2p'||group?.trigger==='all'||mentioned);
@@ -52,27 +64,29 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     // deliberately independent from Agent authorization and routing outcomes.
     const hookAllowed=event.conversationType==='p2p'||Boolean(capabilities(group).includes('hook'));
     const hooks=config.hooks.filter(hook=>hookAllowed&&hook.conversationIds.includes(event.conversationId)&&!event.isSelf&&!event.isApp).map(hook=>({hookId:hook.id,payload:event}));
-    const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&group?.passiveContext&&event.type==='message.received'&&normalized.rawText.trim());
+    const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&group?.passiveContext&&event.type==='message.received'
+      &&(normalized.rawText.trim()||attachmentMetadata.length));
     const receipt=await store.acceptInbound({connectionId,conversationId:event.conversationId,source:event.source,conversationType:event.conversationType,eventKey:event.eventKey,eventType:event.type,messageId:event.messageId,...(event.type==='message.recalled'?{recalledMessageId:event.messageId}:{}),revision:event.revision,occurredAt:event.occurredAt,payload:event,semanticPayload:feishuEventIdentity(event),policyVersion:config.routing.version,passiveContext:contextCandidate,
-      inboundMessage:{...normalized,content:{text:normalized.rawText},groupContextCandidate:contextCandidate},
+      inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata},groupContextCandidate:contextCandidate},
       hooks});
     if(contextCandidate&&!receipt.duplicate)recent.remember({chatId:normalized.chatId,messageId:normalized.messageId,prompt:normalized.rawText,
       senderOpenId:normalized.senderOpenId,senderName:normalized.senderName});
     if(!triggered||!forward)return receipt;
     launchForward((async()=>{
-      const memoryEntries=event.conversationType==='group'?recent.take(normalized.chatId):[];
-      const persistedEntries=event.conversationType==='group'&&group?.passiveContext&&inbound
+      const memoryEntries=event.conversationType==='group'&&contextEnabled?recent.take(normalized.chatId):[];
+      const persistedEntries=event.conversationType==='group'&&group?.passiveContext&&contextEnabled&&inbound
         ? await inbound.loadRecentGroupContext({connectionId,chatId:normalized.chatId,beforeMs:normalized.createdAt,windowMs:contextWindowMs,
-          limit:contextLimit,excludeMessageIds:[normalized.messageId,...memoryEntries.map(entry=>entry.messageId)]}) : [];
-      const contextEntries=mergeGroupContextPrompts(persistedEntries,memoryEntries);
-      const mediaResolvable=normalized.chatType==='p2p'&&normalized.messageType!=='text';
+          limit:contextLimit,excludeMessageIds:[normalized.messageId]}) : [];
+      const contextEntries=contextEnabled?mergeContextEntries(persistedEntries,memoryEntries).slice(-contextLimit):[];
+      const mediaResolvable=normalized.messageType!=='text';
       if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;
       const mergedPrompt=normalized.chatType==='p2p'?normalized.text:mergeMentionPrompts(contextEntries,normalized.text);
       const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
         mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId});
       const result=await forward.handleMessage({
         source:'live',callerId:'live',idempotencyKey:`live:${connectionId}:${normalized.chatId}:${normalized.messageId}`,
-        message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,type:normalized.messageType,event},
+        message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,
+          type:normalized.messageType,event,contextAttachmentLimit},
         actor:{openId:normalized.senderOpenId,name:normalized.senderName},prompt,context:contextEntries,
         groupChatContext:normalized.chatType==='group'?{chatId:normalized.chatId,name:group?.name||'',description:group?.description||''}:null,
         deliveryMode:'bridge',
@@ -84,11 +98,19 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     return receipt;
     } finally { processing.delete(event.messageId); }
   }
+  async function ingestCardAction({hookId,eventId,chatId,messageId,event}) {
+    if(stopping)throw new Error('ingress_stopped');
+    return store.acceptInbound({connectionId,conversationId:chatId,source:'live',conversationType:'group',
+      eventKey:`card_action:${eventId}`,eventType:'card.action',messageId,
+      ...(event.occurredAt?{occurredAt:Date.parse(event.occurredAt)}:{}),
+      payload:event,semanticPayload:event,policyVersion:config.routing.version,passiveContext:false,
+      hooks:[{hookId,payload:event}]});
+  }
   async function deliver(row){let result;try{const payload=parse(row.payload);if(row.kind==='reply')result=await chat.replyMessage({...payload,uuid:row.platformUuid});else if(row.kind==='create')result=await chat.sendMessage({...payload,conversationId:row.conversationId,uuid:row.platformUuid});else if(row.kind==='reaction')result=payload.reactionId?await chat.removeReaction(payload):await chat.addReaction(payload);else if(row.kind==='upload')result=payload.mediaType==='image'?await chat.uploadImage({bytes:Buffer.from(payload.base64,'base64')}):await chat.uploadFile({bytes:Buffer.from(payload.base64,'base64'),fileName:payload.fileName});else if(row.kind==='artifact_upload'&&outbound)result=await outbound.upload(payload);else if(row.kind==='artifact_send'&&outbound){const effect=await store.getOutbox({id:row.id});if(effect?.predecessorStatus!=='sent')throw Object.assign(new Error('artifact_predecessor_unconfirmed'),{outcome:'failed'});result=await outbound.send({...payload,uploadResult:parse(effect.predecessorResult),uuid:row.platformUuid});}else throw Object.assign(new Error('unsupported_delivery'),{outcome:'failed'});await settle(row,{status:'sent',result});}catch(error){const status=error?.outcome==='failed'?'failed':'unknown';const code=deliveryErrorCode(error);await settle(row,{status,errorCode:code,nextAttemptAt:Date.now()+5000});log('warning','chat_delivery',status==='failed'?'failed':'unconfirmed',{code});}}
   async function settle(row,outcome){try{await store.settleOutbox({id:row.id,leaseToken:row.leaseToken,...outcome});}catch{const recorded=await store.getOutbox({id:row.id});if(recorded?.status!=='sent')log('warning','chat_delivery','pending',{code:'delivery_settlement_unconfirmed'});}}
   async function hook(job){const definition=config.hooks.find(item=>item.id===job.hookId);try{if(!definition)throw new Error('hook_removed');const response=await fetchImpl(definition.url,{method:'POST',redirect:'error',signal:AbortSignal.timeout(3000),headers:{'content-type':'application/json',authorization:`Bearer ${hookTokens[definition.id]}`,'idempotency-key':job.id},body:JSON.stringify({deliveryId:job.id,event:parse(job.payload)})});await response.body?.cancel();if(response.status!==204)throw new Error('hook_unacknowledged');await store.finishJobWithOutbox({id:job.id,leaseToken:job.leaseToken,result:{accepted:true}});}catch{await store.retryJob({id:job.id,leaseToken:job.leaseToken,terminal:!definition||job.attempts>=8,errorCode:'hook_unacknowledged',nextAttemptAt:Date.now()+Math.min(60000,1000*2**job.attempts)});log(job.attempts>=8?'error':'warning','hook_delivery','unacknowledged',{code:'hook_unacknowledged'});}}
   function launchForward(operation){const promise=operation.catch(error=>{log('error','forward_ingress','failed',{code:error?.code||'forward_ingress_failed'});}).finally(()=>active.delete(promise));active.add(promise);}
   function launch(operation){const promise=operation.catch(()=>{healthy=false;log('error','communication_worker','failed',{code:'worker_failed'});}).finally(()=>active.delete(promise));active.add(promise);}
   async function loop(){while(!stopping&&healthy){try{if(active.size<8){for(const job of await store.claimJobs({kind:'hook',owner,leaseMs,limit:1}))launch(hook(job));for(const row of await store.claimOutbox({owner,leaseMs,limit:1}))launch(deliver(row));}}catch{healthy=false;log('error','communication_worker','failed',{code:'worker_poll_failed'});}await sleep(100);}}
-  return Object.freeze({ingest,status:()=>({running:started&&!stopping&&healthy}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;await worker;await Promise.allSettled(active);}});
+  return Object.freeze({ingest,ingestCardAction,status:()=>({running:started&&!stopping&&healthy}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;await worker;await Promise.allSettled(active);}});
 }

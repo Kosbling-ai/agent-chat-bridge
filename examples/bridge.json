@@ -14,9 +14,10 @@
     "requestUserInput": false,
     "rolloverIdleMs": 432000000, "rolloverCheckTimeoutMs": 30000,
     "memoryCheckIntervalMs": 60000, "memoryMaxRssMb": 1536, "memoryMaxHeapUsedMb": 1024,
-    "jobRetryMs": 60000, "jobMaxAttempts": 3
+    "jobRetryMs": 60000, "jobMaxAttempts": 3,
+    "groupContextMessageLimit": 50, "groupContextHours": 24, "groupContextAttachmentLimit": 10
   },
-  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id", "displayName": "Agent", "processingReaction": true, "processingReactionEmoji": "Typing", "processingFallbackText": "收到，正在查询。", "mediaEnabled": true, "mediaInboxDir": "data/feishu-inbox", "mediaMaxBytes": 20971520 },
+  "feishu": { "connectionId": "primary", "appIdEnv": "BRIDGE_FEISHU_APP_ID", "appSecretEnv": "BRIDGE_FEISHU_APP_SECRET", "botOpenId": "replace_with_bot_open_id", "displayName": "Agent", "processingReaction": true, "processingReactionEmoji": "Typing", "processingFallbackText": "收到，正在查询。", "mediaEnabled": true, "mediaInboxDir": "data/feishu-inbox", "mediaMaxBytes": 33554432, "mediaDownloadTimeoutMs": 120000 },
   "routing": {
     "version": "1",
     "allowAllPrivateUsers": false,
