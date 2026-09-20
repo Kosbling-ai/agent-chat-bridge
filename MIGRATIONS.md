@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.11`
+Application version: `0.2.12`
+
+Version 0.2.12 does not add a database migration. It changes only runtime connection-pool and worker-retry behavior.
 
 Version 0.2.11 does not add a database migration. Rich-post attachment extraction changes no configuration or stored schema.
 

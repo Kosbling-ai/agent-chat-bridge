@@ -9,6 +9,7 @@ import { codexThreadCreatedAtMs, shouldRolloverForRules } from './codex-rules-ro
 import { exactTurnSnapshot, inProgressTurnIds, interruptTurnAndPredecessors, isNoActiveTurnError, steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from './codex-turn-recovery.mjs';
 import { createPublicProgressProjector } from '../../shared/public-progress.mjs';
 import { normalizeUserInputAnswers, normalizeUserInputRequest, typedRequestKey } from './user-input-request.mjs';
+import { databaseError } from '../../storage/errors.mjs';
 
 const textInput = (text) => ({ type: 'text', text, text_elements: [] });
 const trim = (value) => String(value || '').trim();
@@ -17,6 +18,37 @@ const stableKey = (value) => createHash('sha1').update(String(value || '')).dige
 const bindingKey = ({ feishuOpenId, chatId }) => `${feishuOpenId || 'unknown'}:${chatId || 'unknown'}`;
 const normalizeApprovalPolicy = (value) => !trim(value) || trim(value) === 'auto' ? 'on-request' : trim(value);
 const normalizeApprovalsReviewer = (value) => !trim(value) || trim(value) === 'auto' ? 'auto_review' : trim(value);
+
+export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now } = {}) {
+  if (typeof write !== 'function') throw new Error('delta writer is required');
+  const entries = new Map();
+  return (key, value) => {
+    const current = entries.get(key);
+    if (current) {
+      current.value = value;
+      current.pending = true;
+      return current.promise;
+    }
+    const entry = { value, pending: false, promise: null };
+    entries.set(key, entry);
+    entry.promise = (async () => {
+      while (true) {
+        entry.pending = false;
+        const snapshot = entry.value;
+        const startedAt = now();
+        try { await write(snapshot); }
+        catch (error) {
+          try { Promise.resolve(onError(error, Math.max(0, now() - startedAt), snapshot)).catch((_observerError) => {}); }
+          catch { /* observability never alters delta coalescing */ }
+        }
+        if (entry.pending) continue;
+        entries.delete(key);
+        return;
+      }
+    })();
+    return entry.promise;
+  };
+}
 
 function coded(message, code, { retryable = false, outcome, phase, busyOrigin } = {}) {
   const error = new Error(message); error.code = code; error.retryable = retryable;
@@ -131,6 +163,15 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   let closing = false;
   let restartPending = '';
   let restartNotified = false;
+  const persistDelta = createDeltaCoalescer({
+    now,
+    write: ({ state, event }) => sessionStore.saveCodexRealtimeEvent(state.binding, event),
+    onError: (error, durationMs, snapshot) => log('warning', {
+      module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_delta', status: 'failed',
+      errorClass: databaseError(error).code, errno: error?.errno, sqlState: error?.sqlState, durationMs,
+      threadId: snapshot.state.threadId, turnId: snapshot.event.detail.turnId,
+    }),
+  });
   const rememberResolvedUserInput=key=>{resolvedUserInputs.add(key);if(resolvedUserInputs.size>100)resolvedUserInputs.delete(resolvedUserInputs.values().next().value);};
 
   const client = new CodexAppServerClient({
@@ -138,7 +179,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     eventSink: (event) => handleNotification(event),
     serverRequestSink: (request) => handleServerRequest(request),
     onDisconnect: (error) => handleDisconnect(error),
-    onIdle: () => { maybeNotifyRestart().catch(() => {}); },
+    onIdle: () => { maybeNotifyRestart().catch((_error) => {}); },
   });
 
   async function withKeyLock(key, operation) {
@@ -147,7 +188,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     const current = new Promise((done) => { release = done; });
     const chained = previous.then(() => current, () => current);
     locks.set(key, chained);
-    await previous.catch(() => {});
+    await previous.catch((_error) => {});
     try { return await operation(); }
     finally { release(); if (locks.get(key) === chained) locks.delete(key); }
   }
@@ -323,7 +364,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   async function steer(active, input, { signal } = {}) {
     const operation = active.steerQueue.then(() => steerLocked(active, input, { signal }));
-    active.steerQueue = operation.catch(() => {});
+    active.steerQueue = operation.catch((_error) => {});
     const result = await operation;
     return result?.followUp || result;
   }
@@ -357,7 +398,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           if (ended.status === 'completed') active.resolve({ turn: ended });
           else active.reject(codexTurnError(ended.error, ended.status));
         }
-        await active.completed.catch(() => {});
+        await active.completed.catch((_error) => {});
         while (activeByBinding.get(bindingKey(active.binding)) === active) await new Promise((resolvePromise) => setImmediate(resolvePromise));
         return { restart: true, input };
       }
@@ -391,7 +432,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         state.reject(coded(`Codex turn timed out after ${turnTimeoutMs}ms`, 'CODEX_TURN_TIMEOUT'));
         const release = client.lifecycle.hold();
         interruptTurnAndPredecessors({ request: (...args) => client.request(...args), threadId: state.threadId, expectedTurnId: state.turnId })
-          .catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'timeout_cleanup', status: 'unconfirmed', threadId: state.threadId, turnId: state.turnId }))
+          .catch((_error) => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'timeout_cleanup', status: 'unconfirmed', threadId: state.threadId, turnId: state.turnId }))
           .finally(release);
       }, turnTimeoutMs);
       timeoutTimer.unref?.();
@@ -409,13 +450,13 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       activeByTurn.delete(state.turnId);
       if (activeByBinding.get(bindingKey(state.binding)) === state) activeByBinding.delete(bindingKey(state.binding));
       maybeNotifyRestart();
-    }).catch(() => {});
+    }).catch((_error) => {});
   }
 
   function startAdmission(threadId, messageId) {
     let resolveAdmission; let rejectAdmission;
     const promise = new Promise((resolvePromise, rejectPromise) => { resolveAdmission = resolvePromise; rejectAdmission = rejectPromise; });
-    promise.catch(() => {});
+    promise.catch((_error) => {});
     const admission = { threadId, messageId, promise, resolve: resolveAdmission, reject: rejectAdmission };
     startingByThread.set(threadId, admission);
     return admission;
@@ -429,31 +470,31 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (resolved) pending.request.abandon();
       else await pending.request.respondError(-32002, 'User input request expired');
     } catch { /* a disconnected child is already expired */ }
-    await onUserInputClosed({ ...pending.public, reason }).catch(() => {});
+    await onUserInputClosed({ ...pending.public, reason }).catch((_error) => {});
   }
 
   async function handleServerRequest(request) {
     let normalized;
     try { normalized = normalizeUserInputRequest(request); }
     catch (error) {
-      await request.respondError(-32602, error.code === 'CODEX_USER_INPUT_SECRET_UNSUPPORTED' ? 'Secret questions are unsupported' : 'Invalid user input request').catch(() => {});
+      await request.respondError(-32602, error.code === 'CODEX_USER_INPUT_SECRET_UNSUPPORTED' ? 'Secret questions are unsupported' : 'Invalid user input request').catch((_error) => {});
       return;
     }
     if (closing || config.requestUserInput !== true) {
-      await request.respondError(-32002, 'User input request unavailable').catch(() => {}); return;
+      await request.respondError(-32002, 'User input request unavailable').catch((_error) => {}); return;
     }
     const resolvedKey = `${request.generation}:${normalized.threadId}:${typedRequestKey(normalized.requestId)}`;
     if (resolvedUserInputs.delete(resolvedKey)) { request.abandon(); return; }
     let state = activeByTurn.get(normalized.turnId);
     if (!state) {
       const admission = startingByThread.get(normalized.threadId);
-      if (!admission) { await request.respondError(-32002, 'User input request has no active turn').catch(() => {}); return; }
-      try { state = await admission.promise; } catch { await request.respondError(-32002, 'User input request expired before turn admission').catch(() => {}); return; }
+      if (!admission) { await request.respondError(-32002, 'User input request has no active turn').catch((_error) => {}); return; }
+      try { state = await admission.promise; } catch { await request.respondError(-32002, 'User input request expired before turn admission').catch((_error) => {}); return; }
     }
     const operation=state.userInputQueue.then(async()=>{
       if(resolvedUserInputs.delete(resolvedKey)){request.abandon();return;}
       if (state.threadId !== normalized.threadId || state.turnId !== normalized.turnId || state.settled || closing) {
-        await request.respondError(-32002, 'User input request does not match the active turn').catch(() => {}); return;
+        await request.respondError(-32002, 'User input request does not match the active turn').catch((_error) => {}); return;
       }
       await expireUserInput(state, 'superseded');
       if(resolvedUserInputs.delete(resolvedKey)){request.abandon();return;}
@@ -490,7 +531,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     loadedThreads.clear();
     resolvedUserInputs.clear();
     for (const state of activeByTurn.values()) {
-      expireUserInput(state, 'disconnected', { resolved: true }).catch(() => {});
+      expireUserInput(state, 'disconnected', { resolved: true }).catch((_error) => {});
       const lost = coded('Codex app-server connection was lost; native turn status is unknown', 'CODEX_OBSERVATION_LOST', { retryable: true, outcome: 'unknown' });
       Object.assign(lost, { cause: error, threadId: state.threadId, turnId: state.turnId, startedAt: state.startedAt });
       state.reject(lost);
@@ -630,18 +671,18 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       catch {
         startingByThread.delete(admission.threadId); admission.reject(coded('durable binding failed', 'CODEX_BINDING_UNCERTAIN'));
         state.bindingUncertain = true;
-        waitForTurn(state, normalized.messageId, { created: binding.created }).catch(() => {});
+        waitForTurn(state, normalized.messageId, { created: binding.created }).catch((_error) => {});
         const error = coded('native turn started but durable binding failed', 'CODEX_BINDING_UNCERTAIN', { outcome: 'unknown' });
         Object.assign(error, { threadId: state.threadId, turnId, startedAt });
         throw error;
       }
       startingByThread.delete(admission.threadId); admission.resolve(state);
       await sessionStore.saveCodexRealtimeEvent(binding, { messageId: normalized.messageId, eventKey: `public:${turnId}:started`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: startedAt, detail: { kind: 'started', id: turnId, turnId, at: startedAt } })
-        .catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_started', status: 'failed', threadId: binding.codexSessionId, turnId }));
+        .catch((_error) => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_started', status: 'failed', threadId: binding.codexSessionId, turnId }));
       return { completion: waitForTurn(state, normalized.messageId, { created: binding.created, signal: options.signal }) };
       });
       if (routed.restart) {
-        if (routed.afterFinal) await routed.afterFinal.catch(() => {});
+        if (routed.afterFinal) await routed.afterFinal.catch((_error) => {});
         return execute(routed.restart.input, options);
       }
       if (routed.state) return publicResult(await waitForTurn(routed.state, normalized.messageId, { created: false, signal: options.signal }));
@@ -721,8 +762,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         await sessionStore.saveCodexRealtimeEvent(state.binding, {
           messageId, eventKey: `error:${messageId}`, eventType: 'error', role: 'activity', title: '执行失败',
           text: error.message, createdAt: now(), detail: { errorCode: error.code, turnId: state.turnId, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
-        }).catch(() => {});
-        await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: error.message }).catch(() => {});
+        }).catch((_error) => {});
+        await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: error.message }).catch((_error) => {});
       }
       throw error;
     });
@@ -817,20 +858,19 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     if (!state) return;
     const { method, params } = event;
     const progress = state.publicProgress(method, params);
-    if (progress) sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `public:${turnId}:${progress.id}:${method}`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: progress.at, detail: progress }).catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_progress', status: 'failed' }));
+    if (progress) sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `public:${turnId}:${progress.id}:${method}`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: progress.at, detail: progress }).catch((_error) => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_progress', status: 'failed' }));
     if (method === 'agentMessage/delta' || method === 'item/agentMessage/delta') {
       const itemId = params.itemId || 'agent-delta';
       const next = limitText(`${state.itemText.get(itemId) || ''}${params.delta || ''}`, 12000);
       state.itemText.set(itemId, next); state.lastAgentMessage = next;
-      await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `agent-delta:${turnId}:${itemId}`, eventType: 'agent_message', role: 'assistant', title: 'Codex', text: next, createdAt: now(), detail: { turnId, itemId, streaming: true } })
-        .catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_delta', status: 'failed', threadId: state.threadId, turnId }));
+      await persistDelta(`${turnId}:${itemId}`, { state, event: { messageId: state.messageId, eventKey: `agent-delta:${turnId}:${itemId}`, eventType: 'agent_message', role: 'assistant', title: 'Codex', text: next, createdAt: now(), detail: { turnId, itemId, streaming: true } } });
     } else if (method === 'item/completed' && params.item) {
-      await persistCompletedItem(state, params.item).catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_item', status: 'failed', threadId: state.threadId, turnId }));
+      await persistCompletedItem(state, params.item).catch((_error) => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_item', status: 'failed', threadId: state.threadId, turnId }));
     }
     else if (method === 'error' && params.willRetry !== true) state.reject(codexTurnError(params.error));
     else if (method === 'turn/completed') {
       for (const item of params.turn?.items || []) {
-        await persistCompletedItem(state, item).catch(() => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_item', status: 'failed', threadId: state.threadId, turnId }));
+        await persistCompletedItem(state, item).catch((_error) => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_item', status: 'failed', threadId: state.threadId, turnId }));
       }
       if (params.turn?.status === 'failed' || params.turn?.status === 'interrupted') state.reject(codexTurnError(params.turn?.error, params.turn.status));
       else state.resolve({ turn: params.turn });

@@ -3,9 +3,15 @@ import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { extractAttachments } from '../channels/feishu/media.mjs';
 import { buildCodexForwardPrompt, createRecentMentionPrompts, isBotJoinNotice,
   mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
+import { databaseError } from '../storage/errors.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
-const sleep=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+const sleep=milliseconds=>new Promise(resolve=>{const timer=setTimeout(resolve,milliseconds);timer.unref?.();});
+const TRANSIENT_STORE_ERRORS=new Set(['store_unavailable','store_contention','store_timeout']);
+const POLL_RETRY_BASE_MS=1000;
+const POLL_RETRY_MAX_MS=10000;
+const POLL_FAILURE_LIMIT=6;
+const POLL_FAILURE_WINDOW_MS=30000;
 function mergeContextEntries(...groups) {
   const seen=new Set();
   return groups.flat().map(entry=>({...entry,prompt:String(entry?.prompt??entry?.text??'').trim()}))
@@ -21,9 +27,9 @@ function deliveryErrorCode(error) {
   return 'chat_delivery_failed';
 }
 
-export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now}={}) {
+export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
-  let started=false,stopping=false,healthy=true,worker; const active=new Set(); const processing=new Set();
+  let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,failureDeadline=0,lastFailureStage='',lastErrorClass='',wakeWait; const active=new Set(); const processing=new Set();
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
   const maxEventAgeMs=Number(config.codex.maxEventAgeMs??10*60*1000);
   const contextLimit=Number(config.codex.groupContextMessageLimit??50);
@@ -31,6 +37,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
   const contextEnabled=contextLimit>0&&contextWindowMs>0;
   const recent=createRecentMentionPrompts({now});
+  const pause=milliseconds=>{let wake;const interrupted=new Promise(resolve=>{wake=resolve;wakeWait=wake;});return Promise.race([wait(milliseconds),interrupted]).finally(()=>{if(wakeWait===wake)wakeWait=undefined;});};
   function humanAllowed(event,group) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
     if(event.conversationType==='p2p')return (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId)));
@@ -110,7 +117,36 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   async function settle(row,outcome){try{await store.settleOutbox({id:row.id,leaseToken:row.leaseToken,...outcome});}catch{const recorded=await store.getOutbox({id:row.id});if(recorded?.status!=='sent')log('warning','chat_delivery','pending',{code:'delivery_settlement_unconfirmed'});}}
   async function hook(job){const definition=config.hooks.find(item=>item.id===job.hookId);try{if(!definition)throw new Error('hook_removed');const response=await fetchImpl(definition.url,{method:'POST',redirect:'error',signal:AbortSignal.timeout(3000),headers:{'content-type':'application/json',authorization:`Bearer ${hookTokens[definition.id]}`,'idempotency-key':job.id},body:JSON.stringify({deliveryId:job.id,event:parse(job.payload)})});await response.body?.cancel();if(response.status!==204)throw new Error('hook_unacknowledged');await store.finishJobWithOutbox({id:job.id,leaseToken:job.leaseToken,result:{accepted:true}});}catch{await store.retryJob({id:job.id,leaseToken:job.leaseToken,terminal:!definition||job.attempts>=8,errorCode:'hook_unacknowledged',nextAttemptAt:Date.now()+Math.min(60000,1000*2**job.attempts)});log(job.attempts>=8?'error':'warning','hook_delivery','unacknowledged',{code:'hook_unacknowledged'});}}
   function launchForward(operation){const promise=operation.catch(error=>{log('error','forward_ingress','failed',{code:error?.code||'forward_ingress_failed'});}).finally(()=>active.delete(promise));active.add(promise);}
-  function launch(operation){const promise=operation.catch(()=>{healthy=false;log('error','communication_worker','failed',{code:'worker_failed'});}).finally(()=>active.delete(promise));active.add(promise);}
-  async function loop(){while(!stopping&&healthy){try{if(active.size<8){for(const job of await store.claimJobs({kind:'hook',owner,leaseMs,limit:1}))launch(hook(job));for(const row of await store.claimOutbox({owner,leaseMs,limit:1}))launch(deliver(row));}}catch{healthy=false;log('error','communication_worker','failed',{code:'worker_poll_failed'});}await sleep(100);}}
-  return Object.freeze({ingest,ingestCardAction,status:()=>({running:started&&!stopping&&healthy}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;await worker;await Promise.allSettled(active);}});
+  function launch(operation){const promise=operation.catch(error=>{healthy=false;degraded=false;log('error','communication_worker','failed',{code:'worker_failed',errorClass:databaseError(error).code});}).finally(()=>active.delete(promise));active.add(promise);}
+  async function claim(stage,operation){
+    if(consecutiveFailures&&now()>=failureDeadline){
+      healthy=false;degraded=false;
+      log('error','communication_worker','failed',{code:'worker_poll_failed',reason:'retry_deadline',stage:lastFailureStage||stage,
+        errorClass:lastErrorClass||'store_timeout',durationMs:0,consecutiveFailures,willRetry:false});
+      return null;
+    }
+    const startedAt=now();
+    try {
+      return await operation();
+    } catch(error) {
+      const normalized=databaseError(error);
+      const failedAt=now();
+      if(!consecutiveFailures)failureDeadline=failedAt+POLL_FAILURE_WINDOW_MS;
+      consecutiveFailures+=1;
+      lastFailureStage=stage;lastErrorClass=normalized.code;
+      const transient=TRANSIENT_STORE_ERRORS.has(normalized.code);
+      const withinCount=consecutiveFailures<POLL_FAILURE_LIMIT;
+      const withinWindow=failedAt<failureDeadline;
+      const willRetry=transient&&withinCount&&withinWindow;
+      degraded=willRetry;
+      log(willRetry?'warning':'error','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,
+        durationMs:Math.max(0,failedAt-startedAt),consecutiveFailures,willRetry});
+      if(!willRetry){healthy=false;return null;}
+      const remaining=Math.max(0,failureDeadline-now());
+      await pause(Math.min(remaining,POLL_RETRY_MAX_MS,POLL_RETRY_BASE_MS*2**(consecutiveFailures-1)));
+      return null;
+    }
+  }
+  async function loop(){while(!stopping&&healthy){if(active.size<8){const jobs=await claim('claim_jobs',()=>store.claimJobs({kind:'hook',owner,leaseMs,limit:1}));if(!healthy)break;if(jobs===null)continue;for(const job of jobs)launch(hook(job));const rows=await claim('claim_outbox',()=>store.claimOutbox({owner,leaseMs,limit:1}));if(!healthy)break;if(rows===null)continue;for(const row of rows)launch(deliver(row));if(consecutiveFailures){consecutiveFailures=0;failureDeadline=0;lastFailureStage='';lastErrorClass='';degraded=false;}}if(!stopping&&healthy)await pause(100);}}
+  return Object.freeze({ingest,ingestCardAction,status:()=>({running:started&&!stopping&&healthy,healthy,degraded,consecutiveFailures}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;wakeWait?.();await worker;await Promise.allSettled(active);}});
 }

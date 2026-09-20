@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.12] — Unreleased
+
+- Coalesce streaming assistant-delta persistence per turn item, bound MySQL pool queuing, preserve safe storage error diagnostics through the existing logger fields, and retry transient communication-store polling failures only until the hard 30-second deadline before the existing fail-closed watchdog takes over.
+
+No database migration is needed.
+
 ## [0.2.11] — Unreleased
 
 ### Fixed
