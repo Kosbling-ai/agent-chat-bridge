@@ -6,7 +6,7 @@ export function safeObserver(callback = () => {}) {
   };
 }
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
-  return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, durationMsSnake, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
+  return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
     hookId, eventId, eventType, scopePrefix, statusCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
     component: eventComponent } = {}) => {
     const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
@@ -19,7 +19,6 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       ...(boundedInteger(consecutiveMisses, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { consecutive_misses: consecutiveMisses } : {}),
       ...(boundedInteger(consecutiveFailures, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { consecutive_failures: consecutiveFailures } : {}),
       ...(boundedInteger(durationMs, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { durationMs } : {}),
-      ...(boundedInteger(durationMsSnake, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { duration_ms: durationMsSnake } : {}),
       ...(port !== undefined ? { port } : {}),
       ...(identifier(rpcMethod, 64) !== undefined ? { rpc_method: rpcMethod } : {}),
       ...(identifier(stage, 64) !== undefined ? { stage } : {}),

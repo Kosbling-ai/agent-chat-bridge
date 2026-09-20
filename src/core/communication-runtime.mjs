@@ -29,7 +29,7 @@ function deliveryErrorCode(error) {
 
 export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
-  let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,firstFailureAt=0,wakeWait; const active=new Set(); const processing=new Set();
+  let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,failureDeadline=0,lastFailureStage='',lastErrorClass='',wakeWait; const active=new Set(); const processing=new Set();
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
   const maxEventAgeMs=Number(config.codex.maxEventAgeMs??10*60*1000);
   const contextLimit=Number(config.codex.groupContextMessageLimit??50);
@@ -119,26 +119,34 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   function launchForward(operation){const promise=operation.catch(error=>{log('error','forward_ingress','failed',{code:error?.code||'forward_ingress_failed'});}).finally(()=>active.delete(promise));active.add(promise);}
   function launch(operation){const promise=operation.catch(error=>{healthy=false;degraded=false;log('error','communication_worker','failed',{code:'worker_failed',errorClass:databaseError(error).code});}).finally(()=>active.delete(promise));active.add(promise);}
   async function claim(stage,operation){
+    if(consecutiveFailures&&now()>=failureDeadline){
+      healthy=false;degraded=false;
+      log('error','communication_worker','failed',{code:'worker_poll_failed',reason:'retry_deadline',stage:lastFailureStage||stage,
+        errorClass:lastErrorClass||'store_timeout',durationMs:0,consecutiveFailures,willRetry:false});
+      return null;
+    }
     const startedAt=now();
     try {
       return await operation();
     } catch(error) {
       const normalized=databaseError(error);
       const failedAt=now();
-      if(!consecutiveFailures)firstFailureAt=failedAt;
+      if(!consecutiveFailures)failureDeadline=failedAt+POLL_FAILURE_WINDOW_MS;
       consecutiveFailures+=1;
+      lastFailureStage=stage;lastErrorClass=normalized.code;
       const transient=TRANSIENT_STORE_ERRORS.has(normalized.code);
       const withinCount=consecutiveFailures<POLL_FAILURE_LIMIT;
-      const withinWindow=failedAt-firstFailureAt<POLL_FAILURE_WINDOW_MS;
+      const withinWindow=failedAt<failureDeadline;
       const willRetry=transient&&withinCount&&withinWindow;
       degraded=willRetry;
       log(willRetry?'warning':'error','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,
-        durationMsSnake:Math.max(0,failedAt-startedAt),consecutiveFailures,willRetry});
+        durationMs:Math.max(0,failedAt-startedAt),consecutiveFailures,willRetry});
       if(!willRetry){healthy=false;return null;}
-      await pause(Math.min(POLL_RETRY_MAX_MS,POLL_RETRY_BASE_MS*2**(consecutiveFailures-1)));
+      const remaining=Math.max(0,failureDeadline-now());
+      await pause(Math.min(remaining,POLL_RETRY_MAX_MS,POLL_RETRY_BASE_MS*2**(consecutiveFailures-1)));
       return null;
     }
   }
-  async function loop(){while(!stopping&&healthy){if(active.size<8){const jobs=await claim('claim_jobs',()=>store.claimJobs({kind:'hook',owner,leaseMs,limit:1}));if(!healthy)break;if(jobs===null)continue;for(const job of jobs)launch(hook(job));const rows=await claim('claim_outbox',()=>store.claimOutbox({owner,leaseMs,limit:1}));if(!healthy)break;if(rows===null)continue;for(const row of rows)launch(deliver(row));if(consecutiveFailures){consecutiveFailures=0;firstFailureAt=0;degraded=false;}}if(!stopping&&healthy)await pause(100);}}
+  async function loop(){while(!stopping&&healthy){if(active.size<8){const jobs=await claim('claim_jobs',()=>store.claimJobs({kind:'hook',owner,leaseMs,limit:1}));if(!healthy)break;if(jobs===null)continue;for(const job of jobs)launch(hook(job));const rows=await claim('claim_outbox',()=>store.claimOutbox({owner,leaseMs,limit:1}));if(!healthy)break;if(rows===null)continue;for(const row of rows)launch(deliver(row));if(consecutiveFailures){consecutiveFailures=0;failureDeadline=0;lastFailureStage='';lastErrorClass='';degraded=false;}}if(!stopping&&healthy)await pause(100);}}
   return Object.freeze({ingest,ingestCardAction,status:()=>({running:started&&!stopping&&healthy,healthy,degraded,consecutiveFailures}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;wakeWait?.();await worker;await Promise.allSettled(active);}});
 }

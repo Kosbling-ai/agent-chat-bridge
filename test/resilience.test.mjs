@@ -4,6 +4,7 @@ import { createDeltaCoalescer } from '../src/agents/codex/executor.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createLogger } from '../src/logger.mjs';
 import { StoreError } from '../src/storage/errors.mjs';
+import { createExecutorLogAdapter } from '../src/service.mjs';
 
 const config = {
   feishu: { connectionId: 'fixture', botOpenId: 'bot' },
@@ -32,6 +33,57 @@ test('delta persistence coalesces 20 updates per item into at most two writes', 
   await Promise.all(pending);
   assert.ok(writes.length <= 2);
   assert.equal(writes.at(-1), text);
+});
+
+test('delta coalescer microtask handoff retains the next latest value', async () => {
+  const writes = [];
+  const persist = createDeltaCoalescer({ write: async value => { writes.push(value); } });
+  const first = persist('turn:item', 'a');
+  let second;
+  queueMicrotask(() => { second = persist('turn:item', 'ab'); });
+  await first;
+  await second;
+  assert.equal(writes.at(-1), 'ab');
+});
+
+test('delta coalescer retries the latest pending value after a write failure', async () => {
+  const writes = [];
+  const errors = [];
+  let releaseFirst;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const persist = createDeltaCoalescer({
+    write: async value => {
+      writes.push(value);
+      if (writes.length === 1) { await firstGate; throw Object.assign(new Error('synthetic'), { code: 'ER_LOCK_WAIT_TIMEOUT' }); }
+    },
+    onError: error => errors.push(error.code),
+  });
+  const first = persist('turn:item', 'a');
+  const second = persist('turn:item', 'ab');
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(writes, ['a', 'ab']);
+  assert.deepEqual(errors, ['ER_LOCK_WAIT_TIMEOUT']);
+});
+
+test('delta coalescer keeps interleaved items independent', async () => {
+  const writes = { first: [], second: [] };
+  const releases = {};
+  const gates = Object.fromEntries(['first', 'second'].map(key => [key, new Promise(resolve => { releases[key] = resolve; })]));
+  const persist = createDeltaCoalescer({ write: async ({ key, text }) => {
+    writes[key].push(text);
+    if (writes[key].length === 1) await gates[key];
+  } });
+  const pending = [
+    persist('turn:first', { key: 'first', text: 'a' }),
+    persist('turn:second', { key: 'second', text: 'x' }),
+    persist('turn:first', { key: 'first', text: 'ab' }),
+    persist('turn:second', { key: 'second', text: 'xy' }),
+  ];
+  assert.deepEqual(writes, { first: ['a'], second: ['x'] });
+  releases.first(); releases.second();
+  await Promise.all(pending);
+  assert.deepEqual(writes, { first: ['a', 'ab'], second: ['x', 'xy'] });
 });
 
 test('communication poll retries a transient store error and recovers', async () => {
@@ -103,6 +155,34 @@ test('communication poll retry limit transitions a persistently failing worker t
   await runtime.stop();
 });
 
+test('communication poll deadline prevents a sixth claim after slow failures', async () => {
+  let clock = 0;
+  let claims = 0;
+  const waits = [];
+  const logs = [];
+  const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() {
+        claims += 1;
+        clock += 1800;
+        if (claims <= 5) throw new StoreError('store_timeout');
+        return [];
+      },
+      async claimOutbox() { return []; },
+    },
+    wait: async milliseconds => { waits.push(milliseconds); clock += milliseconds; },
+  });
+  runtime.start();
+  while (runtime.status().running) await immediate();
+  assert.equal(claims, 5);
+  assert.deepEqual(waits, [1000, 2000, 4000, 8000, 7800]);
+  assert.equal(clock, 31800);
+  assert.equal(logs.at(-1)[0], 'error');
+  assert.equal(logs.at(-1)[3].reason, 'retry_deadline');
+  assert.equal(logs.at(-1)[3].willRetry, false);
+  await runtime.stop();
+});
+
 test('communication poll stop interrupts a retry backoff', async () => {
   let retrying = false;
   const runtime = createCommunicationRuntime({ config, chat: {},
@@ -121,16 +201,31 @@ test('communication poll stop interrupts a retry backoff', async () => {
   assert.equal(runtime.status().running, false);
 });
 
-test('logger allowlists storage resilience fields with snake-case output', () => {
+test('logger allowlists storage resilience fields', () => {
   const events = [];
   const log = createLogger({ write: value => events.push(JSON.parse(value)) });
   log('warning', 'communication_worker', 'failed', {
-    stage: 'claim_jobs', errorClass: 'store_timeout', errno: 1205, sqlState: 'HY000', durationMsSnake: 17,
+    stage: 'claim_jobs', errorClass: 'store_timeout', errno: 1205, sqlState: 'HY000', durationMs: 17,
     consecutiveFailures: 2, willRetry: true, sql: 'must not appear', payload: 'must not appear',
   });
   assert.deepEqual(events[0], {
     timestamp: events[0].timestamp, level: 'warning', module: 'bridge', component: 'service',
-    operation: 'communication_worker', status: 'failed', consecutive_failures: 2, duration_ms: 17,
+    operation: 'communication_worker', status: 'failed', consecutive_failures: 2, durationMs: 17,
     stage: 'claim_jobs', error_class: 'store_timeout', errno: 1205, sql_state: 'HY000', will_retry: true,
+  });
+});
+
+test('service executor log adapter forwards only diagnostic allowlist fields', () => {
+  const events = [];
+  const adapter = createExecutorLogAdapter(createLogger({ write: value => events.push(JSON.parse(value)) }));
+  adapter('warning', {
+    operation: 'persist_delta', status: 'failed', errorClass: 'store_contention', errno: 1205,
+    sqlState: 'HY000', durationMs: 23, stage: 'write', consecutiveFailures: 2, willRetry: true,
+    payload: 'must not appear', message: 'must not appear',
+  });
+  assert.deepEqual(events[0], {
+    timestamp: events[0].timestamp, level: 'warning', module: 'bridge', component: 'service',
+    operation: 'persist_delta', status: 'failed', consecutive_failures: 2, durationMs: 23,
+    stage: 'write', error_class: 'store_contention', errno: 1205, sql_state: 'HY000', will_retry: true,
   });
 });

@@ -227,11 +227,7 @@ export async function startService({ config, configPath, env = process.env, log,
     const inbound=factories.inbound({pool,connectionId:config.feishu.connectionId});
     const allowedGroupChatIds = new Set(config.routing.groups
       .filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId));
-    const executorLog = (level, event = {}) => log(level, event.operation || 'codex_executor', event.status || 'unknown', {
-      code: event.error_code || event.code,
-      rpcMethod: event.rpc_method,
-      stage: event.stage,
-    });
+    const executorLog = createExecutorLogAdapter(log);
     const executorConfig = {
       bin,
       cwd,
@@ -371,4 +367,17 @@ export async function startService({ config, configPath, env = process.env, log,
     await close().catch(() => {});
     throw error;
   }
+}
+export function createExecutorLogAdapter(log) {
+  return (level, event = {}) => log(level, event.operation || 'codex_executor', event.status || 'unknown', {
+    code: event.error_code || event.code,
+    rpcMethod: event.rpc_method,
+    stage: event.stage,
+    errorClass: event.errorClass,
+    errno: event.errno,
+    sqlState: event.sqlState,
+    durationMs: event.durationMs,
+    consecutiveFailures: event.consecutiveFailures,
+    willRetry: event.willRetry,
+  });
 }

@@ -31,7 +31,7 @@ export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now
     }
     const entry = { value, pending: false, promise: null };
     entry.promise = (async () => {
-      do {
+      while (true) {
         entry.pending = false;
         const snapshot = entry.value;
         const startedAt = now();
@@ -40,8 +40,11 @@ export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now
           try { Promise.resolve(onError(error, Math.max(0, now() - startedAt), snapshot)).catch((_observerError) => {}); }
           catch { /* observability never alters delta coalescing */ }
         }
-      } while (entry.pending);
-    })().finally(() => entries.delete(key));
+        if (entry.pending) continue;
+        entries.delete(key);
+        return;
+      }
+    })();
     entries.set(key, entry);
     return entry.promise;
   };
@@ -165,7 +168,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     write: ({ state, event }) => sessionStore.saveCodexRealtimeEvent(state.binding, event),
     onError: (error, durationMs, snapshot) => log('warning', {
       module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_delta', status: 'failed',
-      errorClass: databaseError(error).code, errno: error?.errno, sqlState: error?.sqlState, durationMsSnake: durationMs,
+      errorClass: databaseError(error).code, errno: error?.errno, sqlState: error?.sqlState, durationMs,
       threadId: snapshot.state.threadId, turnId: snapshot.event.detail.turnId,
     }),
   });
