@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.13] — Unreleased
+
+- Remove the runtime MySQL advisory writer lock and its dedicated long-lived connection. Use the existing pool, short transactions, unique idempotency keys, connection-scoped rows and task leases for concurrency and recovery. Legacy `storage.writer` settings remain accepted but are ignored.
+
+No database migration is needed.
+
 ## [0.2.12] — Unreleased
 
 - Coalesce streaming assistant-delta persistence per turn item, bound MySQL pool queuing, preserve safe storage error diagnostics through the existing logger fields, and retry transient communication-store polling failures only until the hard 30-second deadline before the existing fail-closed watchdog takes over.

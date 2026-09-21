@@ -25,35 +25,16 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
   writerProbeIntervalMs, writerProbeTimeoutMs, writerProbeMaxMisses, log }) {
   text(connectionId, 128);
   await assertSchemaCurrent(pool);
-  const activeConnections = new Set();
-  const writer = await acquireWriter(pool, (error) => {
-    for(const connection of activeConnections)connection.destroy();
-    try { Promise.resolve(onWriterLost?.(error)).catch(() => {}); } catch { /* Host callback cannot revive the writer. */ }
-  }, { timeoutMs: operationTimeoutMs, connectionId, probeIntervalMs: writerProbeIntervalMs,
-    probeTimeoutMs: writerProbeTimeoutMs, probeMaxMisses: writerProbeMaxMisses, log });
+  // Do not reserve a dedicated connection or use GET_LOCK. The pool owns
+  // connection recovery; SQL transactions, unique keys and leases own
+  // concurrency and idempotency.
+  const writer = await acquireWriter(pool, onWriterLost, { timeoutMs: operationTimeoutMs, connectionId,
+    probeIntervalMs: writerProbeIntervalMs, probeTimeoutMs: writerProbeTimeoutMs,
+    probeMaxMisses: writerProbeMaxMisses, log });
   const read = (fn) => withConnection(pool, fn, { timeoutMs: operationTimeoutMs });
   const write = async (fn) => {
     writer.assert();
-    let active;
-    try {
-      return await withConnection(pool, async (connection) => {
-        active = connection;
-        activeConnections.add(connection);
-        try {
-          // The writer may be lost while the pool is still waiting for this
-          // transaction connection. Recheck only the local fail-closed state;
-          // never wait for the background probe on the write path.
-          writer.assert();
-        } catch (error) {
-          connection.destroy();
-          throw error;
-        }
-        const result = await fn(connection);
-        return result;
-      }, { timeoutMs: operationTimeoutMs, transaction: true });
-    } finally {
-      if (active) activeConnections.delete(active);
-    }
+    return await withConnection(pool, connection => fn(connection), { timeoutMs: operationTimeoutMs, transaction: true });
   };
   async function claimThread(c, connectionId, conversationId, agentId, nativeThreadId) {
     if (nativeThreadId == null) return;
