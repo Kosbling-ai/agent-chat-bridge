@@ -62,6 +62,8 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
       const [[row]] = await pool.query(`SELECT * FROM ${table} LIMIT 1`);
       before[table] = row;
     }
+    before.assistant_codex_forward_jobs.sender_union_id = null;
+    before.assistant_inbound_messages.sender_union_id = null;
     await assert.rejects(migrate(pool), { code: 'legacy_connection_id_required' });
     assert.equal(cliCode(storageCli, ['--config', storageConfig]), 'legacy_connection_id_required');
     assert.equal(cliCode(publicCli, ['migrate', '--config', publicConfig]), 'legacy_connection_id_required');
