@@ -13,7 +13,7 @@ import { createPoolFromEnvironment, storageConnectionReferences } from '../src/s
 import { createMysqlStore } from '../src/storage/store.mjs';
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-const migrationRows = await Promise.all(['001-initial.sql', '002-codex-sessions.sql', '003-forward-runtime.sql', '004-bot-connection.sql']
+const migrationRows = await Promise.all(['001-initial.sql', '002-codex-sessions.sql', '003-forward-runtime.sql', '004-bot-connection.sql', '005-sender-union-id.sql']
   .map(async (file, index) => ({ version: index + 1,
     checksum: createHash('sha256').update(await readFile(new URL(`../src/storage/migrations/${file}`, import.meta.url), 'utf8')).digest('hex') })));
 

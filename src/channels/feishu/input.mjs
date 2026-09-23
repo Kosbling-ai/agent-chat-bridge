@@ -33,6 +33,7 @@ export function normalizeFeishuInput(event, { botOpenId = '' } = {}) {
     chatType: event.conversationType || event.message?.chat_type || '',
     messageType: event.message?.kind || event.message?.type || event.message?.message_type || 'text',
     senderOpenId: event.actor?.openId || event.sender?.sender_id?.open_id || '',
+    senderUnionId: event.actor?.unionId || event.sender?.sender_id?.union_id || '',
     senderName, rawText, text: stripBotMention(rawText, mentions, botOpenId), mentions, botMentioned, createdAt,
     updatedAt: messageTime(event.message?.updatedAt || event.message?.update_time) || createdAt, raw: event,
   };
@@ -55,7 +56,7 @@ export function createRecentMentionPrompts({ now = Date.now, ttlMs = DEFAULT_REC
       prune();
       const entries = prompts.get(input.chatId) || [];
       entries.push({ prompt: optionalText(input.prompt), messageId: input.messageId || '',
-        senderOpenId: input.senderOpenId || '', senderName: input.senderName || '', createdAt: now(), source: 'recent_group_context' });
+        senderOpenId: input.senderOpenId || '', senderUnionId: input.senderUnionId || '', senderName: input.senderName || '', createdAt: now(), source: 'recent_group_context' });
       prompts.set(input.chatId, entries.slice(-limit));
     },
     take(chatId) { prune(); return [...(prompts.get(chatId) || [])]; },
@@ -75,20 +76,22 @@ export function mergeMentionPrompts(recentPrompts = [], currentPrompt = '') {
   return parts.join('\n\n');
 }
 
-function identityLabel(senderName, senderOpenId) {
+function identityLabel(senderName, senderOpenId, senderUnionId) {
   const name = optionalText(senderName) || optionalText(senderOpenId) || '未知用户';
   const openId = optionalText(senderOpenId);
-  return openId ? `${name}（open_id=${openId}）` : name;
+  const unionId = optionalText(senderUnionId);
+  const ids = [openId ? `open_id=${openId}` : '', unionId ? `union_id=${unionId}` : ''].filter(Boolean);
+  return ids.length ? `${name}（${ids.join('，')}）` : name;
 }
 
 export function buildCodexForwardPrompt({ chatType, currentPrompt = '', mergedPrompt = '', recentPrompts = [],
-  senderName = '', senderOpenId = '' } = {}) {
+  senderName = '', senderOpenId = '', senderUnionId = '' } = {}) {
   if (chatType === 'p2p') {
     const privateName = optionalText(senderName) || optionalText(senderOpenId) || '未知用户';
     return [`【发给你的飞书消息 来自 ${privateName}】`, mergedPrompt].map(optionalText).filter(Boolean).join('\n\n');
   }
-  const parts = recentPrompts.filter(entry => entry.prompt).map(entry => `【群消息 来自 ${identityLabel(entry.senderName, entry.senderOpenId)}】\n${entry.prompt}`);
-  const currentName = identityLabel(senderName, senderOpenId);
+  const parts = recentPrompts.filter(entry => entry.prompt).map(entry => `【群消息 来自 ${identityLabel(entry.senderName, entry.senderOpenId, entry.senderUnionId)}】\n${entry.prompt}`);
+  const currentName = identityLabel(senderName, senderOpenId, senderUnionId);
   if (currentPrompt) parts.push(`【提到你的消息 来自 ${currentName}】\n${currentPrompt}`);
   return parts.length ? parts.join('\n\n') : `【提到你的消息 来自 ${currentName}】\n${mergedPrompt}`;
 }

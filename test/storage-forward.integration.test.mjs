@@ -27,10 +27,11 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const store = createForwardJobStore({connectionId:'fixture', pool, now: () => now });
     const input = {
       callerId: 'caller', idempotencyKey: 'daily:1', conversationId: 'chat',
-      messageId: 'system:daily:1', chatType: 'group', senderOpenId: 'system:scope',
+      messageId: 'system:daily:1', chatType: 'group', senderOpenId: 'system:scope', senderUnionId: 'union-scope',
       prompt: 'prompt', executionNamespace: 'daily', deliveryMode: 'caller',
     };
     const first = await store.upsert(input);
+    assert.equal(first.senderUnionId, 'union-scope');
     const duplicate = await store.upsert(input);
     assert.equal(duplicate.id, first.id);
     assert.equal(duplicate.duplicate, true);

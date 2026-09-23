@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.13] — Unreleased
+
+- Preserve Feishu `union_id` alongside the existing `open_id` and sender name through durable hook events, Codex forwarding, sender prompts, forward-job storage, and persisted group context. Existing authorization, bindings, and outbound delivery continue to use `open_id`.
+- Add migration 005 with nullable `sender_union_id` columns for forward jobs and inbound group context. Existing rows remain valid without backfill.
+
 ## [0.2.12] — Unreleased
 
 - Coalesce streaming assistant-delta persistence per turn item, bound MySQL pool queuing, preserve safe storage error diagnostics through the existing logger fields, and retry transient communication-store polling failures only until the hard 30-second deadline before the existing fail-closed watchdog takes over.

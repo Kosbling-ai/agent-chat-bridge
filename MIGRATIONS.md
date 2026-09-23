@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.12`
+Application version: `0.2.13`
+
+Version 0.2.13 adds migration 005. It adds nullable `sender_union_id` columns to `assistant_codex_forward_jobs` and `assistant_inbound_messages` so the bridge can preserve Feishu's cross-application identity alongside the existing `sender_open_id`. Existing rows are not backfilled and an absent union ID remains valid. Stop bridge writers and take the dedicated bridge-schema backup required by the standard migration procedure before applying it; rollback requires restoring that pre-migration backup because the prior binary cannot accept schema ledger version 5.
 
 Version 0.2.12 does not add a database migration. It changes only runtime connection-pool and worker-retry behavior.
 

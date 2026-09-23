@@ -24,7 +24,7 @@ function codexMessageText(item = {}) {
   }).filter(Boolean).join('\n');
 }
 
-function buildCodexForwardPrompt(message, { currentPrompt, mergedPrompt, recentPrompts = [], senderName = '', senderOpenId = '' } = {}) {
+function buildCodexForwardPrompt(message, { currentPrompt, mergedPrompt, recentPrompts = [], senderName = '', senderOpenId = '', senderUnionId = '' } = {}) {
   if (!isGroupMessage(message)) {
     const privateName = optionalText(senderName) || maskFeishuOpenId(senderOpenId);
     return [`【发给你的飞书消息 来自 ${privateName}】`, mergedPrompt]
@@ -34,18 +34,20 @@ function buildCodexForwardPrompt(message, { currentPrompt, mergedPrompt, recentP
   }
   const parts = [];
   for (const entry of recentPrompts || []) {
-    const name = groupSenderIdentityLabel(entry.senderName, entry.senderOpenId);
+    const name = groupSenderIdentityLabel(entry.senderName, entry.senderOpenId, entry.senderUnionId);
     if (entry.prompt) parts.push(`【群消息 来自 ${name}】\n${entry.prompt}`);
   }
-  const currentName = groupSenderIdentityLabel(senderName, senderOpenId);
+  const currentName = groupSenderIdentityLabel(senderName, senderOpenId, senderUnionId);
   if (currentPrompt) parts.push(`【提到你的消息 来自 ${currentName}】\n${currentPrompt}`);
   return parts.length > 0 ? parts.join('\n\n') : `【提到你的消息 来自 ${currentName}】\n${mergedPrompt || ''}`;
 }
 
-function groupSenderIdentityLabel(senderName, senderOpenId) {
+function groupSenderIdentityLabel(senderName, senderOpenId, senderUnionId) {
   const name = optionalText(senderName) || optionalText(senderOpenId) || '未知用户';
   const openId = optionalText(senderOpenId);
-  return openId ? `${name}（open_id=${openId}）` : name;
+  const unionId = optionalText(senderUnionId);
+  const ids = [openId ? `open_id=${openId}` : '', unionId ? `union_id=${unionId}` : ''].filter(Boolean);
+  return ids.length ? `${name}（${ids.join('，')}）` : name;
 }
 
 function maskFeishuOpenId(openId) {
@@ -70,8 +72,8 @@ export function buildConversationPrompt({ event, text, context = [], newThread =
   const groupChat = event.conversationType !== 'p2p';
   let sourcePrompt = buildCodexForwardPrompt({ chat_type: event.conversationType }, {
     currentPrompt: text, mergedPrompt: text,
-    senderName: event.actor?.name ?? '', senderOpenId: event.actor?.openId ?? '',
-    recentPrompts: context.map(item => ({ prompt: item.text, senderName: item.event?.actor?.name ?? '', senderOpenId: item.event?.actor?.openId ?? '' })),
+    senderName: event.actor?.name ?? '', senderOpenId: event.actor?.openId ?? '', senderUnionId: event.actor?.unionId ?? '',
+    recentPrompts: context.map(item => ({ prompt: item.text, senderName: item.event?.actor?.name ?? '', senderOpenId: item.event?.actor?.openId ?? '', senderUnionId: item.event?.actor?.unionId ?? '' })),
   });
   if (!groupChat && outboxDir) sourcePrompt += '\n\n回发文件发布约定：结束本轮回答前必须完成并关闭回发目录中的文件；回答结束后不得继续由后台任务或持有的文件句柄写入这些产物。';
   if (!newThread) return sourcePrompt;
@@ -79,5 +81,5 @@ export function buildConversationPrompt({ event, text, context = [], newThread =
     if (!group.name && !group.description) return sourcePrompt;
     return ['【飞书群聊上下文】', group.name ? `群名称：${group.name}` : '', group.description ? `群介绍：${group.description}` : '', `chat_id：${event.conversationId}`, '说明：这是本 Codex 会话绑定的飞书群，后续群成员 @ 机器人都会延续这个会话。'].filter(Boolean).join('\n') + '\n\n' + sourcePrompt;
   }
-  return ['【飞书私聊会话】', `chat_id：${event.conversationId}`, event.actor?.openId ? `对方 open_id：${event.actor.openId}` : '', outboxDir ? `回发文件目录：${outboxDir}` : ''].filter(Boolean).join('\n') + '\n\n' + sourcePrompt;
+  return ['【飞书私聊会话】', `chat_id：${event.conversationId}`, event.actor?.openId ? `对方 open_id：${event.actor.openId}` : '', event.actor?.unionId ? `对方 union_id：${event.actor.unionId}` : '', outboxDir ? `回发文件目录：${outboxDir}` : ''].filter(Boolean).join('\n') + '\n\n' + sourcePrompt;
 }

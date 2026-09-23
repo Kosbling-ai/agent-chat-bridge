@@ -8,6 +8,7 @@ const MIGRATIONS = await Promise.all([
   [2, './migrations/002-codex-sessions.sql'],
   [3, './migrations/003-forward-runtime.sql'],
   [4, './migrations/004-bot-connection.sql'],
+  [5, './migrations/005-sender-union-id.sql'],
 ].map(async ([version, path]) => {
   const sql = await readFile(new URL(path, import.meta.url), 'utf8');
   return { version, sql, checksum: createHash('sha256').update(sql).digest('hex') };
