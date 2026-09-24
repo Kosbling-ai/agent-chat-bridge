@@ -77,7 +77,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata},groupContextCandidate:contextCandidate},
       hooks});
     if(contextCandidate&&!receipt.duplicate)recent.remember({chatId:normalized.chatId,messageId:normalized.messageId,prompt:normalized.rawText,
-      senderOpenId:normalized.senderOpenId,senderName:normalized.senderName});
+      senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId,senderName:normalized.senderName});
     if(!triggered||!forward)return receipt;
     launchForward((async()=>{
       const memoryEntries=event.conversationType==='group'&&contextEnabled?recent.take(normalized.chatId):[];
@@ -89,12 +89,12 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;
       const mergedPrompt=normalized.chatType==='p2p'?normalized.text:mergeMentionPrompts(contextEntries,normalized.text);
       const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
-        mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId});
+        mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId});
       const result=await forward.handleMessage({
         source:'live',callerId:'live',idempotencyKey:`live:${connectionId}:${normalized.chatId}:${normalized.messageId}`,
         message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,
           type:normalized.messageType,event,contextAttachmentLimit},
-        actor:{openId:normalized.senderOpenId,name:normalized.senderName},prompt,context:contextEntries,
+        actor:{openId:normalized.senderOpenId,unionId:normalized.senderUnionId,name:normalized.senderName},prompt,context:contextEntries,
         groupChatContext:normalized.chatType==='group'?{chatId:normalized.chatId,name:group?.name||'',description:group?.description||''}:null,
         deliveryMode:'bridge',
       });

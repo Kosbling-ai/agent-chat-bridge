@@ -130,6 +130,17 @@ test('group defaults allow all human members; explicit member filter does not li
   await new Promise(setImmediate);
   assert.equal(forwarded.length,1);assert.equal(observed[1].forwardJob, undefined); assert.equal(observed[1].hooks.length, 1);
 });
+
+test('legacy business hook preserves union_id beside the existing open_id', async () => {
+  const accepted = [];
+  const settings = { ...validateConfig(config), hooks: [{ id: 'h', url: 'http://example.invalid/hook', tokenEnv: 'TEST_HOOK', conversationIds: ['private'] }] };
+  const runtime = createRuntime({ config: settings, store: { acceptInbound: async input => { accepted.push(input); return {}; } }, codex: {}, chat: {} });
+  await runtime.ingest({ source: 'live', eventKey: 'business-union', type: 'message.received', conversationId: 'private', conversationType: 'p2p', messageId: 'business-union',
+    actor: { type: 'user', openId: 'human', unionId: 'union-human', name: 'Human' }, isApp: false, isSelf: false,
+    message: { kind: 'text', content: '{"text":"hello"}', parsedContent: { text: 'hello' }, mentions: [] } });
+  assert.equal(accepted[0].hooks[0].payload.actor.openId, 'human');
+  assert.equal(accepted[0].hooks[0].payload.actor.unionId, 'union-human');
+});
 test('error reporter is bounded, sanitized and cannot recursively report failures', async () => {
   const output = [];
   const warning = createLogger({ write: value => output.push(JSON.parse(value)) });

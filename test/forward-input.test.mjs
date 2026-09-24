@@ -28,7 +28,7 @@ test('authorized human and system group bindings scan their separate result dire
 
 test('Feishu text normalization restores post extraction and bot mention removal', () => {
   const event = { messageId: 'message', conversationId: 'chat', conversationType: 'group', occurredAt: 1700000000,
-    actor: { type: 'user', openId: 'sender', name: 'Sender' }, message: { kind: 'post',
+    actor: { type: 'user', openId: 'sender', unionId: 'union-sender', name: 'Sender' }, message: { kind: 'post',
       content: JSON.stringify({ title: 'Title', content: [[{ tag: 'text', text: 'body' }, { tag: 'a', text: 'link', href: 'https://example.invalid' }]] }),
       mentions: [{ openId: 'bot', key: '<at>bot</at>', name: 'Agent' }] } };
   assert.equal(stripBotMention('<at>bot</at> @Agent hello', event.message.mentions, 'bot'), 'hello');
@@ -36,6 +36,7 @@ test('Feishu text normalization restores post extraction and bot mention removal
   assert.equal(normalized.rawText, 'Title\nbodylink (https://example.invalid)');
   assert.equal(normalized.createdAt, 1700000000000);
   assert.equal(normalized.senderName, 'Sender');
+  assert.equal(normalized.senderUnionId, 'union-sender');
 });
 
 test('recent group prompts use chat scope across senders and expire after two minutes', () => {
@@ -50,15 +51,16 @@ test('recent group prompts use chat scope across senders and expire after two mi
 
 test('group prompt keeps prior identities while current sender remains the tool identity', () => {
   const recent = [
-    { inboundId: 7, messageId: 'first', prompt: 'look up order', senderName: 'One', senderOpenId: 'ou_one', createdAt: 1 },
+    { inboundId: 7, messageId: 'first', prompt: 'look up order', senderName: 'One', senderOpenId: 'ou_one', senderUnionId: 'union_one', createdAt: 1 },
     { messageId: 'second', prompt: 'and summarize it', senderName: 'Two', senderOpenId: 'ou_two', createdAt: 2 },
   ];
   const merged = mergeMentionPrompts(recent, 'please do that');
   assert.match(merged, /look up order/);
   assert.match(merged, /please do that/);
   const prompt = buildCodexForwardPrompt({ chatType: 'group', currentPrompt: 'please do that', mergedPrompt: merged,
-    recentPrompts: recent, senderName: 'Current', senderOpenId: 'ou_current' });
-  assert.match(prompt, /群消息 来自 One（open_id=ou_one）/);
+    recentPrompts: recent, senderName: 'Current', senderOpenId: 'ou_current', senderUnionId: 'union_current' });
+  assert.match(prompt, /群消息 来自 One（open_id=ou_one，union_id=union_one）/);
   assert.match(prompt, /群消息 来自 Two（open_id=ou_two）/);
-  assert.match(prompt, /提到你的消息 来自 Current（open_id=ou_current）/);
+  assert.match(prompt, /提到你的消息 来自 Current（open_id=ou_current，union_id=union_current）/);
+  assert.doesNotMatch(prompt, /union_id=undefined/);
 });

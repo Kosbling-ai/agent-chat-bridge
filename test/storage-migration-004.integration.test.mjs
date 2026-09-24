@@ -62,6 +62,8 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
       const [[row]] = await pool.query(`SELECT * FROM ${table} LIMIT 1`);
       before[table] = row;
     }
+    before.assistant_codex_forward_jobs.sender_union_id = null;
+    before.assistant_inbound_messages.sender_union_id = null;
     await assert.rejects(migrate(pool), { code: 'legacy_connection_id_required' });
     assert.equal(cliCode(storageCli, ['--config', storageConfig]), 'legacy_connection_id_required');
     assert.equal(cliCode(publicCli, ['migrate', '--config', publicConfig]), 'legacy_connection_id_required');
@@ -110,8 +112,8 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
     await assert.rejects(migrate(pool, { legacyConnectionId: 'other-bot' }), { code: 'legacy_connection_id_mismatch' });
     assert.equal(cliCode(storageCli, ['--config', storageConfig, '--legacy-connection-id', 'other-bot']), 'legacy_connection_id_mismatch');
     assert.equal(cliCode(publicCli, ['migrate', '--config', publicConfig, '--legacy-connection-id', 'other-bot']), 'legacy_connection_id_mismatch');
-    assert.deepEqual(await migrate(pool, { legacyConnectionId: 'original-bot' }), { version: 4, applied: true });
-    assert.deepEqual(await assertSchemaCurrent(pool), { version: 4 });
+    assert.deepEqual(await migrate(pool, { legacyConnectionId: 'original-bot' }), { version: 5, applied: true });
+    assert.deepEqual(await assertSchemaCurrent(pool), { version: 5 });
     for (const table of assistantTables) {
       const [[row]] = await pool.query(`SELECT * FROM ${table} LIMIT 1`);
       assert.equal(row.connection_id, 'original-bot');
@@ -120,7 +122,7 @@ test('004 preserves 003 rows, rejects missing or changed legacy ownership, and r
       delete row.connection_id;
       assert.deepEqual(row, before[table], table);
     }
-    assert.deepEqual(await migrate(pool), { version: 4, applied: false });
+    assert.deepEqual(await migrate(pool), { version: 5, applied: false });
     await pool.execute("INSERT INTO assistant_codex_sessions (connection_id,feishu_open_id,chat_id,chat_type,codex_session_id,thread_name,created_at,updated_at,last_message_id,last_error) VALUES ('ORIGINAL-BOT','actor','chat','group','other-thread','other',301,302,'','')");
     const [lowerRows] = await pool.execute("SELECT id FROM assistant_codex_sessions WHERE connection_id = 'original-bot' AND feishu_open_id = 'actor' AND chat_id = 'chat'");
     const [upperRows] = await pool.execute("SELECT id FROM assistant_codex_sessions WHERE connection_id = 'ORIGINAL-BOT' AND feishu_open_id = 'actor' AND chat_id = 'chat'");
@@ -139,8 +141,8 @@ test('004 initializes an empty disposable schema without a legacy owner', { skip
   await admin.query(`CREATE DATABASE ${schema}`);
   const pool = createPoolFromEnvironment(refs, { ...process.env, BRIDGE_TEST_DATABASE: schema });
   try {
-    assert.deepEqual(await migrate(pool), { version: 4, applied: true });
-    assert.deepEqual(await migrate(pool), { version: 4, applied: false });
+    assert.deepEqual(await migrate(pool), { version: 5, applied: true });
+    assert.deepEqual(await migrate(pool), { version: 5, applied: false });
     for (const table of assistantTables) {
       assert.equal(await hasColumn(pool, table), true);
       const [[definition]] = await pool.execute("SELECT IS_NULLABLE AS nullable FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'connection_id'", [table]);

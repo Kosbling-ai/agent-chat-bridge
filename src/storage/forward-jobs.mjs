@@ -47,6 +47,7 @@ function row(value) {
     chatType: value.chat_type,
     messageType: value.message_type,
     senderOpenId: value.sender_open_id,
+    senderUnionId: value.sender_union_id || '',
     senderName: value.sender_name,
     groupChatContext: parse(value.group_chat_context_json),
     contextEntries: parse(value.context_entries_json),
@@ -94,8 +95,8 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
           execution: { ...(supplied.execution || {}), bindingOpenId: input.bindingOpenId },
         } : {}) };
         await connection.execute(`INSERT IGNORE INTO assistant_codex_forward_jobs
-          (connection_id,public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,source_message_id,chat_id,chat_type,message_type,sender_open_id,sender_name,conversation_scope,prompt,group_chat_context_json,context_entries_json,status,next_attempt_at,result_json,last_error,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [connectionId,publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),input.sourceMessageId || null,required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,safeJson(initialResult),'',createdAt,createdAt]);
+          (connection_id,public_run_id,request_key_hash,request_hash,caller_id,execution_namespace,delivery_mode,message_id,source_message_id,chat_id,chat_type,message_type,sender_open_id,sender_union_id,sender_name,conversation_scope,prompt,group_chat_context_json,context_entries_json,status,next_attempt_at,result_json,last_error,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [connectionId,publicRunId,keyHash,requestHash,callerId,input.executionNamespace || '',input.deliveryMode || 'bridge',required(input.messageId,191),input.sourceMessageId || null,required(input.conversationId,191),input.chatType || 'group',input.messageType || 'text',input.senderOpenId || '',input.senderUnionId || '',input.senderName || '',input.chatType === 'p2p' ? 'p2p' : 'group',input.prompt || '',safeJson(input.groupChatContext),safeJson(input.contextEntries || []),'pending',input.nextAttemptAt ?? createdAt,safeJson(initialResult),'',createdAt,createdAt]);
         const [[found]] = await connection.execute('SELECT id AS internal_id, assistant_codex_forward_jobs.* FROM assistant_codex_forward_jobs WHERE connection_id=? AND request_key_hash=? LIMIT 1', [connectionId,keyHash]);
         if (!found || found.request_hash !== requestHash) throw new StoreError('job_conflict');
         return { ...row(found), duplicate: found.public_run_id !== publicRunId };

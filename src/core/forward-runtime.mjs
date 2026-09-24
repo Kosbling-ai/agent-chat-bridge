@@ -71,7 +71,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       callerId: input.callerId, idempotencyKey: input.idempotencyKey, conversationId, messageId,
       sourceMessageId: input.message?.messageId || null, bindingOpenId,
       chatType: input.message?.conversationType || input.chatType || 'group', messageType: input.message?.type || 'text',
-      senderOpenId: input.actor?.openId || input.senderOpenId || bindingOpenId, senderName: input.actor?.name || input.senderName || '',
+      senderOpenId: input.actor?.openId || input.senderOpenId || bindingOpenId, senderUnionId: input.actor?.unionId || input.senderUnionId || '', senderName: input.actor?.name || input.senderName || '',
       executionNamespace: '', deliveryMode: 'bridge',
       prompt: input.prompt || input.message?.text || '', groupChatContext: input.groupChatContext || null,
       contextEntries: input.context || [], nextAttemptAt: input.notBefore,
@@ -94,6 +94,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       chatType: 'group',
       messageType: 'event',
       senderOpenId: `system:${input.producerId}`,
+      senderUnionId: '',
       senderName: input.producerId,
       executionNamespace: input.scope,
       deliveryMode: 'caller',
@@ -185,7 +186,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         bindingOpenId: job.executionNamespace ? deriveExecutionScope(job.callerId, job.executionNamespace)
           : (execution.bindingOpenId || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType })),
         chatId: job.chatId, chatType: job.chatType, messageId: job.messageId,
-        senderOpenId: job.senderOpenId, senderName: job.senderName, prompt, attachments: execution.attachments || [], groupChatContext: job.groupChatContext,
+        senderOpenId: job.senderOpenId, senderUnionId: job.senderUnionId || '', senderName: job.senderName, prompt, attachments: execution.attachments || [], groupChatContext: job.groupChatContext,
         busyPolicy: config.steering === false || (job.executionNamespace && !job.result?.businessEvent) ? 'reject' : 'steer',
       };
       state = job.deliveryMode === 'bridge'

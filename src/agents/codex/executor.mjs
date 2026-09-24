@@ -316,7 +316,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     await sessionStore.saveCodexRealtimeEvent(binding, {
       messageId: input.messageId, eventKey: `${eventKeyPrefix}:${input.messageId || stableKey(prompt)}`,
       eventType: 'user_message', role: 'user', title: '用户', text: prompt, createdAt: now(),
-      detail: { senderOpenId: input.senderOpenId || '', senderName: input.senderName || '', chatType: binding.chatType || '', ...detail },
+      detail: { senderOpenId: input.senderOpenId || '', senderUnionId: input.senderUnionId || '', senderName: input.senderName || '', chatType: binding.chatType || '', ...detail },
     });
   }
 

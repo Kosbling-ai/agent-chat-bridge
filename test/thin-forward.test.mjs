@@ -63,6 +63,28 @@ test('group file trigger all reaches forwarding while unauthorized and hook-only
   }
 });
 
+test('union ID reaches the communication hook, Codex sender identity, and prompt without changing open-ID admission',async()=>{
+  const accepted=[];const forwarded=[];
+  const config=validateConfig({...base,routing:{...base.routing,groups:[{...base.routing.groups[0],trigger:'all',userIds:['human']}]},hooks:[{id:'h',url:'https://example.invalid/h',tokenEnv:'TEST_HOOK',conversationIds:['chat']}]});
+  const runtime=createCommunicationRuntime({config,store:{acceptInbound:async input=>{accepted.push(input);return{duplicate:false};}},
+    forward:{handleMessage:async input=>{forwarded.push(input);return{execution:{terminal:'completed'}};}},chat:{}});
+  const event={connectionId:'test',source:'live',eventKey:'union',type:'message.received',conversationId:'chat',conversationType:'group',messageId:'union',occurredAt:Date.now(),
+    actor:{type:'user',openId:'human',unionId:'union-human',name:'Human'},message:{kind:'text',content:'{"text":"hello"}',mentions:[]}};
+  await runtime.ingest(event);await new Promise(setImmediate);
+  assert.equal(accepted[0].hooks[0].payload.actor.unionId,'union-human');
+  assert.equal(accepted[0].inboundMessage.senderUnionId,'union-human');
+  assert.equal(forwarded[0].actor.openId,'human');
+  assert.equal(forwarded[0].actor.unionId,'union-human');
+  assert.match(forwarded[0].prompt,/union_id=union-human/);
+  await runtime.ingest({...event,eventKey:'union-empty',messageId:'union-empty',actor:{type:'user',openId:'human',unionId:'',name:'Human'}});
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,2,'an absent union_id retains the existing route');
+  assert.doesNotMatch(forwarded[1].prompt,/union_id=/);
+  await runtime.ingest({...event,eventKey:'union-no-open-match',messageId:'union-no-open-match',actor:{type:'user',openId:'other',unionId:'union-human',name:'Other'}});
+  await new Promise(setImmediate);
+  assert.equal(forwarded.length,2,'union_id cannot replace the open_id allowlist');
+});
+
 test('passive group attachment metadata is stored without download and carried into a later mention',async()=>{
   const accepted=[];const forwarded=[];
   const config=validateConfig(base);
