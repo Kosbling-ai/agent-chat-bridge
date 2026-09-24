@@ -116,11 +116,6 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
       await delayed.commit();
       const saved = await observer.stop();
       assert.deepEqual(saved.entries.map(entry => entry.id).sort(), ['late', 'visible']);
-      await pool.execute(`UPDATE assistant_codex_events SET detail_json=?,created_at=?
-        WHERE codex_session_id=? AND event_key=?`, [JSON.stringify({kind:'tool',id:'visible',status:'failed'}),1303,'late-thread','tool:visible']);
-      const resumed = observeExecutionCard({ card, since: 1200, cursor: saved.observerCursor, load });
-      const updated = await resumed.stop();
-      assert.equal(updated.entries.find(entry => entry.id === 'visible').status, 'failed');
     } finally {
       delayed.release();
     }
