@@ -4,6 +4,9 @@
 
 - Preserve Feishu `union_id` alongside the existing `open_id` and sender name through durable hook events, Codex forwarding, sender prompts, forward-job storage, and persisted group context. Existing authorization, bindings, and outbound delivery continue to use `open_id`.
 - Add migration 005 with nullable `sender_union_id` columns for forward jobs and inbound group context. Existing rows remain valid without backfill.
+- Remove the runtime MySQL advisory writer lock and its dedicated long-lived connection. Use the existing pool, short transactions, unique idempotency keys, connection-scoped rows and task leases for concurrency and recovery. Legacy `storage.writer` settings remain accepted but are ignored.
+
+The writer-lock removal itself needs no database migration.
 
 ## [0.2.12] — Unreleased
 
