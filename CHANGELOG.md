@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.14] — Unreleased
+
+- Restore the fixed Feishu reply for bot mentions from groups that are not listed in `routing.groups`. A live human `@bot` message in such a group queues one text reply to that message containing the group's `chat_id`; hook-only groups, unauthorized speakers in configured groups, history catch-up, bot/app/self messages and duplicates stay silent. Replies are rate-limited in memory per group and speaker. The new optional `routing.unlistedGroupReply` setting controls `enabled` (default `true`), `text` (`{{chat_id}}` placeholder) and `cooldownMs` (default `600000`).
+
+No database migration is needed.
+
 ## [0.2.13] — Unreleased
 
 - Preserve Feishu `union_id` alongside the existing `open_id` and sender name through durable hook events, Codex forwarding, sender prompts, forward-job storage, and persisted group context. Existing authorization, bindings, and outbound delivery continue to use `open_id`.

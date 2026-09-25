@@ -187,7 +187,7 @@ function validateRuntime(raw) {
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
   if (raw.feishu.outputBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.outputBudgetBytes) || raw.feishu.outputBudgetBytes < 28 * 1024 * 1024 || raw.feishu.outputBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_output_budget');
   feishu.outputBudgetBytes = raw.feishu.outputBudgetBytes ?? 512 * 1024 * 1024;
-  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups'], 'invalid_routing_fields');
+  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
     object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities'], 'invalid_group_fields');
@@ -200,7 +200,14 @@ function validateRuntime(raw) {
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
   if (typeof allowAllPrivateUsers !== 'boolean' || raw.routing.allowAllPrivateUsers === null) throw new ConfigError('invalid_private_access_policy');
-  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups };
+  const unlisted = raw.routing.unlistedGroupReply === undefined ? {} : raw.routing.unlistedGroupReply;
+  object(unlisted, ['enabled', 'text', 'cooldownMs'], 'invalid_unlisted_group_reply_fields');
+  const unlistedGroupReply = { enabled: unlisted.enabled ?? true, text: unlisted.text ?? '这个群暂时还没有 Kosbling Agent 使用权限。如果需要开通，请联系管理员，并提供 chat_id={{chat_id}}。', cooldownMs: unlisted.cooldownMs ?? 600000 };
+  if (Object.values(unlisted).includes(null) || typeof unlistedGroupReply.enabled !== 'boolean' || typeof unlistedGroupReply.text !== 'string'
+      || !unlistedGroupReply.text.trim() || unlistedGroupReply.text.trim().length > 2000 || !Number.isSafeInteger(unlistedGroupReply.cooldownMs)
+      || unlistedGroupReply.cooldownMs < 0 || unlistedGroupReply.cooldownMs > 86_400_000) throw new ConfigError('invalid_unlisted_group_reply');
+  unlistedGroupReply.text = unlistedGroupReply.text.trim();
+  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups, unlistedGroupReply };
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
     object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds', 'inbound'], 'invalid_hook_fields');
