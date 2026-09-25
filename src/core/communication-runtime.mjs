@@ -37,6 +37,19 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
   const contextEnabled=contextLimit>0&&contextWindowMs>0;
   const recent=createRecentMentionPrompts({now});
+  const unlistedReplies=new Map();
+  async function replyUnlistedGroup(event) {
+    const {text,cooldownMs}=config.routing.unlistedGroupReply; const key=`${event.conversationId}:${event.actor.openId||''}`; const at=now();
+    if(unlistedReplies.has(key)&&at-unlistedReplies.get(key)<cooldownMs)return;
+    for(const [entry,sentAt] of unlistedReplies)if(at-sentAt>=cooldownMs)unlistedReplies.delete(entry);
+    unlistedReplies.set(key,at);
+    try {
+      if(typeof store.recordOutbox!=='function')throw new Error('outbox_unavailable');
+      await store.recordOutbox({connectionId,conversationId:event.conversationId,idempotencyKey:`unlisted-group-reply:${event.messageId}`,kind:'reply',
+        payload:{kind:'text',content:{text:text.replaceAll('{{chat_id}}',event.conversationId)},messageId:event.messageId}});
+      log('info','unlisted_group_reply','queued',{code:'unlisted_group_mention'});
+    } catch { if(unlistedReplies.get(key)===at)unlistedReplies.delete(key); log('warning','unlisted_group_reply','failed',{code:'unlisted_group_reply_unrecorded'}); }
+  }
   const pause=milliseconds=>{let wake;const interrupted=new Promise(resolve=>{wake=resolve;wakeWait=wake;});return Promise.race([wait(milliseconds),interrupted]).finally(()=>{if(wakeWait===wake)wakeWait=undefined;});};
   function humanAllowed(event,group) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
@@ -78,6 +91,8 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       hooks});
     if(contextCandidate&&!receipt.duplicate)recent.remember({chatId:normalized.chatId,messageId:normalized.messageId,prompt:normalized.rawText,
       senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId,senderName:normalized.senderName});
+    if(event.type==='message.received'&&event.source==='live'&&event.conversationType==='group'&&!group&&mentioned&&!ignoredByAgent
+      &&event.actor?.type==='user'&&!event.isApp&&!event.isSelf&&config.routing.unlistedGroupReply?.enabled&&!receipt.duplicate)await replyUnlistedGroup(event);
     if(!triggered||!forward)return receipt;
     launchForward((async()=>{
       const memoryEntries=event.conversationType==='group'&&contextEnabled?recent.take(normalized.chatId):[];
