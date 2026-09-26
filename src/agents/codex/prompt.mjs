@@ -24,21 +24,31 @@ export function outboxRelativeDirectory({ outboxRelativeRoot = 'data/feishu-outb
     ? `${outboxRelativeRoot}/system-${scopeHash(bindingOpenId)}/${chatKey(chatId)}`
     : `${outboxRelativeRoot}/${chatKey(chatId)}`;
 }
-export function buildInitialPrompt({ binding, prompt, groupChatContext, outboxRelativeRoot, allowedGroupChatIds = new Set() }) {
-  if (!binding) return prompt;
+export function systemTaskPreamble({ binding, outboxRelativeRoot }) {
   const outbox = outboxRelativeDirectory({ outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
+  return `【独立系统任务】\n任务：${binding.feishuOpenId}\n结果投递群：${binding.chatId}\n本线程仅承接此系统任务，不承接目标群的人工对话。结果由运行时发送到目标群。\n回发文件目录：${outbox}`;
+}
+
+// systemPreamble=false omits the system-task preamble the thread already holds.
+// groupOpening=false omits only the default group wording (name, description and
+// session note) that replace-mode group instructions supersede; chat_id and the
+// result-file notes are functional and always stay.
+export function buildInitialPrompt({ binding, prompt, groupChatContext, outboxRelativeRoot, allowedGroupChatIds = new Set(), systemPreamble = true, groupOpening = true }) {
+  if (!binding) return prompt;
   if (isScheduledBinding(binding.feishuOpenId)) {
-    return `【独立系统任务】\n任务：${binding.feishuOpenId}\n结果投递群：${binding.chatId}\n本线程仅承接此系统任务，不承接目标群的人工对话。结果由运行时发送到目标群。\n回发文件目录：${outbox}\n\n${prompt}`;
+    return systemPreamble ? `${systemTaskPreamble({ binding, outboxRelativeRoot })}\n\n${prompt}` : prompt;
   }
+  const outbox = outboxRelativeDirectory({ outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
   if (binding.chatType && binding.chatType !== 'p2p') {
     const context = normalizeGroupChatContext(groupChatContext);
     const lines = [];
     if (binding.created) {
-      lines.push('【飞书群聊上下文】');
-      if (context?.name) lines.push(`群名称：${context.name}`);
-      if (context?.description) lines.push(`群介绍：${context.description}`);
-      if (context?.chatId) lines.push(`chat_id：${context.chatId}`);
-      lines.push('说明：这是本 Codex 会话绑定的飞书群，后续群成员 @ 机器人都会延续这个会话。');
+      const opening = [];
+      if (groupOpening && context?.name) opening.push(`群名称：${context.name}`);
+      if (groupOpening && context?.description) opening.push(`群介绍：${context.description}`);
+      if (context?.chatId) opening.push(`chat_id：${context.chatId}`);
+      if (groupOpening) opening.push('说明：这是本 Codex 会话绑定的飞书群，后续群成员 @ 机器人都会延续这个会话。');
+      if (opening.length) lines.push('【飞书群聊上下文】', ...opening);
     }
     if (canDeliverOutboxAttachments({ chatType: binding.chatType, chatId: binding.chatId, allowedGroupChatIds })) {
       if (!lines.length) lines.push('【飞书群聊文件回传】');

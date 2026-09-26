@@ -12,11 +12,56 @@ The `bridge` capability permits Agent routing. The existing `trigger` (`mention`
 
 Groups previously present only in `hooks[].conversationIds` must now also appear in `routing.groups`; use `capabilities:["hook"]` for a hook-only group. P2P rules are unchanged.
 
+### Group instructions
+
+A `bridge` group may add optional instructions for its human group thread:
+
+```json
+{
+  "conversationId": "oc_example",
+  "trigger": "mention",
+  "passiveContext": true,
+  "capabilities": ["bridge", "hook"],
+  "instructionFiles": ["instructions/group.md", "/absolute/path/shared.md"],
+  "instructionText": "Short group-specific note.",
+  "instructionMode": "append",
+  "replyContext": { "cardJson": false, "maxChars": 4000 }
+}
+```
+
+`instructionFiles` holds 1–20 distinct paths; a relative path is resolved from the directory containing the bridge configuration file. `instructionText` is an optional trimmed string of at most 8,000 characters for short wording without a file. The bridge combines them in order (text first, then files) under a generic `【飞书群指令】` header with the group `chat_id`, and injects the result into the group's Codex thread as one `developer` item through `thread/inject_items` before the next turn starts. Each file must be a readable UTF-8 regular file, and the configured text plus all files of one group may not exceed 204,800 bytes (200 KiB).
+
+The injected content is fingerprinted with SHA-256. The thread receives it on its first turn, again when the combined content changes (files are re-read when their size, mtime, ctime or inode changes), again after a rollover creates a new thread, and again after Codex reports context compaction, because compaction rebuilds model history. The fingerprint is stored as one `context_injection` row per thread in `assistant_codex_events` (event key `injection:group-instructions`, detail contains only the state, hash, byte count and section count), so a bridge restart does not inject the same content twice. Instructions are never copied into the user turn, logs or the event store.
+
+`instructionMode` is `append` (default) or `replace` and is only accepted together with instructions. In `append` mode the bridge's default group wording stays and the instructions supplement it. In `replace` mode the instructions supersede only the default group wording that describes the group and how to answer: the `群名称`, `群介绍` and `说明：这是本 Codex 会话绑定的飞书群…` lines of the first-turn `【飞书群聊上下文】` block. The replacement applies only when the thread actually holds the current instructions; if they could not be loaded or injected, the default wording is kept for that turn. The mode is part of the injected header and fingerprint, so changing it re-injects once.
+
+These functional blocks can never be replaced or removed by group instructions: the `【飞书群聊上下文】` header with its `chat_id` line; the result-file directory (`回发文件目录`) and its upload note, including the later-turn `【飞书群聊文件回传】` block; sender lines and the per-message `[msg …]` identity blocks; the replied-to message section; attachment blocks; the `【独立系统任务】` preamble and its first-turn logic for business-event threads; and private-chat prompts.
+
+Instructions apply only to human group threads of configured groups; private chats, business-event threads and unconfigured groups are unchanged. Runtime failures never block a turn: an unreadable, missing, empty, non-UTF-8 or over-limit file is skipped with one `group_instructions` `skipped` warning per failure state (fields: `code`, `reason`, `stage` = `file_<index>`, `chat_id`; no path or content) and an `info` `recovered` event once it is usable again. A failed `thread/inject_items` request or fingerprint lookup is logged as a `context_injection` warning and retried on a later turn. `check-config` is the strict preflight: it reads every configured file, reports each problem with the same fields, and exits non-zero. The bridge does not choose, parse or interpret instruction content; the business side owns what the files say.
+
 Hook delivery remains `{deliveryId,event}` with stable event, chat, and message identifiers from the normalized Feishu event. It is a lightweight notification. Business consumers use their own authoritative reader, such as lark-cli, and own polling fallback and message-ID deduplication. They do not create another Feishu WebSocket through this bridge.
 
 ## Input and execution
 
 Live messages preserve the sender name. A bot mention is removed only when it identifies the configured bot. Group passive context reads messages strictly before the current message according to `codex.groupContextMessageLimit` (default `50`) and `codex.groupContextHours` (default `24`). Passive messages persist attachment metadata without downloading it; a later trigger downloads the selected context attachments before the current message attachments and labels their source in the attachment block. `codex.groupContextAttachmentLimit` (default `10`) caps downloadable context attachments per trigger; later items remain metadata with `context_attachment_limit`. Old context rows without attachment metadata are treated as having no attachments, with no compatibility reconstruction. Context and the current speaker are formatted into the prompt; business parsers, role SQL, lark-cli queries, and cron scheduling stay outside the bridge.
+
+Every group prompt entry carries a one-line Feishu message identity block directly below its sender line, so the Agent can refer to the real message when it calls a business tool:
+
+```text
+【群消息 来自 Alice（open_id=ou_a）】
+[msg message_id=om_1 parent_id=om_card root_id=om_card sender_open_id=ou_a create_time=2026-09-26T01:02:02.000Z]
+Looks good.
+
+【提到你的消息 来自 Bob（open_id=ou_b）】
+[msg message_id=om_2 chat_id=oc_group parent_id=om_1 root_id=om_card sender_open_id=ou_b create_time=2026-09-26T01:02:03.000Z]
+Please continue.
+```
+
+`message_id` is the Feishu message ID of that entry, `parent_id` the message it replies to or quotes, `root_id` the root of its reply thread, `sender_open_id` the sender's app-scoped open ID, and `create_time` the Feishu creation time as ISO 8601 UTC. The triggering (`提到你的消息`) entry also carries `chat_id`, and it is always present even when the triggering message has no text body. A field without a value is omitted, and only values matching `^[A-Za-z0-9_.:-]{1,191}$` are printed. When a replied-to message is itself in the passive context, its own entry carries the same ID as the trigger's `parent_id`. Passive messages persist `parentId` and `rootId` in their existing stored content JSON; older rows simply omit the two fields. No other sender profile or platform field is added, and private-chat prompts are unchanged.
+
+When a group trigger replies to another message (it has `parent_id`, or only `root_id`), the bridge adds a `【被回复消息】` section below the trigger's identity block and before its text, with no configuration required. The first line is the parent's identity block (`message_id`, `msg_type`, `parent_id`, `root_id`, `sender_type`, `sender_open_id` for a user or `sender_app_id` for an app, `create_time`); the content follows as `> ` quoted lines. Text and post messages contribute their text, with mention keys replaced by `@name`. Interactive cards contribute their visible text in document order — header/title, text, Markdown and field elements, `@name` mentions, `[图片]`, `[按钮] <label>` for buttons and `[控件] <placeholder>` for other inputs; button values, callback behaviours, links, image keys and identifiers are never included. Images and files contribute `[图片]` or `[文件] <name>`, other types `[<msg_type> 消息]`. A parent that is already in the passive context is referenced (`内容见上方同 message_id 的群消息`) instead of being fetched again.
+
+The parent is read with one bounded (5-second) Feishu `GET /im/v1/messages/:message_id` call per trigger. A failed, deleted or unavailable read is shown as `> 被回复内容不可得` and logged as a `reply_context` `unavailable` warning with `code`, `stage`, `chat_id` and the parent `message_id`; the turn continues. Content is capped at `routing.groups[].replyContext.maxChars` characters (default 4000, range 200–30000) and marked `…（已截断）` when cut. Setting `replyContext.cardJson: true` additionally reads the card with `card_msg_content_type=user_card_content` and appends its original JSON, compacted and capped at the same limit, under `【被回复卡片 JSON】`; this opt-in section does contain the card's button values. Passive context entries keep only their own `parent_id`/`root_id`; their parents are not fetched. Private chats never fetch replied-to messages.
 
 Every forward job and any prepared inbound media prompt are committed before its first claim and native work. A qualifying live human message enters the direct forward path. Recovery processes reply-pending delivery first, then at most five executable jobs serially, with a reentry guard. The executor owns native lifecycle and response waiters; the Feishu SDK acknowledgement does not interrupt a native turn. Legacy rows that already contain start intent, bound/native identity, an unknown native outcome, or an unconfirmed delivery effect remain isolated without replay. Historical API/system rows are not created by this version, automatically migrated, or deleted; existing conservative recovery and isolation rules still apply to them.
 
@@ -74,7 +119,7 @@ The entire encoded request body is capped at 65,536 bytes, which leaves bounded 
 
 Accepted requests return `202 {"job_id":"...","binding_open_id":"system:...","deduplicated":false}`. Identity is `(producer_id,event_id)` inside the current bot connection. Its forward request key is the collision-free domain-separated string `event\0<producer_id>\0<event_id>`, while its database message ID is `event:` followed by the SHA-256 hex digest of `<producer_id>\0<event_id>` (70 ASCII characters). Repeating the same normalized request returns the same job with `deduplicated:true`. Object keys are canonicalized with JavaScript's default UTF-16 code-unit ordering and are not Unicode-normalized, so input key order does not affect the hash while distinct Unicode spellings remain distinct. The job binds by `(producer_id,scope)`, uses the hook's fixed default chat and `delivery_mode='caller'`, and never creates an execution card, sends a final chat reply, or otherwise performs automatic event output. When the binding already has an active turn, the event follows `codex.steering`; an unconfirmed steer stays in durable forward recovery rather than turning the accepted HTTP request into a later delivery error.
 
-The Codex input retains the existing `【独立系统任务】` preamble, followed by a `【业务事件】` block containing type, event ID, correlation ID, occurrence time and reference IDs, then the producer prompt. The bridge does not load business documents or inject customer content.
+Each event turn carries a `【业务事件】` block containing type, event ID, correlation ID, occurrence time and reference IDs, then the producer prompt. The fixed `【独立系统任务】` preamble (task identity, result chat, the thread's scope statement and result-file directory) is prepended only to the first turn of that thread, when any preamble value differs from the one the thread last received, after a rollover creates a new thread, and after Codex reports context compaction. Its SHA-256 fingerprint is stored like group instructions, under the event key `injection:system-preamble`, and survives restarts; a failed lookup sends the preamble again rather than omit it. Because the result chat is part of the thread binding, a new default chat produces a new thread and therefore a fresh preamble. Business-event threads do not receive group instructions. The bridge itself does not choose business documents or inject customer content; beyond the configured group name and description, it adds only the operator-configured group instructions described under Routing.
 
 `GET /v1/events/:event_id` uses the same bearer token and the same domain-separated request-key derivation; the producer identity comes from that token. It returns `{"job_id":"...","status":"pending","updated_at":...}` using the forward job's existing status literals, or 404 when that hook does not own the event. Each Events API request emits exactly one terminal structured log with `hook_id`, `event_id`, `type`, `scope_prefix`, `status_code`, `job_id`, and `error_class`. Logs never contain the prompt or full payload.
 
@@ -85,6 +130,8 @@ Internal bridge delivery status is `waiting`, `pending`, `sent`, `failed`, or `u
 Use `examples/bridge.json` for the current shape. Secrets are read only from explicit environment-variable names. `codex.bin` and `codex.cwd` are explicit; only `codex.envNames` plus configured proxy mappings enter the child. Codex lifecycle, RPC/turn timeout, approval/reviewer, sandbox, network, user-input, rollover and memory-guard settings expose the production defaults shown in the example. `codex.jobRetryMs` and `codex.jobMaxAttempts` retain the forward retry limits; the three `codex.groupContext*` settings control passive-message count, age, and per-trigger attachment downloads. Optional `feishu.replyAsPost` and `feishu.maxOutputChars` select the original ordinary reply mode and cap. `feishu.processingReaction`, `processingReactionEmoji`, and `processingFallbackText` control the original live Typing behavior. `feishu.mediaEnabled` controls inbound downloads while preserving metadata, `mediaInboxDir` selects the inbox, `mediaMaxBytes` is a 1-byte to 32-MiB hard per-resource limit defaulting to 32 MiB, and `mediaDownloadTimeoutMs` is a positive-integer download deadline defaulting to 120000 ms. The process uses one Feishu HTTP client and one WebSocket client.
 
 Paths are resolved from the config file. The executable and workspace must satisfy the ownership checks. Codex state defaults to the launching user's shared `~/.codex`. Optional `codex.sharedHome` may select an absolute path or a path beginning with `~/`; if the launch environment also sets `CODEX_HOME`, both must resolve to the same directory or startup fails. The child still receives only explicitly selected environment names and proxy mappings; the production-derived app-server shell policy inherits from that controlled child environment. Approval policy defaults to `on-request`, the reviewer defaults to the installed protocol value `auto_review`, and sandbox defaults to `workspace-write`.
+
+`check-config` validates the JSON contract and reads configured group instruction files; it never resolves environment secrets.
 
 Run:
 

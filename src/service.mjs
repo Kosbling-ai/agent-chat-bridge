@@ -25,6 +25,7 @@ import { createUserInputRuntime } from './channels/feishu/user-input-runtime.mjs
 import { createBusinessCardAction } from './channels/feishu/business-card-action.mjs';
 import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
+import { createGroupInstructions } from './core/group-instructions.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
 import { startServer } from './server.mjs';
 import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
@@ -256,7 +257,8 @@ export async function startService({ config, configPath, env = process.env, log,
       outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
     };
-    executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,
+    const groupInstructions=createGroupInstructions({groups:config.routing.groups.filter(group=>group.capabilities.includes('bridge')),configDir:root,log});
+    executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,groupInstructions,
       onUserInput:event=>userInput?.open(event),onUserInputClosed:event=>userInput?.expire(event),onRestartRequired:async reason=>{
       log('warning','codex_executor','restart_required',{code:reason});
       await close();

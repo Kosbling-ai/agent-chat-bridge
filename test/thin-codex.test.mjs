@@ -113,11 +113,12 @@ function memoryStore(initial = []) {
     async saveCodexRealtimeEvent(binding, event) { const row = { ...event, event_key: event.eventKey, event_type: event.eventType, detail_json: JSON.stringify(event.detail || {}), id: events.length + 1, binding }; const index = events.findIndex((x) => x.binding.codexSessionId === binding.codexSessionId && x.event_key === row.event_key); if (index >= 0) events[index] = row; else events.push(row); },
     async findAcceptedMessageEvent(binding, messageId, { includeInFlight = false } = {}) { return [...events].reverse().find((row) => row.binding.codexSessionId === binding.codexSessionId && row.messageId === messageId && (row.event_key.startsWith('assistant-final:') || row.event_key.startsWith('error:') || (includeInFlight && row.event_key.startsWith('user-steer-confirmed:')))) || null; },
     async loadSteerEvents(binding, messageId) { return events.filter((row) => row.binding.codexSessionId === binding.codexSessionId && row.event_key.endsWith(`:${messageId}`) && row.event_key.startsWith('user-steer-')); },
+    async loadCodexEvent(binding, eventKey) { return events.find((row) => row.binding.codexSessionId === binding.codexSessionId && row.event_key === eventKey) || null; },
     async readPublicProgress() { return []; },
   };
 }
 
-function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false } = {}) {
+function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false, turnItemsFor = () => [] } = {}) {
   let threadNumber = 0; let turnNumber = 0;
   const children = []; const calls = []; const envs = []; const args = [];
   const spawnImpl = (_bin, childArgs, options) => {
@@ -155,11 +156,11 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkTh
         const id = `turn-${++turnNumber}`;
         for (const [index,request] of serverRequestsOnStart.entries()) instance.send({id:request.id,method:'item/tool/requestUserInput',params:{threadId:message.params.threadId,turnId:id,itemId:`item-${index}`,questions:[{id:'q',header:'Choice',question:'Pick',options:[{label:'A',description:'a'}]}],isBlocking:true,...request.params}});
         if(resolveServerRequestBeforeResponse&&serverRequestsOnStart[0])instance.send({method:'serverRequest/resolved',params:{threadId:message.params.threadId,requestId:serverRequestsOnStart[0].id}});
-        const completed = { method: 'turn/completed', params: { threadId: message.params.threadId, turnId: id, turn: { id, status: 'completed', items: [{ id: `answer-${id}`, type: 'agentMessage', phase: 'final_answer', text: `answer ${id}` }] } } };
+        const completed = { method: 'turn/completed', params: { threadId: message.params.threadId, turnId: id, turn: { id, status: 'completed', items: [...turnItemsFor(turnNumber), { id: `answer-${id}`, type: 'agentMessage', phase: 'final_answer', text: `answer ${id}` }] } } };
         if (completeStarts && raceCompletionBeforeResponse) instance.send(completed);
         respond({ turn: { id } });
         if (completeStarts && !raceCompletionBeforeResponse) setTimeout(() => instance.send(completed), 5);
-      } else if (message.method === 'turn/steer' || message.method === 'turn/interrupt') respond({});
+      } else if (message.method === 'turn/steer' || message.method === 'turn/interrupt' || message.method === 'thread/inject_items') respond({});
     });
     children.push(child); return child;
   };
@@ -1122,3 +1123,142 @@ for (const path of ['error', 'turn/completed', 'resume']) {
     } finally { await executor.close(); rmSync(cwd, { recursive: true, force: true }); }
   });
 }
+
+const injectCalls = runtime => runtime.calls.filter(call => call.method === 'thread/inject_items');
+const turnText = (runtime, index) => runtime.calls.filter(call => call.method === 'turn/start')[index].params.input[0].text;
+const groupTurn = messageId => ({ bindingOpenId: 'group:oc_group', chatId: 'oc_group', chatType: 'group', messageId, prompt: 'work' });
+
+test('configured group instructions enter a group thread once per fingerprint, after changes and after compaction', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-instructions-'));
+  try {
+    const store = memoryStore();
+    let current = { text: 'rules v1', hash: 'h1', bytes: 8, sources: 1 };
+    const provider = { configured: chatId => chatId === 'oc_group', forChat: async chatId => (chatId === 'oc_group' ? current : null) };
+    let compactOnTurn = 0;
+    const runtime = fakeRuntime({ turnItemsFor: turn => (turn === compactOnTurn ? [{ id: 'compact', type: 'contextCompaction' }] : []) });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, groupInstructions: provider });
+    await executor.execute(groupTurn('m1'));
+    assert.deepEqual(injectCalls(runtime).map(call => call.params), [{ threadId: 'thread-1',
+      items: [{ type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'rules v1' }] }] }]);
+    assert.deepEqual(runtime.calls.map(call => call.method).filter(method => ['thread/inject_items', 'turn/start'].includes(method)), ['thread/inject_items', 'turn/start']);
+    assert.equal(turnText(runtime, 0).includes('rules v1'), false, 'instructions are not repeated in the user turn');
+    await executor.execute(groupTurn('m2'));
+    assert.equal(injectCalls(runtime).length, 1, 'an unchanged fingerprint is not injected again');
+    current = { text: 'rules v2', hash: 'h2', bytes: 8, sources: 1 };
+    await executor.execute(groupTurn('m3'));
+    assert.equal(injectCalls(runtime).length, 2);
+    assert.equal(injectCalls(runtime)[1].params.items[0].content[0].text, 'rules v2');
+    compactOnTurn = 4;
+    await executor.execute(groupTurn('m4'));
+    assert.equal(injectCalls(runtime).length, 2);
+    await executor.execute(groupTurn('m5'));
+    assert.equal(injectCalls(runtime).length, 3, 'compaction invalidates the injected fingerprint');
+    await executor.execute({ bindingOpenId: 'ou_human', chatId: 'oc_group', chatType: 'p2p', messageId: 'p1', prompt: 'hello' });
+    await executor.execute({ bindingOpenId: deriveExecutionScope('hook', 'scope:1'), chatId: 'oc_group', chatType: 'group', messageId: 's1', prompt: 'event' });
+    await executor.execute({ bindingOpenId: 'group:oc_plain', chatId: 'oc_plain', chatType: 'group', messageId: 'g1', prompt: 'work' });
+    assert.equal(injectCalls(runtime).length, 3, 'private, system and unconfigured group threads are untouched');
+    await executor.close();
+
+    const marker = store.events.find(row => row.event_key === 'injection:group-instructions');
+    assert.deepEqual(JSON.parse(marker.detail_json), { mode: 'append', bytes: 8, sources: 1, state: 'injected', hash: 'h2' });
+    assert.equal(marker.text, '', 'instruction content is not copied into the event store');
+    const restartedRuntime = fakeRuntime();
+    const restarted = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: restartedRuntime.spawnImpl, groupInstructions: provider });
+    await restarted.execute(groupTurn('m6'));
+    assert.equal(injectCalls(restartedRuntime).length, 0, 'the durable fingerprint survives a restart');
+    await restarted.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('group instruction failures are warnings that never block the turn', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-instructions-'));
+  try {
+    const logs = [];
+    let fail = 'inject';
+    const provider = { configured: () => true, forChat: async () => { if (fail === 'load') throw new Error('SYNTHETIC_SECRET path'); return { text: 'SYNTHETIC_SECRET rules', hash: 'h1', bytes: 1, sources: 1 }; } };
+    const runtime = fakeRuntime({ rejectMethods: new Map([['thread/inject_items', () => {
+      if (fail === 'inject') return { code: -32601, message: 'SYNTHETIC_SECRET method not found' };
+      return undefined;
+    }]]) });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl, groupInstructions: provider, log: (...entry) => logs.push(entry) });
+    assert.equal((await executor.execute(groupTurn('m1'))).answer, 'answer turn-1');
+    assert(logs.some(([level, event]) => level === 'warning' && event.operation === 'context_injection' && event.stage === 'group_instructions_inject' && event.rpc_method === 'thread/inject_items'));
+    fail = 'load';
+    assert.equal((await executor.execute(groupTurn('m2'))).answer, 'answer turn-2');
+    assert(logs.some(([level, event]) => level === 'warning' && event.stage === 'group_instructions_load'));
+    assert.equal(injectCalls(runtime).length, 1, 'a failed injection is retried by a later turn only when instructions load');
+    assert.doesNotMatch(JSON.stringify(logs), /SYNTHETIC_SECRET/);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('system task preamble is sent on the first turn and again only when it changes or after compaction', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-preamble-'));
+  try {
+    const store = memoryStore();
+    const scope = deriveExecutionScope('hook', 'scope:1');
+    const event = (executor, messageId, chatId = 'oc_delivery') => executor.execute({ bindingOpenId: scope, chatId, chatType: 'group', messageId, prompt: '【业务事件】\ntype：mail.inbound' });
+    const runtime = fakeRuntime({ turnItemsFor: turn => (turn === 3 ? [{ id: 'compact', type: 'contextCompaction' }] : []) });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    await event(executor, 'e1');
+    assert.match(turnText(runtime, 0), /^【独立系统任务】\n任务：system:[0-9a-f]+\n结果投递群：oc_delivery\n[^\n]+\n回发文件目录：data\/feishu-outbox\/system-[0-9a-f]+\/oc_delivery\n\n【业务事件】\ntype：mail\.inbound$/);
+    await event(executor, 'e2');
+    assert.equal(turnText(runtime, 1), '【业务事件】\ntype：mail.inbound');
+    await event(executor, 'e3');
+    assert.equal(turnText(runtime, 2), '【业务事件】\ntype：mail.inbound');
+    await event(executor, 'e4');
+    assert.match(turnText(runtime, 3), /^【独立系统任务】/, 'compaction sends the preamble again');
+    await event(executor, 'e5', 'oc_other');
+    assert.match(turnText(runtime, 4), /^【独立系统任务】\n[^\n]+\n结果投递群：oc_other\n/, 'a changed delivery group receives its own preamble');
+    await event(executor, 'e6', 'oc_other');
+    assert.equal(turnText(runtime, 5), '【业务事件】\ntype：mail.inbound');
+    await executor.close();
+
+    const restartedRuntime = fakeRuntime();
+    const restarted = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: restartedRuntime.spawnImpl });
+    await event(restarted, 'e7');
+    assert.equal(turnText(restartedRuntime, 0), '【业务事件】\ntype：mail.inbound', 'a restart does not repeat an unchanged preamble');
+    await restarted.close();
+
+    const movedRuntime = fakeRuntime();
+    const moved = createCodexExecutor({ config: { ...config(cwd), outboxRelativeRoot: 'data/other-outbox' }, sessionStore: store, spawnImpl: movedRuntime.spawnImpl });
+    await event(moved, 'e8');
+    assert.equal(movedRuntime.calls.find(call => call.method === 'turn/start').params.threadId, 'thread-1');
+    assert.match(turnText(movedRuntime, 0), /^【独立系统任务】[\s\S]*回发文件目录：data\/other-outbox\/system-/, 'a changed result directory is sent to the same thread');
+    await moved.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('replace-mode instructions drop only the default group wording once the thread holds them', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-mode-'));
+  try {
+    const context = { chatId: 'oc_group', name: '默认群名', description: '默认介绍' };
+    const turn = (messageId, chatId = 'oc_group') => ({ bindingOpenId: `group:${chatId}`, chatId, chatType: 'group', messageId,
+      prompt: `【提到你的消息 来自 Bob（open_id=ou_b）】\n[msg message_id=${messageId} chat_id=${chatId}]\nwork`, groupChatContext: { ...context, chatId } });
+    const run = async ({ mode, rejectInject = false }) => {
+      const runtime = fakeRuntime(rejectInject ? { rejectMethods: new Map([['thread/inject_items', { code: -32601, message: 'unsupported' }]]) } : {});
+      const provider = { configured: () => true, forChat: async () => ({ text: `rules ${mode}`, hash: `h-${mode}`, mode, bytes: 1, sources: 1 }) };
+      const executor = createCodexExecutor({ config: { ...config(cwd), allowedGroupChatIds: new Set(['oc_group']) }, sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl, groupInstructions: provider });
+      await executor.execute(turn('m1'));
+      await executor.execute({ bindingOpenId: deriveExecutionScope('hook', 'scope:1'), chatId: 'oc_group', chatType: 'group', messageId: 's1', prompt: 'event' });
+      await executor.close();
+      return { first: turnText(runtime, 0), system: turnText(runtime, 1) };
+    };
+    const structural = prompt => {
+      assert.match(prompt, /^【飞书群聊上下文】\n/);
+      assert.match(prompt, /\nchat_id：oc_group\n/);
+      assert.match(prompt, /\n回发文件目录：data\/feishu-outbox\/oc_group\n说明：需要给当前群回发文件时/);
+      assert.match(prompt, /\n\n【提到你的消息 来自 Bob（open_id=ou_b）】\n\[msg message_id=m1 chat_id=oc_group\]\nwork$/);
+    };
+    const appended = await run({ mode: 'append' });
+    structural(appended.first);
+    assert.match(appended.first, /群名称：默认群名\n群介绍：默认介绍\nchat_id：oc_group\n说明：这是本 Codex 会话绑定的飞书群/);
+    const replaced = await run({ mode: 'replace' });
+    structural(replaced.first);
+    assert.doesNotMatch(replaced.first, /默认群名|默认介绍|这是本 Codex 会话绑定的飞书群/);
+    const fallback = await run({ mode: 'replace', rejectInject: true });
+    structural(fallback.first);
+    assert.match(fallback.first, /群名称：默认群名/, 'default wording stays when replacement instructions were not delivered');
+    for (const result of [appended, replaced, fallback]) assert.match(result.system, /^【独立系统任务】\n/);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});

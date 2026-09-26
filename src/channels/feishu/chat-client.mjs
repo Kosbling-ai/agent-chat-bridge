@@ -105,8 +105,12 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
       return call('message', 'reply', { path: { message_id: required(messageId) },
         data: { msg_type: kind, content: content(kind, body), uuid: uuid(effectId), reply_in_thread: replyInThread } }, true);
     },
-    getMessage({ messageId }) {
-      return call('message', 'get', { path: { message_id: required(messageId) }, params: { user_id_type: 'open_id' } });
+    // cardContentType 'user_card_content' returns an interactive message's original card JSON.
+    getMessage({ messageId, cardContentType, timeoutMs: readTimeoutMs = timeoutMs }) {
+      if (cardContentType !== undefined && cardContentType !== 'user_card_content') throw new FeishuChatError('invalid_card_content_type', 'failed');
+      if (!Number.isInteger(readTimeoutMs) || readTimeoutMs < 1 || readTimeoutMs > timeoutMs) throw new FeishuChatError('invalid_chat_argument', 'failed');
+      return call('message', 'get', { path: { message_id: required(messageId) },
+        params: { user_id_type: 'open_id', ...(cardContentType ? { card_msg_content_type: cardContentType } : {}) } }, false, undefined, readTimeoutMs);
     },
     listMessages({ conversationId, pageSize, pageToken, startTime, endTime }) {
       for (const time of [startTime, endTime]) if (time !== undefined && !/^\d{1,13}$/.test(String(time))) throw new FeishuChatError('invalid_history_time', 'failed');

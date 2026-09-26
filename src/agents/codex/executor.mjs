@@ -3,7 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { CodexAppServerClient } from './app-server-client.mjs';
-import { buildInitialPrompt } from './prompt.mjs';
+import { buildInitialPrompt, systemTaskPreamble } from './prompt.mjs';
+import { isScheduledBinding } from './thread-scope.mjs';
 import { collectOutboxAttachments } from './outbound-files.mjs';
 import { codexThreadCreatedAtMs, shouldRolloverForRules } from './codex-rules-rollover.mjs';
 import { exactTurnSnapshot, inProgressTurnIds, interruptTurnAndPredecessors, isNoActiveTurnError, steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from './codex-turn-recovery.mjs';
@@ -18,6 +19,13 @@ const stableKey = (value) => createHash('sha1').update(String(value || '')).dige
 const bindingKey = ({ feishuOpenId, chatId }) => `${feishuOpenId || 'unknown'}:${chatId || 'unknown'}`;
 const normalizeApprovalPolicy = (value) => !trim(value) || trim(value) === 'auto' ? 'on-request' : trim(value);
 const normalizeApprovalsReviewer = (value) => !trim(value) || trim(value) === 'auto' ? 'auto_review' : trim(value);
+// One durable row per thread and injected context kind records the fingerprint the
+// thread already holds, so restarts do not repeat it and changes are sent once.
+const GROUP_INSTRUCTIONS_KEY = 'injection:group-instructions';
+const SYSTEM_PREAMBLE_KEY = 'injection:system-preamble';
+const INJECTION_STALE = Symbol('injection_stale');
+const fingerprint = (value) => createHash('sha256').update(String(value)).digest('hex');
+const humanGroupBinding = (binding) => Boolean(binding?.chatType && binding.chatType !== 'p2p' && !isScheduledBinding(binding.feishuOpenId));
 
 export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now } = {}) {
   if (typeof write !== 'function') throw new Error('delta writer is required');
@@ -151,7 +159,7 @@ export function buildTurnInput(prompt, attachments = []) {
     .map(attachment => ({ type: 'localImage', path: attachment.path }))];
 }
 
-export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, spawnSyncImpl, now = Date.now, onRestartRequired = async () => {}, onUserInput = async () => {}, onUserInputClosed = async () => {}, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval } = {}) {
+export function createCodexExecutor({ config, sessionStore, childEnv = {}, log = () => {}, spawnImpl, spawnSyncImpl, now = Date.now, onRestartRequired = async () => {}, onUserInput = async () => {}, onUserInputClosed = async () => {}, groupInstructions, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval } = {}) {
   if (!config || !sessionStore) throw new Error('config and sessionStore are required');
   const locks = new Map();
   const activeByBinding = new Map();
@@ -159,6 +167,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   const startingByThread = new Map();
   const resolvedUserInputs = new Set();
   const loadedThreads = new Set();
+  const injectedContext = new Map();
   let memoryTimer;
   let closing = false;
   let restartPending = '';
@@ -318,6 +327,91 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       eventType: 'user_message', role: 'user', title: '用户', text: prompt, createdAt: now(),
       detail: { senderOpenId: input.senderOpenId || '', senderUnionId: input.senderUnionId || '', senderName: input.senderName || '', chatType: binding.chatType || '', ...detail },
     });
+  }
+
+  function injectionLog(level, status, fields = {}) {
+    try { log(level, { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'context_injection', status, ...fields }); }
+    catch { /* observability never changes injection outcome */ }
+  }
+
+  function rememberInjection(threadId, key, value) {
+    const cacheKey = `${threadId}\0${key}`;
+    injectedContext.delete(cacheKey);
+    injectedContext.set(cacheKey, value);
+    if (injectedContext.size > 2000) injectedContext.delete(injectedContext.keys().next().value);
+  }
+
+  // Throws when the durable lookup fails so each caller chooses its safe default.
+  async function hasInjection(binding, key, hash) {
+    const cached = injectedContext.get(`${binding.codexSessionId}\0${key}`);
+    if (cached === hash) return true;
+    if (cached === INJECTION_STALE || typeof sessionStore.loadCodexEvent !== 'function') return false;
+    const row = await sessionStore.loadCodexEvent(binding, key);
+    const detail = row ? parseDetail(row) : {};
+    if (detail.state !== 'injected' || detail.hash !== hash) return false;
+    rememberInjection(binding.codexSessionId, key, hash);
+    return true;
+  }
+
+  async function recordInjection(binding, key, hash, detail = {}) {
+    rememberInjection(binding.codexSessionId, key, hash);
+    try {
+      await sessionStore.saveCodexRealtimeEvent(binding, { eventKey: key, eventType: 'context_injection', role: 'activity', title: '上下文注入', text: '', createdAt: now(), detail: { ...detail, state: 'injected', hash } });
+    } catch (error) { injectionLog('warning', 'failed', { stage: 'persist', error_code: key, errorClass: databaseError(error).code }); }
+  }
+
+  function injectedKeys(binding) {
+    if (isScheduledBinding(binding.feishuOpenId)) return [SYSTEM_PREAMBLE_KEY];
+    return groupInstructions && humanGroupBinding(binding) && groupInstructions.configured(binding.chatId) ? [GROUP_INSTRUCTIONS_KEY] : [];
+  }
+
+  // Compaction rebuilds model history, so injected context is sent again on the next turn.
+  function markInjectionsStale(state, reason) {
+    if (state.injectionsStale) return;
+    state.injectionsStale = true;
+    for (const key of injectedKeys(state.binding)) {
+      rememberInjection(state.threadId, key, INJECTION_STALE);
+      sessionStore.saveCodexRealtimeEvent(state.binding, { eventKey: key, eventType: 'context_injection', role: 'activity', title: '上下文注入', text: '', createdAt: now(), detail: { state: 'stale', reason, turnId: state.turnId } })
+        .catch((error) => injectionLog('warning', 'failed', { stage: 'mark_stale', error_code: key, errorClass: databaseError(error).code }));
+    }
+  }
+
+  // Configured group instructions enter a human group thread as a developer item.
+  // Every failure is a warning: the turn continues and the next turn retries.
+  // Returns the mode only when the thread holds the current instructions.
+  async function ensureGroupInstructions(binding) {
+    if (!groupInstructions || !binding?.codexSessionId || !humanGroupBinding(binding) || !groupInstructions.configured(binding.chatId)) return '';
+    let current;
+    try { current = await groupInstructions.forChat(binding.chatId); }
+    catch { injectionLog('warning', 'failed', { stage: 'group_instructions_load', error_code: 'group_instructions_unavailable' }); return ''; }
+    if (!current?.text || !current.hash) return '';
+    try { if (await hasInjection(binding, GROUP_INSTRUCTIONS_KEY, current.hash)) return current.mode || 'append'; }
+    catch (error) { injectionLog('warning', 'failed', { stage: 'group_instructions_lookup', errorClass: databaseError(error).code }); return ''; }
+    const startedAt = now();
+    try {
+      await client.request('thread/inject_items', { threadId: binding.codexSessionId,
+        items: [{ type: 'message', role: 'developer', content: [{ type: 'input_text', text: current.text }] }] });
+    } catch (error) {
+      injectionLog('warning', 'failed', { stage: 'group_instructions_inject', rpc_method: 'thread/inject_items', error_code: error?.code || 'CODEX_RPC_FAILED', durationMs: Math.max(0, now() - startedAt) });
+      return '';
+    }
+    await recordInjection(binding, GROUP_INSTRUCTIONS_KEY, current.hash, { mode: current.mode || 'append', bytes: current.bytes, sources: current.sources });
+    injectionLog('info', 'succeeded', { stage: 'group_instructions_inject', durationMs: Math.max(0, now() - startedAt) });
+    return current.mode || 'append';
+  }
+
+  // A system-task thread receives its fixed preamble on the first turn and again
+  // only after the preamble values change or compaction may have removed it.
+  // Replace-mode instructions supersede the default group wording only once the
+  // thread actually holds them; otherwise the default wording stays.
+  async function initialPrompt(binding, input, instructionMode = '') {
+    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
+    if (!isScheduledBinding(binding.feishuOpenId)) return { prompt: buildInitialPrompt(options) };
+    const hash = fingerprint(systemTaskPreamble(options));
+    let present = false;
+    try { present = await hasInjection(binding, SYSTEM_PREAMBLE_KEY, hash); }
+    catch (error) { injectionLog('warning', 'failed', { stage: 'system_preamble_lookup', errorClass: databaseError(error).code }); }
+    return { prompt: buildInitialPrompt({ ...options, systemPreamble: !present }), systemPreambleHash: present ? '' : hash };
   }
 
   function duplicateResult(binding, event, turnId = '') {
@@ -628,7 +722,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (reconciled) return { completion: Promise.resolve(reconciled) };
       binding = await maybeRollover(binding, normalized.messageId);
       binding = await ensureBindingThreadReadyWithArchiveRecovery(binding, normalized.messageId);
-      let prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
+      let initial = await initialPrompt(binding, normalized, await ensureGroupInstructions(binding));
+      let prompt = initial.prompt;
       await persistUser(binding, normalized, 'user', prompt);
       const startedAt = now();
       await options.onStartIntent?.({ binding, threadId: binding.codexSessionId, messageId: normalized.messageId, startedAt });
@@ -646,7 +741,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           loadedThreads.delete(binding.codexSessionId);
           binding = await rolloverArchivedBinding(binding, normalized.messageId, error);
           await ensureThreadReady(binding);
-          prompt = buildInitialPrompt({ binding, prompt: normalized.prompt, groupChatContext: normalized.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds });
+          initial = await initialPrompt(binding, normalized, await ensureGroupInstructions(binding));
+          prompt = initial.prompt;
           await persistUser(binding, normalized, 'user', prompt);
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
@@ -677,6 +773,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         throw error;
       }
       startingByThread.delete(admission.threadId); admission.resolve(state);
+      if (initial.systemPreambleHash) void recordInjection(binding, SYSTEM_PREAMBLE_KEY, initial.systemPreambleHash);
       await sessionStore.saveCodexRealtimeEvent(binding, { messageId: normalized.messageId, eventKey: `public:${turnId}:started`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: startedAt, detail: { kind: 'started', id: turnId, turnId, at: startedAt } })
         .catch((_error) => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_started', status: 'failed', threadId: binding.codexSessionId, turnId }));
       return { completion: waitForTurn(state, normalized.messageId, { created: binding.created, signal: options.signal }) };
@@ -857,6 +954,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     const state = activeByTurn.get(turnId);
     if (!state) return;
     const { method, params } = event;
+    if (method === 'thread/compacted' || (method === 'item/completed' && params.item?.type === 'contextCompaction')
+      || (method === 'turn/completed' && (params.turn?.items || []).some((item) => item?.type === 'contextCompaction'))) markInjectionsStale(state, 'context_compaction');
     const progress = state.publicProgress(method, params);
     if (progress) sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `public:${turnId}:${progress.id}:${method}`, eventType: 'public_progress', role: 'activity', title: '执行进度', text: '', createdAt: progress.at, detail: progress }).catch((_error) => log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'publish_progress', status: 'failed' }));
     if (method === 'agentMessage/delta' || method === 'item/agentMessage/delta') {

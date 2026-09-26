@@ -65,6 +65,30 @@ function identifier(value, max) {
   if (result.length > max) throw new ConfigError('invalid_identifier_length');
   return result;
 }
+const MAX_GROUP_INSTRUCTION_FILES = 20;
+const MAX_GROUP_INSTRUCTION_TEXT = 8000;
+// Paths stay unresolved here; runtime and check-config resolve them from the config file directory.
+function instructionFiles(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_GROUP_INSTRUCTION_FILES) throw new ConfigError('invalid_group_instruction_files');
+  const paths = value.map(path => {
+    if (typeof path !== 'string' || !path.trim() || path !== path.trim() || path.length > 1024
+      || /[\u0000-\u001f\u007f]/u.test(path)) throw new ConfigError('invalid_group_instruction_files');
+    return path;
+  });
+  if (new Set(paths).size !== paths.length) throw new ConfigError('invalid_group_instruction_files');
+  return Object.freeze(paths);
+}
+function instructionText(value) {
+  if (typeof value !== 'string' || !value.trim() || value.length > MAX_GROUP_INSTRUCTION_TEXT || !value.isWellFormed()
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) throw new ConfigError('invalid_group_instruction_text');
+  return value.trim();
+}
+function replyContext(value) {
+  object(value, ['cardJson', 'maxChars'], 'invalid_group_reply_context');
+  const result = { cardJson: value.cardJson ?? false, maxChars: value.maxChars ?? 4000 };
+  if (typeof result.cardJson !== 'boolean' || !Number.isSafeInteger(result.maxChars) || result.maxChars < 200 || result.maxChars > 30000) throw new ConfigError('invalid_group_reply_context');
+  return Object.freeze(result);
+}
 function validateRuntime(raw) {
   const enabled = ['runtime', 'storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
@@ -190,12 +214,18 @@ function validateRuntime(raw) {
   object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities'], 'invalid_group_fields');
+    object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext'], 'invalid_group_fields');
+    const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
+    if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
     const capabilities=group.capabilities===undefined?['bridge','hook']:strings(group.capabilities);
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
     return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, passiveContext: group.passiveContext, capabilities,
-      ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }) };
+      ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }),
+      ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
+      ...(group.instructionText === undefined ? {} : { instructionText: instructionText(group.instructionText) }),
+      ...(instructed ? { instructionMode: group.instructionMode ?? 'append' } : {}),
+      ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;

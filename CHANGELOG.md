@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.15] — Unreleased
+
+- Add a one-line Feishu message identity block to every group prompt entry: passive context entries carry `message_id`, `parent_id`, `root_id`, `sender_open_id` and `create_time`; the triggering message additionally carries `chat_id` and is always identified even without a text body. Passive messages persist their reply identifiers in the existing stored content JSON. Private-chat prompts are unchanged.
+- Add optional `routing.groups[].instructionFiles` (absolute or relative to the config file) and `instructionText`. Configured content is injected into the group's human Codex thread as one developer item through `thread/inject_items` on the first turn, when its SHA-256 fingerprint changes, after rollover and after context compaction; a durable per-thread fingerprint prevents repeats after restart. Unusable files are skipped with a warning and never block a turn; `check-config` now reads configured files and fails on missing, unreadable, empty, non-UTF-8 or over-limit (200 KiB per group) input.
+- Add optional `routing.groups[].instructionMode` (`append` by default, or `replace`). Replace mode supersedes only the default group name, description and session wording once the thread holds the instructions; `chat_id`, result-file, attachment, message-identity and system-preamble blocks always stay.
+- Add a `【被回复消息】` section to group triggers that reply to another message: the parent's identity block plus its text, or a card's visible text with button labels only. The parent is read once with a 5-second limit; failures show `被回复内容不可得` and log a warning. Optional `routing.groups[].replyContext` sets `maxChars` (default 4000) and `cardJson` (default `false`) to append the card's original JSON.
+- Send the `【独立系统任务】` preamble to a business-event thread only on its first turn, when any preamble value changes, after rollover or after context compaction, using the same durable fingerprint record; other turns carry only the business-event block and producer prompt.
+
+No database migration is needed.
+
 ## [0.2.14] — Unreleased
 
 - Restore the fixed Feishu reply for bot mentions from groups that are not listed in `routing.groups`. A live human `@bot` message in such a group queues one text reply to that message containing the group's `chat_id`; hook-only groups, unauthorized speakers in configured groups, history catch-up, bot/app/self messages and duplicates stay silent. Replies are rate-limited in memory per group and speaker. The new optional `routing.unlistedGroupReply` setting controls `enabled` (default `true`), `text` (`{{chat_id}}` placeholder) and `cooldownMs` (default `600000`).

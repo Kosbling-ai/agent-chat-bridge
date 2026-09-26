@@ -3,6 +3,7 @@ import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { extractAttachments } from '../channels/feishu/media.mjs';
 import { buildCodexForwardPrompt, createRecentMentionPrompts, isBotJoinNotice,
   mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
+import { DEFAULT_REPLY_CONTEXT_MAX_CHARS, loadReplySegment } from '../channels/feishu/reply-context.mjs';
 import { databaseError } from '../storage/errors.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
@@ -87,9 +88,11 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&group?.passiveContext&&event.type==='message.received'
       &&(normalized.rawText.trim()||attachmentMetadata.length));
     const receipt=await store.acceptInbound({connectionId,conversationId:event.conversationId,source:event.source,conversationType:event.conversationType,eventKey:event.eventKey,eventType:event.type,messageId:event.messageId,...(event.type==='message.recalled'?{recalledMessageId:event.messageId}:{}),revision:event.revision,occurredAt:event.occurredAt,payload:event,semanticPayload:feishuEventIdentity(event),policyVersion:config.routing.version,passiveContext:contextCandidate,
-      inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata},groupContextCandidate:contextCandidate},
+      inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata,
+        ...(normalized.parentId?{parentId:normalized.parentId}:{}),...(normalized.rootId?{rootId:normalized.rootId}:{})},groupContextCandidate:contextCandidate},
       hooks});
     if(contextCandidate&&!receipt.duplicate)recent.remember({chatId:normalized.chatId,messageId:normalized.messageId,prompt:normalized.rawText,
+      parentId:normalized.parentId,rootId:normalized.rootId,createdAt:normalized.createdAt,
       senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId,senderName:normalized.senderName});
     if(event.type==='message.received'&&event.source==='live'&&event.conversationType==='group'&&!group&&mentioned&&!ignoredByAgent
       &&event.actor?.type==='user'&&!event.isApp&&!event.isSelf&&config.routing.unlistedGroupReply?.enabled&&!receipt.duplicate)await replyUnlistedGroup(event);
@@ -103,8 +106,12 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       const mediaResolvable=normalized.messageType!=='text';
       if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;
       const mergedPrompt=normalized.chatType==='p2p'?normalized.text:mergeMentionPrompts(contextEntries,normalized.text);
+      const replyTo=normalized.chatType==='p2p'?'':(normalized.parentId||normalized.rootId);
+      const replySegment=replyTo?await loadReplySegment({chat,parentId:replyTo,chatId:normalized.chatId,contextEntries,
+        cardJson:group?.replyContext?.cardJson===true,maxChars:group?.replyContext?.maxChars??DEFAULT_REPLY_CONTEXT_MAX_CHARS,log}):'';
       const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
-        mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId});
+        mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId,
+        chatId:normalized.chatId,messageId:normalized.messageId,parentId:normalized.parentId,rootId:normalized.rootId,createdAt:normalized.createdAt,replySegment});
       const result=await forward.handleMessage({
         source:'live',callerId:'live',idempotencyKey:`live:${connectionId}:${normalized.chatId}:${normalized.messageId}`,
         message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,
