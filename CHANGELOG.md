@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.16] — Unreleased
+
+- Normalize business-card callback `action_time` from seconds, milliseconds, microseconds or nanoseconds before forwarding, and discard invalid or out-of-range values. The original time string still participates in fallback event ID hashing.
+
+No database migration is needed.
+
 ## [0.2.15] — Unreleased
 
 - Add a one-line Feishu message identity block to every group prompt entry: passive context entries carry `message_id`, `parent_id`, `root_id`, `sender_open_id` and `create_time`; the triggering message additionally carries `chat_id` and is always identified even without a text body. Passive messages persist their reply identifiers in the existing stored content JSON. Private-chat prompts are unchanged.

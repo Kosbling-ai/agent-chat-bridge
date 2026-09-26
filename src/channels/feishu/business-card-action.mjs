@@ -18,8 +18,14 @@ function firstString(...values) {
 function occurredAt(value) {
   if (typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value))) {
     const number = Number(value);
-    const date = new Date(number < 10_000_000_000 ? number * 1000 : number);
-    if (!Number.isNaN(date.valueOf())) return date.toISOString();
+    if (!Number.isFinite(number)) return null;
+    const magnitude = Math.abs(number);
+    const milliseconds = magnitude < 1e11 ? number * 1000
+      : magnitude < 1e14 ? number
+        : magnitude < 1e17 ? number / 1000
+          : magnitude < 1e20 ? number / 1e6 : NaN;
+    const date = new Date(milliseconds);
+    return Number.isNaN(date.valueOf()) ? null : date.toISOString();
   }
   if (typeof value === 'string') {
     const date = new Date(value);

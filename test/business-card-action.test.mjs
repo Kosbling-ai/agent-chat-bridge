@@ -105,6 +105,38 @@ test('business card action wrapper passes business receiver contract', async () 
   await fixture.communication.stop();
 });
 
+test('business card action normalizes second, millisecond, microsecond, nanosecond and ISO times', async () => {
+  const events = [];
+  const action = createBusinessCardAction({ hooks: [hook], connectionId: 'fixture',
+    ingest: async ({ event }) => { events.push(event); } });
+  const cases = [
+    1700000000,
+    '1700000000000',
+    '1700000000000000',
+    '1700000000000000000',
+    '2023-11-14T22:13:20.000Z',
+  ];
+  for (const actionTime of cases) {
+    await action.handleCardAction({ ...payload, action: { ...payload.action, action_time: actionTime } });
+  }
+  assert.deepEqual(events.map(event => event.occurredAt), cases.map(() => '2023-11-14T22:13:20.000Z'));
+});
+
+test('business card action rejects invalid times and hashes the original action time', async () => {
+  const events = [];
+  const action = createBusinessCardAction({ hooks: [hook], connectionId: 'fixture',
+    ingest: async ({ event }) => { events.push(event); } });
+  for (const actionTime of [Infinity, '100000000000000000000', 'invalid']) {
+    await action.handleCardAction({ ...payload, event_id: '',
+      action: { ...payload.action, action_time: actionTime } });
+  }
+  assert.deepEqual(events.map(event => event.occurredAt), [null, null, null]);
+  await action.handleCardAction({ ...payload, event_id: '', action: { ...payload.action, action_time: '1700000000000' } });
+  await action.handleCardAction({ ...payload, event_id: '', action: { ...payload.action, action_time: '1700000000000000' } });
+  assert.equal(events[3].occurredAt, events[4].occurredAt);
+  assert.notEqual(events[3].eventId, events[4].eventId);
+});
+
 test('business card action dedups replay', async () => {
   const fixture = harness(); fixture.communication.start();
   assert.equal((await fixture.action.handleCardAction(payload)).toast.type, 'info');

@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.15`
+Application version: `0.2.16`
+
+Version 0.2.16 does not add a database migration. Business-card callback times are normalized from seconds, milliseconds, microseconds or nanoseconds before forwarding. Existing card-action event IDs and deduplication keys are unchanged.
 
 Version 0.2.15 does not add a database migration. Group prompts gain a message identity block, passive messages store `parentId`/`rootId` in the existing content JSON, and injection fingerprints use the existing `assistant_codex_events` unique key. The new optional `routing.groups[].instructionFiles`, `instructionText`, `instructionMode` and `replyContext` fields default to absent; group triggers that reply to a message now make one additional bounded Feishu message read; existing configurations keep working unchanged. Business-event threads now receive the `【独立系统任务】` preamble only on the first turn or after it changes, so producers must not rely on it appearing in every turn.
 
