@@ -21,7 +21,7 @@
     "version": "1",
     "allowAllPrivateUsers": false,
     "privateUserIds": ["replace_with_allowed_open_id"],
-    "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "passiveContext": true, "capabilities": ["bridge", "hook"] }]
+    "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "replyTriggers": false, "passiveContext": true, "capabilities": ["bridge", "hook"] }]
   },
   "hooks": [],
   "errorReporting": { "url": "http://127.0.0.1:18831/errors", "tokenEnv": "BRIDGE_ERROR_TOKEN" }

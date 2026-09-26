@@ -73,7 +73,7 @@ function segment(metadata, body, extra = []) {
 
 // Builds the replied-to message section for a group trigger. A parent already in the
 // passive context is referenced rather than repeated; failures never block the turn.
-export async function loadReplySegment({ chat, parentId, chatId = '', contextEntries = [], cardJson = false,
+export async function loadReplySegment({ chat, parentId, parentMessage, chatId = '', contextEntries = [], cardJson = false,
   maxChars = DEFAULT_REPLY_CONTEXT_MAX_CHARS, log = () => {} } = {}) {
   if (!parentId) return '';
   const observe = (code, stage) => { try { Promise.resolve(log('warning', 'reply_context', 'unavailable', { code, stage, chatId, messageId: parentId })).catch(() => {}); } catch { /* never blocks */ } };
@@ -82,10 +82,12 @@ export async function loadReplySegment({ chat, parentId, chatId = '', contextEnt
     return segment(formatMessageMetadata({ messageId: parentId, parentId: known.parentId, rootId: known.rootId, senderOpenId: known.senderOpenId,
       createdAt: known.messageCreatedAt || known.createdAt }), '内容见上方同 message_id 的群消息');
   }
-  let item;
+  let item = parentMessage;
   try {
-    if (typeof chat?.getMessage !== 'function') throw Object.assign(new Error('reply_fetch_unavailable'), { code: 'reply_fetch_unavailable' });
-    item = (await chat.getMessage({ messageId: parentId, timeoutMs: REPLY_FETCH_TIMEOUT_MS }))?.items?.[0];
+    if (!item) {
+      if (typeof chat?.getMessage !== 'function') throw Object.assign(new Error('reply_fetch_unavailable'), { code: 'reply_fetch_unavailable' });
+      item = (await chat.getMessage({ messageId: parentId, timeoutMs: REPLY_FETCH_TIMEOUT_MS }))?.items?.[0];
+    }
     if (!item || item.deleted) throw Object.assign(new Error('reply_message_missing'), { code: 'reply_message_missing' });
   } catch (error) {
     observe(error?.code || 'reply_fetch_failed', 'message');

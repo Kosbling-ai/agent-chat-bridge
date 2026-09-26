@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.16`
+Application version: `0.2.17`
+
+Version 0.2.17 does not add a database migration. Optional group `replyTriggers` defaults to `false`; confirmed bot text and execution-card message IDs are recorded in the existing inbound-message table for indexed reply lookup. Unknown parent IDs are checked through a bounded Feishu message read.
 
 Version 0.2.16 does not add a database migration. Business-card callback times are normalized from seconds, milliseconds, microseconds or nanoseconds before forwarding. Existing card-action event IDs and deduplication keys are unchanged.
 

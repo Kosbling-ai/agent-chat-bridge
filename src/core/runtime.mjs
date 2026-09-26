@@ -1,4 +1,5 @@
 import { splitReplyCards } from '../channels/feishu/reply-card.mjs';
+import { createReplyTrigger } from '../channels/feishu/reply-trigger.mjs';
 import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { safeObserver } from '../logger.mjs';
@@ -20,6 +21,7 @@ const nativeIds = ({ params = {} }) => ({ nativeThreadId: params.threadId ?? par
 export function createRuntime({ config, store, codex, chat, media, outbound, workspace, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
   log = safeObserver(log);
   const connectionId = config.feishu.connectionId;
+  const botReply = createReplyTrigger({ chat, botOpenId: config.feishu.botOpenId, log });
   const owner = randomUUID();
   const leaseMs = 60000;
   let stopping = false, started = false, healthy = true;
@@ -51,7 +53,9 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
     const human = !event.isApp && !event.isSelf && event.actor.type === 'user';
     const allowed = human && (event.conversationType === 'p2p' ? (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId))) : Boolean(group && (group.userIds === undefined || group.userIds.includes(event.actor.openId))));
     const mentioned = event.message?.mentions?.some(mention => mention.openId === config.feishu.botOpenId);
-    const triggered = allowed && event.type === 'message.received' && (event.conversationType === 'p2p' || group?.trigger === 'all' || mentioned);
+    const replyTriggered = allowed && event.type === 'message.received' && group?.replyTriggers === true
+      && group.trigger !== 'all' && !mentioned ? (await botReply(event)).triggered : false;
+    const triggered = allowed && event.type === 'message.received' && (event.conversationType === 'p2p' || group?.trigger === 'all' || mentioned || replyTriggered);
     const text = extractMessageText(event);
     // Unsupported attachment-only input is retained in inbox/hooks, never misread as text.
     const agentJob = triggered ? { payload: { text: typeof text === 'string' ? text : '', unsupported: !(typeof text === 'string' && text.trim()), messageId: event.messageId, source: 'chat', event } } : undefined;

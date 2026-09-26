@@ -10,6 +10,8 @@ Private Agent messages require `routing.privateUserIds` by default. Set `routing
 
 The `bridge` capability permits Agent routing. The existing `trigger` (`mention` or `all`) and optional `userIds` then decide whether a human message starts Codex. The `hook` capability permits hook subscriptions for that group and does not depend on Agent mentions, member filtering, execution, or replies. A message that qualifies for both routes may register both under the same canonical receipt; neither route consumes the other. Replay keeps each target idempotent. A live human mention of the bot in a group that is absent from `routing.groups` receives a fixed reply naming the group `chat_id`, rate-limited per group and speaker; adjust or disable it with `routing.unlistedGroupReply` (`enabled`, `text`, `cooldownMs`).
 
+Set `routing.groups[].replyTriggers: true` (default `false`) to let an authorized human reply to a message from this bot without mentioning it. Replies to bot text or cards qualify, including history catch-up; replies to other people do not. `trigger: "all"` already accepts every authorized human message. The bridge checks its stored outbound message IDs first, then reads the replied-to parent or thread root from Feishu when needed. Failed reads do not trigger a turn. The existing `【被回复消息】` section still describes the immediate parent.
+
 Groups previously present only in `hooks[].conversationIds` must now also appear in `routing.groups`; use `capabilities:["hook"]` for a hook-only group. P2P rules are unchanged.
 
 ### Group instructions
@@ -20,6 +22,7 @@ A `bridge` group may add optional instructions for its human group thread:
 {
   "conversationId": "oc_example",
   "trigger": "mention",
+  "replyTriggers": false,
   "passiveContext": true,
   "capabilities": ["bridge", "hook"],
   "instructionFiles": ["instructions/group.md", "/absolute/path/shared.md"],

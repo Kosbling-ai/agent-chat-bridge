@@ -214,14 +214,15 @@ function validateRuntime(raw) {
   object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext'], 'invalid_group_fields');
+    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext'], 'invalid_group_fields');
     const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
     if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
+    if (group.replyTriggers !== undefined && typeof group.replyTriggers !== 'boolean') throw new ConfigError('invalid_group_reply_triggers');
     const capabilities=group.capabilities===undefined?['bridge','hook']:strings(group.capabilities);
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
-    if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined)) throw new ConfigError('group_context_requires_bridge');
-    return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, passiveContext: group.passiveContext, capabilities,
+    if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined || group.replyTriggers === true)) throw new ConfigError('group_context_requires_bridge');
+    return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, replyTriggers: group.replyTriggers ?? false, passiveContext: group.passiveContext, capabilities,
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }),
       ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
       ...(group.instructionText === undefined ? {} : { instructionText: instructionText(group.instructionText) }),

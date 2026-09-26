@@ -5,7 +5,16 @@ import { canDeliverOutboxAttachments } from '../../agents/codex/outbox-policy.mj
 import { adaptLocalMarkdownImages, referencedCollectedLocalImages } from './markdown-images.mjs';
 
 const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
-export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, connectionId, workspace, allowedGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
+export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbound, botOpenId, connectionId, workspace, allowedGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
+  async function recordSent(job, messageId, messageType) {
+    if (!messageId || !inbound?.recordReply || !botOpenId) return;
+    try {
+      await inbound.recordReply({ messageId, chatId: job.chatId, chatType: job.chatType,
+        messageType, senderOpenId: botOpenId });
+    } catch (error) {
+      log('warning', 'forward_reply', 'record_failed', { code: error?.code || 'outbound_message_record_failed' });
+    }
+  }
   function artifactScope(job, result = job.result || {}) {
     const execution = result.execution || job.result?.execution || {};
     return {
@@ -53,7 +62,9 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, conn
       const content = replyAsPost ? markdownToFeishuPost(chunk) : { text: chunk };
       const response = await chat.sendMessage({ conversationId: job.chatId, kind, content,
         uuid: stableEventKey(`${prefix}:${kind}:${index}`) });
-      sent.push({ messageId: response?.message_id || response?.messageId || '', msgType: kind, text: chunk, content: JSON.stringify(content) });
+      const messageId = response?.message_id || response?.messageId || '';
+      await recordSent(job, messageId, kind);
+      sent.push({ messageId, msgType: kind, text: chunk, content: JSON.stringify(content) });
     }
     return { sent: sent.length, status: 'sent', items: sent };
   }

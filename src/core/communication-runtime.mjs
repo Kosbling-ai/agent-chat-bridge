@@ -4,6 +4,7 @@ import { extractAttachments } from '../channels/feishu/media.mjs';
 import { buildCodexForwardPrompt, createRecentMentionPrompts, isBotJoinNotice,
   mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
 import { DEFAULT_REPLY_CONTEXT_MAX_CHARS, loadReplySegment } from '../channels/feishu/reply-context.mjs';
+import { createReplyTrigger } from '../channels/feishu/reply-trigger.mjs';
 import { databaseError } from '../storage/errors.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
@@ -38,6 +39,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
   const contextEnabled=contextLimit>0&&contextWindowMs>0;
   const recent=createRecentMentionPrompts({now});
+  const botReply=createReplyTrigger({inbound,chat,botOpenId:config.feishu.botOpenId,now,log});
   const unlistedReplies=new Map();
   async function replyUnlistedGroup(event) {
     const {text,cooldownMs}=config.routing.unlistedGroupReply; const key=`${event.conversationId}:${event.actor.openId||''}`; const at=now();
@@ -78,8 +80,11 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const normalized=normalizeFeishuInput(event,{botOpenId:config.feishu.botOpenId});
     const attachmentMetadata=extractAttachments(event);
     const ignoredByAgent=isBotJoinNotice(normalized)||stale(event,normalized.createdAt);
+    const replyTrigger=agentAllowed&&!ignoredByAgent&&event.type==='message.received'&&group?.replyTriggers===true
+      &&group.trigger!=='all'&&!mentioned?await botReply(event,{deadlineAt:context.deadlineAt}):{triggered:false};
+    if(context.signal?.aborted)throw new Error('ingress_stopped');
     const triggerEligible=event.type==='message.received'&&!ignoredByAgent
-      &&(event.conversationType==='p2p'||group?.trigger==='all'||mentioned);
+      &&(event.conversationType==='p2p'||group?.trigger==='all'||mentioned||replyTrigger.triggered);
     const triggered=agentAllowed&&triggerEligible;
     // Hook subscriptions are event notifications with their own scope. They are
     // deliberately independent from Agent authorization and routing outcomes.
@@ -107,7 +112,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;
       const mergedPrompt=normalized.chatType==='p2p'?normalized.text:mergeMentionPrompts(contextEntries,normalized.text);
       const replyTo=normalized.chatType==='p2p'?'':(normalized.parentId||normalized.rootId);
-      const replySegment=replyTo?await loadReplySegment({chat,parentId:replyTo,chatId:normalized.chatId,contextEntries,
+      const replySegment=replyTo?await loadReplySegment({chat,parentId:replyTo,parentMessage:replyTrigger.parentMessage,chatId:normalized.chatId,contextEntries,
         cardJson:group?.replyContext?.cardJson===true,maxChars:group?.replyContext?.maxChars??DEFAULT_REPLY_CONTEXT_MAX_CHARS,log}):'';
       const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
         mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId,

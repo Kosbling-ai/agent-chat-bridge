@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.17] — Unreleased
+
+- Add optional `routing.groups[].replyTriggers` (default `false`) so replies to this bot's text or cards trigger an authorized group turn without an `@`, including history catch-up. Record confirmed outbound message IDs in the existing message store; check an unknown parent or root with one bounded Feishu read and cache the result. Reply-context injection follows the same path.
+
+No database migration is needed.
+
 ## [0.2.16] — Unreleased
 
 - Normalize business-card callback `action_time` from seconds, milliseconds, microseconds or nanoseconds before forwarding, and discard invalid or out-of-range values. The original time string still participates in fallback event ID hashing.

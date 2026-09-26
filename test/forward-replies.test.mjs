@@ -81,13 +81,13 @@ test('API run without a source message creates the original post in the conversa
 });
 
 test('ordinary replies use chat create, production markdown conversion and 3000-character chunks', async () => {
-  const calls = [];
+  const calls = [], recorded = [];
   const job = { id:'run', leaseOwner:'worker', chatId:'chat', messageId:'source', sourceMessageId:'source',
     result:{ answer:`# Title\n[link](https://example.invalid)\n${'x'.repeat(3100)}` } };
   const replies = createFeishuReplies({ chat: {
     async sendMessage(input) { calls.push(input); return { message_id:`sent-${calls.length}` }; },
     async replyMessage() { throw new Error('production reply must use chat create'); },
-  }, jobs:{}, connectionId:'fixture', maxOutputChars:3500 });
+  }, jobs:{}, inbound:{async recordReply(value){recorded.push(value);}}, botOpenId:'bot', connectionId:'fixture', maxOutputChars:3500 });
   const delivered = await replies.deliver(job, job.result, { assertLease() {} });
   assert.equal(delivered.status, 'sent');
   assert.equal(delivered.messages, 2);
@@ -95,6 +95,22 @@ test('ordinary replies use chat create, production markdown conversion and 3000-
   assert.deepEqual(calls[0].content.zh_cn.content[0], [{ tag:'text', text:'Title' }]);
   assert.deepEqual(calls[0].content.zh_cn.content[1], [{ tag:'a', text:'link', href:'https://example.invalid' }]);
   assert.equal(new Set(calls.map(call => call.uuid)).size, 2);
+  assert.deepEqual(recorded.map(value => [value.messageId,value.chatId,value.messageType,value.senderOpenId]),
+    [['sent-1','chat','post','bot'],['sent-2','chat','post','bot']]);
+});
+
+test('confirmed execution card ID is recorded for reply ownership', async () => {
+  const recorded = [];
+  const job = { id:'run', leaseOwner:'worker', chatId:'chat', chatType:'group', messageId:'source',
+    senderOpenId:'human', deliveryMode:'bridge', result:{} };
+  const feedback = createExecutionFeedback({ jobs:{async patchFeedback({key,value}){job.result={...job.result,[key]:value};}},
+    inbound:{async recordReply(value){recorded.push(value);}}, botOpenId:'bot',
+    cardClient:{im:{v1:{message:{async create(){return{code:0,data:{message_id:'card-id'}};}}}}} });
+  const state = await feedback.start(job);
+  await state.card.update();
+  state.card.stop();
+  assert.deepEqual(recorded.map(value => [value.messageId,value.chatId,value.messageType,value.senderOpenId]),
+    [['card-id','chat','interactive','bot']]);
 });
 
 test('text reply mode keeps the original 1900-character chunks', async () => {

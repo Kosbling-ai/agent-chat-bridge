@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.16` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.17` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
@@ -25,6 +25,8 @@ node bin/agent-chat-bridge.mjs check-config --config ./examples/bridge.json
 Configure explicit environment references and an owned workspace before migration/start. Never put tokens in JSON, `.env`, logs or source control. [Runtime configuration](docs/runtime.md), [Store](docs/storage.md), [Codex executor](docs/codex-adapter.md), [optional Codex proxy](docs/codex-proxy.md), [optional Feishu proxy](docs/feishu-proxy.md), [boundaries](docs/boundaries.md).
 
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
+
+For an authorized group, set `routing.groups[].replyTriggers` to `true` to trigger the Agent when a human replies to a message from this bot without `@` (default `false`). Text and cards both qualify; `trigger: "all"` remains unchanged. See [routing and reply context](docs/runtime.md).
 
 ```sh
 npm test
