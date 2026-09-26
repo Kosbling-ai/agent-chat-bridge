@@ -1,8 +1,14 @@
 # Changelog
 
+## [0.2.18] — Unreleased
+
+- Add optional `routing.groups[].replyTriggers` (default `false`) so replies to this bot's text or cards trigger an authorized group turn without an `@`, including history catch-up. Record confirmed outbound message IDs in the existing message store; check unknown parent and root IDs with bounded Feishu reads and cached ownership results. Reply-context injection follows the same path.
+
+No database migration is needed.
+
 ## [0.2.17] — Unreleased
 
-- Add optional `routing.groups[].replyTriggers` (default `false`) so replies to this bot's text or cards trigger an authorized group turn without an `@`, including history catch-up. Record confirmed outbound message IDs in the existing message store; check an unknown parent or root with one bounded Feishu read and cache the result. Reply-context injection follows the same path.
+- Convert valid Agent reply mentions (`<at user_id="ou_…"></at>`, `<at open_id="ou_…"></at>`, and `@{ou_…}`) into Feishu post `at` elements, including replies configured for text mode. Invalid IDs remain literal. Per-group `routing.groups[].allowMentionAll` enables `<at user_id="all"></at>` only for that group; it defaults to false. Interactive cards are unchanged.
 
 No database migration is needed.
 

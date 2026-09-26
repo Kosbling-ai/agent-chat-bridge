@@ -5,7 +5,7 @@ import { canDeliverOutboxAttachments } from '../../agents/codex/outbox-policy.mj
 import { adaptLocalMarkdownImages, referencedCollectedLocalImages } from './markdown-images.mjs';
 
 const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
-export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbound, botOpenId, connectionId, workspace, allowedGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
+export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbound, botOpenId, connectionId, workspace, allowedGroupChatIds = new Set(), mentionAllGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
   async function recordSent(job, messageId, messageType) {
     if (!messageId || !inbound?.recordReply || !botOpenId) return;
     try {
@@ -51,7 +51,6 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbo
       return { sent: previous.filter(item => item.status === 'sent').length,
         status: previous.some(item => item.status === 'failed') ? 'failed' : 'sent' };
     }
-    const kind = replyAsPost ? 'post' : 'text';
     const chunkSize = replyAsPost ? 3000 : 1900;
     const answer = adaptLocalMarkdownImages(result.answer, result.attachments, { workspace });
     const chunks = chunkText(limitText(answer || 'Codex 没有返回可用结论。', maxOutputChars), chunkSize);
@@ -59,7 +58,9 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbo
     const sent = [];
     for (const [index, chunk] of chunks.entries()) {
       control.assertLease();
-      const content = replyAsPost ? markdownToFeishuPost(chunk) : { text: chunk };
+      const post = markdownToFeishuPost(chunk, { allowMentionAll: job.chatType === 'group' && mentionAllGroupChatIds.has(job.chatId) });
+      const kind = replyAsPost || post.zh_cn.content.some(line => line.some(element => element.tag === 'at')) ? 'post' : 'text';
+      const content = kind === 'post' ? post : { text: chunk };
       const response = await chat.sendMessage({ conversationId: job.chatId, kind, content,
         uuid: stableEventKey(`${prefix}:${kind}:${index}`) });
       const messageId = response?.message_id || response?.messageId || '';
@@ -145,10 +146,11 @@ function codexReplyUuidPrefix(job, result = {}) {
   ].join(':'));
 }
 
-export function markdownToFeishuPost(markdown) {
+export function markdownToFeishuPost(markdown, { allowMentionAll = false } = {}) {
   const content = [];
   let inCodeBlock = false;
   for (const rawLine of String(markdown || '').split(/\r?\n/)) {
+    const isCodeLine = inCodeBlock || /^\s*```/.test(rawLine);
     if (/^\s*```/.test(rawLine)) {
       inCodeBlock = !inCodeBlock;
       content.push([{ tag: 'text', text: rawLine || '```' }]);
@@ -159,7 +161,7 @@ export function markdownToFeishuPost(markdown) {
       content.push([{ tag: 'text', text: ' ' }]);
       continue;
     }
-    content.push(markdownInlineToFeishuElements(line));
+    content.push(markdownInlineToFeishuElements(line, { allowMentionAll, allowMentions: !isCodeLine }));
   }
   return { zh_cn: { title: '', content: content.length ? content : [[{ tag: 'text', text: '' }]] } };
 }
@@ -172,23 +174,52 @@ function normalizeMarkdownLine(line) {
     .replace(/`([^`]+)`/g, '$1');
 }
 
-function markdownInlineToFeishuElements(line) {
+function mentionElements(text, { allowMentionAll, allowMentions }) {
+  if (!allowMentions) return [{ tag: 'text', text }];
+  const elements = [];
+  const pattern = /<at (user_id|open_id)="([^"]*)"><\/at>|@\{([^}]*)\}/g;
+  let index = 0;
+  for (const match of text.matchAll(pattern)) {
+    const id = match[2] ?? match[3];
+    if (!/^ou_[a-z0-9]+$/.test(id) && !(allowMentionAll && match[1] === 'user_id' && id === 'all')) continue;
+    if (match.index > index) elements.push({ tag: 'text', text: text.slice(index, match.index) });
+    elements.push({ tag: 'at', user_id: id });
+    index = match.index + match[0].length;
+  }
+  if (index < text.length) elements.push({ tag: 'text', text: text.slice(index) });
+  return elements.length ? elements : [{ tag: 'text', text }];
+}
+
+function markdownInlineToFeishuElements(line, options) {
   const elements = [];
   const pattern = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
   let index = 0;
   let match;
   while ((match = pattern.exec(line))) {
-    if (match.index > index) elements.push({ tag: 'text', text: line.slice(index, match.index) });
+    if (match.index > index) elements.push(...mentionElements(line.slice(index, match.index), options));
     elements.push({ tag: 'a', text: match[1], href: match[2] });
     index = pattern.lastIndex;
   }
-  if (index < line.length) elements.push({ tag: 'text', text: line.slice(index) });
+  if (index < line.length) elements.push(...mentionElements(line.slice(index), options));
   return elements.length ? elements : [{ tag: 'text', text: line }];
 }
 
 function chunkText(text, size) {
   const chunks = [];
-  for (let index = 0; index < text.length; index += size) chunks.push(text.slice(index, index + size));
+  const mentions = /<at (?:user_id|open_id)="[^"]*"><\/at>|@\{[^}]*\}/g;
+  for (let index = 0; index < text.length;) {
+    let end = Math.min(index + size, text.length);
+    mentions.lastIndex = index;
+    let match;
+    while ((match = mentions.exec(text)) && match.index < end) {
+      if (match.index + match[0].length > end && match.index > index) {
+        end = match.index;
+        break;
+      }
+    }
+    chunks.push(text.slice(index, end));
+    index = end;
+  }
   return chunks.length ? chunks : [''];
 }
 

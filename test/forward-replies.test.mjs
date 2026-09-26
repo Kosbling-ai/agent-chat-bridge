@@ -122,6 +122,59 @@ test('text reply mode keeps the original 1900-character chunks', async () => {
   assert.deepEqual(calls.map(call => [call.kind, call.content.text.length]), [['text',1900],['text',100]]);
 });
 
+test('post replies turn individual and multiple open_id mentions into at elements beside markdown links', () => {
+  const post = markdownToFeishuPost('# Tasks\n**Owner** <at user_id="ou_alice1"></at> and <at open_id="ou_bob2"></at> [details](https://example.invalid) @{ou_c3}');
+  assert.deepEqual(post.zh_cn.content, [
+    [{ tag:'text', text:'Tasks' }],
+    [{ tag:'text', text:'Owner ' }, { tag:'at', user_id:'ou_alice1' }, { tag:'text', text:' and ' },
+      { tag:'at', user_id:'ou_bob2' }, { tag:'text', text:' ' }, { tag:'a', text:'details', href:'https://example.invalid' },
+      { tag:'text', text:' ' }, { tag:'at', user_id:'ou_c3' }],
+  ]);
+});
+
+test('invalid mentions and disabled mention-all stay literal; fenced code does not mention', () => {
+  const literal = '<at user_id="ou_Bad"></at> @{ou_bad-id} <at open_id="all"></at> <at user_id="all"></at>';
+  assert.deepEqual(markdownToFeishuPost(literal).zh_cn.content[0], [{ tag:'text', text:literal }]);
+  assert.deepEqual(markdownToFeishuPost('```\n@{ou_valid1}\n```').zh_cn.content[1], [{ tag:'text', text:'@{ou_valid1}' }]);
+  assert.deepEqual(markdownToFeishuPost('<at user_id="all"></at> @{all}', { allowMentionAll:true }).zh_cn.content[0],
+    [{ tag:'at', user_id:'all' }, { tag:'text', text:' @{all}' }]);
+});
+
+test('text mode promotes valid mentions to post and gates mention-all by group', async () => {
+  const calls = [];
+  const reply = createFeishuReplies({ chat:{ async sendMessage(input) { calls.push(input); return { message_id:'sent' }; } },
+    jobs:{}, connectionId:'fixture', replyAsPost:false, mentionAllGroupChatIds:new Set(['enabled']) });
+  const send = async (chatId, chatType, answer) => reply.deliver({ id:'run', chatId, chatType, messageId:'source', result:{ answer } },
+    { answer }, { assertLease() {} });
+  await send('enabled', 'group', 'Hi @{ou_alice1} and <at open_id="ou_bob2"></at>');
+  await send('disabled', 'group', '<at user_id="all"></at>');
+  await send('enabled', 'group', '<at user_id="all"></at>');
+  await send('enabled', 'p2p', '<at user_id="all"></at>');
+  await send('enabled', 'group', '@{ou_Bad}');
+  assert.deepEqual(calls.map(call => call.kind), ['post', 'text', 'post', 'text', 'text']);
+  assert.deepEqual(calls[0].content.zh_cn.content[0].filter(element => element.tag === 'at'),
+    [{ tag:'at', user_id:'ou_alice1' }, { tag:'at', user_id:'ou_bob2' }]);
+  assert.deepEqual(calls[1].content, { text:'<at user_id="all"></at>' });
+  assert.deepEqual(calls[2].content.zh_cn.content[0], [{ tag:'at', user_id:'all' }]);
+  assert.deepEqual(calls[3].content, { text:'<at user_id="all"></at>' });
+  assert.deepEqual(calls[4].content, { text:'@{ou_Bad}' });
+});
+
+test('reply chunks keep mention markers whole at text and post boundaries', async () => {
+  for (const [replyAsPost, boundary] of [[false, 1900], [true, 3000]]) {
+    const calls = [];
+    const answer = `${'x'.repeat(boundary - 3)}@{ou_owner1} tail`;
+    const reply = createFeishuReplies({ chat:{ async sendMessage(input) { calls.push(input); return { message_id:'sent' }; } },
+      jobs:{}, connectionId:'fixture', replyAsPost, maxOutputChars:5000 });
+    await reply.deliver({ id:'run', chatId:'group', chatType:'group', messageId:'source', result:{ answer } },
+      { answer }, { assertLease() {} });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].kind, replyAsPost ? 'post' : 'text');
+    assert.deepEqual(calls[1].content.zh_cn.content[0],
+      [{ tag:'at', user_id:'ou_owner1' }, { tag:'text', text:' tail' }]);
+  }
+});
+
 test('legacy unconfirmed ordinary reply is held without another create', async () => {
   let creates = 0;
   const job = { id:'run', leaseOwner:'worker', chatId:'chat', messageId:'source',

@@ -29,7 +29,7 @@ function deliveryErrorCode(error) {
   return 'chat_delivery_failed';
 }
 
-export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
+export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,botAppId='',hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
   let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,failureDeadline=0,lastFailureStage='',lastErrorClass='',wakeWait; const active=new Set(); const processing=new Set();
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
@@ -39,7 +39,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
   const contextEnabled=contextLimit>0&&contextWindowMs>0;
   const recent=createRecentMentionPrompts({now});
-  const botReply=createReplyTrigger({inbound,chat,botOpenId:config.feishu.botOpenId,now,log});
+  const botReply=createReplyTrigger({inbound,chat,botOpenId:config.feishu.botOpenId,botAppId,now,log});
   const unlistedReplies=new Map();
   async function replyUnlistedGroup(event) {
     const {text,cooldownMs}=config.routing.unlistedGroupReply; const key=`${event.conversationId}:${event.actor.openId||''}`; const at=now();

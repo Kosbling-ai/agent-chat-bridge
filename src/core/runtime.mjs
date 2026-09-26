@@ -18,10 +18,10 @@ const parse = value => typeof value === 'string' ? JSON.parse(value) : value;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const nativeIds = ({ params = {} }) => ({ nativeThreadId: params.threadId ?? params.thread?.id, nativeTurnId: params.turnId ?? params.turn?.id });
 
-export function createRuntime({ config, store, codex, chat, media, outbound, workspace, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
+export function createRuntime({ config, store, inbound, botAppId = '', codex, chat, media, outbound, workspace, hookTokens = {}, fetchImpl = fetch, log = () => {} }) {
   log = safeObserver(log);
   const connectionId = config.feishu.connectionId;
-  const botReply = createReplyTrigger({ chat, botOpenId: config.feishu.botOpenId, log });
+  const botReply = createReplyTrigger({ inbound, chat, botOpenId: config.feishu.botOpenId, botAppId, log });
   const owner = randomUUID();
   const leaseMs = 60000;
   let stopping = false, started = false, healthy = true;
@@ -54,7 +54,8 @@ export function createRuntime({ config, store, codex, chat, media, outbound, wor
     const allowed = human && (event.conversationType === 'p2p' ? (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId))) : Boolean(group && (group.userIds === undefined || group.userIds.includes(event.actor.openId))));
     const mentioned = event.message?.mentions?.some(mention => mention.openId === config.feishu.botOpenId);
     const replyTriggered = allowed && event.type === 'message.received' && group?.replyTriggers === true
-      && group.trigger !== 'all' && !mentioned ? (await botReply(event)).triggered : false;
+      && group.trigger !== 'all' && !mentioned ? (await botReply(event, { deadlineAt: context.deadlineAt })).triggered : false;
+    if (context.signal?.aborted) throw new Error('ingress_stopped');
     const triggered = allowed && event.type === 'message.received' && (event.conversationType === 'p2p' || group?.trigger === 'all' || mentioned || replyTriggered);
     const text = extractMessageText(event);
     // Unsupported attachment-only input is retained in inbox/hooks, never misread as text.

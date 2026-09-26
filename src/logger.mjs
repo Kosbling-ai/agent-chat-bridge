@@ -7,7 +7,7 @@ export function safeObserver(callback = () => {}) {
 }
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
   return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
-    hookId, eventId, eventType, scopePrefix, statusCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
+    hookId, eventId, eventType, scopePrefix, statusCode, platformCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
     component: eventComponent } = {}) => {
     const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
     const boundedInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
@@ -32,6 +32,7 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       ...(identifier(eventType, 64) !== undefined ? { type: eventType } : {}),
       ...(identifier(scopePrefix, 64) !== undefined ? { scope_prefix: scopePrefix } : {}),
       ...(boundedInteger(statusCode, 100, 599) !== undefined ? { status_code: statusCode } : {}),
+      ...(boundedInteger(platformCode, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { platform_code: platformCode } : {}),
       ...(identifier(jobId, 64) !== undefined ? { job_id: jobId } : {}),
       ...(identifier(errorClass, 64) !== undefined ? { error_class: errorClass } : {}),
       ...(boundedInteger(errno, 0, Number.MAX_SAFE_INTEGER) !== undefined ? { errno } : {}),

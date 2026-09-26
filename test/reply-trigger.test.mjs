@@ -5,6 +5,7 @@ import { createCommunicationRuntime } from '../src/core/communication-runtime.mj
 import { createRuntime } from '../src/core/runtime.mjs';
 import { createReplyTrigger } from '../src/channels/feishu/reply-trigger.mjs';
 import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
+import { createLogger } from '../src/logger.mjs';
 
 const base = { schemaVersion: 1,
   storage: Object.fromEntries(['host', 'port', 'user', 'password', 'database'].map(key => [`${key}Env`, `TEST_${key.toUpperCase()}`])),
@@ -18,12 +19,12 @@ const event = (id, parentId, rootId = '', source = 'live') => ({
   message: { kind: 'text', content: JSON.stringify({ text: `reply ${id}` }), parentId, rootId, mentions: [] },
 });
 
-const parent = (messageId, senderId, msgType = 'text') => ({ message_id: messageId, chat_id: 'chat', msg_type: msgType,
-  sender: { id_type: 'open_id', id: senderId }, body: { content: msgType === 'interactive'
+const parent = (messageId, senderId, msgType = 'text', idType = 'open_id') => ({ message_id: messageId, chat_id: 'chat', msg_type: msgType,
+  sender: { id_type: idType, id: senderId }, body: { content: msgType === 'interactive'
     ? JSON.stringify({ header: { title: { content: 'Business card' } }, body: { elements: [{ tag: 'button', text: { content: 'Approve' } }] } })
     : JSON.stringify({ text: 'Bot answer' }) } });
 
-function fixture(replyTriggers = true, stored = new Set(), messages = {}) {
+function fixture(replyTriggers = true, stored = new Set(), messages = {}, botAppId = '') {
   const config = validateConfig({ ...base, routing: { ...base.routing, groups: [{ ...base.routing.groups[0], replyTriggers }] } });
   const forwarded = [], accepted = [], reads = [], lookups = [];
   const inbound = {
@@ -31,7 +32,7 @@ function fixture(replyTriggers = true, stored = new Set(), messages = {}) {
     async loadRecentGroupContext() { return []; },
   };
   const chat = { async getMessage({ messageId }) { reads.push(messageId); return { items: messages[messageId] ? [messages[messageId]] : [] }; } };
-  const runtime = createCommunicationRuntime({ config, inbound, chat,
+  const runtime = createCommunicationRuntime({ config, inbound, chat, botAppId,
     store: { async acceptInbound(input) { accepted.push(input); return { duplicate: false }; } },
     forward: { async handleMessage(input) { forwarded.push(input); return { execution: { terminal: 'completed' } }; } } });
   const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -66,6 +67,19 @@ test('reply to bot card falls back to one Feishu read and reuses card for reply 
   assert.equal(f.forwarded.length, 1);
   assert.match(f.forwarded[0].prompt, /【被回复消息】[\s\S]*Business card[\s\S]*\[按钮\] Approve/);
   assert.deepEqual(f.reads, ['card']);
+});
+
+test('this application app ID card triggers but another application card does not', async () => {
+  const f = fixture(true, new Set(), {
+    own: parent('own', 'app-ours', 'interactive', 'app_id'),
+    foreign: parent('foreign', 'app-other', 'interactive', 'app_id'),
+  }, 'app-ours');
+  await f.runtime.ingest(event('reply-own-app', 'own'));
+  await f.runtime.ingest(event('reply-other-app', 'foreign'));
+  await f.flush();
+  assert.equal(f.forwarded.length, 1);
+  assert.match(f.forwarded[0].prompt, /【被回复消息】[\s\S]*Business card/);
+  assert.deepEqual(f.reads, ['own', 'foreign']);
 });
 
 test('reply to another person does not trigger, even when the parent is fetched', async () => {
@@ -103,26 +117,98 @@ test('legacy core runtime uses the same bot-reply eligibility before registering
     groups: [{ ...base.routing.groups[0], replyTriggers: true }] } });
   const accepted = [];
   const runtime = createRuntime({ config, store: { async acceptInbound(input) { accepted.push(input); return {}; } },
-    codex: {}, chat: { async getMessage() { return { items: [parent('bot-text', 'bot')] }; } } });
-  await runtime.ingest(event('legacy-reply', 'bot-text'));
+    inbound: { async hasBotMessage() { return true; } }, codex: {},
+    chat: { async getMessage() { throw new Error('stored message must not need a remote lookup'); } } });
+  await runtime.ingest(event('legacy-reply', 'bot-text'), { deadlineAt: Date.now() + 1000 });
   assert.equal(accepted.length, 1);
   assert.equal(accepted[0].agentJob.payload.messageId, 'legacy-reply');
   assert.equal(accepted[0].passiveContext, false);
 });
 
-test('root pointing at the bot triggers when immediate parent is someone else; cached reads are reused', async () => {
+test('legacy core runtime bounds remote reads and refuses an aborted ingress after lookup', async () => {
+  const config = validateConfig({ ...base, routing: { ...base.routing,
+    groups: [{ ...base.routing.groups[0], replyTriggers: true }] } });
+  const accepted = [], timeouts = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const controller = new AbortController();
+  const runtime = createRuntime({ config, store: { async acceptInbound(input) { accepted.push(input); return {}; } },
+    inbound: { async hasBotMessage() { return false; } }, codex: {},
+    chat: { async getMessage({ timeoutMs }) { timeouts.push(timeoutMs); await gate; return { items: [parent('bot-text', 'bot')] }; } } });
+  const ingress = runtime.ingest(event('legacy-aborted', 'bot-text'),
+    { deadlineAt: Date.now() + 1000, signal: controller.signal });
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  release();
+  await assert.rejects(ingress, /ingress_stopped/);
+  assert.equal(timeouts.length, 1);
+  assert(timeouts[0] > 0 && timeouts[0] <= 750);
+  assert.deepEqual(accepted, []);
+});
+
+test('root pointing at the bot triggers while reply context freshly reads the parent per event', async () => {
   const f = fixture(true, new Set(['bot-root']), { human: parent('human', 'someone-else') });
   await f.runtime.ingest(event('reply-root-1', 'human', 'bot-root'));
   await f.runtime.ingest(event('reply-root-2', 'human', 'bot-root'));
   await f.flush();
   assert.equal(f.forwarded.length, 2);
-  assert.deepEqual(f.reads, ['human'], 'ownership and context reuse the cached parent');
+  assert.deepEqual(f.reads, ['human', 'human'], 'reply-context never reuses a prior event body');
   assert.match(f.forwarded[0].prompt, /【被回复消息】/);
+});
+
+test('stored bot root wins before a slow parent could consume the remote budget', async () => {
+  const reads = [], local = [];
+  const lookup = createReplyTrigger({ botOpenId: 'bot',
+    inbound: { async hasBotMessage({ messageId }) { local.push(messageId); return messageId === 'bot-root'; } },
+    chat: { async getMessage() { reads.push('slow-parent'); throw new Error('must not read'); } } });
+  assert.equal((await lookup(event('root-local', 'human-parent', 'bot-root'),
+    { deadlineAt: Date.now() + 1000 })).triggered, true);
+  assert.deepEqual(local, ['human-parent', 'bot-root']);
+  assert.deepEqual(reads, []);
 });
 
 test('Feishu sender must match this bot in the same chat', async () => {
   const lookup = createReplyTrigger({ botOpenId: 'bot', chat: { async getMessage() { return { items: [{ ...parent('p', 'bot'), chat_id: 'another-chat' }] }; } } });
   assert.equal((await lookup(event('wrong-chat', 'p'))).triggered, false);
+});
+
+test('failed parent reads have a 60-second negative cache and one warning per five minutes', async () => {
+  let clock = 1000, reads = 0;
+  const logged = [];
+  const log = createLogger({ write: value => logged.push(JSON.parse(value)) });
+  const lookup = createReplyTrigger({ botOpenId: 'bot', now: () => clock, log,
+    chat: { async getMessage() {
+      reads += 1;
+      throw Object.assign(new Error('private'), { code: 'feishu_api_rejected', platformCode: 230006, secret: 'must not log' });
+    } } });
+  for (const at of [1000, 2000, 62000, 302000]) {
+    clock = at;
+    assert.equal((await lookup(event(`failed-${at}`, 'private-parent'))).triggered, false);
+  }
+  assert.equal(reads, 3);
+  assert.equal(logged.length, 2);
+  assert(logged.every(entry => entry.code === 'feishu_api_rejected' && entry.platform_code === 230006));
+  assert(logged.every(entry => !JSON.stringify(entry).includes('must not log')));
+});
+
+test('concurrent checks share one remote read but do not share its body', async () => {
+  let release, reads = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const lookup = createReplyTrigger({ botOpenId: 'bot', chat: { async getMessage() {
+    reads += 1;
+    await gate;
+    return { items: [parent('same', 'bot')] };
+  } } });
+  const first = lookup(event('first', 'same'));
+  const second = lookup(event('second', 'same'));
+  await new Promise(resolve => setImmediate(resolve));
+  release();
+  const results = await Promise.all([first, second]);
+  assert.equal(reads, 1);
+  assert(results.every(result => result.triggered));
+  assert.equal(results.filter(result => result.parentMessage).length, 1);
+  assert.equal((await lookup(event('third', 'same'))).parentMessage, undefined,
+    'cached ownership does not retain content');
 });
 
 test('stored bot message lookup scopes connection, chat and bot open ID', async () => {

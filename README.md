@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.17` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.18` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
@@ -23,6 +23,8 @@ node bin/agent-chat-bridge.mjs check-config --config ./examples/bridge.json
 ```
 
 Configure explicit environment references and an owned workspace before migration/start. Never put tokens in JSON, `.env`, logs or source control. [Runtime configuration](docs/runtime.md), [Store](docs/storage.md), [Codex executor](docs/codex-adapter.md), [optional Codex proxy](docs/codex-proxy.md), [optional Feishu proxy](docs/feishu-proxy.md), [boundaries](docs/boundaries.md).
+
+For an Agent reply that needs to notify someone, write `<at user_id="ou_example1"></at>`, `<at open_id="ou_example1"></at>`, or `@{ou_example1}` in the answer. The bridge sends each valid open_id (`ou_` followed by lowercase letters or digits) as a Feishu post `at` element, including when `feishu.replyAsPost` is `false`. Invalid IDs remain literal text. To let a specific group use `<at user_id="all"></at>`, set `allowMentionAll: true` on that group's `routing.groups[]` entry; the default is `false`, and private chats cannot use it. Interactive cards are unchanged.
 
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
 

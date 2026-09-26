@@ -228,6 +228,8 @@ export async function startService({ config, configPath, env = process.env, log,
     const inbound=factories.inbound({pool,connectionId:config.feishu.connectionId});
     const allowedGroupChatIds = new Set(config.routing.groups
       .filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId));
+    const mentionAllGroupChatIds = new Set(config.routing.groups
+      .filter(group => group.capabilities.includes('bridge') && group.allowMentionAll).map(group => group.conversationId));
     const executorLog = createExecutorLogAdapter(log);
     const executorConfig = {
       bin,
@@ -290,7 +292,7 @@ export async function startService({ config, configPath, env = process.env, log,
     }
     outbound = createdOutbound;
     checkCancelled();
-    const replies=factories.replies({chat,outbound,jobs,inbound,botOpenId:config.feishu.botOpenId,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,
+    const replies=factories.replies({chat,outbound,jobs,inbound,botOpenId:config.feishu.botOpenId,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,mentionAllGroupChatIds,
       sendAttachment: input => sendOutboundAttachment({ client, ...input }),
       replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
     const stopAuthorize=async({actor,conversationId,conversationType})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(conversationType==='p2p'&&config.routing.allowAllPrivateUsers===true)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
@@ -307,7 +309,7 @@ export async function startService({ config, configPath, env = process.env, log,
       maxAttempts:config.codex.jobMaxAttempts,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
-    communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
+    communication=factories.communication({config,store,inbound,forward,chat,outbound,botAppId:credentials.appId,hookTokens,log});
     businessCardAction=factories.businessCardAction({hooks:config.hooks,connectionId:config.feishu.connectionId,
       ingest:communication.ingestCardAction,
       runAsync:runCardOperation,log});

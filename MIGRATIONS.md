@@ -1,8 +1,10 @@
 # Versions and migrations
 
-Application version: `0.2.17`
+Application version: `0.2.18`
 
-Version 0.2.17 does not add a database migration. Optional group `replyTriggers` defaults to `false`; confirmed bot text and execution-card message IDs are recorded in the existing inbound-message table for indexed reply lookup. Unknown parent IDs are checked through a bounded Feishu message read.
+Version 0.2.18 does not add a database migration. Optional group `replyTriggers` defaults to `false`; confirmed bot text and execution-card message IDs are recorded in the existing inbound-message table for indexed reply lookup. Unknown parent and root IDs are checked through bounded Feishu message reads.
+
+Version 0.2.17 does not add a database migration. `routing.groups[].allowMentionAll` is optional and defaults to false. Reply mentions are rendered as Feishu post elements; text-mode replies with valid mentions are sent as posts.
 
 Version 0.2.16 does not add a database migration. Business-card callback times are normalized from seconds, milliseconds, microseconds or nanoseconds before forwarding. Existing card-action event IDs and deduplication keys are unchanged.
 
