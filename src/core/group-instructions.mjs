@@ -125,7 +125,7 @@ export function createGroupInstructions({ groups = [], configDir, maxBytes = GRO
         if (bytes + file.bytes > maxBytes) { skipped(chatId, index, 'total_too_large'); continue; }
         usable(chatId, index);
         bytes += file.bytes;
-        sections.push(`【指令文件 ${path}】\n${file.text}`);
+        sections.push(`【指令文件 ${index + 1}】\n${file.text}`);
       }
       if (!sections.length) return null;
       const text = [header(chatId, group.mode), ...sections].join('\n\n');

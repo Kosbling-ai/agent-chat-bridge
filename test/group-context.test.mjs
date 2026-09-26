@@ -145,7 +145,8 @@ test('instruction provider hot-reloads changed files and skips unreadable files 
   assert.equal(await provider.forChat('oc_plain'), null);
   const first = await provider.forChat('oc_1');
   assert.match(first.text, /^【飞书群指令】\nchat_id：oc_1\n/);
-  assert.match(first.text, /short text\n\n【指令文件 .*rules\.md】\nversion one$/);
+  assert.match(first.text, /short text\n\n【指令文件 1】\nversion one$/);
+  assert.doesNotMatch(first.text, /\/Users\//);
   assert.equal(first.sources, 2);
   assert.match(first.hash, /^[0-9a-f]{64}$/);
   assert.equal((await provider.forChat('oc_1')).hash, first.hash);
@@ -182,6 +183,11 @@ test('check-config validates configured instruction files relative to the config
   const passed = run();
   assert.equal(passed.status, 0, passed.stdout);
   assert.match(passed.stdout, /"operation":"check_config","status":"succeeded"/);
+  for (const fields of [{ instructionFiles: ['rules/group.md'] }, { instructionText: 'rules' }, { instructionMode: 'append' }, { replyContext: {} }]) {
+    await writeFile(configPath, JSON.stringify(withGroup({ capabilities: ['hook'], ...fields })));
+    const rejected = run();
+    assert.equal(rejected.status, 1, rejected.stdout);
+  }
 });
 
 const cardItem = (content, extra = {}) => ({ message_id: 'om_card', msg_type: 'interactive', body: { content: JSON.stringify(content) },
@@ -206,6 +212,17 @@ test('card flattening keeps visible text in order and drops callback values, lin
   const flattened = flattenCardText(originalCard);
   assert.equal(flattened, '审批卡\n**正文** 第一段\n字段说明\n版本：3\n[按钮] 批准发送\n[控件] 选择原因');
   assert.doesNotMatch(flattened, /hidden|act_|hash_|business/);
+  const callbackCards = [
+    { elements: [[{ tag: 'button', text: '批准', value: { text: 'hidden-value-text', content: 'hidden-value-content' } }]] },
+    { schema: '2.0', value: { text: 'hidden-value-text', content: 'hidden-value-content' },
+      behaviors: [{ type: 'callback', value: { text: 'hidden' } }],
+      body: { elements: [{ tag: 'button', text: '批准', behaviors: [{ type: 'callback', value: { text: 'hidden' } }] }] } },
+  ];
+  for (const card of callbackCards) {
+    const text = flattenCardText(card);
+    assert.match(text, /\[按钮\] 批准/);
+    assert.doesNotMatch(text, /hidden(?:-value-(?:text|content))?/);
+  }
 });
 
 test('reply segment reads a text parent through the chat client and resolves mention names', async () => {
@@ -287,6 +304,9 @@ test('reply context and instruction mode settings are validated', () => {
   assert.equal(validateConfig(base).routing.groups[0].instructionMode, undefined);
   for (const fields of [{ instructionText: 'rules', instructionMode: 'prepend' }, { instructionMode: 'append' }]) {
     assert.throws(() => validateConfig(withGroup(fields)), { code: 'invalid_group_instruction_mode' });
+  }
+  for (const fields of [{ instructionFiles: ['rules.md'] }, { instructionText: 'rules' }, { instructionMode: 'append' }, { replyContext: {} }]) {
+    assert.throws(() => validateConfig(withGroup({ capabilities: ['hook'], ...fields })), { code: /^(?:group_context_requires_bridge|invalid_group_instruction_mode)$/ });
   }
 });
 

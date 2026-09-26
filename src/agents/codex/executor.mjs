@@ -357,7 +357,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     rememberInjection(binding.codexSessionId, key, hash);
     try {
       await sessionStore.saveCodexRealtimeEvent(binding, { eventKey: key, eventType: 'context_injection', role: 'activity', title: '上下文注入', text: '', createdAt: now(), detail: { ...detail, state: 'injected', hash } });
-    } catch (error) { injectionLog('warning', 'failed', { stage: 'persist', error_code: key, errorClass: databaseError(error).code }); }
+    } catch (error) { injectionLog('warning', 'failed', { stage: key === SYSTEM_PREAMBLE_KEY ? 'system_preamble_persist' : 'group_instructions_persist', errorClass: databaseError(error).code }); }
   }
 
   function injectedKeys(binding) {
@@ -372,7 +372,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     for (const key of injectedKeys(state.binding)) {
       rememberInjection(state.threadId, key, INJECTION_STALE);
       sessionStore.saveCodexRealtimeEvent(state.binding, { eventKey: key, eventType: 'context_injection', role: 'activity', title: '上下文注入', text: '', createdAt: now(), detail: { state: 'stale', reason, turnId: state.turnId } })
-        .catch((error) => injectionLog('warning', 'failed', { stage: 'mark_stale', error_code: key, errorClass: databaseError(error).code }));
+        .catch((error) => injectionLog('warning', 'failed', { stage: key === SYSTEM_PREAMBLE_KEY ? 'system_preamble_mark_stale' : 'group_instructions_mark_stale', errorClass: databaseError(error).code }));
     }
   }
 
