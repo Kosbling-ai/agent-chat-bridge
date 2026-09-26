@@ -21,6 +21,13 @@ const withGroup = fields => ({ ...base, routing: { ...base.routing, groups: [{ .
 const bin = fileURLToPath(new URL('../bin/agent-chat-bridge.mjs', import.meta.url));
 const T0 = Date.UTC(2026, 8, 26, 1, 2, 3);
 
+test('mention-all is explicitly enabled per group and rejects non-boolean values', () => {
+  assert.equal(validateConfig(base).routing.groups[0].allowMentionAll, false);
+  assert.equal(validateConfig(withGroup({ allowMentionAll:true })).routing.groups[0].allowMentionAll, true);
+  for (const value of ['true', null, 1]) assert.throws(() => validateConfig(withGroup({ allowMentionAll:value })),
+    { code:'invalid_group_mention_all' });
+});
+
 test('message metadata lists stable Feishu identifiers and drops unusable values', () => {
   assert.equal(formatMessageMetadata({ messageId: 'om_2', chatId: 'oc_1', parentId: 'om_1', rootId: 'om_0', senderOpenId: 'ou_a', createdAt: T0 }),
     '[msg message_id=om_2 chat_id=oc_1 parent_id=om_1 root_id=om_0 sender_open_id=ou_a create_time=2026-09-26T01:02:03.000Z]');

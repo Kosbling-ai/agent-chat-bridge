@@ -214,10 +214,11 @@ function validateRuntime(raw) {
   object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext'], 'invalid_group_fields');
+    object(group, ['conversationId', 'userIds', 'trigger', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll'], 'invalid_group_fields');
     const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
     if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
+    if (group.allowMentionAll !== undefined && typeof group.allowMentionAll !== 'boolean') throw new ConfigError('invalid_group_mention_all');
     const capabilities=group.capabilities===undefined?['bridge','hook']:strings(group.capabilities);
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
     if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined)) throw new ConfigError('group_context_requires_bridge');
@@ -226,6 +227,7 @@ function validateRuntime(raw) {
       ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
       ...(group.instructionText === undefined ? {} : { instructionText: instructionText(group.instructionText) }),
       ...(instructed ? { instructionMode: group.instructionMode ?? 'append' } : {}),
+      allowMentionAll: group.allowMentionAll ?? false,
       ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');

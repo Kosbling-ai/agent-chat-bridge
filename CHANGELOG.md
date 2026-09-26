@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.17] — Unreleased
+
+- Convert valid Agent reply mentions (`<at user_id="ou_…"></at>`, `<at open_id="ou_…"></at>`, and `@{ou_…}`) into Feishu post `at` elements, including replies configured for text mode. Invalid IDs remain literal. Per-group `routing.groups[].allowMentionAll` enables `<at user_id="all"></at>` only for that group; it defaults to false. Interactive cards are unchanged.
+
+No database migration is needed.
+
 ## [0.2.16] — Unreleased
 
 - Normalize business-card callback `action_time` from seconds, milliseconds, microseconds or nanoseconds before forwarding, and discard invalid or out-of-range values. The original time string still participates in fallback event ID hashing.

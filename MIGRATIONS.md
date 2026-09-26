@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.16`
+Application version: `0.2.17`
+
+Version 0.2.17 does not add a database migration. `routing.groups[].allowMentionAll` is optional and defaults to false. Reply mentions are rendered as Feishu post elements; text-mode replies with valid mentions are sent as posts.
 
 Version 0.2.16 does not add a database migration. Business-card callback times are normalized from seconds, milliseconds, microseconds or nanoseconds before forwarding. Existing card-action event IDs and deduplication keys are unchanged.
 
