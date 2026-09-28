@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.15] — Unreleased
+
+- Add read-only `GET /health/tasks` for connection-scoped failed and interrupted forward-job counts within a bounded time window. Invalid windows return 400 and unreadable storage returns a fixed 503 error. No database migration or configuration change is needed.
+
 ## [0.2.14] — Unreleased
 
 - Restore the fixed Feishu reply for bot mentions from groups that are not listed in `routing.groups`. A live human `@bot` message in such a group queues one text reply to that message containing the group's `chat_id`; hook-only groups, unauthorized speakers in configured groups, history catch-up, bot/app/self messages and duplicates stay silent. Replies are rate-limited in memory per group and speaker. The new optional `routing.unlistedGroupReply` setting controls `enabled` (default `true`), `text` (`{{chat_id}}` placeholder) and `cooldownMs` (default `600000`).

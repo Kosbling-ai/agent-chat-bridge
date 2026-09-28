@@ -321,7 +321,7 @@ export async function startService({ config, configPath, env = process.env, log,
       const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending&&!executorStatus.fault, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
       return { ready: !stopping && Object.values(components).every(Boolean), components };
     };
-    const createdHttp = await factories.server({ config, log, readiness, eventRuntime: forward, inboundTokens });
+    const createdHttp = await factories.server({ config, log, readiness, eventRuntime: forward, jobs, inboundTokens });
     if (stopping) {
       await cleanupLateComponent('server', () => createdHttp?.close?.());
       throw stoppedError();
