@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.18` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.19` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
@@ -29,6 +29,16 @@ For an Agent reply that needs to notify someone, write `<at user_id="ou_example1
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
 
 For an authorized group, set `routing.groups[].replyTriggers` to `true` to trigger the Agent when a human replies to a message from this bot without `@` (default `false`). Text and cards both qualify; `trigger: "all"` remains unchanged. See [routing and reply context](docs/runtime.md).
+
+`GET /health/tasks?window_minutes=120` has the same access conditions as `/health/ready` and reads only this process's configured `connection_id`. The integer window is 5–1440 minutes (default 120); invalid values return 400 `invalid_window_minutes`. It includes failed chat (`bridge`) and business-event (`caller`) jobs whose `finished_at` falls in the window. A failed job with code `CODEX_TURN_INTERRUPTED` is counted only in `interrupted.total`; deferred jobs are excluded. At most the 500 most recently finished jobs are counted, with `failed.truncated=true` if more match. Codes outside `[A-Z0-9_]{1,64}` become `OTHER`; at most 10 code entries are returned in descending count order, with remaining codes folded into `OTHER`. Storage failure returns 503 `task_health_unavailable` rather than zero counts. The response contains no prompts, message bodies, sender or group identifiers, or raw error text.
+
+Example response:
+
+```json
+{"window_minutes":120,"checked_at":1790000000000,"failed":{"total":3,"truncated":false,"latest_finished_at":1789999000000,"by_code":[{"code":"CODEX_USAGE_LIMIT_EXCEEDED","count":2},{"code":"OTHER","count":1}],"by_mode":{"bridge":1,"caller":2}},"interrupted":{"total":0}}
+```
+
+Runtime health notifications still first fire after a persistent issue has lasted 30 minutes. Failed jobs do not automatically retry when quota returns. A failure remains visible until it leaves the selected window, which does not imply quota is still exhausted.
 
 ```sh
 npm test
