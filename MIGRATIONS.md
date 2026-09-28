@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.14`
+Application version: `0.2.15`
+
+Version 0.2.15 adds no database migration or configuration change. It adds the read-only `GET /health/tasks` endpoint.
 
 Version 0.2.14 does not add a database migration. It adds the optional `routing.unlistedGroupReply` configuration (enabled, text, cooldownMs); existing configurations keep working with the defaults.
 

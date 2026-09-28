@@ -82,6 +82,64 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
     if (!result.affectedRows) throw new StoreError('forward_lease_lost');
   }
   const operations = {
+    taskHealthSummary({ windowMinutes, checkedAt }) {
+      const since = checkedAt - windowMinutes * 60_000;
+      return read(async connection => {
+        const [[result]] = await connection.execute(`WITH candidates AS (
+            SELECT id, finished_at, delivery_mode, last_error
+            FROM assistant_codex_forward_jobs FORCE INDEX (idx_forward_status_next)
+            WHERE connection_id=? AND status='failed' AND finished_at>=? AND finished_at<=?
+            ORDER BY finished_at DESC, id DESC LIMIT 501
+          ), ranked AS (
+            SELECT candidates.*, ROW_NUMBER() OVER (ORDER BY finished_at DESC, id DESC) AS sample_rank
+            FROM candidates
+          ), sampled AS (
+            SELECT finished_at, delivery_mode,
+              BINARY last_error = 'CODEX_TURN_INTERRUPTED' AS interrupted,
+              CASE WHEN CHAR_LENGTH(last_error) BETWEEN 1 AND 64
+                AND NOT REGEXP_LIKE(last_error, '[^A-Z0-9_]', 'c') THEN last_error ELSE 'OTHER' END AS error_code
+            FROM ranked WHERE sample_rank<=500
+          ), summary AS (
+            SELECT COALESCE(SUM(NOT interrupted),0) AS failed_total,
+              COALESCE(SUM(interrupted),0) AS interrupted_total,
+              MAX(CASE WHEN NOT interrupted THEN finished_at END) AS latest_finished_at,
+              COALESCE(SUM(NOT interrupted AND delivery_mode='bridge'),0) AS bridge_total,
+              COALESCE(SUM(NOT interrupted AND delivery_mode='caller'),0) AS caller_total
+            FROM sampled
+          ), codes AS (
+            SELECT error_code, COUNT(*) AS code_total FROM sampled
+            WHERE NOT interrupted GROUP BY error_code
+          )
+          SELECT /*+ MAX_EXECUTION_TIME(1500) */ summary.*,
+            (SELECT COUNT(*) FROM candidates) AS candidate_total,
+            (SELECT JSON_ARRAYAGG(JSON_OBJECT('code',error_code,'count',code_total)) FROM codes) AS code_counts
+          FROM summary`, [connectionId, since, checkedAt]);
+        const counts = typeof result.code_counts === 'string' ? JSON.parse(result.code_counts) : result.code_counts || [];
+        const rankedCodes = counts.map(({ code, count }) => ({ code, count: Number(count) }))
+          .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code));
+        const keep = rankedCodes.length > 10 && !rankedCodes.slice(0, 10).some(item => item.code === 'OTHER') ? 9 : 10;
+        const byCode = rankedCodes.slice(0, keep);
+        const remainder = rankedCodes.slice(keep).reduce((total, item) => total + item.count, 0);
+        if (remainder) {
+          const other = byCode.find(item => item.code === 'OTHER');
+          if (other) other.count += remainder;
+          else byCode.push({ code: 'OTHER', count: remainder });
+        }
+        byCode.sort((a, b) => b.count - a.count || a.code.localeCompare(b.code));
+        return {
+          window_minutes: windowMinutes,
+          checked_at: checkedAt,
+          failed: {
+            total: Number(result.failed_total),
+            truncated: Number(result.candidate_total) > 500,
+            latest_finished_at: result.latest_finished_at == null ? null : Number(result.latest_finished_at),
+            by_code: byCode,
+            by_mode: { bridge: Number(result.bridge_total), caller: Number(result.caller_total) },
+          },
+          interrupted: { total: Number(result.interrupted_total) },
+        };
+      });
+    },
     async upsert(input) {
       const callerId = required(input.callerId, 128);
       const idempotencyKey = required(input.idempotencyKey, 512);

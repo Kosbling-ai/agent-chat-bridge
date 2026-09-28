@@ -95,7 +95,7 @@ export function canonicalJsonHash(value) {
   return createHash('sha256').update(JSON.stringify(canonicalize(value))).digest('hex');
 }
 
-export async function startServer({ config, log, readiness, eventRuntime, inboundTokens = {} }) {
+export async function startServer({ config, log, readiness, eventRuntime, jobs, inboundTokens = {} }) {
   log = safeObserver(log);
   const inboundHooks = (config.hooks || []).filter(hook => hook.inbound).map(hook => ({ hook, token: inboundTokens[hook.id] }));
   let stopping = false;
@@ -110,6 +110,7 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
   const server = http.createServer({ requestTimeout: 5000, headersTimeout: 5000 }, async (request, response) => {
     let eventLog;
     let responseStatus;
+    let taskHealth;
     try {
       const url = new URL(request.url, 'http://bridge.invalid');
       const eventMatch = /^\/v1\/events\/([^/]+)$/.exec(url.pathname);
@@ -159,6 +160,22 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
         };
         responseStatus = !stopping && state.ready ? 200 : 503;
         reply(response, responseStatus, { ...state, ready: !stopping && state.ready });
+      } else if (url.pathname === '/health/tasks') {
+        taskHealth = { startedAt: Date.now() };
+        const values = url.searchParams.getAll('window_minutes');
+        if ([...url.searchParams.keys()].some(key => key !== 'window_minutes') || values.length > 1
+          || (values.length === 1 && !/^(?:[1-9]\d*)$/.test(values[0]))) {
+          throw new HttpError(400, 'invalid_window_minutes');
+        }
+        const windowMinutes = values.length ? Number(values[0]) : 120;
+        if (!Number.isInteger(windowMinutes) || windowMinutes < 5 || windowMinutes > 1440) {
+          throw new HttpError(400, 'invalid_window_minutes');
+        }
+        taskHealth.windowMinutes = windowMinutes;
+        if (stopping || !jobs?.taskHealthSummary) throw new HttpError(503, 'task_health_unavailable');
+        const result = await jobs.taskHealthSummary({ windowMinutes, checkedAt: Date.now() });
+        responseStatus = 200;
+        reply(response, 200, result);
       } else {
         responseStatus = 404;
         reply(response, 404, { error: 'not_found' });
@@ -166,9 +183,16 @@ export async function startServer({ config, log, readiness, eventRuntime, inboun
     } catch (error) {
       if (response.headersSent || response.destroyed) { response.destroy(); return; }
       responseStatus = error instanceof HttpError ? error.status : 503;
-      const code = error instanceof HttpError ? error.code : 'service_unavailable';
+      const code = taskHealth
+        ? responseStatus === 400 ? 'invalid_window_minutes' : 'task_health_unavailable'
+        : error instanceof HttpError ? error.code : 'service_unavailable';
       eventLog = { ...eventLog, errorClass: code };
-      if (!request.url?.startsWith('/v1/events')) {
+      if (taskHealth) {
+        log(responseStatus === 400 ? 'warning' : 'error', 'http_task_health', 'failed', {
+          code, statusCode: responseStatus, durationMs: Date.now() - taskHealth.startedAt,
+          windowMinutes: taskHealth.windowMinutes,
+        });
+      } else if (!request.url?.startsWith('/v1/events')) {
         log('error', 'http_health', 'failed', { code: 'service_unavailable' });
       }
       reply(response, responseStatus, { error: code });
