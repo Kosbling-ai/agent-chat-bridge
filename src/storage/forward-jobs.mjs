@@ -96,7 +96,8 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
           ), sampled AS (
             SELECT finished_at, delivery_mode,
               BINARY last_error = 'CODEX_TURN_INTERRUPTED' AS interrupted,
-              CASE WHEN REGEXP_LIKE(last_error, '^[A-Z0-9_]{1,64}$', 'c') THEN last_error ELSE 'OTHER' END AS error_code
+              CASE WHEN CHAR_LENGTH(last_error) BETWEEN 1 AND 64
+                AND NOT REGEXP_LIKE(last_error, '[^A-Z0-9_]', 'c') THEN last_error ELSE 'OTHER' END AS error_code
             FROM ranked WHERE sample_rank<=500
           ), summary AS (
             SELECT COALESCE(SUM(NOT interrupted),0) AS failed_total,

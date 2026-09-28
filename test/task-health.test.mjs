@@ -48,5 +48,6 @@ test('task health summary returns fixed 503 when storage is unreadable', async t
   const entry = lines.find(line => line.operation === 'http_task_health');
   assert.equal(entry.level, 'error');
   assert.equal(entry.status_code, 503);
+  assert.equal(entry.window_minutes, 30);
   assert.equal(JSON.stringify(lines).includes('private database text'), false);
 });

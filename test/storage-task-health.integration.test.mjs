@@ -63,6 +63,26 @@ test('interrupted excluded from failed task health summary', {
   assert.equal(result.interrupted.total, 1);
 }));
 
+test('error code with trailing newline becomes OTHER in task health summary', {
+  skip: !enabled, timeout: 40_000,
+}, async () => withStore('health-invalid-codes', async ({ insert, store }) => {
+  const at = 1_000_000;
+  await insert([
+    { code: 'FAIL\n', finishedAt: at },
+    { code: 'FAIL\r\n', finishedAt: at - 1 },
+    { code: `${'A'.repeat(64)}\n`, finishedAt: at - 2 },
+    { code: 'B'.repeat(65), finishedAt: at - 3 },
+    { code: 'CODEX_USAGE_LIMIT_EXCEEDED\n', finishedAt: at - 4 },
+    { code: 'CODEX_USAGE_LIMIT_EXCEEDED', finishedAt: at - 5 },
+  ]);
+  const result = await store.taskHealthSummary({ windowMinutes: 5, checkedAt: at });
+  assert.equal(result.failed.total, 6);
+  assert.deepEqual(result.failed.by_code, [
+    { code: 'OTHER', count: 5 },
+    { code: 'CODEX_USAGE_LIMIT_EXCEEDED', count: 1 },
+  ]);
+}));
+
 test('other connection excluded from task health summary', {
   skip: !enabled, timeout: 40_000,
 }, async () => withStore('health-empty', async ({ insert, store }) => {
