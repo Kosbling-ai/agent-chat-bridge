@@ -3,6 +3,8 @@ import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { extractAttachments } from '../channels/feishu/media.mjs';
 import { buildCodexForwardPrompt, createRecentMentionPrompts, isBotJoinNotice,
   mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
+import { DEFAULT_REPLY_CONTEXT_MAX_CHARS, loadReplySegment } from '../channels/feishu/reply-context.mjs';
+import { createReplyTrigger } from '../channels/feishu/reply-trigger.mjs';
 import { databaseError } from '../storage/errors.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
@@ -27,7 +29,7 @@ function deliveryErrorCode(error) {
   return 'chat_delivery_failed';
 }
 
-export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
+export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,botAppId='',hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
   let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,failureDeadline=0,lastFailureStage='',lastErrorClass='',wakeWait; const active=new Set(); const processing=new Set();
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
@@ -37,6 +39,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
   const contextEnabled=contextLimit>0&&contextWindowMs>0;
   const recent=createRecentMentionPrompts({now});
+  const botReply=createReplyTrigger({inbound,chat,botOpenId:config.feishu.botOpenId,botAppId,now,log});
   const unlistedReplies=new Map();
   async function replyUnlistedGroup(event) {
     const {text,cooldownMs}=config.routing.unlistedGroupReply; const key=`${event.conversationId}:${event.actor.openId||''}`; const at=now();
@@ -77,8 +80,11 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const normalized=normalizeFeishuInput(event,{botOpenId:config.feishu.botOpenId});
     const attachmentMetadata=extractAttachments(event);
     const ignoredByAgent=isBotJoinNotice(normalized)||stale(event,normalized.createdAt);
+    const replyTrigger=agentAllowed&&!ignoredByAgent&&event.type==='message.received'&&group?.replyTriggers===true
+      &&group.trigger!=='all'&&!mentioned?await botReply(event,{deadlineAt:context.deadlineAt}):{triggered:false};
+    if(context.signal?.aborted)throw new Error('ingress_stopped');
     const triggerEligible=event.type==='message.received'&&!ignoredByAgent
-      &&(event.conversationType==='p2p'||group?.trigger==='all'||mentioned);
+      &&(event.conversationType==='p2p'||group?.trigger==='all'||mentioned||replyTrigger.triggered);
     const triggered=agentAllowed&&triggerEligible;
     // Hook subscriptions are event notifications with their own scope. They are
     // deliberately independent from Agent authorization and routing outcomes.
@@ -87,9 +93,11 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&group?.passiveContext&&event.type==='message.received'
       &&(normalized.rawText.trim()||attachmentMetadata.length));
     const receipt=await store.acceptInbound({connectionId,conversationId:event.conversationId,source:event.source,conversationType:event.conversationType,eventKey:event.eventKey,eventType:event.type,messageId:event.messageId,...(event.type==='message.recalled'?{recalledMessageId:event.messageId}:{}),revision:event.revision,occurredAt:event.occurredAt,payload:event,semanticPayload:feishuEventIdentity(event),policyVersion:config.routing.version,passiveContext:contextCandidate,
-      inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata},groupContextCandidate:contextCandidate},
+      inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata,
+        ...(normalized.parentId?{parentId:normalized.parentId}:{}),...(normalized.rootId?{rootId:normalized.rootId}:{})},groupContextCandidate:contextCandidate},
       hooks});
     if(contextCandidate&&!receipt.duplicate)recent.remember({chatId:normalized.chatId,messageId:normalized.messageId,prompt:normalized.rawText,
+      parentId:normalized.parentId,rootId:normalized.rootId,createdAt:normalized.createdAt,
       senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId,senderName:normalized.senderName});
     if(event.type==='message.received'&&event.source==='live'&&event.conversationType==='group'&&!group&&mentioned&&!ignoredByAgent
       &&event.actor?.type==='user'&&!event.isApp&&!event.isSelf&&config.routing.unlistedGroupReply?.enabled&&!receipt.duplicate)await replyUnlistedGroup(event);
@@ -103,8 +111,12 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       const mediaResolvable=normalized.messageType!=='text';
       if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;
       const mergedPrompt=normalized.chatType==='p2p'?normalized.text:mergeMentionPrompts(contextEntries,normalized.text);
+      const replyTo=normalized.chatType==='p2p'?'':(normalized.parentId||normalized.rootId);
+      const replySegment=replyTo?await loadReplySegment({chat,parentId:replyTo,parentMessage:replyTrigger.parentMessage,chatId:normalized.chatId,contextEntries,
+        cardJson:group?.replyContext?.cardJson===true,maxChars:group?.replyContext?.maxChars??DEFAULT_REPLY_CONTEXT_MAX_CHARS,log}):'';
       const prompt=buildCodexForwardPrompt({chatType:normalized.chatType,currentPrompt:normalized.text,
-        mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId});
+        mergedPrompt:mergedPrompt||normalized.text,recentPrompts:contextEntries,senderName:normalized.senderName,senderOpenId:normalized.senderOpenId,senderUnionId:normalized.senderUnionId,
+        chatId:normalized.chatId,messageId:normalized.messageId,parentId:normalized.parentId,rootId:normalized.rootId,createdAt:normalized.createdAt,replySegment});
       const result=await forward.handleMessage({
         source:'live',callerId:'live',idempotencyKey:`live:${connectionId}:${normalized.chatId}:${normalized.messageId}`,
         message:{messageId:normalized.messageId,conversationId:normalized.chatId,conversationType:normalized.chatType,

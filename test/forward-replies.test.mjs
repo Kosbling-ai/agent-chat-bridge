@@ -81,13 +81,13 @@ test('API run without a source message creates the original post in the conversa
 });
 
 test('ordinary replies use chat create, production markdown conversion and 3000-character chunks', async () => {
-  const calls = [];
+  const calls = [], recorded = [];
   const job = { id:'run', leaseOwner:'worker', chatId:'chat', messageId:'source', sourceMessageId:'source',
     result:{ answer:`# Title\n[link](https://example.invalid)\n${'x'.repeat(3100)}` } };
   const replies = createFeishuReplies({ chat: {
     async sendMessage(input) { calls.push(input); return { message_id:`sent-${calls.length}` }; },
     async replyMessage() { throw new Error('production reply must use chat create'); },
-  }, jobs:{}, connectionId:'fixture', maxOutputChars:3500 });
+  }, jobs:{}, inbound:{async recordReply(value){recorded.push(value);}}, botOpenId:'bot', connectionId:'fixture', maxOutputChars:3500 });
   const delivered = await replies.deliver(job, job.result, { assertLease() {} });
   assert.equal(delivered.status, 'sent');
   assert.equal(delivered.messages, 2);
@@ -95,6 +95,22 @@ test('ordinary replies use chat create, production markdown conversion and 3000-
   assert.deepEqual(calls[0].content.zh_cn.content[0], [{ tag:'text', text:'Title' }]);
   assert.deepEqual(calls[0].content.zh_cn.content[1], [{ tag:'a', text:'link', href:'https://example.invalid' }]);
   assert.equal(new Set(calls.map(call => call.uuid)).size, 2);
+  assert.deepEqual(recorded.map(value => [value.messageId,value.chatId,value.messageType,value.senderOpenId]),
+    [['sent-1','chat','post','bot'],['sent-2','chat','post','bot']]);
+});
+
+test('confirmed execution card ID is recorded for reply ownership', async () => {
+  const recorded = [];
+  const job = { id:'run', leaseOwner:'worker', chatId:'chat', chatType:'group', messageId:'source',
+    senderOpenId:'human', deliveryMode:'bridge', result:{} };
+  const feedback = createExecutionFeedback({ jobs:{async patchFeedback({key,value}){job.result={...job.result,[key]:value};}},
+    inbound:{async recordReply(value){recorded.push(value);}}, botOpenId:'bot',
+    cardClient:{im:{v1:{message:{async create(){return{code:0,data:{message_id:'card-id'}};}}}}} });
+  const state = await feedback.start(job);
+  await state.card.update();
+  state.card.stop();
+  assert.deepEqual(recorded.map(value => [value.messageId,value.chatId,value.messageType,value.senderOpenId]),
+    [['card-id','chat','interactive','bot']]);
 });
 
 test('text reply mode keeps the original 1900-character chunks', async () => {
@@ -104,6 +120,59 @@ test('text reply mode keeps the original 1900-character chunks', async () => {
     jobs:{}, connectionId:'fixture', replyAsPost:false, maxOutputChars:3500 });
   assert.equal((await replies.deliver(job, job.result, { assertLease() {} })).messages, 2);
   assert.deepEqual(calls.map(call => [call.kind, call.content.text.length]), [['text',1900],['text',100]]);
+});
+
+test('post replies turn individual and multiple open_id mentions into at elements beside markdown links', () => {
+  const post = markdownToFeishuPost('# Tasks\n**Owner** <at user_id="ou_alice1"></at> and <at open_id="ou_bob2"></at> [details](https://example.invalid) @{ou_c3}');
+  assert.deepEqual(post.zh_cn.content, [
+    [{ tag:'text', text:'Tasks' }],
+    [{ tag:'text', text:'Owner ' }, { tag:'at', user_id:'ou_alice1' }, { tag:'text', text:' and ' },
+      { tag:'at', user_id:'ou_bob2' }, { tag:'text', text:' ' }, { tag:'a', text:'details', href:'https://example.invalid' },
+      { tag:'text', text:' ' }, { tag:'at', user_id:'ou_c3' }],
+  ]);
+});
+
+test('invalid mentions and disabled mention-all stay literal; fenced code does not mention', () => {
+  const literal = '<at user_id="ou_Bad"></at> @{ou_bad-id} <at open_id="all"></at> <at user_id="all"></at>';
+  assert.deepEqual(markdownToFeishuPost(literal).zh_cn.content[0], [{ tag:'text', text:literal }]);
+  assert.deepEqual(markdownToFeishuPost('```\n@{ou_valid1}\n```').zh_cn.content[1], [{ tag:'text', text:'@{ou_valid1}' }]);
+  assert.deepEqual(markdownToFeishuPost('<at user_id="all"></at> @{all}', { allowMentionAll:true }).zh_cn.content[0],
+    [{ tag:'at', user_id:'all' }, { tag:'text', text:' @{all}' }]);
+});
+
+test('text mode promotes valid mentions to post and gates mention-all by group', async () => {
+  const calls = [];
+  const reply = createFeishuReplies({ chat:{ async sendMessage(input) { calls.push(input); return { message_id:'sent' }; } },
+    jobs:{}, connectionId:'fixture', replyAsPost:false, mentionAllGroupChatIds:new Set(['enabled']) });
+  const send = async (chatId, chatType, answer) => reply.deliver({ id:'run', chatId, chatType, messageId:'source', result:{ answer } },
+    { answer }, { assertLease() {} });
+  await send('enabled', 'group', 'Hi @{ou_alice1} and <at open_id="ou_bob2"></at>');
+  await send('disabled', 'group', '<at user_id="all"></at>');
+  await send('enabled', 'group', '<at user_id="all"></at>');
+  await send('enabled', 'p2p', '<at user_id="all"></at>');
+  await send('enabled', 'group', '@{ou_Bad}');
+  assert.deepEqual(calls.map(call => call.kind), ['post', 'text', 'post', 'text', 'text']);
+  assert.deepEqual(calls[0].content.zh_cn.content[0].filter(element => element.tag === 'at'),
+    [{ tag:'at', user_id:'ou_alice1' }, { tag:'at', user_id:'ou_bob2' }]);
+  assert.deepEqual(calls[1].content, { text:'<at user_id="all"></at>' });
+  assert.deepEqual(calls[2].content.zh_cn.content[0], [{ tag:'at', user_id:'all' }]);
+  assert.deepEqual(calls[3].content, { text:'<at user_id="all"></at>' });
+  assert.deepEqual(calls[4].content, { text:'@{ou_Bad}' });
+});
+
+test('reply chunks keep mention markers whole at text and post boundaries', async () => {
+  for (const [replyAsPost, boundary] of [[false, 1900], [true, 3000]]) {
+    const calls = [];
+    const answer = `${'x'.repeat(boundary - 3)}@{ou_owner1} tail`;
+    const reply = createFeishuReplies({ chat:{ async sendMessage(input) { calls.push(input); return { message_id:'sent' }; } },
+      jobs:{}, connectionId:'fixture', replyAsPost, maxOutputChars:5000 });
+    await reply.deliver({ id:'run', chatId:'group', chatType:'group', messageId:'source', result:{ answer } },
+      { answer }, { assertLease() {} });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].kind, replyAsPost ? 'post' : 'text');
+    assert.deepEqual(calls[1].content.zh_cn.content[0],
+      [{ tag:'at', user_id:'ou_owner1' }, { tag:'text', text:' tail' }]);
+  }
 });
 
 test('legacy unconfirmed ordinary reply is held without another create', async () => {

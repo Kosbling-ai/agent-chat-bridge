@@ -203,7 +203,7 @@ test('group mention can register forward and hook branches without either consum
   await new Promise(setImmediate);
   assert(accepted.every(item=>item.forwardJob===undefined&&item.hooks.length===1));
   assert.equal(forwarded.length,2,'forward upsert owns Agent terminal deduplication after an inbox replay');
-  assert.equal(forwarded[0].prompt,'【提到你的消息 来自 Human（open_id=human）】\nhello');
+  assert.match(forwarded[0].prompt,/^【提到你的消息 来自 Human（open_id=human）】\n\[msg message_id=message chat_id=chat sender_open_id=human create_time=\d{4}-\d{2}-\d{2}T[^\]]+Z\]\nhello$/);
 });
 
 test('hook-only, bridge-only and both capabilities keep independent routing',async()=>{

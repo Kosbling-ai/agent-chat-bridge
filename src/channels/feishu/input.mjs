@@ -34,6 +34,8 @@ export function normalizeFeishuInput(event, { botOpenId = '' } = {}) {
     messageType: event.message?.kind || event.message?.type || event.message?.message_type || 'text',
     senderOpenId: event.actor?.openId || event.sender?.sender_id?.open_id || '',
     senderUnionId: event.actor?.unionId || event.sender?.sender_id?.union_id || '',
+    parentId: optionalText(event.message?.parentId || event.message?.parent_id),
+    rootId: optionalText(event.message?.rootId || event.message?.root_id),
     senderName, rawText, text: stripBotMention(rawText, mentions, botOpenId), mentions, botMentioned, createdAt,
     updatedAt: messageTime(event.message?.updatedAt || event.message?.update_time) || createdAt, raw: event,
   };
@@ -56,6 +58,7 @@ export function createRecentMentionPrompts({ now = Date.now, ttlMs = DEFAULT_REC
       prune();
       const entries = prompts.get(input.chatId) || [];
       entries.push({ prompt: optionalText(input.prompt), messageId: input.messageId || '',
+        parentId: input.parentId || '', rootId: input.rootId || '', messageCreatedAt: input.createdAt || 0,
         senderOpenId: input.senderOpenId || '', senderUnionId: input.senderUnionId || '', senderName: input.senderName || '', createdAt: now(), source: 'recent_group_context' });
       prompts.set(input.chatId, entries.slice(-limit));
     },
@@ -84,16 +87,46 @@ function identityLabel(senderName, senderOpenId, senderUnionId) {
   return ids.length ? `${name}（${ids.join('，')}）` : name;
 }
 
+// Only platform identifiers with a conservative character set enter the block,
+// so a malformed value cannot close the bracket or add another prompt line.
+const metadataId = value => {
+  const text = optionalText(value);
+  return /^[A-Za-z0-9_.:-]{1,191}$/.test(text) ? text : '';
+};
+const metadataTime = value => {
+  const date = new Date(messageTime(value));
+  return date.getTime() > 0 ? date.toISOString() : '';
+};
+
+// Generic Feishu message identity for one group-prompt entry. Fields without a
+// usable value are omitted; message text and other profile fields never enter it.
+export function formatMessageMetadata({ messageId, chatId, msgType, parentId, rootId, senderType, senderOpenId, senderAppId, createdAt } = {}) {
+  const fields = [['message_id', metadataId(messageId)], ['chat_id', metadataId(chatId)], ['msg_type', metadataId(msgType)],
+    ['parent_id', metadataId(parentId)], ['root_id', metadataId(rootId)], ['sender_type', metadataId(senderType)],
+    ['sender_open_id', metadataId(senderOpenId)], ['sender_app_id', metadataId(senderAppId)], ['create_time', metadataTime(createdAt)]]
+    .filter(([, value]) => value).map(([key, value]) => `${key}=${value}`);
+  return fields.length ? `[msg ${fields.join(' ')}]` : '';
+}
+
+function groupEntry(label, identity, metadata, body, replySegment = '') {
+  return [`【${label} 来自 ${identity}】`, metadata, replySegment, optionalText(body)].filter(Boolean).join('\n');
+}
+
 export function buildCodexForwardPrompt({ chatType, currentPrompt = '', mergedPrompt = '', recentPrompts = [],
-  senderName = '', senderOpenId = '', senderUnionId = '' } = {}) {
+  senderName = '', senderOpenId = '', senderUnionId = '', chatId = '', messageId = '', parentId = '', rootId = '', createdAt = 0, replySegment = '' } = {}) {
   if (chatType === 'p2p') {
     const privateName = optionalText(senderName) || optionalText(senderOpenId) || '未知用户';
     return [`【发给你的飞书消息 来自 ${privateName}】`, mergedPrompt].map(optionalText).filter(Boolean).join('\n\n');
   }
-  const parts = recentPrompts.filter(entry => entry.prompt).map(entry => `【群消息 来自 ${identityLabel(entry.senderName, entry.senderOpenId, entry.senderUnionId)}】\n${entry.prompt}`);
-  const currentName = identityLabel(senderName, senderOpenId, senderUnionId);
-  if (currentPrompt) parts.push(`【提到你的消息 来自 ${currentName}】\n${currentPrompt}`);
-  return parts.length ? parts.join('\n\n') : `【提到你的消息 来自 ${currentName}】\n${mergedPrompt}`;
+  const parts = recentPrompts.filter(entry => entry.prompt).map(entry => groupEntry('群消息',
+    identityLabel(entry.senderName, entry.senderOpenId, entry.senderUnionId),
+    formatMessageMetadata({ messageId: entry.messageId, parentId: entry.parentId, rootId: entry.rootId,
+      senderOpenId: entry.senderOpenId, createdAt: entry.messageCreatedAt || entry.createdAt }), entry.prompt));
+  // The triggering message is always identified, even when it has no text body.
+  const body = currentPrompt || (parts.length ? '' : mergedPrompt);
+  parts.push(groupEntry('提到你的消息', identityLabel(senderName, senderOpenId, senderUnionId),
+    formatMessageMetadata({ messageId, chatId, parentId, rootId, senderOpenId, createdAt }), body, optionalText(replySegment)));
+  return parts.join('\n\n');
 }
 
 export function formatGroupContext(entries = []) {

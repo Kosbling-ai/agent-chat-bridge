@@ -3,6 +3,8 @@ import { ConfigError, loadConfig } from '../src/config.mjs';
 import { createLogger } from '../src/logger.mjs';
 import { readFile } from 'node:fs/promises';
 import { StoreError } from '../src/storage/errors.mjs';
+import { dirname, resolve } from 'node:path';
+import { checkGroupInstructions } from '../src/core/group-instructions.mjs';
 
 const SAFE_MIGRATION_CODES = new Set(['legacy_connection_id_required', 'legacy_connection_id_mismatch', 'invalid_legacy_connection_id', 'writer_busy', 'migration_busy', 'schema_version_mismatch']);
 const HELP = `agent-chat-bridge
@@ -15,7 +17,7 @@ Usage:
   agent-chat-bridge migrate --config <path> [--legacy-connection-id <original-connection-id>]
 
 An explicit JSON config path is required; no config or .env auto-discovery.
-check-config validates syntax only and never resolves environment secrets.
+check-config validates syntax and configured group instruction files; it never resolves environment secrets.
 start assembles explicitly configured Feishu, Codex and MySQL components.
 Health-only configuration remains live but readiness returns 503.
 migrate explicitly applies the configured Store schema; start never migrates.
@@ -35,6 +37,9 @@ try {
     }
     const config = await loadConfig(path);
     if (command === 'check-config') {
+      const problems = await checkGroupInstructions(config.routing?.groups ?? [], { configDir: dirname(resolve(path)) });
+      for (const problem of problems) log('warning', 'check_config', 'failed', { code: 'invalid_group_instruction_file', ...problem });
+      if (problems.length) throw new ConfigError('invalid_group_instruction_file');
       log('info', 'check_config', 'succeeded');
     } else if (command === 'migrate') {
       const { migrateService } = await import('../src/service.mjs');

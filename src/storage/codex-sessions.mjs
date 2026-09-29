@@ -77,6 +77,13 @@ export function createCodexSessionStore({ pool, schema, connectionId, now = Date
       `user-steer-attempt:${messageId}`, `user-steer-confirmed:${messageId}`, `user-steer-rejected:${messageId}`]);
   }
 
+  // Point lookup on the (connection_id, codex_session_id, event_key) unique key.
+  async function loadCodexEvent(binding, eventKey) {
+    if (!binding?.codexSessionId || !eventKey) return null;
+    return one(`SELECT event_key, event_type, detail_json, created_at FROM ${table('assistant_codex_events')}
+      WHERE connection_id = ? AND codex_session_id = ? AND event_key = ? LIMIT 1`, [connectionId, binding.codexSessionId, limit(eventKey, 180)]);
+  }
+
   async function readPublicProgress({ binding, threadId, messageId, cursor = 0, limit: pageLimit = 100 }) {
     const bounded = Math.max(1, Math.min(250, Number(pageLimit) || 100));
     const objectCursor = cursor && typeof cursor === 'object' ? cursor : null;
@@ -95,7 +102,7 @@ export function createCodexSessionStore({ pool, schema, connectionId, now = Date
   const operations = {
     loadBinding, saveCodexBinding,
     touchCodexBinding: saveCodexBinding,
-    saveCodexRealtimeEvent, findAcceptedMessageEvent, loadSteerEvents, readPublicProgress,
+    saveCodexRealtimeEvent, findAcceptedMessageEvent, loadSteerEvents, loadCodexEvent, readPublicProgress,
   };
   return Object.freeze(Object.fromEntries(Object.entries(operations).map(([name, operation]) => [name, (input, ...rest) => {
     if (input?.connectionId !== undefined && input.connectionId !== connectionId) throw new StoreError('invalid_store_input');

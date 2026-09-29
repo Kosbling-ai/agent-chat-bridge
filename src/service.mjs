@@ -25,6 +25,7 @@ import { createUserInputRuntime } from './channels/feishu/user-input-runtime.mjs
 import { createBusinessCardAction } from './channels/feishu/business-card-action.mjs';
 import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
+import { createGroupInstructions } from './core/group-instructions.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
 import { startServer } from './server.mjs';
 import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
@@ -227,6 +228,8 @@ export async function startService({ config, configPath, env = process.env, log,
     const inbound=factories.inbound({pool,connectionId:config.feishu.connectionId});
     const allowedGroupChatIds = new Set(config.routing.groups
       .filter(group => group.capabilities.includes('bridge')).map(group => group.conversationId));
+    const mentionAllGroupChatIds = new Set(config.routing.groups
+      .filter(group => group.capabilities.includes('bridge') && group.allowMentionAll).map(group => group.conversationId));
     const executorLog = createExecutorLogAdapter(log);
     const executorConfig = {
       bin,
@@ -256,7 +259,8 @@ export async function startService({ config, configPath, env = process.env, log,
       outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
     };
-    executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,
+    const groupInstructions=createGroupInstructions({groups:config.routing.groups.filter(group=>group.capabilities.includes('bridge')),configDir:root,log});
+    executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,groupInstructions,
       onUserInput:event=>userInput?.open(event),onUserInputClosed:event=>userInput?.expire(event),onRestartRequired:async reason=>{
       log('warning','codex_executor','restart_required',{code:reason});
       await close();
@@ -288,7 +292,7 @@ export async function startService({ config, configPath, env = process.env, log,
     }
     outbound = createdOutbound;
     checkCancelled();
-    const replies=factories.replies({chat,outbound,jobs,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,
+    const replies=factories.replies({chat,outbound,jobs,inbound,botOpenId:config.feishu.botOpenId,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,mentionAllGroupChatIds,
       sendAttachment: input => sendOutboundAttachment({ client, ...input }),
       replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
     const stopAuthorize=async({actor,conversationId,conversationType})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(conversationType==='p2p'&&config.routing.allowAllPrivateUsers===true)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
@@ -296,7 +300,7 @@ export async function startService({ config, configPath, env = process.env, log,
       runAsync:runCardOperation,config:{displayName:config.feishu.displayName,cardTextProvider},log});
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
       emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
-    const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,authorize:stopAuthorize,executor,workspace:cwd,
+    const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,inbound,botOpenId:config.feishu.botOpenId,authorize:stopAuthorize,executor,workspace:cwd,
       runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName,cardTextProvider},log});
     forward=factories.forward({config:{
       steering:config.codex.steering,
@@ -305,7 +309,7 @@ export async function startService({ config, configPath, env = process.env, log,
       maxAttempts:config.codex.jobMaxAttempts,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
-    communication=factories.communication({config,store,inbound,forward,chat,outbound,hookTokens,log});
+    communication=factories.communication({config,store,inbound,forward,chat,outbound,botAppId:credentials.appId,hookTokens,log});
     businessCardAction=factories.businessCardAction({hooks:config.hooks,connectionId:config.feishu.connectionId,
       ingest:communication.ingestCardAction,
       runAsync:runCardOperation,log});

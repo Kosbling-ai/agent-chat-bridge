@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.15` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.19` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
@@ -24,7 +24,11 @@ node bin/agent-chat-bridge.mjs check-config --config ./examples/bridge.json
 
 Configure explicit environment references and an owned workspace before migration/start. Never put tokens in JSON, `.env`, logs or source control. [Runtime configuration](docs/runtime.md), [Store](docs/storage.md), [Codex executor](docs/codex-adapter.md), [optional Codex proxy](docs/codex-proxy.md), [optional Feishu proxy](docs/feishu-proxy.md), [boundaries](docs/boundaries.md).
 
+For an Agent reply that needs to notify someone, write `<at user_id="ou_example1"></at>`, `<at open_id="ou_example1"></at>`, or `@{ou_example1}` in the answer. The bridge sends each valid open_id (`ou_` followed by lowercase letters or digits) as a Feishu post `at` element, including when `feishu.replyAsPost` is `false`. Invalid IDs remain literal text. To let a specific group use `<at user_id="all"></at>`, set `allowMentionAll: true` on that group's `routing.groups[]` entry; the default is `false`, and private chats cannot use it. Interactive cards are unchanged.
+
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
+
+For an authorized group, set `routing.groups[].replyTriggers` to `true` to trigger the Agent when a human replies to a message from this bot without `@` (default `false`). Text and cards both qualify; `trigger: "all"` remains unchanged. See [routing and reply context](docs/runtime.md).
 
 `GET /health/tasks?window_minutes=120` has the same access conditions as `/health/ready` and reads only this process's configured `connection_id`. The integer window is 5–1440 minutes (default 120); invalid values return 400 `invalid_window_minutes`. It includes failed chat (`bridge`) and business-event (`caller`) jobs whose `finished_at` falls in the window. A failed job with code `CODEX_TURN_INTERRUPTED` is counted only in `interrupted.total`; deferred jobs are excluded. At most the 500 most recently finished jobs are counted, with `failed.truncated=true` if more match. Codes outside `[A-Z0-9_]{1,64}` become `OTHER`; at most 10 code entries are returned in descending count order, with remaining codes folded into `OTHER`. Storage failure returns 503 `task_health_unavailable` rather than zero counts. The response contains no prompts, message bodies, sender or group identifiers, or raw error text.
 

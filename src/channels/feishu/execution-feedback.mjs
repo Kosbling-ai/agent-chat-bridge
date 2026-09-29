@@ -14,7 +14,7 @@ const productionCardState = saved => {
   return state;
 };
 
-export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClient, authorize = async () => true,
+export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClient, inbound, botOpenId, authorize = async () => true,
   executor, workspace, runAsync = operation => { Promise.resolve().then(operation).catch(() => {}); }, config = {}, log = () => {}, now = Date.now } = {}) {
   const bindingOpenId = (job, result = job.result || {}) => result.execution?.bindingOpenId
     || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType });
@@ -25,9 +25,18 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
 
   async function persist(job, state, key, value) {
     state.control.assertOwned?.();
+    const newCardMessageId = key === 'executionCard' && value?.messageId !== state.result.executionCard?.messageId ? value.messageId : '';
     await jobs.patchFeedback({ id: job.id, leaseOwner: job.leaseOwner, key, value });
     state.control.assertOwned?.();
     state.result = { ...state.result, [key]: structuredClone(value) };
+    if (newCardMessageId && inbound?.recordReply && botOpenId) {
+      try {
+        await inbound.recordReply({ messageId: newCardMessageId, chatId: job.chatId, chatType: job.chatType,
+          messageType: 'interactive', senderOpenId: botOpenId });
+      } catch (error) {
+        log('warning', 'execution_card', 'record_failed', { code: error?.code || 'outbound_message_record_failed' });
+      }
+    }
   }
 
   function cardFor(job, state, saved, persistCard = true) {
