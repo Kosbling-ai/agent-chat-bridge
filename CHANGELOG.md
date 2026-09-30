@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.22] — Unreleased
+
+- Fix user-input and Computer Use card admission while a thin-forward turn is still running: bind the verified live thread/turn to an unbound job atomically with card creation. Existing identities cannot be overwritten and message, chat, actor and callback checks remain enforced.
+- Add isolated MySQL regression coverage for missing native IDs, mismatched identities and authenticated submission; retain bounded failure codes for card admission diagnostics.
+
+No database migration is needed.
+
 ## [0.2.21] — Unreleased
 
 - Add opt-in `codex.computerUse` support for bundled `cua_repl` native-app approval elicitations. Forward recognized requests to the initiating user's Feishu interaction card, and send explicit allow/decline results back to the same live Codex request. Ordinary MCP tool calls are unchanged.

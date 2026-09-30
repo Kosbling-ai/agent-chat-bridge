@@ -163,3 +163,13 @@ test('unconfirmed answer admission becomes durable unknown and never calls nativ
   const response=await f.runtime.handleCardAction({operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'string:"rpc"',itemId:'item'},form_value:{q_0_choice:'o_0'}}});
   assert.equal(response.toast.content,'提交状态未确认，请勿重复提交');assert.equal(f.nativeCalls,0);assert.equal(f.job.result.userInput.status,'unknown');assert.match(f.patches.at(-1).data.content,/提交状态未确认/);await f.runtime.close();
 });
+
+test('card admission binds native IDs only from a matching live executor binding',async()=>{
+  for(const binding of [undefined,{codexSessionId:'other',chatId:'chat'},{codexSessionId:'thread',chatId:'other'},{codexSessionId:'thread',chatId:'chat'}]){
+    const f=fixture();let bound;
+    const original=f.jobs.beginUserInput;f.jobs.beginUserInput=async input=>{bound=input.bindExecution;return original(input);};
+    await f.runtime.open({binding,messageId:'source',threadId:'thread',turnId:'turn',itemId:'item',requestId:0,requestKey:'number:0',
+      questions:[{id:'q',header:'h',question:'q',options:[],isOther:false}]});
+    assert.equal(bound,binding?.codexSessionId==='thread'&&binding?.chatId==='chat');await f.runtime.close();
+  }
+});

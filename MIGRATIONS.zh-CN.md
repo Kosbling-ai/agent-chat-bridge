@@ -2,7 +2,9 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.21`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.22`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+
+0.2.22 修复运行中任务尚未持久化轮次标识时授权卡片无法发送的问题。仅允许已匹配的活动执行器补全缺失标识，不覆盖已有绑定，无数据库迁移或配置变更。
 
 0.2.21 新增 `codex.computerUse`（布尔值，默认 `false`），用于把 Computer Use 的应用授权请求转成飞书交互卡片。无数据库迁移，不自动安装插件或授予系统权限。修改配置后重启服务，旧卡片会失效。详见 [Computer Use](docs/computer-use.md)。
 

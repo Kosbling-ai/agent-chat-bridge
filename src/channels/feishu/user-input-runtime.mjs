@@ -22,7 +22,8 @@ export function createUserInputRuntime({jobs,executor,cardClient,authorize=async
       if(!job)throw Object.assign(new Error('job not found'),{code:'user_input_job_missing'});
       const requestKey=request.requestKey; const cardUuid=stable(`user-input:${job.id}:${requestKey}:${request.itemId}`);
       const begun=await jobs.beginUserInput({id:job.id,messageId:job.messageId,threadId:request.threadId,turnId:request.turnId,itemId:request.itemId,
-        requestKey,questions:request.questions,cardUuid});
+        requestKey,questions:request.questions,cardUuid,
+        bindExecution:request.binding?.codexSessionId===request.threadId&&request.binding?.chatId===job.chatId});
       if(request.signal?.aborted){await jobs.expireUserInput({id:job.id,requestKey}).catch(()=>{});throw Object.assign(new Error('request expired'),{code:'user_input_expired'});}
       if(!['new','replay'].includes(begun.outcome)||begun.userInput?.status!=='pending')throw Object.assign(new Error('request stale'),{code:'user_input_stale'});
       const userInput={...begun.userInput,jobId:job.id,requestId:request.requestId};
