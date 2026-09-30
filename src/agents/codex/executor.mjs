@@ -603,9 +603,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       };
       state.userInput = { request, public: publicRequest, controller, settled: false };
       try { await onUserInput(publicRequest); }
-      catch {
+      catch (error) {
         if(state.userInput?.request===request)await expireUserInput(state, 'delivery_failed');
-        log('error', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'user_input_card', status: 'failed', threadId: state.threadId, turnId: state.turnId });
+        const code = ['user_input_job_missing', 'user_input_stale', 'user_input_expired', 'user_input_card_unknown', 'invalid_store_input', 'store_timeout'].includes(error?.code) ? error.code : 'user_input_delivery_failed';
+        log('error', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'user_input_card', status: 'failed', code, threadId: state.threadId, turnId: state.turnId });
       }
     });
     state.userInputQueue=operation.catch(()=>{});

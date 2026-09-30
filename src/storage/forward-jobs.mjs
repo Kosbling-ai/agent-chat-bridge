@@ -462,7 +462,15 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
           WHERE connection_id=? AND public_run_id=? FOR UPDATE`, [connectionId,id]);
         if (!found) return { outcome:'not_found' };
         const result=parse(found.result_json); const execution=result.execution||{};
-        if (found.status!=='running'||found.message_id!==messageId||execution.threadId!==threadId||execution.turnId!==turnId) return {outcome:'stale'};
+        if (found.status!=='running'||found.message_id!==messageId) return {outcome:'stale'};
+        // The thin forwarder records native IDs only on completion. A request
+        // verified against the live executor may bind a still-unbound job here,
+        // atomically with its first card. Never replace an existing binding.
+        const unbound = !Object.hasOwn(execution,'threadId') && !Object.hasOwn(execution,'turnId');
+        if (execution.threadId!==threadId || execution.turnId!==turnId) {
+          if (input.bindExecution!==true || !unbound) return {outcome:'stale'};
+          result.execution={...execution,threadId,turnId};
+        }
         if (result.userInput?.requestKey===requestKey&&result.userInput?.itemId===itemId) return {outcome:'replay',userInput:result.userInput};
         if(result.userInput?.threadId===threadId&&result.userInput?.turnId===turnId
           &&(['submitting','unknown'].includes(result.userInput.status)||result.userInput.card?.status==='unknown'))return {outcome:'blocked',userInput:result.userInput};
