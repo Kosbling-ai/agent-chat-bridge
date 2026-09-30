@@ -1,3 +1,4 @@
+import { COMPUTER_USE_REQUEST, normalizeComputerUseApproval, computerUseApprovalResult, cancelComputerUseApproval } from './computer-use-approval.mjs';
 import { codexTurnError } from './turn-error.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
@@ -562,6 +563,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     pending.settled = true; pending.controller?.abort(); state.userInput = null;
     try {
       if (resolved) pending.request.abandon();
+      else if (pending.public.kind === 'computerUse') await pending.request.respondResult(cancelComputerUseApproval());
       else await pending.request.respondError(-32002, 'User input request expired');
     } catch { /* a disconnected child is already expired */ }
     await onUserInputClosed({ ...pending.public, reason }).catch((_error) => {});
@@ -569,12 +571,14 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   async function handleServerRequest(request) {
     let normalized;
-    try { normalized = normalizeUserInputRequest(request); }
+    const computerUse = request.method === COMPUTER_USE_REQUEST;
+    try { normalized = computerUse ? normalizeComputerUseApproval(request) : normalizeUserInputRequest(request); }
     catch (error) {
+      if (computerUse) { await request.respondResult(cancelComputerUseApproval()).catch((_error) => {}); return; }
       await request.respondError(-32602, error.code === 'CODEX_USER_INPUT_SECRET_UNSUPPORTED' ? 'Secret questions are unsupported' : 'Invalid user input request').catch((_error) => {});
       return;
     }
-    if (closing || config.requestUserInput !== true) {
+    if (closing || (computerUse ? config.computerUse !== true : config.requestUserInput !== true)) {
       await request.respondError(-32002, 'User input request unavailable').catch((_error) => {}); return;
     }
     const resolvedKey = `${request.generation}:${normalized.threadId}:${typedRequestKey(normalized.requestId)}`;
@@ -614,7 +618,9 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     if (!state || state.threadId !== threadId || state.messageId !== messageId || !pending || pending.settled
       || typedRequestKey(pending.public.requestId) !== typedRequestKey(requestId) || pending.public.itemId !== itemId) return { status: 'expired' };
     let result;
-    try { result = normalizeUserInputAnswers(pending.public.questions, answers); }
+    try { result = pending.public.kind === 'computerUse'
+      ? computerUseApprovalResult(pending.public.questions, answers)
+      : normalizeUserInputAnswers(pending.public.questions, answers); }
     catch (error) { return { status: 'invalid', code: error.code }; }
     pending.settled = true; pending.controller?.abort(); state.userInput = null;
     try { await pending.request.respondResult(result); return { status: 'submitted' }; }

@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.20`
+Application version: `0.2.21`
+
+Version 0.2.21 adds optional `codex.computerUse` (boolean, default `false`). No database migration is needed. Enable it only where the bundled `cua_repl` MCP runtime is installed and available to the configured Codex home. Restart the bridge after changing the option; existing cards do not survive a process restart. See [Computer Use](docs/computer-use.md) for setup and verification.
 
 Version 0.2.20 does not add a database migration. It adds the optional `routing.silentReply` object (`tokens` default `[]`, `card` default `"delete"`) and the optional per-group `routing.groups[].silentReply` override. With the defaults nothing changes except that hooks no longer receive recalls of the bot's own recorded messages; see the upgrade note below.
 

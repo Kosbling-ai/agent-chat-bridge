@@ -40,6 +40,9 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
   assert.equal(validateConfig(config).codex.turnTimeoutMs, 12 * 60 * 60 * 1000);
   assert.equal(validateConfig(config).codex.approvalPolicy, 'on-request');
   assert.equal(validateConfig(config).codex.approvalsReviewer, 'auto_review');
+  assert.equal(validateConfig(config).codex.computerUse, false);
+  assert.equal(validateConfig({ ...config, codex: { ...config.codex, computerUse: true } }).codex.computerUse, true);
+  assert.throws(() => validateConfig({ ...config, codex: { ...config.codex, computerUse: 'true' } }), /invalid_codex_computer_use/);
   assert.equal(validateConfig(config).codex.requestUserInput, false);
   assert.equal(validateConfig({ ...config, codex: { ...config.codex, requestUserInput: false } }).codex.requestUserInput, false);
   assert.equal(validateConfig({ ...config, codex: { ...config.codex, requestUserInput: true } }).codex.requestUserInput, true);

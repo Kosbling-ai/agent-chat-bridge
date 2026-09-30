@@ -1,0 +1,53 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { normalizeComputerUseApproval, computerUseApprovalResult } from '../src/agents/codex/computer-use-approval.mjs';
+import { renderUserInputCard, answersFromForm } from '../src/channels/feishu/user-input-card.mjs';
+
+const request = () => ({ requestId: 0, generation: 1, params: {
+  threadId: 'thread', turnId: 'turn', serverName: 'cua_repl', mode: 'openai/form',
+  requestedSchema: { type: 'object', properties: {} },
+  _meta: { codex_approval_kind: 'mcp_tool_call', connector_id: 'computer-use',
+    tool_name: 'get_app_state', tool_params: { app: 'com.google.Chrome' },
+    tool_params_display: [{ name: 'app', value: 'Google Chrome' }], persist: ['session', 'always'], riskLevel: 'medium' },
+} });
+
+test('native app approval becomes an explicit card choice and a one-shot MCP result', () => {
+  const normalized = normalizeComputerUseApproval(request());
+  assert.equal(normalized.requestId, 0);
+  assert.match(normalized.questions[0].question, /Google Chrome/);
+  assert.match(normalized.questions[0].question, /com.google.Chrome/);
+  const card = renderUserInputCard({ ...normalized, jobId: 'job', requestKey: 'key' });
+  const field = card.body.elements[0].elements.find(x => x.tag === 'select_static');
+  assert.equal(field.required, true);
+  assert.equal(field.initial_option, undefined);
+  assert.throws(() => answersFromForm(normalized, {}));
+  const accepted = answersFromForm(normalized, { q_0_choice: 'o_1' });
+  assert.deepEqual(computerUseApprovalResult(normalized.questions, accepted), { action: 'accept', content: null, _meta: null });
+  const declined = answersFromForm(normalized, { q_0_choice: 'o_0' });
+  assert.deepEqual(computerUseApprovalResult(normalized.questions, declined), { action: 'decline', content: null, _meta: null });
+  assert.throws(() => computerUseApprovalResult(normalized.questions, { computer_use: { answers: ['always'] } }));
+});
+
+test('unsupported modes, servers, schemas, audio and uncorrelated requests fail closed', () => {
+  const mutations = [
+    p => p.mode = 'url', p => p.mode = 'openai/userVerification', p => p.serverName = 'untrusted',
+    p => p.threadId = '', p => p.turnId = null, p => p._meta = null,
+    p => p._meta.connector_id = 'other', p => p._meta.codex_approval_kind = 'other',
+    p => p._meta.persist = ['always'], p => p._meta.tool_name = 'start_audio_recording',
+    p => p._meta.tool_name = 'execute_script', p => p._meta.tool_name = 'delete_app',
+    p => p._meta.tool_params.secret = 'unrendered', p => p._meta.tool_params.app = 'computer-audio', p => p._meta.tool_params.app = '',
+    p => p._meta.tool_params.app = 'app\nforged', p => p.requestedSchema = {},
+    p => p.requestedSchema.properties = { password: { type: 'string' } },
+    p => p.requestedSchema.required = ['secret'], p => p.requestedSchema.oneOf = [],
+    p => p.requestedSchema.additionalProperties = true,
+  ];
+  for (const mutate of mutations) { const r = request(); mutate(r.params); assert.throws(() => normalizeComputerUseApproval(r), { code: 'CODEX_COMPUTER_USE_UNSUPPORTED' }); }
+});
+
+test('approval identity includes generation and typed request ID; untrusted display text is escaped', () => {
+  const r = request(); const original = normalizeComputerUseApproval(r);
+  r.generation++; assert.notEqual(normalizeComputerUseApproval(r).itemId, original.itemId);
+  r.generation--; r.requestId = '0'; assert.notEqual(normalizeComputerUseApproval(r).itemId, original.itemId);
+  r.params._meta.tool_params_display[0].value = '[Fake](https://example.com)';
+  assert.match(normalizeComputerUseApproval(r).questions[0].question, /\\\[Fake\\\]/);
+});

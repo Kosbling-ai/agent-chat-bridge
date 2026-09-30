@@ -154,7 +154,7 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkTh
         if (archiveTurnStartOnce) { archiveTurnStartOnce = false; setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: `session ${message.params.threadId} is archived` } })); return; }
         if (rejectTurnStart) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: 'synthetic transport uncertainty' } })); return; }
         const id = `turn-${++turnNumber}`;
-        for (const [index,request] of serverRequestsOnStart.entries()) instance.send({id:request.id,method:'item/tool/requestUserInput',params:{threadId:message.params.threadId,turnId:id,itemId:`item-${index}`,questions:[{id:'q',header:'Choice',question:'Pick',options:[{label:'A',description:'a'}]}],isBlocking:true,...request.params}});
+        for (const [index,request] of serverRequestsOnStart.entries()) instance.send({id:request.id,method:request.method||'item/tool/requestUserInput',params:{threadId:message.params.threadId,turnId:id,itemId:`item-${index}`,questions:[{id:'q',header:'Choice',question:'Pick',options:[{label:'A',description:'a'}]}],isBlocking:true,...request.params}});
         if(resolveServerRequestBeforeResponse&&serverRequestsOnStart[0])instance.send({method:'serverRequest/resolved',params:{threadId:message.params.threadId,requestId:serverRequestsOnStart[0].id}});
         const completed = { method: 'turn/completed', params: { threadId: message.params.threadId, turnId: id, turn: { id, status: 'completed', items: [...turnItemsFor(turnNumber), { id: `answer-${id}`, type: 'agentMessage', phase: 'final_answer', text: `answer ${id}` }] } } };
         if (completeStarts && raceCompletionBeforeResponse) instance.send(completed);
@@ -1261,4 +1261,44 @@ test('replace-mode instructions drop only the default group wording once the thr
     assert.match(fallback.first, /群名称：默认群名/, 'default wording stays when replacement instructions were not delivered');
     for (const result of [appended, replaced, fallback]) assert.match(result.system, /^【独立系统任务】\n/);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+
+const computerRequest = (params = {}) => ({ id: 'cua', method: 'mcpServer/elicitation/request', params: {
+  serverName: 'cua_repl', mode: 'openai/form', requestedSchema: { type: 'object', properties: {} },
+  _meta: { codex_approval_kind: 'mcp_tool_call', connector_id: 'computer-use', tool_name: 'get_app_state',
+    tool_params: { app: 'com.google.Chrome' }, persist: ['session', 'always'] }, ...params,
+} });
+
+for (const choice of ['允许本次请求', '拒绝']) test(`computer use routes a correlated MCP approval through the card callback: ${choice}`, async t => {
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-cua-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));mkdirSync(join(cwd,'home'));
+  const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[computerRequest()]});let opened;
+  const executor=createCodexExecutor({config:{...config(cwd),computerUse:true,requestUserInput:false},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:''}),onUserInput:async r=>{opened=r;}});
+  const running=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'message',prompt:'work'});running.catch(()=>{});
+  t.after(async()=>{await executor.close();await running.catch(()=>{});});
+  while(!opened)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(runtime.calls.some(m=>m.id==='cua'&&(m.result||m.error)),false);
+  assert.deepEqual(runtime.calls.find(m=>m.method==='initialize').params.capabilities.extensions,{'openai/form':{}});
+  assert.equal(runtime.calls.find(m=>m.method==='initialize').params.capabilities.mcpServerOpenaiFormElicitation,true);
+  const input={threadId:opened.threadId,turnId:opened.turnId,requestId:opened.requestId,itemId:opened.itemId,messageId:'message',answers:{computer_use:{answers:[choice]}}};
+  assert.equal((await executor.answerUserInput({...input,threadId:'wrong'})).status,'expired');
+  assert.equal((await executor.answerUserInput(input)).status,'submitted');
+  assert.deepEqual(runtime.calls.find(m=>m.id==='cua'&&m.result).result,{action:choice==='拒绝'?'decline':'accept',content:null,_meta:null});
+  assert.equal((await executor.answerUserInput(input)).status,'expired');
+});
+
+for (const scenario of ['disabled','unsupported','delivery-failure','resolved']) test(`computer use never grants access on ${scenario}`, async t => {
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-cua-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));mkdirSync(join(cwd,'home'));
+  const req=computerRequest(scenario==='unsupported'?{mode:'url'}:{});
+  const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[req],resolveServerRequestBeforeResponse:scenario==='resolved'});let opens=0;
+  const executor=createCodexExecutor({config:{...config(cwd),computerUse:scenario!=='disabled'},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:''}),onUserInput:async()=>{opens++;throw new Error('card failed');}});
+  const running=executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'message',prompt:'work'});running.catch(()=>{});
+  t.after(async()=>{await executor.close();await running.catch(()=>{});});
+  if(scenario==='resolved')await new Promise(resolve=>setTimeout(resolve,30));
+  else while(!runtime.calls.some(m=>m.id==='cua'&&(m.result||m.error)))await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(opens,scenario==='delivery-failure'?1:0);
+  assert.equal(runtime.calls.some(m=>m.id==='cua'&&m.result?.action==='accept'),false);
+  if(['unsupported','delivery-failure'].includes(scenario))assert.equal(runtime.calls.find(m=>m.id==='cua'&&m.result)?.result.action,'cancel');
 });

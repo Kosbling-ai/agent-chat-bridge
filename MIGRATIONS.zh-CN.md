@@ -2,7 +2,9 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.20`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.21`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+
+0.2.21 新增 `codex.computerUse`（布尔值，默认 `false`），用于把 Computer Use 的应用授权请求转成飞书交互卡片。无数据库迁移，不自动安装插件或授予系统权限。修改配置后重启服务，旧卡片会失效。详见 [Computer Use](docs/computer-use.md)。
 
 0.2.20 不增加数据库迁移、不改配置 `schemaVersion`、不新增环境变量。新增可选的「静默回复哨兵」：`routing.silentReply` 为所有 `bridge` 群设默认值（`tokens` 缺省 `[]`，`card` 为 `"delete"` 或 `"complete"`，缺省 `"delete"`），`routing.groups[].silentReply` 可逐字段覆盖单个群，未写的字段继承全局，群上写 `"tokens": []` 即对该群关闭。不配置 token 时哨兵功能不生效。要生效，操作者需在私有 bridge.json 里给全局或相关群配置 token，例如 `"silentReply": { "tokens": ["NO_REPLY"] }`，跑 `check-config` 后重启一次实例。bridge 不会把 token 告诉 Agent，哨兵约定（例如「无需回复时只回 `NO_REPLY`」）要写进该群的群指令（`instructionFiles` / `instructionText`）或 Agent 工作区规则，字面值与配置一致。匹配规则：Agent 最终答复去掉首尾空白后与某个 token **精确相等**（区分大小写，不做前缀或包含匹配），私聊永不静默。命中后不发文字回复；`delete` 撤回执行卡（飞书只允许机器人撤回发送后 24 小时内自己发的消息，群里可能显示「撤回了一条消息」），撤回失败自动退化为 `complete`：把执行卡改为完成态并显示卡片文案 `silentReply`（缺省「已处理，无需回复。」），哨兵字面值不会出现在卡片或消息里。任务状态仍为 `completed`，结果 JSON 记 `silentReply: { "status": "silent", "card": … }`，日志记 `forward_reply` / `silent`（`reason` 为 `card_<值>`），不算失败。`card` 取值：`deleted` 已撤回；`completed` 已改为中性完成态；`none` 没有已确认的卡片，无需处理；`unchanged` 卡片存在但撤回和改卡都失败——此时任务退回 `reply_pending`（`last_error=silent_card_unchanged`），按 `codex.jobRetryMs` 间隔重试静默收尾，直到用满 `codex.jobMaxAttempts` 次回复尝试；仍失败才记 `completed` 并打 warning，卡片可能停在最后的执行中状态。以上任何情况都不发文字。
 

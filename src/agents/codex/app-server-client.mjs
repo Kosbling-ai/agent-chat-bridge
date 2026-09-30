@@ -1,3 +1,4 @@
+import { COMPUTER_USE_REQUEST } from './computer-use-approval.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { DEFAULT_IDLE_CLOSE_MS, IdleLifecycle, closeOwnedChild, classifyCodexRpcError } from './idle-lifecycle.mjs';
 
@@ -96,7 +97,9 @@ export class CodexAppServerClient {
     child.once('exit', (code, signal) => this.handleExit(new Error(`codex app-server exited${code == null ? '' : ` code=${code}`}${signal ? ` signal=${signal}` : ''}`), child));
     await this.request('initialize', {
       clientInfo: { name: 'agent-chat-bridge', version: this.config.clientVersion || '0.2.4' },
-      capabilities: { experimentalApi: true },
+      capabilities: { experimentalApi: true, ...(this.config.computerUse === true ? {
+        mcpServerOpenaiFormElicitation: true, extensions: { 'openai/form': {} },
+      } : {}) },
     }, { skipStart: true });
     if (this.child !== child) throw new Error('codex app-server child changed during initialize');
     this.ready = true;
@@ -163,7 +166,9 @@ export class CodexAppServerClient {
 
   handleServerRequest(message, child) {
     const generation=this.childGenerations.get(child);
-    if (!validRequestId(message.id) || message.method !== 'item/tool/requestUserInput' || this.config.requestUserInput !== true) {
+    const supported = (message.method === 'item/tool/requestUserInput' && this.config.requestUserInput === true)
+      || (message.method === COMPUTER_USE_REQUEST && this.config.computerUse === true);
+    if (!validRequestId(message.id) || !supported) {
       try { child.stdin.write(`${JSON.stringify({ id: message.id ?? null, error: { code: -32601, message: 'Unsupported server request' } })}\n`); } catch { /* disconnect path settles the child */ }
       return;
     }
