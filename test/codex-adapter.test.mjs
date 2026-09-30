@@ -205,7 +205,8 @@ test('close escalates SIGTERM to SIGKILL and rejects pending work', options, asy
 test('a single stalled notification fails observably instead of blocking later work forever', options, async t => {
   let resolveFault;
   const failure = new Promise(resolve => { resolveFault = resolve; });
-  const { adapter } = await setup(t, 'normal', { rpcTimeoutMs: 100 }, {
+  // The same deadline covers OS child startup; 100ms races startup on busy hosts.
+  const { adapter } = await setup(t, 'normal', { rpcTimeoutMs: 1000 }, {
     onNotification: () => new Promise(() => {}), onFault: async value => { resolveFault(value); },
   });
   await adapter.start();

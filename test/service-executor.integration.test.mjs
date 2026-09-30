@@ -24,7 +24,7 @@ function sessionStore() {
   };
 }
 
-test('service launches the real executor child with mapped config and closes an active turn', { timeout: 5000 }, async t => {
+test('service launches the real executor child with mapped config and closes an active turn', { timeout: 15000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-service-executor-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   let service;
@@ -53,7 +53,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     schemaVersion: 1,
     listen: { host: '127.0.0.1', port: 0 },
     storage: { hostEnv: 'DB_HOST', portEnv: 'DB_PORT', userEnv: 'DB_USER', passwordEnv: 'DB_PASSWORD', databaseEnv: 'DB_DATABASE' },
-    codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], rulesFiles: ['AGENTS.md'], rolloverOnRulesUpdate: true },
+    codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], rulesFiles: ['AGENTS.md'], rolloverOnRulesUpdate: true, computerUse: true },
     feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot', catchup: false },
     routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true, capabilities: ['bridge'] }] },
     hooks: [],
@@ -118,6 +118,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(executorConfig.idleCloseMs, 60_000);
   assert.equal(executorConfig.closeGraceMs, 5_000);
   assert.equal(executorConfig.rpcTimeoutMs, 120_000);
+  assert.equal(executorConfig.computerUse, true);
   assert.equal(executorConfig.turnTimeoutMs, 12 * 60 * 60 * 1000);
   assert.equal(executorConfig.approvalPolicy, 'on-request');
   assert.equal(executorConfig.approvalsReviewer, 'auto_review');

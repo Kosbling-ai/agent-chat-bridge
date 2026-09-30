@@ -143,7 +143,7 @@ function validateRuntime(raw) {
   object(rawRuntime, ['unhealthyExitMs'], 'invalid_runtime_fields');
   const runtime = { unhealthyExitMs: rawRuntime.unhealthyExitMs ?? 30_000 };
   if (!Number.isSafeInteger(runtime.unhealthyExitMs) || runtime.unhealthyExitMs <= 0 || runtime.unhealthyExitMs > MAX_TIMER_MS) throw new ConfigError('invalid_runtime_unhealthy_exit');
-  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'computerUse', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
   if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
   if (raw.codex.proxyEnv !== undefined) {
@@ -168,6 +168,8 @@ function validateRuntime(raw) {
   if (typeof codex.networkAccess !== 'boolean') throw new ConfigError('invalid_codex_network_access');
   codex.requestUserInput = raw.codex.requestUserInput ?? false;
   if (typeof codex.requestUserInput !== 'boolean') throw new ConfigError('invalid_codex_request_user_input');
+  codex.computerUse = raw.codex.computerUse ?? false;
+  if (typeof codex.computerUse !== 'boolean') throw new ConfigError('invalid_codex_computer_use');
   codex.threadNamePrefix = raw.codex.threadNamePrefix === undefined ? 'bridge' : string(raw.codex.threadNamePrefix);
   codex.steering = raw.codex.steering ?? true;
   if (typeof codex.steering !== 'boolean') throw new ConfigError('invalid_steering_flag');

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.21] — Unreleased
+
+- Add opt-in `codex.computerUse` support for bundled `cua_repl` native-app approval elicitations. Forward recognized requests to the initiating user's Feishu interaction card, and send explicit allow/decline results back to the same live Codex request. Ordinary MCP tool calls are unchanged.
+- Reuse durable card identity, actor authorization, one-shot submission and expiry handling. Do not automatically approve apps or persist permanent grants. Unsupported MCP forms, URL/auth challenges, audio recording and requests without a correlated turn are cancelled.
+
+No database migration is needed. The installed Codex Computer Use runtime and OS permissions remain prerequisites; this option does not install plugins or grant OS access.
+
 ## [0.2.20] — Unreleased
 
 - Add an optional silent-reply sentinel for human group turns. `routing.silentReply` sets the defaults for every `bridge` group (`tokens`, default `[]`; `card`, `"delete"` or `"complete"`, default `"delete"`) and `routing.groups[].silentReply` overrides either field for one group. When a completed Agent answer, trimmed of surrounding whitespace, exactly equals a configured token (case-sensitive, no prefix or substring match), the bridge sends no text reply, recalls the execution card (`delete`) or closes it as completed with the neutral card text `silentReply` (`complete`, default `已处理，无需回复。`), and records the job as `completed` with `result.silentReply = { status: "silent", card }` plus a `forward_reply` `silent` log. A failed recall falls back to `complete`; the sentinel is never shown and never sent as ordinary text. Private chats, failed or deferred turns, business-event jobs and all other answers keep their existing delivery. Outbox attachments are still delivered.

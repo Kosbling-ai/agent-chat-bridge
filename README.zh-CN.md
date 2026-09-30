@@ -4,7 +4,7 @@
 
 英文文档和实际代码是主契约；API、配置字段、命令和结构化日志保持英文。
 
-版本：`0.2.20`，当前为未发布开发版；0.1.1 是此前实现版本。0.2.5 增加多 bot 共用专用 bridge MySQL schema 所需的迁移 004，旧 assistant 数据必须显式指定原 bot 的连接 ID；还可把 Codex 支持的用户提问映射为当前 turn 的独立飞书卡片，由原发送者一次提交多道单选或自由填空。此能力默认禁用，需显式配置 `codex.requestUserInput:true` 才启用；secret 提问会被拒绝，过期或断线后的请求不能恢复。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
+版本：`0.2.21`，当前为未发布开发版；0.1.1 是此前实现版本。0.2.5 增加多 bot 共用专用 bridge MySQL schema 所需的迁移 004，旧 assistant 数据必须显式指定原 bot 的连接 ID；还可把 Codex 支持的用户提问映射为当前 turn 的独立飞书卡片，由原发送者一次提交多道单选或自由填空。此能力默认禁用，需显式配置 `codex.requestUserInput:true` 才启用；secret 提问会被拒绝，过期或断线后的请求不能恢复。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
 
 这是独立的飞书 + Codex bridge。一个进程持有一套飞书 bot/WebSocket 和一个 Codex app-server/executor；MySQL 使用 bridge 自己的 schema。communication worker 负责 hook 和已登记消息 outbox，唯一的 forward worker 负责 Codex 执行、恢复、卡片、Typing、停止和答案/附件投递。
 
@@ -42,3 +42,5 @@ Agent 判断某次群聊触发无需回复时，可以只回一个由操作者�
 `tokens` 缺省 `[]`（即关闭），`card` 缺省 `"delete"`。bridge 不会把 token 告诉 Agent，哨兵约定要以相同字面值写进群指令或工作区规则。Agent 最终答复去掉首尾空白后与某个 token 精确相等（区分大小写，不做前缀或包含匹配）时，bridge 不发文字回复：`"delete"` 撤回执行卡（飞书只允许机器人撤回发送后 24 小时内自己发的消息，群里可能显示「撤回了一条消息」），撤回失败退化为 `"complete"`；`"complete"` 把执行卡改为完成态并显示中性卡片文案 `silentReply`（缺省「已处理，无需回复。」）。哨兵字面值不会展示。任务记为 `completed`，结果中 `silentReply.status` 为 `silent`；卡片既撤不回也改不了时按 `codex.jobMaxAttempts` 重试。私聊、失败或补充转达的任务、非哨兵答复均不受影响；outbox 附件照常发送。bot 自己消息的撤回事件不再转给 hook。升级说明见[中文迁移说明](MIGRATIONS.zh-CN.md)。
 
 迁移或启动前只使用独立 bridge schema 和受控凭证注入。不要把 token 写入 JSON、`.env`、日志或版本控制。迁移边界见[中文说明](MIGRATIONS.zh-CN.md)。
+
+设置 `codex.computerUse: true` 后，可在飞书卡片中处理 [Computer Use 应用授权](docs/computer-use.md)；需要本机已有相应 Codex 运行时。
