@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { deriveExecutionScope, codexBindingOpenId } from '../agents/codex/thread-scope.mjs';
 import { buildBusinessEventPrompt } from '../agents/codex/prompt.mjs';
+import { matchSilentReply } from './silent-reply.mjs';
 
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED', 'CODEX_USAGE_LIMIT_EXCEEDED'].includes(error?.code);
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
@@ -28,6 +29,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 10_000 || retryDelayMs > 1_800_000) throw new Error('invalid_forward_retry_delay');
   if (!Number.isSafeInteger(pollMs) || pollMs < 1 || pollMs > 600_000) throw new Error('invalid_forward_poll');
   if (!Number.isSafeInteger(executeTimeoutMs) || executeTimeoutMs < 10_000) throw new Error('invalid_forward_timeout');
+  if (config.silentReply !== undefined && typeof config.silentReply !== 'function') throw new Error('invalid_forward_silent_reply');
+  const silentReplyPolicy = config.silentReply || (() => null);
   const active = new Set();
   const preparations = new Map();
   const leaseControllers = new Set();
@@ -270,18 +273,49 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       log('warning', 'forward_execution', 'stopped', { code: error.code });
     }
   }
+  // Only a completed Agent answer can be a sentinel; bridge-authored failure
+  // and deferral text is never silenced.
+  function silentReplyFor(job, result) {
+    if (job.deliveryMode !== 'bridge' || job.chatType !== 'group' || result.deferred || result.failed
+      || ['failed', 'interrupted'].includes(result.turnStatus || result.execution?.terminal)) return null;
+    const policy = silentReplyPolicy(job);
+    return matchSilentReply(result.answer, policy) ? policy : null;
+  }
+
   async function deliverJob(job, reaction = null) {
     try {
       await withLease(job, async lease => {
         let result = job.result || {};
         if (!result.deferred) result = await replies?.prepare?.(job, result) || result;
         lease.assertOwned();
+        const silent = silentReplyFor(job, result);
         let delivery = { status: job.deliveryMode === 'caller' ? 'not_requested' : 'sent' };
         try {
           if (job.deliveryMode === 'bridge') {
-            const cardDelivered = await feedback?.finish?.(job, result, null, lease);
+            let skipText;
+            if (silent) {
+              const card = (await feedback?.finishSilent?.(job, result, silent, lease)) || 'none';
+              lease.assertOwned();
+              // 'unchanged' means an existing card could be neither recalled nor
+              // closed; retry the silent close within the reply attempt limit.
+              const replyAttempt = Number(job.replyAttempts ?? maxAttempts);
+              if (card === 'unchanged' && replyAttempt < maxAttempts) {
+                const nextRetryAt = now() + retryDelayMs;
+                await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, replyPending: true,
+                  errorCode: 'silent_card_unchanged', nextAttemptAt: nextRetryAt });
+                log('warning', 'forward_reply', 'retrying', { code: 'silent_card_unchanged', runId: job.id,
+                  attempt: replyAttempt, maxAttempts, nextRetryAt });
+                return;
+              }
+              result = { ...result, silentReply: { status: 'silent', card } };
+              skipText = true;
+              log(card === 'unchanged' ? 'warning' : 'info', 'forward_reply', 'silent', {
+                runId: job.id, reason: `card_${card}`, ...(card === 'unchanged' ? { code: 'silent_card_unchanged' } : {}) });
+            } else {
+              skipText = (await feedback?.finish?.(job, result, null, lease)) || result.deferred;
+            }
             lease.assertOwned();
-            delivery = await replies.deliver(job, result, { skipText: cardDelivered || result.deferred,
+            delivery = await replies.deliver(job, result, { skipText,
               signal: lease.signal, assertLease: lease.assertOwned });
             if (delivery.status === 'unknown') {
               await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner, replyPending: true,
@@ -292,9 +326,9 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
           lease.assertOwned();
           const status = result.deferred ? 'deferred' : result.failed ? 'failed' : 'completed';
           await jobs.markFinished({ id: job.id, leaseOwner: job.leaseOwner, status, result,
-            replySent: job.deliveryMode === 'bridge' && delivery.status === 'sent',
+            replySent: job.deliveryMode === 'bridge' && delivery.status === 'sent' && !silent,
             errorCode: delivery.status === 'failed' ? 'reply_delivery_failed' : job.last_error || result.errorCode });
-          if (inbound && job.deliveryMode === 'bridge' && delivery.status === 'sent') {
+          if (inbound && job.deliveryMode === 'bridge' && delivery.status === 'sent' && !silent) {
             await inbound.recordReply({ messageId: `bridge-reply:${job.id}`, chatId: job.chatId,
               chatType: job.chatType, text: result.answer || '', createdAt: now() });
           }

@@ -105,6 +105,11 @@ export function createFeishuChatClient({ client, timeoutMs = 15000, maxMediaByte
       return call('message', 'reply', { path: { message_id: required(messageId) },
         data: { msg_type: kind, content: content(kind, body), uuid: uuid(effectId), reply_in_thread: replyInThread } }, true);
     },
+    // Recalls a message this bot sent. Feishu only allows a bot to recall its
+    // own messages within 24 hours; callers own any fallback.
+    deleteMessage({ messageId }) {
+      return call('message', 'delete', { path: { message_id: required(messageId) } }, true);
+    },
     // cardContentType 'user_card_content' returns an interactive message's original card JSON.
     getMessage({ messageId, cardContentType, timeoutMs: readTimeoutMs = timeoutMs }) {
       if (cardContentType !== undefined && cardContentType !== 'user_card_content') throw new FeishuChatError('invalid_card_content_type', 'failed');

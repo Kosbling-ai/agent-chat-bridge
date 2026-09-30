@@ -26,6 +26,7 @@ import { createBusinessCardAction } from './channels/feishu/business-card-action
 import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { createGroupInstructions } from './core/group-instructions.mjs';
+import { resolveSilentReplyPolicy } from './core/silent-reply.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
 import { startServer } from './server.mjs';
 import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
@@ -308,6 +309,7 @@ export async function startService({ config, configPath, env = process.env, log,
       retryDelayMs:config.codex.jobRetryMs,
       maxAttempts:config.codex.jobMaxAttempts,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
+      silentReply:job=>resolveSilentReplyPolicy(config.routing,job),
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
     communication=factories.communication({config,store,inbound,forward,chat,outbound,botAppId:credentials.appId,hookTokens,log});
     businessCardAction=factories.businessCardAction({hooks:config.hooks,connectionId:config.feishu.connectionId,

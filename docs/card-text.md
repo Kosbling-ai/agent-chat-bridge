@@ -55,6 +55,7 @@ Example: change only these fields in your bot's existing text file:
 | `interrupted` | 已中断 | — |
 | `retrying` | 连接恢复中 | — |
 | `deferred` | 补充已转达 | — |
+| `silentReply` | 已处理，无需回复。 | — |
 | `stopButton` | 停止执行 | — |
 | `forkButton` | 保留历史并新建会话 | — |
 | `omitted` | 较早的执行过程已收起，仅展示最近进度。 | — |

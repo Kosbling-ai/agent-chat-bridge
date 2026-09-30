@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.19`
+Application version: `0.2.20`
+
+Version 0.2.20 does not add a database migration. It adds the optional `routing.silentReply` object (`tokens` default `[]`, `card` default `"delete"`) and the optional per-group `routing.groups[].silentReply` override. With the defaults nothing changes except that hooks no longer receive recalls of the bot's own recorded messages; see the upgrade note below.
 
 Version 0.2.19 does not add a database migration. Optional group `replyTriggers` defaults to `false`; confirmed bot text and execution-card message IDs are recorded in the existing inbound-message table for indexed reply lookup. Unknown parent and root IDs are checked through bounded Feishu message reads.
 
@@ -27,6 +29,37 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.20 silent-reply sentinel
+
+No database migration, no config `schemaVersion` change and no new environment variable. Silent jobs keep the existing `completed` status; the outcome is stored inside the existing result JSON as `silentReply: { "status": "silent", "card": "deleted" | "completed" | "unchanged" | "none" }`, with `reply_sent_at` left empty.
+
+The feature is off until the operator lists at least one token. To enable it, add the token to the private bridge.json either for every `bridge` group or for selected groups, then run `check-config` and restart the instance once:
+
+```json
+{ "routing": { "silentReply": { "tokens": ["NO_REPLY"], "card": "delete" } } }
+```
+
+```json
+{ "conversationId": "oc_example", "trigger": "mention", "passiveContext": true, "silentReply": { "tokens": ["NO_REPLY"] } }
+```
+
+A group object inherits each omitted field from `routing.silentReply`; `"tokens": []` on a group turns the feature off for that group only. Tokens are 1–200 characters without surrounding whitespace or control characters, at most 20 per level; `card` is `"delete"` or `"complete"`. `silentReply` is rejected on a hook-only group. Matching is exact and case-sensitive after trimming the Agent answer: `NO_REPLY` matches `" NO_REPLY\n"` but not `no_reply`, `NO_REPLY.` or `NO_REPLY 已处理`. Private chats are never silenced.
+
+The bridge does not tell the Agent which tokens are configured. Put the convention (for example "reply exactly `NO_REPLY` when no answer is needed") into the group's instructions (`routing.groups[].instructionFiles` / `instructionText`) or the Agent workspace rules, using the same literal value as the configuration.
+
+`delete` recalls the bot's execution card through `im.v1.message.delete`. Feishu only lets a bot recall its own message within 24 hours of sending it, and the chat may show a "recalled a message" notice. Any recall failure falls back to `complete`, which patches the card to completed with the per-bot card text `silentReply` (default `已处理，无需回复。`). The sentinel itself is never rendered or sent. Once a recall or completion is persisted, a delivery retry does not repeat it.
+
+`result.silentReply.card` (and the `forward_reply` `silent` log `reason`, prefixed `card_`) means: `deleted` recalled; `completed` closed with neutral text; `none` no confirmed card existed, so nothing was shown or changed; `unchanged` an existing card could be neither recalled nor patched. For `unchanged` the job returns to `reply_pending` with `last_error = silent_card_unchanged` and is retried after `codex.jobRetryMs` until `codex.jobMaxAttempts` reply attempts are used; if the card is still unchanged it finishes `completed` with a `forward_reply` `silent` warning, and the card may keep its last running state. No text is sent in any of these cases.
+
+Recall events are now filtered for every group, independent of `silentReply`: a live `im.message.recalled_v1` event, or a history catch-up message returned as deleted, whose message ID is a bot outbound message already recorded in `assistant_inbound_messages` (execution cards and replies) is still accepted and tombstoned but is no longer delivered to hooks and is never group context. Feishu recall events carry no operator, so this lookup is the only way to recognize the bridge's own recall. A failed lookup logs a `recall_filter` warning and keeps the previous hook delivery. Hook consumers that relied on seeing recalls of bot messages must read them from Feishu directly.
+
+Rollback to 0.2.19:
+
+1. Remove `silentReply` from `routing` and every `routing.groups[]` entry; 0.2.19 rejects these unknown keys at startup.
+2. If the per-bot `feishu.cardTextFile` defines a custom `silentReply` key, remove it too; 0.2.19 treats the whole card-text file as invalid and falls back to default wording.
+3. Before switching binaries, confirm that no silent job is waiting for delivery, because 0.2.19 would send the sentinel text into the group. List pending replies with `SELECT public_run_id, JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.answer')) AS answer FROM assistant_codex_forward_jobs WHERE connection_id='<connection-id>' AND status='reply_pending';` and wait until none of them has a configured token as its answer.
+4. Restart once. Already recalled cards stay recalled, and hooks again receive recalls of bot messages.
 
 ## Branch promotion
 

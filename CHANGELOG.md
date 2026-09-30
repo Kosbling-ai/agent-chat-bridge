@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.20] — Unreleased
+
+- Add an optional silent-reply sentinel for human group turns. `routing.silentReply` sets the defaults for every `bridge` group (`tokens`, default `[]`; `card`, `"delete"` or `"complete"`, default `"delete"`) and `routing.groups[].silentReply` overrides either field for one group. When a completed Agent answer, trimmed of surrounding whitespace, exactly equals a configured token (case-sensitive, no prefix or substring match), the bridge sends no text reply, recalls the execution card (`delete`) or closes it as completed with the neutral card text `silentReply` (`complete`, default `已处理，无需回复。`), and records the job as `completed` with `result.silentReply = { status: "silent", card }` plus a `forward_reply` `silent` log. A failed recall falls back to `complete`; the sentinel is never shown and never sent as ordinary text. Private chats, failed or deferred turns, business-event jobs and all other answers keep their existing delivery. Outbox attachments are still delivered.
+- Retry a silent close whose existing card could be neither recalled nor patched (`card: "unchanged"`) through the ordinary reply-pending retry, bounded by `codex.jobRetryMs` and `codex.jobMaxAttempts`, before finishing with a warning.
+- Stop delivering recalls of the bot's own recorded outbound messages (execution cards, replies) to hooks, for live `im.message.recalled_v1` events and history catch-up deletions alike; such recalls are still accepted and tombstoned and never become group context. A failed ownership lookup keeps the previous hook delivery.
+- Add the generic `deleteMessage` Feishu chat-client helper (`im.v1.message.delete`).
+
+No database migration is needed. With no tokens configured, reply behavior is unchanged.
+
 ## [0.2.19] — Unreleased
 
 - Add optional `routing.groups[].replyTriggers` (default `false`) so replies to this bot's text or cards trigger an authorized group turn without an `@`, including history catch-up. Record confirmed outbound message IDs in the existing message store; check unknown parent and root IDs with bounded Feishu reads and cached ownership results. Reply-context injection follows the same path.

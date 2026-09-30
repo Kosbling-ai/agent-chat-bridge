@@ -362,3 +362,37 @@ test('stop button belongs to the original live turn and disappears at completion
  assert.equal(button.behaviors[0].value.expectedTurnId, 'original-turn');
  assert.equal(renderExecutionCard({...state,status:'interrupted'}).body.elements.some(x=>x.tag==='button'),false);
 });
+
+test('silent completion closes the existing card with neutral copy and never renders the answer', async () => {
+  const { card, calls, persisted } = fixture({ messageId: 'om_card', status: 'running', turnId: 'turn', jobId: 'job', entries: [tool('t')] });
+  assert.equal(await card.finishSilently(), true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'patch');
+  assert.equal(calls[0].payload.path.message_id, 'om_card');
+  const final = JSON.parse(calls[0].payload.data.content);
+  assert.equal(final.header.template, 'green');
+  assert.equal(final.config.summary.content, 'agent-chat-bridge · 已完成');
+  assert.ok(final.body.elements.some(element => element.tag === 'markdown' && element.content === '已处理，无需回复。'));
+  assert.doesNotMatch(JSON.stringify(final), /stop_execution|NO_REPLY/);
+  assert.equal(card.snapshot().silent, 'completed');
+  assert.equal(card.snapshot().entries[0].status, 'completed');
+  assert.equal(persisted.at(-1).silent, 'completed');
+});
+
+test('silent completion uses configured card copy and escapes it as plain text', () => {
+  const rendered = renderExecutionCard({ status: 'completed', silent: 'completed', entries: [] }, 'NO_REPLY', 'Bot', { silentReply: '*已阅*' });
+  const encoded = JSON.stringify(rendered);
+  assert.ok(rendered.body.elements.some(element => element.content === '\\*已阅\\*'));
+  assert.doesNotMatch(encoded, /NO_REPLY/);
+});
+
+test('silent completion never creates a card and reports a failed patch without fallback text', async () => {
+  const empty = fixture();
+  assert.equal(await empty.card.finishSilently(), false);
+  assert.equal(empty.calls.length, 0);
+  const failed = fixture({ messageId: 'om_card', status: 'running', entries: [], delivery: 'fallback' },
+    { async patch() { return { code: 230011 }; } });
+  assert.equal(await failed.card.finishSilently(), false);
+  assert.equal(failed.card.snapshot().delivery, undefined);
+  assert.equal(failed.persisted.length, 0);
+});

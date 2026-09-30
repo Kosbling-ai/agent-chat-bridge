@@ -53,6 +53,14 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       log('info','unlisted_group_reply','queued',{code:'unlisted_group_mention'});
     } catch { if(unlistedReplies.get(key)===at)unlistedReplies.delete(key); log('warning','unlisted_group_reply','failed',{code:'unlisted_group_reply_unrecorded'}); }
   }
+  // A recall of a message this bot sent (execution card, reply) is the bridge's
+  // own effect. Feishu recall events carry no operator, so check the recorded
+  // outbound IDs; a failed lookup keeps the previous hook delivery.
+  async function ownOutboundRecall(event) {
+    if(event.type!=='message.recalled'||typeof inbound?.hasBotMessage!=='function'||!config.feishu.botOpenId)return false;
+    try { return Boolean(await inbound.hasBotMessage({messageId:event.messageId,chatId:event.conversationId,botOpenId:config.feishu.botOpenId})); }
+    catch { log('warning','recall_filter','failed',{code:'outbound_message_lookup_failed'}); return false; }
+  }
   const pause=milliseconds=>{let wake;const interrupted=new Promise(resolve=>{wake=resolve;wakeWait=wake;});return Promise.race([wait(milliseconds),interrupted]).finally(()=>{if(wakeWait===wake)wakeWait=undefined;});};
   function humanAllowed(event,group) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
@@ -89,8 +97,11 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     // Hook subscriptions are event notifications with their own scope. They are
     // deliberately independent from Agent authorization and routing outcomes.
     const hookAllowed=event.conversationType==='p2p'||Boolean(capabilities(group).includes('hook'));
-    const hooks=config.hooks.filter(hook=>hookAllowed&&hook.conversationIds.includes(event.conversationId)&&!event.isSelf&&!event.isApp).map(hook=>({hookId:hook.id,payload:event}));
-    const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&group?.passiveContext&&event.type==='message.received'
+    const hookCandidates=config.hooks.filter(hook=>hookAllowed&&hook.conversationIds.includes(event.conversationId)&&!event.isSelf&&!event.isApp);
+    const ownRecall=hookCandidates.length>0&&await ownOutboundRecall(event);
+    if(context.signal?.aborted)throw new Error('ingress_stopped');
+    const hooks=ownRecall?[]:hookCandidates.map(hook=>({hookId:hook.id,payload:event}));
+    const contextCandidate=Boolean(agentAllowed&&!triggered&&!ignoredByAgent&&!ownRecall&&group?.passiveContext&&event.type==='message.received'
       &&(normalized.rawText.trim()||attachmentMetadata.length));
     const receipt=await store.acceptInbound({connectionId,conversationId:event.conversationId,source:event.source,conversationType:event.conversationType,eventKey:event.eventKey,eventType:event.type,messageId:event.messageId,...(event.type==='message.recalled'?{recalledMessageId:event.messageId}:{}),revision:event.revision,occurredAt:event.occurredAt,payload:event,semanticPayload:feishuEventIdentity(event),policyVersion:config.routing.version,passiveContext:contextCandidate,
       inboundMessage:{...normalized,content:{text:normalized.rawText,attachments:attachmentMetadata,

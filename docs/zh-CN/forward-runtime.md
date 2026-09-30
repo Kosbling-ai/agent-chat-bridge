@@ -24,7 +24,7 @@ HTTP 监听器只公开 `GET /health/live` 和 `GET /health/ready`。原 `/v1` r
 
 真实飞书用户已有 binding 时，busy 失败卡片提供“保留历史并新建会话”。只有原消息发送者可点击，回调会重新核对当前 bot 范围内的 job、卡片、聊天、授权和冻结的源线程；它只执行一次显式 `thread/fork`，使用当前 bridge 的工作目录与权限默认值，并在同一 binding admission 锁内完成持久化与旧线程 CAS 切换。该操作不 resume/interrupt 源线程、不启动 turn，也不重放失败消息。原生明确拒绝或 binding 已变化时保留当前 binding；原生结果或数据库提交结果未知时会记录为未确认，不会自动重试，需管理员核查持久状态。跨进程 writer 占用时 native 是否支持 fork 取决于 Codex 实现，bridge 会将拒绝作为可见失败处理，不假定一定成功。
 
-执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份。进度读取遇到瞬时错误时会保留 cursor，以最长 8 倍轮询间隔做指数退避且不重放 Codex turn；连续失败 3 次后，运行卡提示进度暂不可用，读取恢复后移除提示。租约丢失、runtime 停止和显式取消会终止观察，最终答案投递仍走独立路径。已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
+执行卡恢复冻结生产控制器：首张运行卡立即创建，后续进度按间隔 patch，终态卡失败后走普通消息 fallback；例外是命中 `silentReply` 哨兵的静默收尾，撤回或改卡失败也不会发文字，只按重试上限重试。sidecar 保存原消息 ID、状态、最多 24 条进度和停止身份。进度读取遇到瞬时错误时会保留 cursor，以最长 8 倍轮询间隔做指数退避且不重放 Codex turn；连续失败 3 次后，运行卡提示进度暂不可用，读取恢复后移除提示。租约丢失、runtime 停止和显式取消会终止观察，最终答案投递仍走独立路径。已有旧控制器写下的未确认卡片效果继续 held，不会重放。普通 fallback 用 chat create，缺省 post 按 3000 字分片并转换 Markdown，可选 text 按 1900 字分片；两者受 `feishu.maxOutputChars`（缺省 3500）限制。live 执行前会等待原 Typing reaction 添加；失败时发送一次配置的文字 fallback。最终清理失败不阻断已完成回复；恢复只清理消息事件中仍开放的 reaction 及飞书第一页中相同 emoji 的 app reaction，不重放未确认添加。
 
 `feishu.cardTextFile` 是 bridge 自己的展示配置：管理员修改已配置的 JSON 文件后，执行卡和提问卡会在下一次创建或更新时热加载，但 bridge 不会把文件路径、字段清单或编辑规则注入 Codex prompt。该配置不改变执行状态、按钮动作、模型最终回答或普通回复的 Markdown 转换。
 

@@ -2,7 +2,13 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.19`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.20`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+
+0.2.20 不增加数据库迁移、不改配置 `schemaVersion`、不新增环境变量。新增可选的「静默回复哨兵」：`routing.silentReply` 为所有 `bridge` 群设默认值（`tokens` 缺省 `[]`，`card` 为 `"delete"` 或 `"complete"`，缺省 `"delete"`），`routing.groups[].silentReply` 可逐字段覆盖单个群，未写的字段继承全局，群上写 `"tokens": []` 即对该群关闭。不配置 token 时哨兵功能不生效。要生效，操作者需在私有 bridge.json 里给全局或相关群配置 token，例如 `"silentReply": { "tokens": ["NO_REPLY"] }`，跑 `check-config` 后重启一次实例。bridge 不会把 token 告诉 Agent，哨兵约定（例如「无需回复时只回 `NO_REPLY`」）要写进该群的群指令（`instructionFiles` / `instructionText`）或 Agent 工作区规则，字面值与配置一致。匹配规则：Agent 最终答复去掉首尾空白后与某个 token **精确相等**（区分大小写，不做前缀或包含匹配），私聊永不静默。命中后不发文字回复；`delete` 撤回执行卡（飞书只允许机器人撤回发送后 24 小时内自己发的消息，群里可能显示「撤回了一条消息」），撤回失败自动退化为 `complete`：把执行卡改为完成态并显示卡片文案 `silentReply`（缺省「已处理，无需回复。」），哨兵字面值不会出现在卡片或消息里。任务状态仍为 `completed`，结果 JSON 记 `silentReply: { "status": "silent", "card": … }`，日志记 `forward_reply` / `silent`（`reason` 为 `card_<值>`），不算失败。`card` 取值：`deleted` 已撤回；`completed` 已改为中性完成态；`none` 没有已确认的卡片，无需处理；`unchanged` 卡片存在但撤回和改卡都失败——此时任务退回 `reply_pending`（`last_error=silent_card_unchanged`），按 `codex.jobRetryMs` 间隔重试静默收尾，直到用满 `codex.jobMaxAttempts` 次回复尝试；仍失败才记 `completed` 并打 warning，卡片可能停在最后的执行中状态。以上任何情况都不发文字。
+
+同版本起，撤回事件对所有群统一过滤（与是否配置 `silentReply` 无关）：实时 `im.message.recalled_v1`，或 history catch-up 读到的已删除消息，若其消息 ID 是 bridge 已记录的 bot 出站消息（执行卡、回复），仍照常入库并记墓碑，但不再转给 hook，也不作为群上下文。飞书撤回事件不带操作者，只能靠这张记录识别；查询失败时记 `recall_filter` warning 并按原逻辑转给 hook。依赖 hook 收到 bot 消息撤回的业务方需改为直接查飞书。
+
+回退到 0.2.19：① 删掉 `routing` 与各 `routing.groups[]` 的 `silentReply`，否则旧版严格校验会拒绝启动；② 若 `feishu.cardTextFile` 指向的文案文件里自定义了 `silentReply` 键，也要删掉，否则 0.2.19 会判整个文案文件无效并退回默认文案；③ 切换前先确认没有待投递的静默任务，否则 0.2.19 会把哨兵原文当文字发进群，可用 `SELECT public_run_id, JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.answer')) AS answer FROM assistant_codex_forward_jobs WHERE connection_id='<connection-id>' AND status='reply_pending';` 查看，等到其中没有答复为哨兵的任务；④ 重启一次。已撤回的卡片不会恢复，hook 会重新收到 bot 消息的撤回事件。
 
 0.2.15 热修增加只读 `GET /health/tasks` 任务失败汇总接口，不增加数据库迁移或配置变更。原 staging 0.2.15–0.2.18 依次顺延为 0.2.16–0.2.19；这四版均不增加数据库迁移。
 

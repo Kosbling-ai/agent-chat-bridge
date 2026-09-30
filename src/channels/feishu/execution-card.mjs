@@ -31,14 +31,16 @@ export function renderExecutionCard(state, answer = '', displayName = 'agent-cha
   flush();
   if (state.status === 'running' && state.progressUnavailable) elements.unshift(progressText(copy.progressUnavailable));
   if (state.omitted) elements.unshift(progressText(copy.omitted));
-  if (answer) elements.push(answerMd(answer));
+  // A silent completion never renders the Agent's answer, only neutral card copy.
+  if (state.silent) elements.push(md(escapeMarkdown(copy.silentReply)));
+  else if (answer) elements.push(answerMd(answer));
   if (!elements.length) elements.push(progressText(copy.received));
   elements.push(md(`**${escapeMarkdown(formatText(copy.statusFooter, { status: statusText }))}**${state.delivery === 'fallback' ? escapeMarkdown(formatText(copy.fallbackSuffix, { fallback: copy.fallback })) : ''}`));
   if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.stopButton }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
   if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.forkButton }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
   let card = { schema: '2.0', config: { update_multi: true, summary: { content: formatText(copy.cardSummary, { title, status: statusText }) } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: title } }, body: { elements } };
   // IM cards are limited to 30 KB, including UTF-8 and JSON scaffolding.
-  while (Buffer.byteLength(JSON.stringify(card)) > 28000 && card.body.elements.length > (answer ? 2 : 1)) card.body.elements.shift();
+  while (Buffer.byteLength(JSON.stringify(card)) > 28000 && card.body.elements.length > (answer || state.silent ? 2 : 1)) card.body.elements.shift();
   if (Buffer.byteLength(JSON.stringify(card)) > 28000) throw new Error('card final answer exceeds budget');
   return card;
 }
@@ -144,6 +146,24 @@ export class ExecutionCard {
     await this.persist(this.snapshot());
     if (this.state.messageId) await this.update('').catch((error) => this.log('fallback', 'warn', { operation: 'close_fallback_card', error_code: errorCode(error) }));
     return false;
+  }
+  // Closes an existing card as completed with neutral copy instead of the answer.
+  // It never creates a card and never switches to ordinary-message fallback.
+  async finishSilently() {
+    this.stop(); await this.chain;
+    if (!this.state.messageId) return false;
+    this.state.status = 'completed';
+    this.state.silent = 'completed';
+    delete this.state.delivery;
+    this.state.entries = this.state.entries.map((x) => x.kind === 'tool' && x.status === 'running' ? { ...x, status: 'completed' } : x);
+    try {
+      await this.update('');
+      await this.log('succeeded', 'info', { operation: 'silent_complete' });
+      return true;
+    } catch (error) {
+      await this.log('fallback', 'warn', { operation: 'silent_complete', error_code: errorCode(error) }).catch(() => {});
+      return false;
+    }
   }
 }
 function errorCode(error) { return String(error?.code || error?.name || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64); }

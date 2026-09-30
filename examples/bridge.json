@@ -21,6 +21,7 @@
     "version": "1",
     "allowAllPrivateUsers": false,
     "privateUserIds": ["replace_with_allowed_open_id"],
+    "silentReply": { "tokens": [], "card": "delete" },
     "groups": [{ "conversationId": "replace_with_chat_id", "trigger": "mention", "replyTriggers": false, "passiveContext": true, "capabilities": ["bridge", "hook"] }]
   },
   "hooks": [],

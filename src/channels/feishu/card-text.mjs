@@ -6,7 +6,7 @@ import { relative, isAbsolute } from 'node:path';
 export const DEFAULT_CARD_TEXT = Object.freeze({
   title: '', received: '已收到，正在处理你的请求。',
   running: '执行中', completed: '已完成', failed: '执行失败', interrupted: '已中断',
-  retrying: '连接恢复中', deferred: '补充已转达',
+  retrying: '连接恢复中', deferred: '补充已转达', silentReply: '已处理，无需回复。',
   stopButton: '停止执行', forkButton: '保留历史并新建会话',
   omitted: '较早的执行过程已收起，仅展示最近进度。', fallback: '结果将通过普通消息送达',
   progressUnavailable: '进度暂不可用，任务仍在后台执行。',

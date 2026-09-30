@@ -89,6 +89,30 @@ function replyContext(value) {
   if (typeof result.cardJson !== 'boolean' || !Number.isSafeInteger(result.maxChars) || result.maxChars < 200 || result.maxChars > 30000) throw new ConfigError('invalid_group_reply_context');
   return Object.freeze(result);
 }
+const SILENT_REPLY_CARD_MODES = Object.freeze(['delete', 'complete']);
+const MAX_SILENT_REPLY_TOKENS = 20;
+const MAX_SILENT_REPLY_TOKEN_CHARS = 200;
+// Tokens are compared exactly with the trimmed final answer, so a token with
+// surrounding whitespace could never match and is rejected here.
+function silentReply(value, { partial = false } = {}) {
+  object(value, ['tokens', 'card'], 'invalid_silent_reply_fields');
+  const result = {};
+  if (value.tokens !== undefined || !partial) {
+    const tokens = value.tokens === undefined ? [] : value.tokens;
+    if (!Array.isArray(tokens) || tokens.length > MAX_SILENT_REPLY_TOKENS) throw new ConfigError('invalid_silent_reply');
+    for (const token of tokens) {
+      if (typeof token !== 'string' || !token || token !== token.trim() || Array.from(token).length > MAX_SILENT_REPLY_TOKEN_CHARS
+        || !token.isWellFormed() || /[\p{Cc}\p{Zl}\p{Zp}]/u.test(token)) throw new ConfigError('invalid_silent_reply');
+    }
+    result.tokens = Object.freeze([...new Set(tokens)]);
+  }
+  if (value.card !== undefined || !partial) {
+    const card = value.card === undefined ? 'delete' : value.card;
+    if (!SILENT_REPLY_CARD_MODES.includes(card)) throw new ConfigError('invalid_silent_reply');
+    result.card = card;
+  }
+  return Object.freeze(result);
+}
 function validateRuntime(raw) {
   const enabled = ['runtime', 'storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
@@ -211,10 +235,10 @@ function validateRuntime(raw) {
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
   if (raw.feishu.outputBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.outputBudgetBytes) || raw.feishu.outputBudgetBytes < 28 * 1024 * 1024 || raw.feishu.outputBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_output_budget');
   feishu.outputBudgetBytes = raw.feishu.outputBudgetBytes ?? 512 * 1024 * 1024;
-  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply'], 'invalid_routing_fields');
+  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll'], 'invalid_group_fields');
+    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply'], 'invalid_group_fields');
     const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
     if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
@@ -222,14 +246,16 @@ function validateRuntime(raw) {
     if (group.allowMentionAll !== undefined && typeof group.allowMentionAll !== 'boolean') throw new ConfigError('invalid_group_mention_all');
     const capabilities=group.capabilities===undefined?['bridge','hook']:strings(group.capabilities);
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
-    if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined || group.replyTriggers === true)) throw new ConfigError('group_context_requires_bridge');
+    if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined || group.replyTriggers === true
+      || group.silentReply !== undefined)) throw new ConfigError('group_context_requires_bridge');
     return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, replyTriggers: group.replyTriggers ?? false, passiveContext: group.passiveContext, capabilities,
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }),
       ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
       ...(group.instructionText === undefined ? {} : { instructionText: instructionText(group.instructionText) }),
       ...(instructed ? { instructionMode: group.instructionMode ?? 'append' } : {}),
       allowMentionAll: group.allowMentionAll ?? false,
-      ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }) };
+      ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }),
+      ...(group.silentReply === undefined ? {} : { silentReply: silentReply(group.silentReply, { partial: true }) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
@@ -241,7 +267,8 @@ function validateRuntime(raw) {
       || !unlistedGroupReply.text.trim() || unlistedGroupReply.text.trim().length > 2000 || !Number.isSafeInteger(unlistedGroupReply.cooldownMs)
       || unlistedGroupReply.cooldownMs < 0 || unlistedGroupReply.cooldownMs > 86_400_000) throw new ConfigError('invalid_unlisted_group_reply');
   unlistedGroupReply.text = unlistedGroupReply.text.trim();
-  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups, unlistedGroupReply };
+  const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups, unlistedGroupReply,
+    silentReply: silentReply(raw.routing.silentReply === undefined ? {} : raw.routing.silentReply) };
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
     object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds', 'inbound'], 'invalid_hook_fields');

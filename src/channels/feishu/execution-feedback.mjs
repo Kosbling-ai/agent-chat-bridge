@@ -5,7 +5,7 @@ import { adaptLocalMarkdownImages } from './markdown-images.mjs';
 
 const stable = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const toast = (content, type = 'info') => ({ toast: { type, content } });
-const safeCode = error => String(error?.code || 'fork_failed').replace(/[^A-Za-z0-9_-]/g, '').slice(0,64) || 'fork_failed';
+const safeCode = (error, fallback = 'fork_failed') => String(error?.code || fallback).replace(/[^A-Za-z0-9_-]/g, '').slice(0,64) || fallback;
 const unconfirmedCard = saved => saved?.delivery === 'unknown'
   || ['intent', 'unknown'].includes(saved?.deliveryState?.status);
 const productionCardState = saved => {
@@ -193,6 +193,48 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     return delivered;
   }
 
+  // Called instead of finish() when the answer is a configured silent-reply
+  // sentinel. It never renders the answer and never falls back to text.
+  // Returns 'deleted', 'completed', 'unchanged' or 'none' (no card to close).
+  async function finishSilent(job, result, policy = {}, control = {}) {
+    if (job.deliveryMode === 'caller') return 'none';
+    const state = stateFor({ ...job, result }, control);
+    const snapshot = result.executionCard || state.result.executionCard;
+    if (!snapshot?.messageId) return 'none';
+    // A persisted marker means an earlier attempt already recalled or closed this card.
+    if (['deleted', 'completed'].includes(snapshot.silent)) return snapshot.silent;
+    if (unconfirmedCard(snapshot)) {
+      log('warning', 'execution_card', 'silent_skipped', { code: 'execution_card_delivery_unknown', runId: job.id });
+      return 'none';
+    }
+    if (policy.card !== 'complete') {
+      let deleted = false;
+      try {
+        if (typeof chat?.deleteMessage !== 'function') throw Object.assign(new Error('message delete unavailable'), { code: 'message_delete_unavailable' });
+        await chat.deleteMessage({ messageId: snapshot.messageId });
+        deleted = true;
+      } catch (error) {
+        log('warning', 'execution_card', 'delete_failed', { code: safeCode(error, 'message_delete_failed'), runId: job.id,
+          ...(Number.isInteger(error?.platformCode) ? { platformCode: error.platformCode } : {}) });
+      }
+      if (deleted) {
+        const value = { ...productionCardState(snapshot), status: 'completed', silent: 'deleted' };
+        result.executionCard = value;
+        // The recall already happened; a retry sees the marker and does not recall again.
+        await persist(job, state, 'executionCard', value).catch(error => {
+          if (['forward_lease_lost', 'forward_runtime_stopping'].includes(error?.code)) throw error;
+          log('warning', 'execution_card', 'record_failed', { code: safeCode(error, 'execution_card_record_failed'), runId: job.id });
+        });
+        return 'deleted';
+      }
+    }
+    const card = cardFor(job, state, snapshot);
+    if (!card) return 'none';
+    const completed = await card.finishSilently();
+    result.executionCard = card.snapshot();
+    return completed ? 'completed' : 'unchanged';
+  }
+
   async function handleCardAction(data) {
     const value = data?.action?.value || {};
     if (value.action === 'fork_busy_session') {
@@ -290,5 +332,5 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     control.assertOwned?.();
   }
 
-  return Object.freeze({ start, observe, restore, restoreWaiting, activate, wait, prepare, finish, handleCardAction, abandon, cleanup });
+  return Object.freeze({ start, observe, restore, restoreWaiting, activate, wait, prepare, finish, finishSilent, handleCardAction, abandon, cleanup });
 }

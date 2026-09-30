@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.19` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.20` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
@@ -47,6 +47,16 @@ node scripts/test-storage.mjs test/core.integration.test.mjs
 ```
 
 npm publishing remains disabled (`private: true`). The intended public source repository is [Kosbling-ai/agent-chat-bridge](https://github.com/Kosbling-ai/agent-chat-bridge); creating and pushing it is separate from deployment or platform acceptance. No production replacement has been performed. Licensing is pending: public visibility does not itself grant an open-source license. See [source provenance](docs/provenance.md).
+
+### Silent-reply sentinel
+
+An Agent can signal that a group turn needs no answer by replying with an operator-configured sentinel. Set `routing.silentReply` (defaults for every `bridge` group) and/or `routing.groups[].silentReply` (per-group override, field by field):
+
+```json
+{ "routing": { "silentReply": { "tokens": ["NO_REPLY"], "card": "delete" } } }
+```
+
+`tokens` defaults to `[]` (feature off) and `card` to `"delete"`. When a completed Agent answer, trimmed of surrounding whitespace, exactly equals a token (case-sensitive; no prefix or substring matching), the bridge sends no text reply. `card: "delete"` recalls the execution card and falls back to `"complete"` if the recall fails (Feishu allows recalling only the bot's own messages within 24 hours); `"complete"` closes the card as completed with the neutral card text `silentReply` (default `已处理，无需回复。`). The sentinel is never displayed. The job finishes as `completed` with `result.silentReply.status = "silent"`; a card that can be neither recalled nor patched is retried within `codex.jobMaxAttempts`. Private chats, failed or deferred turns and non-matching answers are unchanged; outbox attachments are still delivered. The bridge does not tell the Agent the tokens: put the convention, with the same literal value, into the group instructions or workspace rules. Recalls of the bot's own messages are no longer delivered to hooks. See [upgrade and rollback notes](MIGRATIONS.md).
 
 ### Custom execution-card text
 

@@ -320,3 +320,77 @@ test('terminal card removes local image paths with the same collected attachment
   assert.match(encoded,/Before sent 图片.*missing.*未能发送。 after/);
   assert.doesNotMatch(encoded,/\/workspace|\/tmp\/missing/);
 });
+
+function silentHarness({ deleteMessage, patch, saved } = {}) {
+  const job = jobFixture();
+  job.sourceMessageId = null;
+  if (saved !== undefined) job.result.executionCard = saved;
+  const effects = [];
+  const logs = [];
+  const feedback = createExecutionFeedback({
+    jobs: { async patchFeedback({ key, value }) { effects.push(['persist', key, structuredClone(value)]); job.result = { ...job.result, [key]: structuredClone(value) }; } },
+    sessions: {}, executor: {}, log: (...entry) => logs.push(entry),
+    chat: deleteMessage === null ? {} : { async deleteMessage(input) { effects.push(['delete', input.messageId]); return deleteMessage?.(input) ?? {}; } },
+    cardClient: { im: { v1: { message: {
+      async create() { effects.push(['create']); return { code: 0, data: { message_id: 'new-card' } }; },
+      async patch(input) { effects.push(['patch', JSON.parse(input.data.content)]); return patch?.(input) ?? { code: 0 }; },
+    } } } },
+  });
+  return { job, feedback, effects, logs };
+}
+
+test('silent reply recalls the execution card and records a retry-safe marker', async () => {
+  const { job, feedback, effects } = silentHarness();
+  const result = { ...job.result, answer: 'NO_REPLY', execution: { terminal: 'completed' } };
+  assert.equal(await feedback.finishSilent(job, result, { tokens: ['NO_REPLY'], card: 'delete' }), 'deleted');
+  assert.deepEqual(effects.map(([name]) => name), ['delete', 'persist']);
+  assert.equal(effects[0][1], 'card-message');
+  assert.equal(effects[1][2].silent, 'deleted');
+  assert.equal(result.executionCard.silent, 'deleted');
+  assert.equal(await feedback.finishSilent(job, result, { tokens: ['NO_REPLY'], card: 'delete' }), 'deleted');
+  assert.equal(effects.filter(([name]) => name === 'delete').length, 1, 'a retry does not recall twice');
+});
+
+test('silent reply falls back to a neutral completed card when recall fails', async () => {
+  for (const deleteMessage of [() => { throw Object.assign(new Error('rejected'), { code: 'feishu_api_rejected', platformCode: 230011 }); }, null]) {
+    const { job, feedback, effects, logs } = silentHarness({ deleteMessage });
+    const result = { ...job.result, answer: 'NO_REPLY' };
+    assert.equal(await feedback.finishSilent(job, result, { tokens: ['NO_REPLY'], card: 'delete' }), 'completed');
+    const patched = effects.find(([name]) => name === 'patch')[1];
+    assert.equal(patched.header.template, 'green');
+    assert.match(JSON.stringify(patched), /已处理，无需回复。/);
+    assert.doesNotMatch(JSON.stringify(patched), /NO_REPLY/);
+    assert.equal(result.executionCard.silent, 'completed');
+    assert.equal(logs.some(([level, operation, status]) => level === 'warning' && operation === 'execution_card' && status === 'delete_failed'), true);
+  }
+});
+
+test('silent reply complete mode patches without recall and is idempotent after persistence', async () => {
+  const { job, feedback, effects } = silentHarness();
+  const result = { ...job.result, answer: 'NO_REPLY' };
+  assert.equal(await feedback.finishSilent(job, result, { tokens: ['NO_REPLY'], card: 'complete' }), 'completed');
+  assert.deepEqual(effects.filter(([name]) => name !== 'persist').map(([name]) => name), ['patch']);
+  assert.doesNotMatch(JSON.stringify(effects), /NO_REPLY/);
+  assert.equal(await feedback.finishSilent(job, job.result, { tokens: ['NO_REPLY'], card: 'complete' }), 'completed');
+  assert.equal(effects.filter(([name]) => name === 'patch').length, 1);
+});
+
+test('silent reply leaves missing or unconfirmed cards alone and reports a failed patch', async () => {
+  const missing = silentHarness({ saved: null });
+  assert.equal(await missing.feedback.finishSilent(missing.job, { answer: 'NO_REPLY' }, { card: 'delete' }), 'none');
+  assert.deepEqual(missing.effects, []);
+  const unknown = silentHarness({ saved: { status: 'running', entries: [], messageId: 'card-message', delivery: 'unknown' } });
+  assert.equal(await unknown.feedback.finishSilent(unknown.job, unknown.job.result, { card: 'delete' }), 'none');
+  assert.deepEqual(unknown.effects, []);
+  const failed = silentHarness({ patch: () => ({ code: 99 }) });
+  assert.equal(await failed.feedback.finishSilent(failed.job, failed.job.result, { card: 'complete' }), 'unchanged');
+  assert.equal(failed.effects.some(([name]) => name === 'create'), false);
+});
+
+test('ordinary finish still renders the answer when silent replies are configured elsewhere', async () => {
+  const { job, feedback, effects } = silentHarness();
+  const result = { ...job.result, answer: 'NO_REPLY please', execution: { terminal: 'completed' } };
+  assert.equal(await feedback.finish(job, result), true);
+  assert.equal(effects.some(([name]) => name === 'delete'), false);
+  assert.match(JSON.stringify(effects.find(([name]) => name === 'patch')[1]), /NO_REPLY please/);
+});
