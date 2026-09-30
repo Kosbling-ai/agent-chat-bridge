@@ -51,3 +51,20 @@ test('approval identity includes generation and typed request ID; untrusted disp
   r.params._meta.tool_params_display[0].value = '[Fake](https://example.com)';
   assert.match(normalizeComputerUseApproval(r).questions[0].question, /\\\[Fake\\\]/);
 });
+
+test('captured cua_repl standard-form request preserves the actual native metadata shape', () => {
+  // Captured from bundled runtime 26.915.31945 with an isolated synthetic Sky
+  // service; no native app was accessed and the request was answered decline.
+  const params = {
+    _meta: { codex_approval_kind: 'mcp_tool_call', connector_id: 'computer-use', connector_name: 'Computer Use',
+      persist: ['session', 'always'], progressToken: 0, riskLevel: 'low', tool_name: 'get_app_state',
+      tool_params: { app: 'com.example.fixture' }, tool_params_display: [{ display_name: 'App', name: 'app', value: 'Synthetic Fixture' }] },
+    message: 'Allow Computer Use to use "Synthetic Fixture"?', mode: 'form', requestedSchema: { properties: {}, type: 'object' },
+    // Correlation is added by Codex app-server, not the MCP server.
+    threadId: 'thread', turnId: 'turn', serverName: 'cua_repl',
+  };
+  const normalized = normalizeComputerUseApproval({ requestId: 0, generation: 1, params });
+  assert.match(normalized.questions[0].question, /com.example.fixture/);
+  assert.deepEqual(computerUseApprovalResult(normalized.questions, { computer_use: { answers: ['拒绝'] } }),
+    { action: 'decline', content: null, _meta: null });
+});
