@@ -37,3 +37,5 @@ If no card appears, verify the option in that bot's actual `bridge.json`, its Co
 此开关补充的是 MCP 执行中向用户请求应用授权的通道，不影响已有普通 MCP 工具调用。用户在飞书卡片上明确选择允许或拒绝；不自动批准、不提供永久授权。沿用原交互卡片的身份校验、持久化和单次提交机制。
 
 本机仍须安装可用的 Computer Use 插件及辅助程序，并具备系统权限。原生应用授权与浏览器连接是两条不同链路，需分别验证。当前不支持任意 MCP 表单、登录/验证码、录音或无法关联到活动轮次的请求。
+
+The bundled runtime was also probed in an isolated process with a synthetic Sky service: it emitted standard MCP `elicitation/create` (`mode: "form"`, empty object schema, native `computer-use` metadata) and accepted a `decline` response. No native app was accessed or approved in this protocol check. The bridge additionally declares the compatible `openai/form` extension; the standard-form path does not depend on that extension. A live user-approved app read remains a separate deployment verification step.
