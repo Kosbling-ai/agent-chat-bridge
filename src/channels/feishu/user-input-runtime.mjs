@@ -52,6 +52,7 @@ export function createUserInputRuntime({jobs,executor,cardClient,authorize=async
   }
   async function handleCardAction(data){
     const value=data?.action?.value||{}; if(value.action!=='submit_user_input')return null;
+    log('info','user_input_submit','received');
     if(!accepting)return toast('服务正在关闭，该提问已失效','error');
     const operator=data?.operator?.open_id||''; const job=await jobs.getRun({id:String(value.jobId||'')}); const userInput=job?.result?.userInput;
     if(!job||!userInput||!operator||job.chatId!==data?.context?.open_chat_id||job.senderOpenId!==operator
