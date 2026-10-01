@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.22`
+Application version: `0.2.23`
+
+Version 0.2.23 fixes JSON 2.0 question-card callback declarations. No schema/config change is required. Generate new approval cards after restart; expired cards remain invalid.
 
 Version 0.2.22 fixes card admission for running thin-forward jobs whose native IDs have not yet been persisted. No schema/config change is required; only the matching live executor may establish an absent binding.
 

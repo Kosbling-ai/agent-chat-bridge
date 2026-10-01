@@ -77,7 +77,7 @@ test('user-input card customizes fixed copy without changing questions or submis
   assert.equal(fields[0].content,'**原始标题**\n原始问题');assert.equal(fields[1].placeholder.content,'选一个');
   assert.deepEqual(fields[1].options,[{text:{tag:'plain_text',content:'原始选项 · 原始说明'},value:'o_0'}]);
   assert.equal(fields[2].placeholder.content,'另填');assert.equal(fields[3].text.content,'发送');
-  assert.deepEqual(fields[3].value,{action:'submit_user_input',jobId:'run',requestKey:'key',itemId:'item'});
+  assert.deepEqual(fields[3].behaviors[0].value,{action:'submit_user_input',jobId:'run',requestKey:'key',itemId:'item'});
   assert.equal(renderUserInputCard(userInput,{terminal:'submitted',cardText:copy}).body.elements[0].content,'**已\\*提交**');
   assert.equal(renderUserInputCard(userInput,{terminal:'unknown',cardText:copy}).body.elements[0].content,'**未\\_确认**');
   assert.equal(renderUserInputCard(userInput,{terminal:'expired',cardText:copy}).body.elements[0].content,'**已\\#失效**');
@@ -107,7 +107,9 @@ test('user-input runtime authenticates exact card identity and submits once asyn
   const f=fixture();const request={messageId:'source',threadId:'thread',turnId:'turn',itemId:'item',requestId:0,requestKey:'number:0',
     questions:[{id:'q',header:'选择',question:'选一个',options:[{label:'A',description:''}],isOther:false}]};
   await f.runtime.open(request);assert.equal(f.creates.length,1);
-  const payload={operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:{action:'submit_user_input',jobId:'run-1',requestKey:'number:0',itemId:'item'},form_value:{q_0_choice:'o_0'}}};
+  const button=JSON.parse(f.creates[0].data.content).body.elements[0].elements.at(-1);
+  assert.equal(button.form_action_type,'submit');assert.equal(button.behaviors[0].type,'callback');assert.equal(button.value,undefined);
+  const payload={operator:{open_id:'actor'},context:{open_chat_id:'chat',open_message_id:'card'},action:{value:button.behaviors[0].value,form_value:{q_0_choice:'o_0'}}};
   assert.equal((await f.runtime.handleCardAction({...payload,operator:{open_id:'other'}})).toast.content,'该提问已失效');
   assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答正在提交');
   assert.equal(f.authorization.conversationType,'p2p');

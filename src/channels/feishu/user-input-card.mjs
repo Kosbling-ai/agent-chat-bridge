@@ -25,7 +25,7 @@ export function renderUserInputCard(userInput, { displayName='agent-chat-bridge'
       }
     });
     fields.push({tag:'button',name:'submit_user_input',text:plain(copy.inputSubmit),type:'primary_filled',form_action_type:'submit',
-      value:{action:'submit_user_input',jobId:userInput.jobId,requestKey:userInput.requestKey,itemId:userInput.itemId}});
+      behaviors:[{type:'callback',value:{action:'submit_user_input',jobId:userInput.jobId,requestKey:userInput.requestKey,itemId:userInput.itemId}}]});
     elements.push({tag:'form',name:'codex_user_input',elements:fields});
   }
   const card={schema:'2.0',config:{update_multi:true,summary:{content:formatText(copy.inputSummary,{title})}},

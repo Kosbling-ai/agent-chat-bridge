@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.23] — Unreleased
+
+- Fix question-card submit buttons to declare the JSON 2.0 callback behavior, carrying the existing request identity through the form submission.
+- Exercise authenticated one-shot submission using the callback payload from the rendered card, and log callback arrival without answers or user data.
+
+No database migration is needed. Expired cards remain expired; request a new approval after upgrading.
+
 ## [0.2.22] — Unreleased
 
 - Fix user-input and Computer Use card admission while a thin-forward turn is still running: bind the verified live thread/turn to an unbound job atomically with card creation. Existing identities cannot be overwritten and message, chat, actor and callback checks remain enforced.
