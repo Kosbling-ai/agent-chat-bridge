@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.24] — Unreleased
+
+- Offer explicit current-turn Computer Use app approval to avoid a separate card for every keypress, paste and window read. Keep one-request approval and denial available.
+- Scope grants to the live executor turn and app approval context; changed risk/warnings require a new decision. Disconnects, completion and restarts discard grants. No MCP session/permanent permission is persisted.
+
+No database migration is needed.
+
 ## [0.2.23] — Unreleased
 
 - Fix question-card submit buttons to declare the JSON 2.0 callback behavior, carrying the existing request identity through the form submission.

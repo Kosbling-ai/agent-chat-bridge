@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeComputerUseApproval, computerUseApprovalResult } from '../src/agents/codex/computer-use-approval.mjs';
+import { normalizeComputerUseApproval, computerUseApprovalDecision, computerUseApprovalResult } from '../src/agents/codex/computer-use-approval.mjs';
 import { renderUserInputCard, answersFromForm } from '../src/channels/feishu/user-input-card.mjs';
 
 const request = () => ({ requestId: 0, generation: 1, params: {
@@ -20,15 +20,21 @@ test('native app approval becomes an explicit card choice and a one-shot MCP res
   const field = card.body.elements[0].elements.find(x => x.tag === 'select_static');
   assert.equal(field.required, true);
   assert.equal(field.initial_option, undefined);
+  assert.deepEqual(normalized.questions[0].options.map(option => option.label), ['拒绝', '允许本次请求', '本轮任务内允许该应用']);
   assert.throws(() => answersFromForm(normalized, {}));
   const accepted = answersFromForm(normalized, { q_0_choice: 'o_1' });
   assert.deepEqual(computerUseApprovalResult(normalized.questions, accepted), { action: 'accept', content: null, _meta: null });
   const declined = answersFromForm(normalized, { q_0_choice: 'o_0' });
   assert.deepEqual(computerUseApprovalResult(normalized.questions, declined), { action: 'decline', content: null, _meta: null });
+  assert.deepEqual(computerUseApprovalDecision(normalized.questions, { computer_use: { answers: ['本轮任务内允许该应用'] } }), {
+    result: { action: 'accept', content: null, _meta: null }, grantForTurn: true,
+  });
   assert.throws(() => computerUseApprovalResult(normalized.questions, { computer_use: { answers: ['always'] } }));
 });
 
 test('unsupported modes, servers, schemas, audio and uncorrelated requests fail closed', () => {
+  assert.throws(() => normalizeComputerUseApproval({ ...request(), generation: undefined }), { code: 'CODEX_COMPUTER_USE_UNSUPPORTED' });
+  assert.throws(() => normalizeComputerUseApproval({ ...request(), generation: 0 }), { code: 'CODEX_COMPUTER_USE_UNSUPPORTED' });
   const mutations = [
     p => p.mode = 'url', p => p.mode = 'openai/userVerification', p => p.serverName = 'untrusted',
     p => p.threadId = '', p => p.turnId = null, p => p._meta = null,
@@ -37,6 +43,8 @@ test('unsupported modes, servers, schemas, audio and uncorrelated requests fail 
     p => p._meta.tool_name = 'execute_script', p => p._meta.tool_name = 'delete_app',
     p => p._meta.tool_params.secret = 'unrendered', p => p._meta.tool_params.app = 'computer-audio', p => p._meta.tool_params.app = '',
     p => p._meta.tool_params.app = 'app\nforged', p => p.requestedSchema = {},
+    p => p._meta.riskLevel = 'low\nforged', p => p._meta.riskLevel = 'x'.repeat(41),
+    p => p._meta.subtitle = 'warning\nforged', p => p._meta.subtitle = 'x'.repeat(701),
     p => p.requestedSchema.properties = { password: { type: 'string' } },
     p => p.requestedSchema.required = ['secret'], p => p.requestedSchema.oneOf = [],
     p => p.requestedSchema.additionalProperties = true,

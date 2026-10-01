@@ -4,6 +4,7 @@ import { normalizeUserInputAnswers } from './user-input-request.mjs';
 
 export const COMPUTER_USE_REQUEST = 'mcpServer/elicitation/request';
 const allow = '允许本次请求';
+const allowForTurn = '本轮任务内允许该应用';
 const deny = '拒绝';
 const appTools = new Set(['get_app_state', 'click', 'drag', 'scroll', 'press_key', 'paste', 'type_text', 'set_value', 'select_text', 'perform_secondary_action']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -16,7 +17,8 @@ const invalid = () => Object.assign(new Error('Unsupported computer use approval
 export function normalizeComputerUseApproval(request) {
   const p = request?.params;
   const meta = p?._meta;
-  if (!object(p) || !text(p.threadId, 255) || !text(p.turnId, 255)
+  if (!Number.isSafeInteger(request?.generation) || request.generation < 1
+      || !object(p) || !text(p.threadId, 255) || !text(p.turnId, 255)
       || p.serverName !== 'cua_repl' || !['form', 'openai/form', 'openaiForm'].includes(p.mode)
       || !object(meta) || meta.codex_approval_kind !== 'mcp_tool_call' || meta.connector_id !== 'computer-use'
       || !object(meta.tool_params) || Object.keys(meta.tool_params).some(key => key !== 'app') || !text(meta.tool_params.app, 255)
@@ -31,23 +33,39 @@ export function normalizeComputerUseApproval(request) {
   const display = Array.isArray(meta.tool_params_display)
     ? meta.tool_params_display.find(field => field?.name === 'app')?.value : undefined;
   const name = text(display, 255) ? display : app;
+  if (meta.riskLevel != null && !text(meta.riskLevel, 40)) throw invalid();
+  if (meta.subtitle != null && meta.subtitle !== '' && !text(meta.subtitle, 700)) throw invalid();
   const risk = text(meta.riskLevel, 40) ? meta.riskLevel : '未提供';
-  const warning = text(meta.subtitle, 700) ? `\n提示：${escapeMarkdown(meta.subtitle)}` : '';
+  const subtitle = text(meta.subtitle, 700) ? meta.subtitle : '';
+  const warning = subtitle ? `\n提示：${escapeMarkdown(subtitle)}` : '';
   const question = `Codex 请求通过 Computer Use 操作应用：${escapeMarkdown(name)}\n应用标识：${escapeMarkdown(app)}\n工具：${escapeMarkdown(meta.tool_name)}\n风险等级：${escapeMarkdown(risk)}${warning}\n允许后可读取该应用内容并执行界面操作；此选择不保存为永久授权。后续涉及敏感或不可逆操作时仍须单独确认。`;
   const identity = `${request.generation}:${p.threadId}:${p.turnId}:${typeof request.requestId}:${JSON.stringify(request.requestId)}`;
+  const turnGrantKey = createHash('sha256').update(JSON.stringify([request.generation, app, risk, subtitle])).digest('hex');
   return {
     requestId: request.requestId, threadId: p.threadId, turnId: p.turnId,
     itemId: `computer-use-${createHash('sha256').update(identity).digest('hex')}`,
+    computerUseGrant: { app, key: turnGrantKey },
     isBlocking: true, kind: 'computerUse',
     questions: [{ id: 'computer_use', header: 'Computer Use 应用授权', question, isOther: false,
-      options: [{ label: deny, description: '不允许此次应用访问' }, { label: allow, description: '继续本次应用访问，不保存永久授权' }] }],
+      options: [
+        { label: deny, description: '不允许此次应用访问' },
+        { label: allow, description: '仅继续本次应用访问' },
+        { label: allowForTurn, description: '本轮任务内相同风险提示的该应用访问无需再次确认' },
+      ] }],
+  };
+}
+
+export function computerUseApprovalDecision(questions, answers) {
+  const result = normalizeUserInputAnswers(questions, answers);
+  const choice = result.answers.computer_use.answers[0];
+  return {
+    result: { action: choice === deny ? 'decline' : 'accept', content: null, _meta: null },
+    grantForTurn: choice === allowForTurn,
   };
 }
 
 export function computerUseApprovalResult(questions, answers) {
-  const result = normalizeUserInputAnswers(questions, answers);
-  const accepted = result.answers.computer_use.answers[0] === allow;
-  return { action: accepted ? 'accept' : 'decline', content: null, _meta: null };
+  return computerUseApprovalDecision(questions, answers).result;
 }
 
 export const cancelComputerUseApproval = () => ({ action: 'cancel', content: null, _meta: null });

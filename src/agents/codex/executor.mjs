@@ -1,4 +1,4 @@
-import { COMPUTER_USE_REQUEST, normalizeComputerUseApproval, computerUseApprovalResult, cancelComputerUseApproval } from './computer-use-approval.mjs';
+import { COMPUTER_USE_REQUEST, normalizeComputerUseApproval, computerUseApprovalDecision, cancelComputerUseApproval } from './computer-use-approval.mjs';
 import { codexTurnError } from './turn-error.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
@@ -475,6 +475,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     if (duplicate) return duplicateResult(active.binding, duplicate, active.turnId);
     const reconciled = await reconcileSteer(active.binding, input.messageId, input.prompt);
     if (reconciled) { active.pendingSteerId = null; return reconciled; }
+    clearComputerUseGrants(active);
     const attemptId = randomUUID();
     const before = await client.request('thread/read', { threadId: active.threadId, includeTurns: true });
     const baselineIds = (before?.thread?.turns || []).find((turn) => turn.id === active.turnId)?.items?.filter((item) => item.type === 'userMessage').map((item) => item.id) || [];
@@ -515,11 +516,12 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       lastAgentMessage: '', pendingSteerId: null, settled: false, stopRequested: false,
       userInput: null,
       userInputQueue: Promise.resolve(),
+      computerUseGrants: new Map(), computerUseGrantEpoch: 0,
       steerQueue: Promise.resolve(), waiters: new Set(),
       finalized: null,
       completed: new Promise((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; }),
-      resolve(value) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); resolveCompletion(value); },
-      reject(error) { if (state.settled) return; state.settled = true; clearTimeout(timeoutTimer); rejectCompletion(error); },
+      resolve(value) { if (state.settled) return; state.settled = true; clearComputerUseGrants(state); clearTimeout(timeoutTimer); resolveCompletion(value); },
+      reject(error) { if (state.settled) return; state.settled = true; clearComputerUseGrants(state); clearTimeout(timeoutTimer); rejectCompletion(error); },
     };
     const turnTimeoutMs = Number(config.turnTimeoutMs ?? 12 * 60 * 60 * 1000);
     if (turnTimeoutMs > 0) {
@@ -533,6 +535,11 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       timeoutTimer.unref?.();
     }
     return state;
+  }
+
+  function clearComputerUseGrants(state) {
+    state?.computerUseGrants?.clear();
+    if (state) state.computerUseGrantEpoch = (state.computerUseGrantEpoch || 0) + 1;
   }
 
   async function registerState(state) {
@@ -594,14 +601,25 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (state.threadId !== normalized.threadId || state.turnId !== normalized.turnId || state.settled || closing) {
         await request.respondError(-32002, 'User input request does not match the active turn').catch((_error) => {}); return;
       }
+      const { computerUseGrant, ...publicNormalized } = normalized;
+      if (computerUseGrant) {
+        const cached = state.computerUseGrants.get(computerUseGrant.app);
+        if (cached === computerUseGrant.key) {
+          try { await request.respondResult({ action: 'accept', content: null, _meta: null }); }
+          catch { state.computerUseGrants.delete(computerUseGrant.app); }
+          return;
+        }
+        if (cached) state.computerUseGrants.delete(computerUseGrant.app);
+      }
       await expireUserInput(state, 'superseded');
       if(resolvedUserInputs.delete(resolvedKey)){request.abandon();return;}
       const controller=new AbortController();
+      const grantEpoch = state.computerUseGrantEpoch;
       const publicRequest = {
-        ...normalized, messageId: state.messageId, binding: state.binding, signal:controller.signal,
+        ...publicNormalized, messageId: state.messageId, binding: state.binding, signal:controller.signal,
         requestKey: typedRequestKey(normalized.requestId),
       };
-      state.userInput = { request, public: publicRequest, controller, settled: false };
+      state.userInput = { request, public: publicRequest, controller, settled: false, computerUseGrant, grantEpoch };
       try { await onUserInput(publicRequest); }
       catch (error) {
         if(state.userInput?.request===request)await expireUserInput(state, 'delivery_failed');
@@ -615,23 +633,40 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   async function answerUserInput({ threadId, turnId, requestId, itemId, messageId, answers }) {
     const state = activeByTurn.get(turnId);
-    const pending = state?.userInput;
-    if (!state || state.threadId !== threadId || state.messageId !== messageId || !pending || pending.settled
-      || typedRequestKey(pending.public.requestId) !== typedRequestKey(requestId) || pending.public.itemId !== itemId) return { status: 'expired' };
-    let result;
-    try { result = pending.public.kind === 'computerUse'
-      ? computerUseApprovalResult(pending.public.questions, answers)
-      : normalizeUserInputAnswers(pending.public.questions, answers); }
-    catch (error) { return { status: 'invalid', code: error.code }; }
-    pending.settled = true; pending.controller?.abort(); state.userInput = null;
-    try { await pending.request.respondResult(result); return { status: 'submitted' }; }
-    catch { return { status: 'unknown' }; }
+    if (!state) return { status: 'expired' };
+    const operation = state.userInputQueue.then(async () => {
+      const pending = state.userInput;
+      if (state.settled || closing || state.threadId !== threadId || state.messageId !== messageId || !pending || pending.settled
+        || typedRequestKey(pending.public.requestId) !== typedRequestKey(requestId) || pending.public.itemId !== itemId) return { status: 'expired' };
+      let result; let grantForTurn = false;
+      try {
+        if (pending.public.kind === 'computerUse') ({ result, grantForTurn } = computerUseApprovalDecision(pending.public.questions, answers));
+        else result = normalizeUserInputAnswers(pending.public.questions, answers);
+      } catch (error) { return { status: 'invalid', code: error.code }; }
+      if (pending.computerUseGrant && pending.grantEpoch !== state.computerUseGrantEpoch) {
+        await expireUserInput(state, 'task_changed');
+        return { status: 'expired' };
+      }
+      pending.settled = true; pending.controller?.abort(); state.userInput = null;
+      try {
+        await pending.request.respondResult(result);
+        if (pending.computerUseGrant) {
+          if (grantForTurn && pending.grantEpoch === state.computerUseGrantEpoch && !state.settled)
+            state.computerUseGrants.set(pending.computerUseGrant.app, pending.computerUseGrant.key);
+          else if (result.action === 'decline') state.computerUseGrants.delete(pending.computerUseGrant.app);
+        }
+        return { status: 'submitted' };
+      } catch { return { status: 'unknown' }; }
+    });
+    state.userInputQueue = operation.catch(() => {});
+    return operation;
   }
 
   function handleDisconnect(error) {
     loadedThreads.clear();
     resolvedUserInputs.clear();
     for (const state of activeByTurn.values()) {
+      clearComputerUseGrants(state);
       expireUserInput(state, 'disconnected', { resolved: true }).catch((_error) => {});
       const lost = coded('Codex app-server connection was lost; native turn status is unknown', 'CODEX_OBSERVATION_LOST', { retryable: true, outcome: 'unknown' });
       Object.assign(lost, { cause: error, threadId: state.threadId, turnId: state.turnId, startedAt: state.startedAt });

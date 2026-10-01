@@ -20,7 +20,7 @@ Ordinary MCP calls already work through Codex. This feature adds the missing ser
 
 ## Approval flow
 
-When the CUA runtime asks to access an app, the initiating Feishu user receives an interaction card showing the app identifier, tool, risk and any warning. The user must select **拒绝** or **允许本次请求** and submit. There is no preselected approval and no permanent-approval option. An accepted result has no persistence hint (`_meta: null`); the bridge does not cache app approvals. The runtime can ask again on subsequent calls.
+When the CUA runtime asks to access an app, the initiating Feishu user receives an interaction card showing the app identifier, tool, risk and any warning. The user selects **拒绝**, **允许本次请求**, or **本轮任务内允许该应用** and submits. There is no preselected approval and no permanent-approval option. One-request approval still prompts for the next operation. Current-turn approval covers recognized native operations for the same app and unchanged risk/warning context within this live task only; another app, changed risk/warning, a new turn, disconnect or restart requires a new decision. Grants exist only in the isolated live executor turn state. Accepted MCP results contain no persistence hint (`_meta: null`), so no process-wide or permanent grant is created.
 
 The card uses the existing durable user-input delivery and callback authorization: the actor, chat, message, job, request ID and item ID must match, and only one answer reaches the live Codex process. Superseded/expired requests, failed card delivery, disconnects and restarts never grant access. Restarted processes do not replay approvals from old cards. App access does not authorize every consequential action in that app; Codex's confirmation rules and managed policy still apply.
 
@@ -36,7 +36,7 @@ If no card appears, verify the option in that bot's actual `bridge.json`, its Co
 
 ## 中文说明
 
-此开关补充的是 MCP 执行中向用户请求应用授权的通道，不影响已有普通 MCP 工具调用。用户在飞书卡片上明确选择允许或拒绝；不自动批准、不提供永久授权。沿用原交互卡片的身份校验、持久化和单次提交机制。
+此开关补充的是 MCP 执行中向用户请求应用授权的通道，不影响已有普通 MCP 工具调用。用户在飞书卡片上明确选择拒绝、仅允许本次请求或本轮任务内允许该应用；不自动扩大单次授权、不提供永久授权。选择本轮允许后，同一任务中该应用的常规操作复用授权；新消息指令、风险提示变化、任务结束、断线或重启后失效。沿用原交互卡片的身份校验、持久化和单次提交机制。
 
 本机仍须安装可用的 Computer Use 插件及辅助程序，并具备系统权限。原生应用授权与浏览器连接是两条不同链路，需分别验证。当前不支持任意 MCP 表单、登录/验证码、录音或无法关联到活动轮次的请求。
 
