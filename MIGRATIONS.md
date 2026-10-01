@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.23`
+Application version: `0.2.24`
+
+Version 0.2.24 adds an explicit current-turn app approval option. Grants are in memory only and expire with the live turn or disconnect; no database migration or permanent permission is introduced.
 
 Version 0.2.23 fixes JSON 2.0 question-card callback declarations. No schema/config change is required. Generate new approval cards after restart; expired cards remain invalid.
 

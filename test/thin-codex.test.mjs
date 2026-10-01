@@ -1270,6 +1270,17 @@ const computerRequest = (params = {}) => ({ id: 'cua', method: 'mcpServer/elicit
     tool_params: { app: 'com.google.Chrome' }, persist: ['session', 'always'] }, ...params,
 } });
 
+const emitComputerRequest = (runtime, opened, id, { toolName = 'get_app_state', app = 'com.google.Chrome', riskLevel, subtitle } = {}) => {
+  const base = computerRequest().params;
+  runtime.children[0].send({ id, method: 'mcpServer/elicitation/request', params: {
+    ...base, threadId: opened.threadId, turnId: opened.turnId,
+    _meta: { ...base._meta, tool_name: toolName, tool_params: { app },
+      ...(riskLevel === undefined ? {} : { riskLevel }), ...(subtitle === undefined ? {} : { subtitle }) },
+  } });
+};
+
+const waitUntil = async predicate => { while (!predicate()) await new Promise(resolve => setImmediate(resolve)); };
+
 for (const choice of ['允许本次请求', '拒绝']) test(`computer use routes a correlated MCP approval through the card callback: ${choice}`, async t => {
   const cwd=mkdtempSync(join(tmpdir(),'bridge-cua-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));mkdirSync(join(cwd,'home'));
   const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[computerRequest()]});let opened;
@@ -1301,4 +1312,53 @@ for (const scenario of ['disabled','unsupported','delivery-failure','resolved'])
   assert.equal(opens,scenario==='delivery-failure'?1:0);
   assert.equal(runtime.calls.some(m=>m.id==='cua'&&m.result?.action==='accept'),false);
   if(['unsupported','delivery-failure'].includes(scenario))assert.equal(runtime.calls.find(m=>m.id==='cua'&&m.result)?.result.action,'cancel');
+});
+
+test('turn-scoped computer use grant reuses only the same app and warning context, and never crosses a steer or turn', async t => {
+  const cwd=mkdtempSync(join(tmpdir(),'bridge-cua-turn-'));t.after(()=>rmSync(cwd,{recursive:true,force:true}));mkdirSync(join(cwd,'home'));
+  const runtime=fakeRuntime({completeStarts:false,serverRequestsOnStart:[computerRequest()]});const opened=[];
+  const executor=createCodexExecutor({config:{...config(cwd),computerUse:true},sessionStore:memoryStore(),spawnImpl:runtime.spawnImpl,
+    spawnSyncImpl:()=>({status:0,stdout:''}),onUserInput:async request=>{opened.push(request);}});
+  const input=(messageId,prompt)=>({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId,prompt,busyPolicy:'steer'});
+  const first=executor.execute(input('message','work'));first.catch(()=>{});
+  t.after(async()=>{await executor.close();await first.catch(()=>{});});
+  await waitUntil(()=>opened.length===1);
+  assert.equal(opened[0].computerUseGrant, undefined, 'private grant identity is not sent to the card sink');
+  const answer=(request,choice)=>executor.answerUserInput({threadId:request.threadId,turnId:request.turnId,requestId:request.requestId,
+    itemId:request.itemId,messageId:'message',answers:{computer_use:{answers:[choice]}}});
+  const grantAnswer=answer(opened[0],'本轮任务内允许该应用');
+  emitComputerRequest(runtime,opened[0],'same-app-other-tool',{toolName:'click'});
+  assert.equal((await grantAnswer).status,'submitted');
+  await waitUntil(()=>runtime.calls.some(call=>call.id==='same-app-other-tool'&&call.result));
+  assert.equal(opened.length,1);
+  assert.equal(runtime.calls.find(call=>call.id==='same-app-other-tool').result.action,'accept');
+
+  emitComputerRequest(runtime,opened[0],'changed-risk',{toolName:'click',riskLevel:'high',subtitle:'Sensitive control'});
+  await waitUntil(()=>opened.length===2);
+
+  const steered=await executor.execute(input('follow-up','new task'));
+  assert.equal(steered.accepted,true);
+  assert.equal((await answer(opened[1],'本轮任务内允许该应用')).status,'expired');
+  assert.equal(runtime.calls.find(call=>call.id==='changed-risk'&&call.result)?.result.action,'cancel');
+  emitComputerRequest(runtime,opened[0],'after-steer',{toolName:'click'});
+  await waitUntil(()=>opened.length===3);
+  assert.equal(runtime.calls.some(call=>call.id==='after-steer'&&call.result?.action==='accept'),false);
+  assert.equal((await answer(opened[2],'允许本次请求')).status,'submitted');
+  emitComputerRequest(runtime,opened[0],'after-one-shot',{toolName:'click'});
+  await waitUntil(()=>opened.length===4);
+  assert.equal((await answer(opened[3],'拒绝')).status,'submitted');
+
+  emitComputerRequest(runtime,opened[0],'changed-app',{toolName:'click',app:'com.apple.Safari'});
+  await waitUntil(()=>opened.length===5);
+  assert.equal((await answer(opened[4],'拒绝')).status,'submitted');
+
+  runtime.children[0].send({method:'turn/completed',params:{threadId:opened[0].threadId,turnId:opened[0].turnId,
+    turn:{id:opened[0].turnId,status:'completed',items:[]}}});
+  await first;
+  const second=executor.execute(input('message-2','next turn'));second.catch(()=>{});
+  await waitUntil(()=>opened.length===6);
+  assert.notEqual(opened[5].turnId,opened[0].turnId);
+  runtime.children[0].send({method:'turn/completed',params:{threadId:opened[5].threadId,turnId:opened[5].turnId,
+    turn:{id:opened[5].turnId,status:'completed',items:[]}}});
+  await second;
 });
