@@ -113,6 +113,32 @@ function silentReply(value, { partial = false } = {}) {
   }
   return Object.freeze(result);
 }
+// Per-group Codex permission switch for threads bound to that group chat (the
+// human group thread and business-event threads whose result chat is this
+// group). Each field replaces the global value and may grant more or less
+// than it; cwd and model stay global. Values are the app-server protocol
+// enums, compared exactly (no trimming).
+const GROUP_APPROVAL_POLICIES = Object.freeze(['untrusted', 'on-request', 'never']);
+const GROUP_APPROVALS_REVIEWERS = Object.freeze(['user', 'auto_review', 'guardian_subagent']);
+const GROUP_SANDBOX_MODES = Object.freeze(['read-only', 'workspace-write', 'danger-full-access']);
+function groupCodex(value) {
+  object(value, ['approvalPolicy', 'approvalsReviewer', 'sandbox'], 'invalid_group_codex_fields');
+  const result = {};
+  if (value.approvalPolicy !== undefined) {
+    if (!GROUP_APPROVAL_POLICIES.includes(value.approvalPolicy)) throw new ConfigError('invalid_group_codex_approval_policy');
+    result.approvalPolicy = value.approvalPolicy;
+  }
+  if (value.approvalsReviewer !== undefined) {
+    if (!GROUP_APPROVALS_REVIEWERS.includes(value.approvalsReviewer)) throw new ConfigError('invalid_group_codex_approvals_reviewer');
+    result.approvalsReviewer = value.approvalsReviewer;
+  }
+  if (value.sandbox !== undefined) {
+    if (!GROUP_SANDBOX_MODES.includes(value.sandbox)) throw new ConfigError('invalid_group_codex_sandbox');
+    result.sandbox = value.sandbox;
+  }
+  if (Object.keys(result).length === 0) throw new ConfigError('invalid_group_codex_fields');
+  return Object.freeze(result);
+}
 function validateRuntime(raw) {
   const enabled = ['runtime', 'storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
@@ -238,7 +264,7 @@ function validateRuntime(raw) {
   object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply'], 'invalid_group_fields');
+    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'codex'], 'invalid_group_fields');
     const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
     if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
@@ -247,7 +273,7 @@ function validateRuntime(raw) {
     const capabilities=group.capabilities===undefined?['bridge','hook']:strings(group.capabilities);
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
     if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined || group.replyTriggers === true
-      || group.silentReply !== undefined)) throw new ConfigError('group_context_requires_bridge');
+      || group.silentReply !== undefined || group.codex !== undefined)) throw new ConfigError('group_context_requires_bridge');
     return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, replyTriggers: group.replyTriggers ?? false, passiveContext: group.passiveContext, capabilities,
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }),
       ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
@@ -255,7 +281,8 @@ function validateRuntime(raw) {
       ...(instructed ? { instructionMode: group.instructionMode ?? 'append' } : {}),
       allowMentionAll: group.allowMentionAll ?? false,
       ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }),
-      ...(group.silentReply === undefined ? {} : { silentReply: silentReply(group.silentReply, { partial: true }) }) };
+      ...(group.silentReply === undefined ? {} : { silentReply: silentReply(group.silentReply, { partial: true }) }),
+      ...(group.codex === undefined ? {} : { codex: groupCodex(group.codex) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;

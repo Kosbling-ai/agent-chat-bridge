@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.20`
+Application version: `0.2.21`
+
+Version 0.2.21 does not add a database migration. It adds the optional per-group `routing.groups[].codex` override (`approvalPolicy`, `approvalsReviewer`, `sandbox`) for `bridge` groups. It applies to the group's human thread and to business-event threads whose hook `inbound.defaultChatId` is that group. Without the field nothing changes; see the enable and rollback steps below.
 
 Version 0.2.20 does not add a database migration. It adds the optional `routing.silentReply` object (`tokens` default `[]`, `card` default `"delete"`) and the optional per-group `routing.groups[].silentReply` override. With the defaults nothing changes except that hooks no longer receive recalls of the bot's own recorded messages; see the upgrade note below.
 
@@ -29,6 +31,31 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.21 per-group Codex permissions
+
+No database migration, no config `schemaVersion` change and no new environment variable. Without `routing.groups[].codex` every thread keeps the global `codex.approvalPolicy`, `codex.approvalsReviewer` and `codex.sandbox`, and the Codex request parameters are the same as in 0.2.20.
+
+The object accepts `approvalPolicy` (`untrusted`, `on-request`, `never`), `approvalsReviewer` (`user`, `auto_review`, `guardian_subagent`) and `sandbox` (`read-only`, `workspace-write`, `danger-full-access`), at least one of them, compared exactly. It is rejected on a hook-only group. It applies to group bindings of that chat id: the human group thread and business-event threads whose hook `inbound.defaultChatId` is the group. Private chats never match. Codex full access needs both `"approvalPolicy": "never"` and `"sandbox": "danger-full-access"`; with `never` and the sandbox still `workspace-write`, Codex rejects every MCP tool call that needs approval with `MCP tool call requires approval, but approval policy is never`. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions).
+
+To enable it:
+
+1. Add the object to the group in the private bridge.json:
+
+   ```json
+   { "conversationId": "oc_example", "trigger": "mention", "passiveContext": true, "capabilities": ["bridge", "hook"],
+     "codex": { "approvalPolicy": "never", "sandbox": "danger-full-access" } }
+   ```
+
+2. Run `node bin/agent-chat-bridge.mjs check-config --config <path>` and fix any reported code.
+3. Restart the bridge once. The bridge does not reload configuration while it runs. Existing threads need no rollover: after the restart, the new app-server child resumes each thread with the new settings before its next turn.
+
+To turn it off on 0.2.21, remove the object and restart once; the threads return to the global settings on their next turn.
+
+Rollback to 0.2.20:
+
+1. Remove `codex` from every `routing.groups[]` entry; 0.2.20 rejects the key with `invalid_group_fields` at startup.
+2. Switch the binary and restart once. Threads resume with the global settings.
 
 ## 0.2.20 silent-reply sentinel
 

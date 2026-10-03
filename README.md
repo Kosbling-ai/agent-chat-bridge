@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.20` is the current unreleased development version. Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.21` is the current unreleased development version. 0.2.21 adds the optional per-group `routing.groups[].codex` permission override (`approvalPolicy`, `approvalsReviewer`, `sandbox`) for a `bridge` group's human thread and for business-event threads whose hook `inbound.defaultChatId` is that group; Codex full access needs `approvalPolicy: "never"` with `sandbox: "danger-full-access"`. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 

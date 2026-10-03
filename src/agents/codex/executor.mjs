@@ -210,12 +210,34 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     return { feishuOpenId, chatId, chatType };
   }
 
-  function threadDefaults(extra = {}) {
+  // A configured group may switch the Codex approval and sandbox settings for
+  // every thread bound to that group chat: the human group thread and
+  // business-event threads whose result chat is the group. Only group bindings
+  // match, so a private chat whose id equals a configured group id keeps the
+  // global settings.
+  const groupCodexOverrides = new Map(config.groupCodexOverrides || []);
+  function codexPolicyFor(binding) {
+    const override = binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId) : undefined;
+    return {
+      approvalPolicy: normalizeApprovalPolicy(override?.approvalPolicy || config.approvalPolicy),
+      approvalsReviewer: normalizeApprovalsReviewer(override?.approvalsReviewer || config.approvalsReviewer),
+      sandbox: override?.sandbox || config.sandbox || 'workspace-write',
+    };
+  }
+
+  // turn/start has no `sandbox` parameter (its `sandboxPolicy` is a structured
+  // policy object). The sandbox chosen on thread start, resume or fork stays in
+  // force for later turns, and every turn runs on a thread this app-server
+  // child started, resumed or forked through threadDefaults.
+  function turnPolicyFor(binding) {
+    const { approvalPolicy, approvalsReviewer } = codexPolicyFor(binding);
+    return { approvalPolicy, approvalsReviewer };
+  }
+
+  function threadDefaults(extra = {}, binding) {
     return {
       cwd: config.cwd,
-      approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy),
-      approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
-      sandbox: config.sandbox || 'workspace-write',
+      ...codexPolicyFor(binding),
       ...(config.model ? { model: config.model } : {}),
       ...extra,
     };
@@ -226,7 +248,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       serviceName: config.serviceName || 'Agent Chat Bridge',
       threadSource: 'user',
       ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}),
-    }));
+    }, actor));
     const threadId = trim(response?.thread?.id);
     if (!threadId) throw coded('Codex did not return a thread id', 'CODEX_THREAD_START_UNCONFIRMED', { outcome: 'unknown' });
     loadedThreads.add(threadId);
@@ -253,7 +275,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     let response;
     try {
       response = await client.request('thread/resume', threadDefaults({ threadId: binding.codexSessionId,
-        ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }));
+        ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
     } catch (error) {
       if (error?.code === 'CODEX_THREAD_BUSY' && error.outcome === 'rejected') {
         error.phase = 'pre_admission';
@@ -732,7 +754,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       try {
         response = await client.request('turn/start', {
           threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
-          approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy), approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
+          ...turnPolicyFor(binding),
           ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
         });
       } catch (error) {
@@ -747,7 +769,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
             threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
-            approvalPolicy: normalizeApprovalPolicy(config.approvalPolicy), approvalsReviewer: normalizeApprovalsReviewer(config.approvalsReviewer),
+            ...turnPolicyFor(binding),
             ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
           }).catch((failure) => { startingByThread.delete(admission.threadId); admission.reject(failure); throw failure; });
         } else {
@@ -819,7 +841,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     let snapshot;
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
-        ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }));
+        ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
       snapshot = exactTurnSnapshot(response?.thread, resume.turnId);
       const otherActiveIds = inProgressTurnIds(response?.thread).filter((turnId) => turnId !== resume.turnId);
       if (snapshot.status !== 'unknown' && otherActiveIds.length === 0) loadedThreads.add(resume.threadId);
@@ -914,7 +936,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         response = await client.request('thread/fork', threadDefaults({
           threadId: sourceThreadId, ephemeral: false, deferGoalContinuation: true,
           ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}),
-        }));
+        }, actor));
       } catch (error) {
         error.code ||= 'CODEX_FORK_UNCONFIRMED';
         error.outcome ||= 'unknown';
