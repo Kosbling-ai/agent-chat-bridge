@@ -260,6 +260,10 @@ export async function startService({ config, configPath, env = process.env, log,
       maxOutputChars: config.feishu.maxOutputChars,
       outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
+      // Keyed by external Feishu chat id; a Map keeps ids such as "__proto__" inert.
+      groupCodexOverrides: new Map(config.routing.groups
+        .filter(group => group.capabilities.includes('bridge') && group.codex)
+        .map(group => [group.conversationId, group.codex])),
     };
     const groupInstructions=createGroupInstructions({groups:config.routing.groups.filter(group=>group.capabilities.includes('bridge')),configDir:root,log});
     executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,groupInstructions,

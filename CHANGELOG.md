@@ -16,17 +16,18 @@ No database migration is needed. Expired cards remain expired; request a new app
 
 ## [0.2.22] — Unreleased
 
+- Add opt-in `codex.computerUse` support for bundled `cua_repl` native-app approval elicitations. Forward recognized requests to the initiating user's Feishu interaction card, and send explicit allow/decline results back to the same live Codex request. Ordinary MCP tool calls are unchanged.
+- Reuse durable card identity, actor authorization, one-shot submission and expiry handling. Do not automatically approve apps or persist permanent grants. Unsupported MCP forms, URL/auth challenges, audio recording and requests without a correlated turn are cancelled.
 - Fix user-input and Computer Use card admission while a thin-forward turn is still running: bind the verified live thread/turn to an unbound job atomically with card creation. Existing identities cannot be overwritten and message, chat, actor and callback checks remain enforced.
 - Add isolated MySQL regression coverage for missing native IDs, mismatched identities and authenticated submission; retain bounded failure codes for card admission diagnostics.
 
-No database migration is needed.
+No database migration is needed. The installed Codex Computer Use runtime and OS permissions remain prerequisites; this option does not install plugins or grant OS access.
 
 ## [0.2.21] — Unreleased
 
-- Add opt-in `codex.computerUse` support for bundled `cua_repl` native-app approval elicitations. Forward recognized requests to the initiating user's Feishu interaction card, and send explicit allow/decline results back to the same live Codex request. Ordinary MCP tool calls are unchanged.
-- Reuse durable card identity, actor authorization, one-shot submission and expiry handling. Do not automatically approve apps or persist permanent grants. Unsupported MCP forms, URL/auth challenges, audio recording and requests without a correlated turn are cancelled.
+- Add the optional per-group `routing.groups[].codex` permission override with `approvalPolicy` (`untrusted`, `on-request`, `never`), `approvalsReviewer` (`user`, `auto_review`, `guardian_subagent`) and `sandbox` (`read-only`, `workspace-write`, `danger-full-access`). Each configured field replaces the global `codex.approvalPolicy`, `codex.approvalsReviewer` or `codex.sandbox` for group bindings of that chat id: the human group thread and business-event threads whose hook `inbound.defaultChatId` is the group. Private chats never match, even with the same chat id. The executor sends the approval policy, reviewer and sandbox on `thread/start`, `thread/resume` and `thread/fork`, and the approval policy and reviewer on `turn/start`, which has no `sandbox` parameter. Codex full access needs `"approvalPolicy": "never"` together with `"sandbox": "danger-full-access"`; `never` with `workspace-write` makes Codex reject MCP tool calls that need approval. The field requires the `bridge` capability (`group_context_requires_bridge`) and rejects an empty object or unknown keys (`invalid_group_codex_fields`) and values outside the enums, compared without trimming (`invalid_group_codex_approval_policy`, `invalid_group_codex_approvals_reviewer`, `invalid_group_codex_sandbox`). Enabling or removing it takes a `check-config` and one restart; 0.2.20 rejects the key, so remove it before rolling back.
 
-No database migration is needed. The installed Codex Computer Use runtime and OS permissions remain prerequisites; this option does not install plugins or grant OS access.
+No database migration is needed. Without the field, approval and sandbox behavior and the Codex request parameters are unchanged.
 
 ## [0.2.20] — Unreleased
 

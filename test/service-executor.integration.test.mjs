@@ -55,7 +55,9 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     storage: { hostEnv: 'DB_HOST', portEnv: 'DB_PORT', userEnv: 'DB_USER', passwordEnv: 'DB_PASSWORD', databaseEnv: 'DB_DATABASE' },
     codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], rulesFiles: ['AGENTS.md'], rolloverOnRulesUpdate: true, computerUse: true },
     feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot', catchup: false },
-    routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true, capabilities: ['bridge'] }] },
+    routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true, capabilities: ['bridge'] },
+      { conversationId: 'chat-full', trigger: 'mention', passiveContext: true, capabilities: ['bridge', 'hook'], codex: { approvalPolicy: 'never', sandbox: 'danger-full-access' } },
+      { conversationId: 'chat-hook', trigger: 'mention', passiveContext: false, capabilities: ['hook'] }] },
     hooks: [],
   };
   const env = {
@@ -128,7 +130,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(executorConfig.memoryCheckIntervalMs, 60_000);
   assert.equal(executorConfig.memoryMaxRssBytes, 1536 * 1024 * 1024);
   assert.equal(executorConfig.memoryMaxHeapUsedBytes, 1024 * 1024 * 1024);
-  assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['chat']);
+  assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['chat', 'chat-full']);
+  assert.deepEqual(executorConfig.groupCodexOverrides, new Map([['chat-full', { approvalPolicy: 'never', sandbox: 'danger-full-access' }]]));
   assert.equal(forwardConfig.executeTimeoutMs, 12 * 60 * 60 * 1000 + 10_000);
   assert.equal(forwardConfig.retryDelayMs, 60_000);
   assert.equal(forwardConfig.maxAttempts, 3);

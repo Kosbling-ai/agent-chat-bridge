@@ -1,6 +1,6 @@
 # Forward runtime and hooks
 
-The unreleased development version uses one leased Codex forward worker for human Feishu conversations. It keeps the communication worker for hook delivery and internal durable chat effects. One Feishu bot and WebSocket client feed both routes; one Codex app-server and forward worker start or observe Codex work. Thread start, resume and turn start use the protocol-defined `auto_review` approval reviewer.
+The unreleased development version uses one leased Codex forward worker for human Feishu conversations. It keeps the communication worker for hook delivery and internal durable chat effects. One Feishu bot and WebSocket client feed both routes; one Codex app-server and forward worker start or observe Codex work. Thread start, resume and turn start use the protocol-defined `auto_review` approval reviewer by default; `codex.approvalsReviewer` and a [per-group Codex override](#per-group-codex-permissions) can select another protocol reviewer.
 
 The implementation is validated with synthetic providers and disposable MySQL. It has not been connected to a real bot or model, deployed, or wired into the Kosbling business producer. The producer migration is separate work.
 
@@ -17,6 +17,25 @@ Set `routing.silentReply` (`tokens`, default `[]`; `card`, `"delete"` or `"compl
 Recalls of the bot's own messages are filtered for every group: a live `im.message.recalled_v1` event, or a history catch-up message returned as deleted, whose message ID is a recorded bot outbound message (execution card or reply in `assistant_inbound_messages`) is accepted and tombstoned but not delivered to hooks and never used as group context. Feishu recall events carry no operator, so a failed lookup logs a `recall_filter` warning and keeps hook delivery.
 
 Groups previously present only in `hooks[].conversationIds` must now also appear in `routing.groups`; use `capabilities:["hook"]` for a hook-only group. P2P rules are unchanged.
+
+### Per-group Codex permissions
+
+A `bridge` group may replace the global Codex approval and sandbox settings for the threads bound to it. This is a permission switch: a value can grant more or less than the global setting. Codex full access needs both fields:
+
+```json
+{ "conversationId": "oc_example", "trigger": "mention", "passiveContext": true, "capabilities": ["bridge", "hook"],
+  "codex": { "approvalPolicy": "never", "sandbox": "danger-full-access" } }
+```
+
+`codex.approvalPolicy` accepts `untrusted`, `on-request` or `never`; `codex.approvalsReviewer` accepts `user`, `auto_review` or `guardian_subagent`; `codex.sandbox` accepts `read-only`, `workspace-write` or `danger-full-access`. Values are compared exactly, without trimming. At least one field is required and no other key is accepted. Invalid input fails `check-config` and startup with `invalid_group_codex_fields`, `invalid_group_codex_approval_policy`, `invalid_group_codex_approvals_reviewer` or `invalid_group_codex_sandbox`; the field on a group without the `bridge` capability fails with `group_context_requires_bridge`. Each configured field replaces the global `codex.approvalPolicy`, `codex.approvalsReviewer` or `codex.sandbox` for that group; an omitted field keeps the global value. cwd and model stay global.
+
+Approval policy alone does not give full access. In codex-cli 0.153.4 a call to an MCP tool without annotations such as `readOnlyHint` requires approval. With `on-request` the approval reviewer decides. With `never` while the sandbox is still `workspace-write`, Codex rejects every such call with `MCP tool call requires approval, but approval policy is never`. Only `never` together with `danger-full-access` lets MCP tool calls and shell commands run without approval and without a sandbox.
+
+The override applies to group bindings of that chat id: the human group thread and every business-event thread whose result chat (the hook's `inbound.defaultChatId`) is this group. A private chat never matches, even if its chat id equals a configured group id. Other groups and private chats keep the global settings. The executor sends the approval policy, reviewer and sandbox on `thread/start`, `thread/resume` and `thread/fork`, and the approval policy and reviewer on every `turn/start`. `turn/start` has no `sandbox` parameter; the sandbox set when the bridge's app-server child starts, resumes or forks a thread applies to that thread's later turns.
+
+To enable it, add the `codex` object to the group in the private bridge.json, run `node bin/agent-chat-bridge.mjs check-config --config <path>`, then restart the bridge once. The bridge does not reload configuration while it runs. Existing threads need no rollover: after the restart, the new app-server child resumes each thread with the new settings before its next turn. Removing the field and restarting returns those threads to the global settings in the same way.
+
+To roll back to 0.2.20, first remove every `routing.groups[].codex` key: 0.2.20 rejects the key with `invalid_group_fields` at startup. Then switch the binary and restart.
 
 ### Group instructions
 

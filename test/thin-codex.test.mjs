@@ -1362,3 +1362,93 @@ test('turn-scoped computer use grant reuses only the same app and warning contex
     turn:{id:opened[5].turnId,status:'completed',items:[]}}});
   await second;
 });
+
+const FULL_ACCESS = Object.freeze({ approvalPolicy: 'never', approvalsReviewer: 'auto_review', sandbox: 'danger-full-access' });
+const GLOBAL_POLICY = Object.freeze({ approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', sandbox: 'workspace-write' });
+// The 0.2.20 turn/start parameter set; turn/start never carries a sandbox key.
+const TURN_START_KEYS = ['approvalPolicy', 'approvalsReviewer', 'cwd', 'effort', 'input', 'model', 'threadId'];
+const policyOf = (params) => ({ approvalPolicy: params.approvalPolicy, approvalsReviewer: params.approvalsReviewer, sandbox: params.sandbox });
+const overrideConfig = (cwd) => ({ ...config(cwd), groupCodexOverrides: new Map([
+  ['chat-custom', { approvalPolicy: 'never', sandbox: 'danger-full-access' }],
+  ['chat-reviewer', { approvalsReviewer: 'user' }],
+]) });
+
+test('a group codex override reaches thread/start and turn/start of the human and business-event threads of that group only', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const runtime = fakeRuntime();
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore(), childEnv: { PATH: '/safe/bin' }, spawnImpl: runtime.spawnImpl });
+    const run = async (input) => {
+      const from = runtime.calls.length;
+      await executor.execute({ senderName: 'User', prompt: 'hello', busyPolicy: 'steer', ...input });
+      const calls = runtime.calls.slice(from);
+      return { start: calls.find((call) => call.method === 'thread/start').params, turn: calls.find((call) => call.method === 'turn/start').params };
+    };
+    const human = await run({ bindingOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', messageId: 'm1', senderOpenId: 'ou-human' });
+    assert.deepEqual(policyOf(human.start), FULL_ACCESS);
+    assert.deepEqual(policyOf(human.turn), { ...FULL_ACCESS, sandbox: undefined });
+    assert.deepEqual(Object.keys(human.turn).sort(), TURN_START_KEYS);
+    // A business-event thread whose result chat is the group gets the same override.
+    const event = await run({ bindingOpenId: 'system:0123456789abcdef0123456789abcdef', chatId: 'chat-custom', chatType: 'group', messageId: 'm2', senderOpenId: 'system' });
+    assert.deepEqual(policyOf(event.start), FULL_ACCESS);
+    assert.deepEqual(policyOf(event.turn), { ...FULL_ACCESS, sandbox: undefined });
+    // A reviewer-only override changes the reviewer and keeps the global policy and sandbox.
+    const reviewer = await run({ bindingOpenId: 'ou-human', chatId: 'chat-reviewer', chatType: 'group', messageId: 'm3', senderOpenId: 'ou-human' });
+    assert.deepEqual(policyOf(reviewer.start), { ...GLOBAL_POLICY, approvalsReviewer: 'user' });
+    assert.deepEqual(policyOf(reviewer.turn), { ...GLOBAL_POLICY, approvalsReviewer: 'user', sandbox: undefined });
+    // Another group and a private chat whose id equals the configured group id keep the global settings.
+    for (const input of [
+      { bindingOpenId: 'ou-human', chatId: 'chat-other', chatType: 'group', messageId: 'm4', senderOpenId: 'ou-human' },
+      { bindingOpenId: 'ou-private', chatId: 'chat-custom', chatType: 'p2p', messageId: 'm5', senderOpenId: 'ou-private' },
+    ]) {
+      const global = await run(input);
+      assert.deepEqual(policyOf(global.start), GLOBAL_POLICY, input.chatType);
+      assert.deepEqual(policyOf(global.turn), { ...GLOBAL_POLICY, sandbox: undefined }, input.chatType);
+      assert.deepEqual(Object.keys(global.turn).sort(), TURN_START_KEYS, input.chatType);
+    }
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('a group codex override reaches both thread/resume paths and thread/fork, never a private chat with the same id', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-group', threadName: 'group', created: false };
+  const privateSameId = { feishuOpenId: 'ou-private', chatId: 'chat-custom', chatType: 'p2p', codexSessionId: 'thread-private', threadName: 'private', created: false };
+  const inputFor = (binding, messageId) => ({ bindingOpenId: binding.feishuOpenId, chatId: binding.chatId, chatType: binding.chatType, messageId, senderOpenId: binding.feishuOpenId, senderName: 'User', prompt: 'work', busyPolicy: 'steer' });
+  const callFor = (runtime, method, threadId) => runtime.calls.find((call) => call.method === method && call.params.threadId === threadId)?.params;
+  try {
+    // Resume before a new turn (ensureThreadReady).
+    const readyRuntime = fakeRuntime();
+    const ready = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore([group, privateSameId]), spawnImpl: readyRuntime.spawnImpl });
+    await ready.execute(inputFor(group, 'm1'));
+    await ready.execute(inputFor(privateSameId, 'm2'));
+    assert.deepEqual(policyOf(callFor(readyRuntime, 'thread/resume', 'thread-group')), FULL_ACCESS);
+    assert.deepEqual(policyOf(callFor(readyRuntime, 'turn/start', 'thread-group')), { ...FULL_ACCESS, sandbox: undefined });
+    assert.deepEqual(policyOf(callFor(readyRuntime, 'thread/resume', 'thread-private')), GLOBAL_POLICY);
+    assert.deepEqual(policyOf(callFor(readyRuntime, 'turn/start', 'thread-private')), { ...GLOBAL_POLICY, sandbox: undefined });
+    await ready.close();
+
+    // Resume of a known turn (prepareKnownResume) starts no new turn.
+    const knownRuntime = fakeRuntime({ resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+    const known = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore([group, privateSameId]), spawnImpl: knownRuntime.spawnImpl });
+    for (const binding of [group, privateSameId]) {
+      const result = await known.execute(inputFor(binding, 'job'), { resume: { threadId: binding.codexSessionId, turnId: 'known', startedAt: Date.now() - 5_000 } });
+      assert.equal(result.answer, 'known');
+    }
+    assert.equal(knownRuntime.calls.filter((call) => call.method === 'turn/start').length, 0);
+    assert.deepEqual(policyOf(callFor(knownRuntime, 'thread/resume', 'thread-group')), FULL_ACCESS);
+    assert.deepEqual(policyOf(callFor(knownRuntime, 'thread/resume', 'thread-private')), GLOBAL_POLICY);
+    await known.close();
+
+    // Fork keeps every other parameter unchanged.
+    const forkRuntime = fakeRuntime();
+    const forker = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore([group, privateSameId]), spawnImpl: forkRuntime.spawnImpl });
+    for (const binding of [group, privateSameId]) {
+      await forker.forkBinding({ binding, expectedSourceThreadId: binding.codexSessionId, onForked: async () => ({ outcome: 'succeeded' }) });
+    }
+    const forkParams = (policy, threadId) => ({ cwd, ...policy, model: 'gpt-test', threadId, ephemeral: false, deferGoalContinuation: true, config: { model_reasoning_effort: 'medium' } });
+    assert.deepEqual(callFor(forkRuntime, 'thread/fork', 'thread-group'), forkParams(FULL_ACCESS, 'thread-group'));
+    assert.deepEqual(callFor(forkRuntime, 'thread/fork', 'thread-private'), forkParams(GLOBAL_POLICY, 'thread-private'));
+    await forker.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
