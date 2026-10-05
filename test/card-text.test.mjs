@@ -29,12 +29,13 @@ test('card text providers keep their files and valid values isolated', async (t)
   const second = await cardFile();
   t.after(() => Promise.all([rm(first.directory, { recursive: true, force: true }), rm(second.directory, { recursive: true, force: true })]));
   await writeJson(first.file, { title: '甲机器人', running: '甲正在执行' });
-  await writeJson(second.file, { title: '乙机器人', completed: '乙已完成' });
+  await writeJson(second.file, { title: '乙机器人', completed: '乙已完成', processGroup: '乙的过程' });
   const firstText = createCardTextProvider({ file: first.file, log: quiet });
   const secondText = createCardTextProvider({ file: second.file, log: quiet });
 
   assert.deepEqual(await firstText(), { ...DEFAULT_CARD_TEXT, title: '甲机器人', running: '甲正在执行' });
-  assert.deepEqual(await secondText(), { ...DEFAULT_CARD_TEXT, title: '乙机器人', completed: '乙已完成' });
+  assert.deepEqual(await secondText(), { ...DEFAULT_CARD_TEXT, title: '乙机器人', completed: '乙已完成', processGroup: '乙的过程' });
+  assert.equal(DEFAULT_CARD_TEXT.processGroup, '执行过程');
 });
 
 test('card text is reread after a valid hot update', async (t) => {
@@ -159,19 +160,20 @@ test('custom card text changes visible strings while preserving answer, colors a
     forkButton: '从历史继续',
     omitted: '更早记录已隐藏',
     fallback: '将通过普通消息发送',
+    processGroup: '处理记录',
   };
-  const running = renderExecutionCard({ status: 'running', jobId: 'job-1', turnId: 'turn-1', omitted: true, entries: [] }, '# 原样答案', '默认名称', text);
+  const running = renderExecutionCard({ status: 'running', jobId: 'job-1', turnId: 'turn-1', omitted: true, entries: [{ kind: 'tool', id: 'tool-0', title: '检查', status: 'completed', summary: '' }] }, '# 原样答案', '默认名称', text);
   assert.equal(running.header.title.content, '我的执行助手');
   assert.equal(running.config.summary.content, '我的执行助手 · 忙碌中');
   assert.equal(running.header.template, 'blue');
-  assert.equal(running.body.elements[0].text.content, '更早记录已隐藏');
+  assert.equal(running.body.elements.find((element) => element.tag === 'collapsible_panel').elements[0].content, '更早记录已隐藏\n- 检查 · 顺利完成');
   assert.deepEqual(running.body.elements.find((element) => element.content === '# 原样答案'), { tag: 'markdown', content: '# 原样答案', text_size: 'heading' });
   assert.equal(running.body.elements.find((element) => element.tag === 'button').text.content, '立即停止');
   assert.deepEqual(running.body.elements.find((element) => element.tag === 'button').behaviors, [{ type: 'callback', value: { action: 'stop_execution', jobId: 'job-1', expectedTurnId: 'turn-1' } }]);
   const toolCard = renderExecutionCard({ status: 'running', entries: [{ kind: 'tool', id: 'tool-1', title: '读取配置', status: 'running', summary: '' }] }, '', '默认名称', text);
-  assert.equal(toolCard.body.elements[0].header.title.content, '1 个工具调用 · 1 个执行中');
-  assert.equal(toolCard.body.elements[0].elements[0].header.title.content, '读取配置 · 忙碌中');
-  assert.equal(toolCard.body.elements[0].elements[0].elements[0].text.content, '忙碌中');
+  const toolPanel = toolCard.body.elements.find((element) => element.tag === 'collapsible_panel');
+  assert.equal(toolPanel.header.title.content, '1 个工具调用 · 1 个执行中');
+  assert.deepEqual(toolPanel.elements, [{ tag: 'markdown', content: '- 读取配置 · 忙碌中' }]);
   const escaped = renderExecutionCard({ status: 'running', entries: [] }, '', '默认名称', { ...text, running: '忙*碌_#' });
   assert.ok(escaped.body.elements.some((element) => element.content === '**忙\\*碌\\_\\#**'));
 
@@ -181,6 +183,9 @@ test('custom card text changes visible strings while preserving answer, colors a
   const fork = failed.body.elements.find((element) => element.tag === 'button');
   assert.equal(fork.text.content, '从历史继续');
   assert.deepEqual(fork.behaviors, [{ type: 'callback', value: { action: 'fork_busy_session', jobId: 'job-2', expectedSourceThreadId: 'source-1' } }]);
+
+  const progressOnly = renderExecutionCard({ status: 'completed', entries: [{ kind: 'commentary', id: 'c', text: '核对完毕' }] }, '结论', '默认名称', text);
+  assert.equal(progressOnly.body.elements.find((element) => element.tag === 'collapsible_panel').header.title.content, '处理记录');
 
   const fallbackTitle = renderExecutionCard({ status: 'completed', entries: [] }, '', '显示名称', { ...text, title: '' });
   assert.equal(fallbackTitle.header.title.content, '显示名称');

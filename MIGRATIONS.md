@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.21`
+Application version: `0.2.22`
+
+Version 0.2.22 does not add a database migration. It compacts the execution-card layout: the answer (or latest progress while running) and the status line stay visible, and the process folds into at most one collapsed, non-nested panel. There is no configuration change, no card text key was removed or renamed (one optional key, `processGroup`, was added), and stored card state keeps its format; see the note below.
 
 Version 0.2.21 does not add a database migration. It adds the optional per-group `routing.groups[].codex` override (`approvalPolicy`, `approvalsReviewer`, `sandbox`) for `bridge` groups. It applies to the group's human thread and to business-event threads whose hook `inbound.defaultChatId` is that group. Without the field nothing changes; see the enable and rollback steps below.
 
@@ -31,6 +33,12 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.22 compact execution card
+
+No database migration, no config `schemaVersion` change, no new configuration field and no new environment variable. The sidecar card state (`messageId`, status, up to 24 progress entries, stop and fork identity) keeps its format, and every card is re-rendered from that state on each patch, so a running card created by 0.2.21 switches to the new layout on its next update and needs no conversion. Existing `feishu.cardTextFile` files keep working because no key was removed or renamed; `toolGroup`, `toolItem` and `omitted` now title, fill and head the single process panel, and tool lines no longer carry durations, exit codes or tool names. The optional new key `processGroup` (default `执行过程`) titles the panel of a finished card that has commentary but no tool call. See [the execution-card layout](docs/runtime.md) and [card text](docs/card-text.md).
+
+Upgrade: switch the binary and restart once. Rollback to 0.2.21: first remove `processGroup` from every card text file, because 0.2.21 rejects unknown fields and would fall back to default wording; then switch the binary back and restart once. Cards return to the nested-panel layout on their next patch.
 
 ## 0.2.21 per-group Codex permissions
 

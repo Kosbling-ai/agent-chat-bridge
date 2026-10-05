@@ -26,14 +26,18 @@ test('templates are single pass and unknown or malformed variables retain last v
 test('tool count and activity templates keep actual counts and callbacks', () => {
   const copy = {...DEFAULT_CARD_TEXT,toolGroup:'{count} 项行动 · {activity}',toolGroupRunning:'正在执行 {running} 项',toolGroupFinished:'全数收工',toolItem:'{title}（{status}）',toolUnknownStatus:'状态未知',cardSummary:'{title}：{status}'};
   const state = {status:'running',jobId:'job',turnId:'turn',entries:[{kind:'tool',title:'检查',status:'running'},{kind:'tool',title:'读取',status:'completed'}]};
-  const card = renderExecutionCard(state,'','Cookie',copy);
-  assert.equal(card.body.elements[0].header.title.content,'2 项行动 · 正在执行 1 项');
-  assert.equal(card.body.elements[0].elements[0].header.title.content,'检查（执行中）');
-  assert.equal(card.body.elements[0].elements[0].elements[0].text.content,'执行中');
+  const card = renderExecutionCard(state,'','Cookie',copy), panel = card.body.elements.find(x=>x.tag==='collapsible_panel');
+  assert.equal(panel.header.title.content,'2 项行动 · 正在执行 1 项');
+  assert.deepEqual(panel.elements,[{tag:'markdown',content:'- 检查（执行中）\n- 读取（已完成）'}]);
   assert.equal(card.config.summary.content,'Cookie：执行中');
   assert.deepEqual(card.body.elements.at(-1).behaviors[0].value,{action:'stop_execution',jobId:'job',expectedTurnId:'turn'});
   state.entries.forEach(x=>x.status='completed');
-  assert.equal(renderExecutionCard(state,'','Cookie',copy).body.elements[0].header.title.content,'2 项行动 · 全数收工');
+  assert.equal(renderExecutionCard(state,'','Cookie',copy).body.elements.find(x=>x.tag==='collapsible_panel').header.title.content,'2 项行动 · 全数收工');
+  state.entries[0].status='lost';
+  assert.equal(renderExecutionCard({...state,status:'completed'},'完成','Cookie',copy).body.elements.find(x=>x.tag==='collapsible_panel').elements[0].content,'- 检查（状态未知）\n- 读取（已完成）');
+  const progressOnly = {status:'completed',entries:[{kind:'commentary',id:'c',text:'只有进展'}]};
+  assert.equal(renderExecutionCard(progressOnly,'完成','Cookie',copy).body.elements.find(x=>x.tag==='collapsible_panel').header.title.content,'执行过程');
+  assert.equal(renderExecutionCard(progressOnly,'完成','Cookie',{...copy,processGroup:'{count} 过程'}).body.elements.find(x=>x.tag==='collapsible_panel').header.title.content,'{count} 过程');
 });
 
 test('missing tool summary follows hot-loaded state text instead of storing an old default', async () => {
@@ -41,6 +45,7 @@ test('missing tool summary follows hot-loaded state text instead of storing an o
   const card = new ExecutionCard({client:{im:{v1:{message:{async create(p){content=JSON.parse(p.data.content);return {code:0,data:{message_id:'m'}};},async patch(p){content=JSON.parse(p.data.content);return {code:0};}}}}},chatId:'c',uuid:'u',cardTextProvider:async()=>current,logger:{info(){},warn(){}}});
   card.push({kind:'tool',id:'t',title:'检查',status:'running'});await card.chain;card.stop();
   assert.equal(card.snapshot().entries[0].summary,'');
+  assert.equal(content.body.elements.find(x=>x.tag==='collapsible_panel').elements[0].content,'- 检查 · 开工');
   current={...current,running:'忙碌'};await card.update();
-  assert.equal(content.body.elements[0].elements[0].elements[0].text.content,'忙碌');
+  assert.equal(content.body.elements.find(x=>x.tag==='collapsible_panel').elements[0].content,'- 检查 · 忙碌');
 });

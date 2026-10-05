@@ -6,42 +6,51 @@ const panel = (id, title, elements) => ({ tag: 'collapsible_panel', element_id: 
 const md = (content, textSize) => ({ tag: 'markdown', content, ...(textSize ? { text_size: textSize } : {}) });
 const progressText = (content) => ({ tag: 'div', text: { tag: 'plain_text', content, text_size: 'normal', text_color: 'grey' } });
 const answerMd = (content) => md(content, 'heading');
+const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'deferred']);
+const CARD_BUDGET = 28000;
+const oneLine = (text) => publicText(text, 800).replace(/\s+/g, ' ').trim();
+// A plain line right after a list item would be read as that item's continuation.
+const joinLines = (lines) => lines.map((x, i) => `${i && x.kind === 'commentary' && lines[i - 1].kind === 'tool' ? '\n' : ''}${x.text}`).join('\n');
+// Visible area: answer (or latest progress while live) and status; the process
+// is one collapsed plain list, never nested panels.
 export function renderExecutionCard(state, answer = '', displayName = 'agent-chat-bridge', cardText = DEFAULT_CARD_TEXT) {
   const copy = { ...DEFAULT_CARD_TEXT, ...cardText };
   const title = copy.title || displayName;
   const statusText = copy[state.status] || copy.running;
+  const live = !TERMINAL.has(state.status);
   const entries = (state.entries || []).slice(-24);
-  const elements = [];
-  let group = [];
-  const flush = () => {
-    if (!group.length) return;
-    const running = group.filter((x) => x.status === 'running').length;
-    const activity = running ? formatText(copy.toolGroupRunning, { running }) : copy.toolGroupFinished;
-    elements.push(panel(`group_${elements.length}`, formatText(copy.toolGroup, { count: group.length, running, activity }), group.map((x, i) => {
-      const rendered = renderPublicToolEntry(x, copy);
-      const status = copy[x.status] || copy.toolUnknownStatus;
-      return panel(`tool_${elements.length}_${i}`, formatText(copy.toolItem, { title: rendered.title, status }), [progressText(rendered.summary || status)]);
-    })));
-    group = [];
-  };
-  for (const entry of entries) {
-    if (entry.kind === 'tool') group.push(entry);
-    else { flush(); elements.push(progressText(publicText(entry.text, 800))); }
-  }
-  flush();
-  if (state.status === 'running' && state.progressUnavailable) elements.unshift(progressText(copy.progressUnavailable));
-  if (state.omitted) elements.unshift(progressText(copy.omitted));
+  const tools = entries.filter((x) => x.kind === 'tool');
+  const running = live ? tools.filter((x) => x.status === 'running').length : 0;
+  // One line per tool: durations, exit codes and tool names stay out of the card.
+  const toolLine = (x) => `- ${escapeMarkdown(formatText(copy.toolItem, { title: renderPublicToolEntry(x, copy).title, status: copy[x.status] || copy.toolUnknownStatus }))}`;
+  // Live cards list tools only; terminal cards keep commentary and tools in time order.
+  const lines = state.silent ? [] : (live ? tools : entries).map((x) => x.kind === 'tool' ? { kind: 'tool', text: toolLine(x) }
+    : oneLine(x.text) ? { kind: 'commentary', text: `· ${escapeMarkdown(oneLine(x.text))}` } : null).filter(Boolean);
+  const groupTitle = tools.length ? formatText(copy.toolGroup, { count: tools.length, running, activity: running ? formatText(copy.toolGroupRunning, { running }) : copy.toolGroupFinished }) : copy.processGroup;
+  const head = [];
   // A silent completion never renders the Agent's answer, only neutral card copy.
-  if (state.silent) elements.push(md(escapeMarkdown(copy.silentReply)));
-  else if (answer) elements.push(answerMd(answer));
-  if (!elements.length) elements.push(progressText(copy.received));
-  elements.push(md(`**${escapeMarkdown(formatText(copy.statusFooter, { status: statusText }))}**${state.delivery === 'fallback' ? escapeMarkdown(formatText(copy.fallbackSuffix, { fallback: copy.fallback })) : ''}`));
-  if (state.status === 'running' && state.turnId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.stopButton }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
-  if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) elements.push({ tag: 'button', text: { tag: 'plain_text', content: copy.forkButton }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
-  let card = { schema: '2.0', config: { update_multi: true, summary: { content: formatText(copy.cardSummary, { title, status: statusText }) } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: title } }, body: { elements } };
-  // IM cards are limited to 30 KB, including UTF-8 and JSON scaffolding.
-  while (Buffer.byteLength(JSON.stringify(card)) > 28000 && card.body.elements.length > (answer || state.silent ? 2 : 1)) card.body.elements.shift();
-  if (Buffer.byteLength(JSON.stringify(card)) > 28000) throw new Error('card final answer exceeds budget');
+  if (state.silent) head.push(md(escapeMarkdown(copy.silentReply)));
+  else if (answer) head.push(answerMd(answer));
+  else if (live) {
+    const latest = entries.findLast((x) => x.kind === 'commentary' && String(x.text || '').trim());
+    head.push(progressText(latest ? publicText(latest.text, 800) : copy.received));
+  }
+  if (state.status === 'running' && state.progressUnavailable) head.push(progressText(copy.progressUnavailable));
+  head.push(md(`**${escapeMarkdown(formatText(copy.statusFooter, { status: statusText }))}**${state.delivery === 'fallback' ? escapeMarkdown(formatText(copy.fallbackSuffix, { fallback: copy.fallback })) : ''}`));
+  const tail = [];
+  if (state.status === 'running' && state.turnId && state.jobId) tail.push({ tag: 'button', text: { tag: 'plain_text', content: copy.stopButton }, type: 'danger', behaviors: [{ type: 'callback', value: { action: 'stop_execution', jobId: state.jobId, expectedTurnId: state.turnId } }] });
+  if (state.status === 'failed' && state.forkSourceThreadId && state.jobId) tail.push({ tag: 'button', text: { tag: 'plain_text', content: copy.forkButton }, type: 'primary', behaviors: [{ type: 'callback', value: { action: 'fork_busy_session', jobId: state.jobId, expectedSourceThreadId: state.forkSourceThreadId } }] });
+  const build = (kept, omitted, withPanel) => {
+    const body = joinLines([...(omitted ? [{ kind: 'note', text: escapeMarkdown(copy.omitted) }] : []), ...kept]);
+    return { schema: '2.0', config: { update_multi: true, summary: { content: formatText(copy.cardSummary, { title, status: statusText }) } }, header: { template: state.status === 'failed' ? 'red' : state.status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: title } }, body: { elements: [...head, ...(withPanel ? [panel('process', groupTitle, [md(body)])] : []), ...tail] } };
+  };
+  // IM cards are limited to 30 KB, including UTF-8 and JSON scaffolding. The
+  // oldest process lines go first, then the panel; the answer is never cut.
+  const fits = (value) => Buffer.byteLength(JSON.stringify(value)) <= CARD_BUDGET;
+  let kept = lines, omitted = Boolean(state.omitted), card = build(kept, omitted, lines.length > 0);
+  while (!fits(card) && kept.length) { kept = kept.slice(1); omitted = true; card = build(kept, omitted, true); }
+  if (!fits(card)) card = build([], false, false);
+  if (!fits(card)) throw new Error('card final answer exceeds budget');
   return card;
 }
 export class ExecutionCard {

@@ -14,6 +14,8 @@ function fixture(saved, overrides = {}, options = {}) {
   return { card, calls, persisted };
 }
 const tool = (id, status = 'running') => ({ kind: 'tool', id, title: '读取信息', status, summary: '正在处理' });
+const panels = (elements) => elements.flatMap((element) => element.tag === 'collapsible_panel' ? [element, ...panels(element.elements || [])] : []);
+const processPanel = (card) => card.body.elements.find((element) => element.tag === 'collapsible_panel');
 function manualPollClock() {
   let callback; let time = 0; let cleared = false;
   return {
@@ -25,7 +27,7 @@ function manualPollClock() {
   };
 }
 
-test('one message has commentary, nested tools and final answer; replay patches same id', async () => {
+test('one message puts the final answer first and the process in one flat panel; replay patches same id', async () => {
   const { card, calls, persisted } = fixture();
   card.push({ kind: 'started' }); await card.chain;
   card.push({ kind: 'commentary', id: 'c', text: '我先核对记录。' });
@@ -36,31 +38,103 @@ test('one message has commentary, nested tools and final answer; replay patches 
   assert.equal(final.config.update_multi, true);
   assert.equal(final.config.summary.content, 'agent-chat-bridge · 已完成');
   assert.equal(final.header.title.content, 'agent-chat-bridge');
-  assert.ok(JSON.stringify(final).includes('最终答案'));
-  assert.equal(final.body.elements[1].tag, 'collapsible_panel');
-  assert.equal(final.body.elements[1].elements[0].tag, 'collapsible_panel');
-  assert.deepEqual(final.body.elements[0], { tag: 'div', text: { tag: 'plain_text', content: '我先核对记录。', text_size: 'normal', text_color: 'grey' } });
-  assert.deepEqual(final.body.elements[1].elements[0].elements[0], { tag: 'div', text: { tag: 'plain_text', content: '正在处理', text_size: 'normal', text_color: 'grey' } });
-  const answer = final.body.elements.find((element) => element.content === '最终答案');
-  assert.equal(answer.text_size, 'heading');
+  assert.deepEqual(final.body.elements.map((element) => element.tag), ['markdown', 'markdown', 'collapsible_panel']);
+  assert.deepEqual(final.body.elements[0], { tag: 'markdown', content: '最终答案', text_size: 'heading' });
+  assert.deepEqual(final.body.elements[1], { tag: 'markdown', content: '**已完成**' });
+  assert.equal(panels(final.body.elements).length, 1);
+  assert.equal(final.body.elements[2].expanded, false);
+  assert.equal(final.body.elements[2].header.title.content, '1 个工具调用 · 已结束');
+  assert.deepEqual(final.body.elements[2].elements, [{ tag: 'markdown', content: '· 我先核对记录。\n- 读取信息 · 已完成' }]);
   const replay = fixture(persisted.at(-1));
   assert.equal(await replay.card.finish('最终答案'), true);
   assert.equal(replay.calls[0].method, 'patch');
   assert.equal(replay.calls[0].payload.path.message_id, 'om_card');
 });
 
-test('progress uses normal grey plain text while final Markdown stays intact and larger', () => {
+test('live progress is grey plain text; final Markdown stays intact and larger; history is escaped one line each', () => {
   const commentary = '过程段落\n\n- 一项\n- 二项\n\n```js\nconst value = 1;\n```';
   const answer = '# 最终标题\n\n正文包含 **加粗**。\n\n1. 第一项\n2. 第二项\n\n```js\nconst answer = 42;\n```';
-  const card = renderExecutionCard({ status: 'completed', entries: [{ kind: 'commentary', id: 'c', text: commentary }] }, answer);
-  assert.deepEqual(card.body.elements[0], { tag: 'div', text: { tag: 'plain_text', content: commentary, text_size: 'normal', text_color: 'grey' } });
-  assert.deepEqual(card.body.elements[1], { tag: 'markdown', content: answer, text_size: 'heading' });
-  assert.deepEqual(card.body.elements[2], { tag: 'markdown', content: '**已完成**' });
+  const entries = [{ kind: 'commentary', id: 'c', text: commentary }];
+  const running = renderExecutionCard({ status: 'running', entries });
+  assert.deepEqual(running.body.elements, [
+    { tag: 'div', text: { tag: 'plain_text', content: commentary, text_size: 'normal', text_color: 'grey' } },
+    { tag: 'markdown', content: '**执行中**' },
+  ]);
+  const card = renderExecutionCard({ status: 'completed', entries }, answer);
+  assert.deepEqual(card.body.elements[0], { tag: 'markdown', content: answer, text_size: 'heading' });
+  assert.deepEqual(card.body.elements[1], { tag: 'markdown', content: '**已完成**' });
+  assert.equal(card.body.elements[2].header.title.content, '执行过程');
+  assert.deepEqual(card.body.elements[2].elements, [{ tag: 'markdown', content: '· 过程段落 - 一项 - 二项 \\`\\`\\`js const value = 1; \\`\\`\\`' }]);
+  assert.equal(card.body.elements.length, 3);
+});
+
+test('terminal history keeps time order and starts a commentary after a tool line on a new paragraph', () => {
+  const entries = [tool('t1', 'completed'), { kind: 'commentary', id: 'c', text: '中间说明' }, tool('t2', 'interrupted')];
+  const card = renderExecutionCard({ status: 'interrupted', entries }, '已停止');
+  assert.equal(processPanel(card).header.title.content, '2 个工具调用 · 已结束');
+  assert.equal(processPanel(card).elements[0].content, '- 读取信息 · 已完成\n\n· 中间说明\n- 读取信息 · 已中断');
+});
+
+test('running card shows only the latest progress, then status, one plain tool-line panel and the stop button', () => {
+  const entries = [
+    { kind: 'commentary', id: 'c1', text: '先读规则。', at: 1 },
+    { kind: 'tool', id: 't1', title: 'rules_get · 读取信息', summary: '工具：rules_get', presentation: { version: 1, kind: 'tool', variant: 'read', data: { name: 'rules_get', durationMs: 31 } }, status: 'completed', at: 2 },
+    { kind: 'commentary', id: 'c2', text: '再查订单。', at: 3 },
+    { kind: 'tool', id: 't2', title: 'order_search · 处理订单', summary: '', presentation: { version: 1, kind: 'tool', variant: 'order', data: { name: 'order_search' } }, status: 'running', at: 4 },
+    { kind: 'tool', id: 't3', title: '旧版工具', summary: '耗时：3.0 秒\n工具：legacy', status: 'failed', at: 5 },
+  ];
+  const card = renderExecutionCard({ status: 'running', jobId: 'job', turnId: 'turn', omitted: true, entries });
+  assert.deepEqual(card.body.elements.map((element) => element.tag), ['div', 'markdown', 'collapsible_panel', 'button']);
+  assert.equal(card.body.elements[0].text.content, '再查订单。');
+  assert.doesNotMatch(JSON.stringify(card.body.elements.slice(0, 2)), /先读规则/);
+  assert.equal(card.body.elements[1].content, '**执行中**');
+  const panel = card.body.elements[2];
+  assert.equal(panel.header.title.content, '3 个工具调用 · 1 个执行中');
+  assert.deepEqual(panel.elements, [{ tag: 'markdown', content: [
+    '较早的执行过程已收起，仅展示最近进度。',
+    '- rules\\_get · 读取信息 · 已完成',
+    '- order\\_search · 处理订单 · 执行中',
+    '- 旧版工具 · 执行失败',
+  ].join('\n') }]);
+  assert.doesNotMatch(JSON.stringify(panel), /｜|耗时|工具：/);
+  assert.equal(panels(card.body.elements).length, 1);
+  assert.doesNotMatch(JSON.stringify(panel), /先读规则|再查订单/);
+  assert.equal(card.body.elements[3].behaviors[0].value.action, 'stop_execution');
+});
+
+test('a live card without tools has no panel and falls back to the received notice', () => {
+  const card = renderExecutionCard({ status: 'retrying', omitted: true, entries: [{ kind: 'commentary', id: 'c', text: '   ' }] });
+  assert.deepEqual(card.body.elements, [
+    { tag: 'div', text: { tag: 'plain_text', content: '已收到，正在处理你的请求。', text_size: 'normal', text_color: 'grey' } },
+    { tag: 'markdown', content: '**连接恢复中**' },
+  ]);
+  const terminal = renderExecutionCard({ status: 'interrupted', entries: [] }, '');
+  assert.deepEqual(terminal.body.elements, [{ tag: 'markdown', content: '**已中断**' }]);
+});
+
+test('process lines are dropped oldest first, then the panel, but the answer is never cut', () => {
+  const entries = Array.from({ length: 24 }, (_, i) => ({ kind: 'commentary', id: `c${i}`, text: `第${i}段` + '长'.repeat(790), at: i }));
+  const card = renderExecutionCard({ status: 'completed', entries }, '完整答复');
+  assert.ok(Buffer.byteLength(JSON.stringify(card)) <= 28000);
+  assert.equal(card.body.elements[0].content, '完整答复');
+  const content = processPanel(card).elements[0].content;
+  assert.ok(content.startsWith('较早的执行过程已收起，仅展示最近进度。\n· 第'));
+  assert.doesNotMatch(content, /第0段/);
+  assert.match(content, /第23段/);
+  const lines = content.split('\n');
+  const first = Number(lines[1].match(/第(\d+)段/)[1]);
+  assert.deepEqual(lines.slice(1).map((line) => Number(line.match(/第(\d+)段/)[1])), Array.from({ length: 24 - first }, (_, i) => first + i));
+
+  const base = Buffer.byteLength(JSON.stringify(renderExecutionCard({ status: 'completed', entries: [] }, 'a')));
+  const answer = 'a'.repeat(28000 - base + 1 - 40);
+  const tight = renderExecutionCard({ status: 'completed', entries: [{ kind: 'commentary', id: 'c', text: '过程' }] }, answer);
+  assert.deepEqual(tight.body.elements, [{ tag: 'markdown', content: answer, text_size: 'heading' }, { tag: 'markdown', content: '**已完成**' }]);
+  assert.throws(() => renderExecutionCard({ status: 'completed', entries }, 'a'.repeat(28000)), /card final answer exceeds budget/);
 });
 
 test('temporary progress-unavailable state is visible only while running', () => {
   const running = renderExecutionCard({ status: 'running', progressUnavailable: true, entries: [] });
-  assert.equal(running.body.elements[0].text.content, '进度暂不可用，任务仍在后台执行。');
+  assert.deepEqual(running.body.elements.map((element) => element.text?.content || element.content), ['已收到，正在处理你的请求。', '进度暂不可用，任务仍在后台执行。', '**执行中**']);
   const completed = renderExecutionCard({ status: 'completed', progressUnavailable: true, entries: [] }, '# 最终答案');
   assert.doesNotMatch(JSON.stringify(completed), /进度暂不可用/);
   assert.ok(JSON.stringify(completed).includes('# 最终答案'));
@@ -108,9 +182,13 @@ test('failure and interrupt close running tools, late progress cannot overwrite 
   }
 });
 
-test('rendered history has bounded UTF8 bytes with nested tool groups', () => {
-  const state = { status: 'running', entries: Array.from({ length: 100 }, (_, i) => i % 2 ? tool(`t${i}`) : { kind: 'commentary', id: `c${i}`, text: '长'.repeat(2000) }) };
-  assert.ok(Buffer.byteLength(JSON.stringify(renderExecutionCard(state))) < 30000);
+test('rendered history has bounded UTF8 bytes and at most one panel', () => {
+  for (const status of ['running', 'completed', 'failed']) {
+    const state = { status, entries: Array.from({ length: 100 }, (_, i) => i % 2 ? tool(`t${i}`) : { kind: 'commentary', id: `c${i}`, text: '长'.repeat(2000) }) };
+    const card = renderExecutionCard(state, status === 'running' ? '' : '答复');
+    assert.ok(Buffer.byteLength(JSON.stringify(card)) < 30000);
+    assert.equal(panels(card.body.elements).length, 1);
+  }
 });
 
 test('observer advances cursor through unrelated rows without exposing them', async () => {
@@ -360,6 +438,10 @@ test('stop button belongs to the original live turn and disappears at completion
  const card = renderExecutionCard(state);
  const button = card.body.elements.find(x=>x.tag==='button');
  assert.equal(button.behaviors[0].value.expectedTurnId, 'original-turn');
+ assert.equal(card.body.elements.at(-1), button);
+ const failed = renderExecutionCard({ ...state, status:'failed', forkSourceThreadId:'source', entries:[tool('t','completed')] }, '失败原因');
+ assert.deepEqual(failed.body.elements.map(x=>x.tag), ['markdown','markdown','collapsible_panel','button']);
+ assert.equal(failed.body.elements.at(-1).behaviors[0].value.action, 'fork_busy_session');
  assert.equal(renderExecutionCard({...state,status:'interrupted'}).body.elements.some(x=>x.tag==='button'),false);
 });
 
@@ -372,7 +454,7 @@ test('silent completion closes the existing card with neutral copy and never ren
   const final = JSON.parse(calls[0].payload.data.content);
   assert.equal(final.header.template, 'green');
   assert.equal(final.config.summary.content, 'agent-chat-bridge · 已完成');
-  assert.ok(final.body.elements.some(element => element.tag === 'markdown' && element.content === '已处理，无需回复。'));
+  assert.deepEqual(final.body.elements, [{ tag: 'markdown', content: '已处理，无需回复。' }, { tag: 'markdown', content: '**已完成**' }]);
   assert.doesNotMatch(JSON.stringify(final), /stop_execution|NO_REPLY/);
   assert.equal(card.snapshot().silent, 'completed');
   assert.equal(card.snapshot().entries[0].status, 'completed');

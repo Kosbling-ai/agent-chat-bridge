@@ -27,9 +27,11 @@ Supported fields and placeholders are listed below. Values are nonempty, single-
 
 Card text is presentation configuration owned by the bridge. Enabling it does not add the file path, field list or editing rules to Codex prompts. Edit the configured JSON file directly; the bridge hot-loads the result on the next card update. The text applies to all conversations of that bot. Separate files isolate presentation settings, not OS permissions between agents sharing one macOS account.
 
+Since 0.2.22 the execution card has a single collapsed process panel: `toolGroup` (with `toolGroupRunning` or `toolGroupFinished` as `{activity}`) is its title, or `processGroup` when a finished card has commentary but no tool call; each tool is one list line built from `toolItem` only, and `omitted` is the panel's first line when older lines were dropped. `received` and `progressUnavailable` stay in the visible area of a running card. The execution card no longer shows durations, exit codes or tool-name rows, so `durationLabel`, `durationTemplate`, `exitCodeLabel`, `commandLabel`, `toolLabel` and `fieldTemplate` stay accepted but have no visible effect there. Every existing field keeps its name, so an existing text file needs no change. `processGroup` is new in 0.2.22; remove it from the file before rolling back to 0.2.21, which rejects unknown fields.
+
 Execution-card text and user-input form text are configurable. Tool counts, running counts, durations, exit codes and safe tool/file names come from actual events. Templates customize labels and formatting, not underlying execution state. Model-authored commentary, answers, question/option contents, legacy API reply cards, Typing fallback messages and action-response toasts are outside this facility. Actions, status transitions and backgrounds are unchanged. No database migration is required.
 
-New tool events retain bounded, sanitized presentation metadata, so an active card can re-render their labels with updated wording. Older saved tool entries without metadata retain their recorded title/summary; the containing panels and card labels still use current copy. Raw shell text, arguments and tool output are never added to this metadata.
+New tool events retain bounded, sanitized presentation metadata, so an active card can re-render their labels with updated wording. Older saved tool entries without metadata retain their recorded title/summary; the process panel and card labels still use current copy. Raw shell text, arguments and tool output are never added to this metadata.
 
 Example: change only these fields in your bot's existing text file:
 
@@ -66,6 +68,7 @@ Example: change only these fields in your bot's existing text file:
 | `toolGroupFinished` | 已结束 | — |
 | `toolItem` | {title} · {status} | `{title}`, `{status}` |
 | `toolUnknownStatus` | 已结束 | — |
+| `processGroup` | 执行过程 | — |
 | `cardSummary` | {title} · {status} | `{title}`, `{status}` |
 | `statusFooter` | {status} | `{status}` |
 | `fallbackSuffix` |  · {fallback} | `{fallback}` |
