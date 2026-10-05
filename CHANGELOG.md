@@ -1,20 +1,20 @@
 # Changelog
 
-## [0.2.24] — Unreleased
+## [0.2.25] — Unreleased
 
 - Offer explicit current-turn Computer Use app approval to avoid a separate card for every keypress, paste and window read. Keep one-request approval and denial available.
 - Scope grants to the live executor turn and app approval context; changed risk/warnings require a new decision. Disconnects, completion and restarts discard grants. No MCP session/permanent permission is persisted.
 
 No database migration is needed.
 
-## [0.2.23] — Unreleased
+## [0.2.24] — Unreleased
 
 - Fix question-card submit buttons to declare the JSON 2.0 callback behavior, carrying the existing request identity through the form submission.
 - Exercise authenticated one-shot submission using the callback payload from the rendered card, and log callback arrival without answers or user data.
 
 No database migration is needed. Expired cards remain expired; request a new approval after upgrading.
 
-## [0.2.22] — Unreleased
+## [0.2.23] — Unreleased
 
 - Add opt-in `codex.computerUse` support for bundled `cua_repl` native-app approval elicitations. Forward recognized requests to the initiating user's Feishu interaction card, and send explicit allow/decline results back to the same live Codex request. Ordinary MCP tool calls are unchanged.
 - Reuse durable card identity, actor authorization, one-shot submission and expiry handling. Do not automatically approve apps or persist permanent grants. Unsupported MCP forms, URL/auth challenges, audio recording and requests without a correlated turn are cancelled.
@@ -22,6 +22,13 @@ No database migration is needed. Expired cards remain expired; request a new app
 - Add isolated MySQL regression coverage for missing native IDs, mismatched identities and authenticated submission; retain bounded failure codes for card admission diagnostics.
 
 No database migration is needed. The installed Codex Computer Use runtime and OS permissions remain prerequisites; this option does not install plugins or grant OS access.
+
+## [0.2.22] — Unreleased
+
+- Compact the execution card to the shared Feishu card layout. The visible area holds only key content and the process folds into at most one collapsed panel, never nested panels. A running card shows the latest public commentary (or `received`), the progress-unavailable notice when it applies, the status line, one panel titled by `toolGroup` whose single Markdown block lists one line per tool (`- {toolItem}`, without durations, exit codes or tool names), and the stop button. Completed, failed, interrupted and deferred cards show the final answer and status line first, then one `N 个工具调用 · 已结束` panel (titled by the new card text key `processGroup`, default `执行过程`, when there was commentary but no tool call) with all retained commentary (`· ` prefix) and tool lines in time order, then the fork button on a failed busy card; a card without commentary or tools has no panel. Silent completion shows only `silentReply` and the status line. Per-tool panels and separate duration/tool-name rows are gone.
+- The 28 KB card budget now drops the oldest panel lines first (the panel then starts with `omitted`), then the panel; the final answer is never truncated and still selects the ordinary-message fallback when it alone exceeds the budget.
+
+No database migration and no configuration change are needed. No card text key was removed or renamed, so existing `feishu.cardTextFile` files keep working; the only new key is the optional `processGroup`, which 0.2.21 rejects, so remove it before rolling back. Stored card state is unchanged; a card created by 0.2.21 switches to the new layout on its next patch.
 
 ## [0.2.21] — Unreleased
 

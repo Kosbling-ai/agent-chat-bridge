@@ -2,11 +2,13 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.24`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.25`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
 
-0.2.22 新增 `codex.computerUse`（布尔值，默认 `false`），用于把 Computer Use 的应用授权请求转成飞书交互卡片。无数据库迁移，不自动安装插件或授予系统权限。修改配置后重启服务，旧卡片会失效。详见 [Computer Use](docs/computer-use.md)。
+0.2.23 新增 `codex.computerUse`（布尔值，默认 `false`），用于把 Computer Use 的应用授权请求转成飞书交互卡片。无数据库迁移，不自动安装插件或授予系统权限。修改配置后重启服务，旧卡片会失效。详见 [Computer Use](docs/computer-use.md)。
 
-0.2.22 同时修复运行中任务尚未持久化轮次标识时授权卡片无法发送的问题。仅允许已匹配的活动执行器补全缺失标识，不覆盖已有绑定，无数据库迁移或配置变更。
+0.2.23 同时修复运行中任务尚未持久化轮次标识时授权卡片无法发送的问题。仅允许已匹配的活动执行器补全缺失标识，不覆盖已有绑定，无数据库迁移或配置变更。
+
+0.2.22 不增加数据库迁移、不改配置 `schemaVersion`、不新增配置字段或环境变量。执行卡按统一卡片版式压缩：可见区只保留答复（运行中为最近一条进展）和状态行，执行过程最多折叠进一个面板，不再嵌套每个工具一个面板，也不再单列耗时/工具名行。卡片 sidecar 状态格式不变，每次 patch 都按状态重新渲染，0.2.21 创建的运行卡在下一次更新时即换成新版式，无需转换。卡片文案键没有删除或改名，已有 `feishu.cardTextFile` 继续有效；`toolGroup`、`toolItem`、`omitted` 现在分别是唯一过程面板的标题、每行工具文案和面板首行，工具行不再附耗时、退出码或工具名。新增可选键 `processGroup`（缺省「执行过程」），用于只有进展、没有工具调用的终态卡面板标题。升级：切换版本并重启一次。回退到 0.2.21：先从所有卡片文案文件删掉 `processGroup`（0.2.21 会拒绝未知字段并退回缺省文案），再切回旧版本并重启一次，卡片在下一次 patch 时恢复嵌套面板版式。
 
 0.2.21 不增加数据库迁移、不改配置 `schemaVersion`、不新增环境变量。新增可选的按群 Codex 权限覆盖 `routing.groups[].codex`，只允许 `bridge` 群使用（hook-only 群报 `group_context_requires_bridge`）。可写键：`approvalPolicy`（`untrusted`、`on-request`、`never`）、`approvalsReviewer`（`user`、`auto_review`、`guardian_subagent`）、`sandbox`（`read-only`、`workspace-write`、`danger-full-access`），至少写一个，取值精确匹配、不做首尾去空白；空对象或未知键报 `invalid_group_codex_fields`，非法值分别报 `invalid_group_codex_approval_policy`、`invalid_group_codex_approvals_reviewer`、`invalid_group_codex_sandbox`。写了的字段替换对应的全局 `codex.approvalPolicy`、`codex.approvalsReviewer`、`codex.sandbox`，可以比全局更宽或更严；没写的字段沿用全局，cwd 与 model 始终沿用全局。不配置时所有线程沿用全局设置，发给 Codex 的请求参数与 0.2.20 相同。作用范围：该 chat_id 的群绑定，即该群的人类群线程，以及 hook `inbound.defaultChatId` 为该群的业务事件线程；私聊即使 chat_id 与配置的群相同也不命中，其它群不变。bridge 在 `thread/start`、`thread/resume`、`thread/fork` 上下发审批策略、reviewer 和沙箱，在每次 `turn/start` 上下发审批策略和 reviewer；`turn/start` 没有 `sandbox` 参数，线程新建、恢复或分叉时设定的沙箱对之后的 turn 持续生效。Codex 完全权限要两项一起：`"approvalPolicy": "never"` 加 `"sandbox": "danger-full-access"`。只设 `never` 而沙箱仍是 `workspace-write` 时，需要审批的 MCP 工具调用（codex-cli 0.153.4 中没有 `readOnlyHint` 等注解的 MCP 工具每次调用都需要审批）会被 Codex 直接拒绝，错误为 `MCP tool call requires approval, but approval policy is never`。启用：① 在私有 bridge.json 对应群条目加 `"codex": { "approvalPolicy": "never", "sandbox": "danger-full-access" }`；② 运行 `node bin/agent-chat-bridge.mjs check-config --config <路径>`；③ 重启 bridge 一次（bridge 运行中不热重载配置）。已存在的线程无需轮换：重启后新的 app-server 子进程会在下一次 turn 前带新设置恢复该线程。在 0.2.21 上关闭：删掉该对象后重启一次，线程在下一次 turn 回到全局设置。回退到 0.2.20：① 先删掉所有 `routing.groups[]` 的 `codex` 键，否则 0.2.20 严格校验会以 `invalid_group_fields` 拒绝启动；② 切换版本并重启一次。
 

@@ -4,7 +4,7 @@
 
 英文文档和实际代码是主契约；API、配置字段、命令和结构化日志保持英文。
 
-版本：`0.2.24`，当前为未发布开发版；0.2.21 新增 `routing.groups[].codex` 按群覆盖 Codex 权限（`approvalPolicy`、`approvalsReviewer`、`sandbox`），作用于该 `bridge` 群的人类群线程，以及 hook `inbound.defaultChatId` 为该群的业务事件线程；私聊和其它群不变。Codex 完全权限需要 `approvalPolicy: "never"` 与 `sandbox: "danger-full-access"` 同时设置，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.1.1 是此前实现版本。0.2.5 增加多 bot 共用专用 bridge MySQL schema 所需的迁移 004，旧 assistant 数据必须显式指定原 bot 的连接 ID；还可把 Codex 支持的用户提问映射为当前 turn 的独立飞书卡片，由原发送者一次提交多道单选或自由填空。此能力默认禁用，需显式配置 `codex.requestUserInput:true` 才启用；secret 提问会被拒绝，过期或断线后的请求不能恢复。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
+版本：`0.2.25`，当前为未发布开发版；0.2.22 压缩执行卡：可见区只保留答复（运行中为最近一条进展）和状态行，执行过程最多折叠进一个不嵌套的面板，卡片文案键未删改（新增可选键 `processGroup`），已存状态不变。0.2.21 新增 `routing.groups[].codex` 按群覆盖 Codex 权限（`approvalPolicy`、`approvalsReviewer`、`sandbox`），作用于该 `bridge` 群的人类群线程，以及 hook `inbound.defaultChatId` 为该群的业务事件线程；私聊和其它群不变。Codex 完全权限需要 `approvalPolicy: "never"` 与 `sandbox: "danger-full-access"` 同时设置，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.1.1 是此前实现版本。0.2.5 增加多 bot 共用专用 bridge MySQL schema 所需的迁移 004，旧 assistant 数据必须显式指定原 bot 的连接 ID；还可把 Codex 支持的用户提问映射为当前 turn 的独立飞书卡片，由原发送者一次提交多道单选或自由填空。此能力默认禁用，需显式配置 `codex.requestUserInput:true` 才启用；secret 提问会被拒绝，过期或断线后的请求不能恢复。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
 
 这是独立的飞书 + Codex bridge。一个进程持有一套飞书 bot/WebSocket 和一个 Codex app-server/executor；MySQL 使用 bridge 自己的 schema。communication worker 负责 hook 和已登记消息 outbox，唯一的 forward worker 负责 Codex 执行、恢复、卡片、Typing、停止和答案/附件投递。
 

@@ -11,7 +11,7 @@ export const DEFAULT_CARD_TEXT = Object.freeze({
   omitted: '较早的执行过程已收起，仅展示最近进度。', fallback: '结果将通过普通消息送达',
   progressUnavailable: '进度暂不可用，任务仍在后台执行。',
   toolGroup: '{count} 个工具调用 · {activity}', toolGroupRunning: '{running} 个执行中',
-  toolGroupFinished: '已结束', toolItem: '{title} · {status}', toolUnknownStatus: '已结束',
+  toolGroupFinished: '已结束', toolItem: '{title} · {status}', toolUnknownStatus: '已结束', processGroup: '执行过程',
   cardSummary: '{title} · {status}', statusFooter: '{status}', fallbackSuffix: ' · {fallback}',
   inputSubmitted: '回答已提交。', inputUnknown: '提交状态未确认，请勿重复提交。', inputExpired: '该提问已失效。',
   inputChoose: '请选择', inputOther: '其他（请填写）', inputAnswer: '请输入回答', inputSubmit: '提交回答',

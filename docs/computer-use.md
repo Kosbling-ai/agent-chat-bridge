@@ -30,7 +30,7 @@ Only the bundled `cua_repl` server's recognized `computer-use` native app-access
 
 After deployment, ask the bot to read a harmless app window. Confirm the app identifier on the resulting card, choose an answer, and check the resulting tool output. Test denial as well as acceptance. A green `/health/ready` only shows component readiness; it does not prove an app was read or a browser page was loaded.
 
-If submitting a card has no effect, use a freshly generated card after upgrading to 0.2.23 or later. JSON 2.0 form buttons must declare a `behaviors` callback. Check `feishu_card_callback received`, then `user_input_submit received`, and the durable answer state; logs omit the answers. If the first event is absent, also verify the app subscribes to `card.action.trigger`.
+If submitting a card has no effect, use a freshly generated card after upgrading to 0.2.24 or later. JSON 2.0 form buttons must declare a `behaviors` callback. Check `feishu_card_callback received`, then `user_input_submit received`, and the durable answer state; logs omit the answers. If the first event is absent, also verify the app subscribes to `card.action.trigger`.
 
 If no card appears, verify the option in that bot's actual `bridge.json`, its Codex home/plugin registration, and the installed runtime version. A Cloudflare page is a website verification issue, not a bridge approval failure. Do not work around managed or OS access denials.
 
