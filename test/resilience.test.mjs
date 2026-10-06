@@ -243,3 +243,66 @@ test('service executor log adapter forwards only diagnostic allowlist fields', (
     stage: 'write', error_class: 'store_contention', errno: 1205, sql_state: 'HY000', will_retry: true,
   });
 });
+
+test('uncertain claim commit recovers without stopping the communication worker', async () => {
+  let claims = 0, releaseRetry, releaseIdle;
+  const logs = [];
+  const runtime = createCommunicationRuntime({ config, chat: {}, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() { if (++claims === 1) throw new StoreError('commit_unknown', {reason:'commit_timeout'}); return []; },
+      async claimOutbox() { return []; },
+    },
+    wait: async ms => { if (ms === 1000) await new Promise(r => { releaseRetry = r; }); else await new Promise(r => { releaseIdle = r; }); },
+  });
+  runtime.start();
+  while (!releaseRetry) await immediate();
+  assert.equal(runtime.status().running, true);
+  assert.equal(logs[0][3].reason, 'commit_timeout');
+  assert.equal(logs[0][3].willRetry, true);
+  releaseRetry();
+  while (!releaseIdle) await immediate();
+  assert.equal(runtime.status().healthy, true);
+  assert.equal(runtime.status().consecutiveFailures, 0);
+  await runtime.stop(); releaseIdle();
+});
+
+test('persistently uncertain claims still exhaust the bounded retry budget', async () => {
+  let clock = 0;
+  const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock,
+    store: { async claimJobs() { throw new StoreError('commit_unknown'); } },
+    wait: async ms => { clock += ms; },
+  });
+  runtime.start();
+  while (runtime.status().running) await immediate();
+  assert.equal(runtime.status().healthy, false);
+  assert.equal(runtime.status().consecutiveFailures, 6);
+  await runtime.stop();
+});
+
+test('idle communication polling backs off to one second and shutdown wakes it', async () => {
+  const waits = []; let releaseIdle;
+  const runtime = createCommunicationRuntime({ config, chat: {},
+    store: { async claimJobs() { return []; }, async claimOutbox() { return []; } },
+    wait: async ms => { waits.push(ms); if (waits.length === 6) await new Promise(r => { releaseIdle = r; }); },
+  });
+  runtime.start();
+  while (!releaseIdle) await immediate();
+  assert.deepEqual(waits, [100, 200, 400, 800, 1000, 1000]);
+  await runtime.stop(); releaseIdle();
+});
+
+test('a long-running operation does not keep empty claim polling at the fast cadence', async () => {
+  const waits = []; let claims = 0, releaseHook, releaseIdle;
+  const runtime = createCommunicationRuntime({ config: { ...config, hooks: [{id:'hook',url:'https://example.invalid'}] },
+    chat: {}, hookTokens: {hook:'synthetic'},
+    store: { async claimJobs() { return ++claims === 1 ? [{id:'one',hookId:'hook',payload:{},leaseToken:'lease'}] : []; },
+      async claimOutbox() { return []; }, async finishJobWithOutbox() {} },
+    fetchImpl: async () => { await new Promise(r => { releaseHook = r; }); return {status:204}; },
+    wait: async ms => { waits.push(ms); if (waits.length === 7) await new Promise(r => { releaseIdle = r; }); },
+  });
+  runtime.start();
+  while (!releaseIdle) await immediate();
+  assert.deepEqual(waits, [100,100,200,400,800,1000,1000]);
+  releaseHook();
+  await runtime.stop(); releaseIdle();
+});

@@ -157,7 +157,7 @@ Migration is explicit; startup only checks the migration ledger. `/health/live` 
 
 The bridge uses the MySQL connection pool for storage operations. Reads use a normal pooled connection. Writes use a short transaction only when several changes must commit together; single-row updates rely on atomic SQL predicates. Unique keys provide idempotency for message, job and outbox keys, while row leases protect claimable work. Every runtime table is scoped by `connection_id`, so independent bot processes do not need a process-wide advisory lock or a dedicated long-lived database connection.
 
-`storage.writer` settings are accepted as deprecated compatibility fields and have no runtime effect. Existing configurations can retain them while migrating; new configurations should omit them. Communication polling treats normalized `store_unavailable`, `store_contention`, and `store_timeout` failures as transient: it remains running in a visible degraded state and retries with bounded exponential backoff from 1 second through 10 seconds. The final backoff is truncated at a hard deadline 30 seconds after the first failure, and no new claim starts at or after that deadline. Six consecutive failures or the deadline, whichever comes first, makes the worker unhealthy; non-transient errors do so immediately. `runtime.unhealthyExitMs` (default 30000 ms) then applies to the Store and unhealthy communication workers through the existing fail-closed non-zero exit path. Codex and Feishu still affect readiness, but their existing restart and reconnect lifecycles are not overridden by this watchdog.
+`storage.writer` settings are accepted as deprecated compatibility fields and have no runtime effect. Existing configurations can retain them while migrating; new configurations should omit them. Communication polling treats normalized `store_unavailable`, `store_contention`, `store_timeout`, and claim-only `commit_unknown` failures as transient: it remains running in a visible degraded state and retries with bounded exponential backoff from 1 second through 10 seconds. The final backoff is truncated at a hard deadline 30 seconds after the first failure, and no new claim starts at or after that deadline. Six consecutive failures or the deadline, whichever comes first, makes the worker unhealthy; non-transient errors do so immediately. `runtime.unhealthyExitMs` (default 30000 ms) then applies to the Store and unhealthy communication workers through the existing fail-closed non-zero exit path. Codex and Feishu still affect readiness, but their existing restart and reconnect lifecycles are not overridden by this watchdog.
 
 Restart does not clear queues, replay ambiguous deliveries, change leases, or bypass existing idempotency. The normal durable claim, lease, and deduplication rules decide what work is eligible after the supervisor starts a replacement process.
 
@@ -170,3 +170,31 @@ An interactive-card callback whose `value.action` is `business` is routed direct
 The matching hook receives the existing authenticated delivery wrapper `{deliveryId,event}`. Its `event` is the standard Feishu envelope `{schemaVersion:1,channel:'feishu',type:'card.action',connectionId,eventId,chatId,messageId,operatorOpenId,operatorName?,value,occurredAt}`. These fields have the same envelope-level placement as existing `message.received` events; there is no second nested `event` object. The bridge treats business fields inside `value` as opaque. The Feishu event ID is used when present; otherwise the bridge derives a stable SHA-256 ID from the card message, operator, value and action time. Invalid or absent event time is represented as `occurredAt:null`, so replay hashing remains stable. Business-side hook workers must add handling for the `card.action` type; the existing message worker does not reinterpret card actions as received messages.
 
 The callback waits up to two seconds for durable registration before returning `已收到，处理结果稍后更新在卡片上`. A slower registration continues after the toast; a registration failure observed before the response returns `已收到，系统记录延迟，请稍后确认卡片状态` and is error-reported. Delivery is persisted under `card_action:<event_id>` in the existing inbox and hook queue, so callback replays do not create another delivery and transient hook failures use the existing durable retry policy.
+
+
+### Claim deadlines and recovery
+
+A claim only reserves work; it does not call a hook or send a Feishu message.
+When its COMMIT acknowledgement is lost, the store resolves the original row IDs
+and lease token on a new connection before handing any work to a worker. It
+never retries an arbitrary transaction or interprets an uncertain platform send
+as a safe new send. An unresolved claim stays pending for reconciliation rather
+than being replaced by a new claim. Recovery verifies scope, owner, token and
+lease expiry under row locks.
+
+Background claims have a 5-second storage deadline. The short ingress deadline
+is unchanged. A transient failure uses the bounded polling retry policy above;
+a persistent database failure still becomes unhealthy. Idle communication
+polling backs off from 100 ms to 1 second, and returns to 100 ms when a poll claims
+work. Long-running model turns do not keep empty polling at the fast cadence. This bounds idle pickup latency without continuous empty transactions.
+
+Storage diagnostics distinguish `commit_timeout` from `commit_error` and retain
+only safe driver code, numeric errno and SQLSTATE. Raw driver messages, SQL and
+credentials are never logged. Readiness is a component snapshot, not proof that
+a particular user message reached Feishu, entered the bridge, or completed.
+
+On macOS, use `ProcessType=Standard` for the bridge and its local MySQL service.
+`Background` is intended for work that yields to user activity and applies CPU
+and I/O resource restrictions; it is a poor fit for a database serving short
+request deadlines. Keep normal MySQL durability settings. Do not disable flushes
+or drop transaction protection to work around deadline failures.
