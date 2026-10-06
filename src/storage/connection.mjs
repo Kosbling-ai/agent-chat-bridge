@@ -1,5 +1,5 @@
 import mysql from 'mysql2/promise';
-import { StoreError, databaseError } from './errors.mjs';
+import { StoreError, databaseError, driverDetails } from './errors.mjs';
 
 const STORAGE_REFERENCE_FIELDS = ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'];
 
@@ -41,7 +41,7 @@ export function withConnection(pool, operation, { timeoutMs = 1800, transaction 
     const timer = setTimeout(() => {
       expired = true;
       connection?.destroy();
-      reject(new StoreError(committing ? 'commit_unknown' : 'store_timeout'));
+      reject(new StoreError(committing ? 'commit_unknown' : 'store_timeout', { reason: committing ? 'commit_timeout' : 'operation_timeout' }));
     }, timeoutMs);
     (async () => {
       try {
@@ -63,7 +63,7 @@ export function withConnection(pool, operation, { timeoutMs = 1800, transaction 
         if (committing) {
           connection?.destroy();
           connection = undefined;
-          reject(new StoreError('commit_unknown'));
+          reject(new StoreError('commit_unknown', { reason: 'commit_error', ...driverDetails(error) }));
         } else {
           if (transaction && connection) {
             try { await connection.rollback(); } catch { connection.destroy(); connection = undefined; }

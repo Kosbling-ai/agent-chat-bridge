@@ -7,6 +7,7 @@ import { StoreError } from './errors.mjs';
 import { recoveryOperations } from './recovery.mjs';
 import { rotationOperations } from './rotation.mjs';
 import { steeringOperations } from './steering.mjs';
+import { safeObserver } from '../logger.mjs';
 
 const json = (value) => JSON.stringify(value);
 function canonical(value) {
@@ -21,9 +22,10 @@ function limit(value = 50) { if (!Number.isInteger(value) || value < 1 || value 
 function scope(input) { return [text(input.connectionId, 128), text(input.conversationId)]; }
 function lease(input) { text(input.id, 36); text(input.leaseToken, 36); }
 
-export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, onWriterLost, now = Date.now,
+export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, claimTimeoutMs = 5000, onWriterLost, now = Date.now,
   writerProbeIntervalMs, writerProbeTimeoutMs, writerProbeMaxMisses, log }) {
   text(connectionId, 128);
+  log = safeObserver(log);
   await assertSchemaCurrent(pool);
   // Do not reserve a dedicated connection or use GET_LOCK. The pool owns
   // connection recovery; SQL transactions, unique keys and leases own
@@ -36,6 +38,11 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
     writer.assert();
     return await withConnection(pool, connection => fn(connection), { timeoutMs: operationTimeoutMs, transaction: true });
   };
+  const claimWrite = async (fn) => {
+    writer.assert();
+    return await withConnection(pool, connection => fn(connection), { timeoutMs: claimTimeoutMs, transaction: true });
+  };
+  const pendingClaims = new Map();
   async function claimThread(c, connectionId, conversationId, agentId, nativeThreadId) {
     if (nativeThreadId == null) return;
     text(nativeThreadId);
@@ -127,11 +134,67 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
     const take = limit(input.limit);
     text(input.owner, 128);
     if (!Number.isInteger(input.leaseMs) || input.leaseMs < 100 || input.leaseMs > 300000) throw new StoreError('invalid_lease');
-    return write(async (c) => {
+    if (table === 'bridge_jobs' && !['agent','hook'].includes(input.kind)) throw new StoreError('invalid_job_kind');
+    const pendingKey = `${table}:${input.owner}:${table === 'bridge_jobs' ? input.kind : ''}`;
+    const recover = async (pending) => {
+      let observed;
+      try {
+        await withConnection(pool, async (c) => {
+          const placeholders = pending.ids.map(() => '?').join(',');
+          [observed] = await c.execute(`SELECT * FROM ${table}
+            WHERE connection_id=? AND id IN (${placeholders}) FOR UPDATE`, [connectionId,...pending.ids]);
+        }, { timeoutMs: claimTimeoutMs, transaction: true });
+      } catch (error) {
+        // A read-only confirmation may itself lose the COMMIT acknowledgement.
+        // Once its locking read returned, the original claim was resolved and
+        // the captured rows are authoritative; otherwise preserve the claim for
+        // the next poll instead of claiming more work.
+        if (error?.code !== 'commit_unknown' || observed === undefined) throw error;
+      }
+      const rowsById = new Map(observed.map(row => [row.id,row]));
+      const identityMatches = pending.ids.map(id => rowsById.get(id)).filter(row => row
+        && row.status === 'running' && row.lease_owner === pending.owner && row.lease_token === pending.token
+        && (table !== 'bridge_jobs' || row.kind === pending.kind));
+      if (identityMatches.length === pending.ids.length) {
+        if (identityMatches.every(row => Number(row.lease_expires_at) > now())) {
+          pendingClaims.delete(pendingKey);
+          log('warning','storage_claim_recovery','recovered',{code:'commit_unknown',reason:pending.error.reason,
+            errorCode:pending.error.errorCode,errno:pending.error.errno,sqlState:pending.error.sqlState,
+            stage:table === 'bridge_jobs' ? 'claim_jobs' : 'claim_outbox',kind:pending.kind,
+            durationMs:Math.max(0,now()-pending.startedAt)});
+          return pending.ids.map(id => decode(rowsById.get(id)));
+        }
+        // The lease can no longer fence execution. Let the normal claim rules
+        // classify the expired row instead of returning stale ownership.
+        pendingClaims.delete(pendingKey);
+        return null;
+      }
+      if (identityMatches.length === 0) {
+        // The locking read waited for the original transaction and proves that
+        // its token is absent, so that claim did not commit (or is no longer ours).
+        pendingClaims.delete(pendingKey);
+        log('warning','storage_claim_recovery','not_committed',{code:'commit_unknown',reason:pending.error.reason,
+          errorCode:pending.error.errorCode,errno:pending.error.errno,sqlState:pending.error.sqlState,
+          stage:table === 'bridge_jobs' ? 'claim_jobs' : 'claim_outbox',kind:pending.kind,
+          durationMs:Math.max(0,now()-pending.startedAt)});
+        return null;
+      }
+      // Claim updates are atomic. A partial match cannot be safely returned or
+      // replaced, especially for non-idempotent outbox effects.
+      throw pending.error;
+    };
+    const pending = pendingClaims.get(pendingKey);
+    if (pending) {
+      const recovered = await recover(pending);
+      if (recovered) return recovered;
+    }
+    const token = randomUUID();
+    const claimed = { table, owner: input.owner, kind: input.kind, token, ids: [], error: null, startedAt: now() };
+    try {
+      return await claimWrite(async (c) => {
       let condition;
       let params;
       if (table === 'bridge_jobs') {
-        if (!['agent','hook'].includes(input.kind)) throw new StoreError('invalid_job_kind');
         condition = `j.connection_id=? AND j.kind=? AND (
           (j.status='pending' AND j.next_attempt_at<=?) OR
           (j.status='running' AND j.lease_expires_at<=?)
@@ -154,9 +217,9 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
         params = [connectionId,now(), now()-55*60*1000, now()];
       }
       const [rows] = await c.execute(`SELECT j.* FROM ${table} j WHERE ${condition} ORDER BY j.created_at,j.id LIMIT ${take} FOR UPDATE SKIP LOCKED`, params);
+      claimed.ids = rows.map(row => row.id);
       const result = [];
       for (const row of rows) {
-        const token = randomUUID();
         await c.execute(`UPDATE ${table} SET status='running',attempts=attempts+1,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=?${table === 'bridge_outbox' ? ',first_attempt_at=COALESCE(first_attempt_at,?)' : ''} WHERE id=? AND connection_id=?`, [input.owner,token,now()+input.leaseMs,now(),...(table === 'bridge_outbox' ? [now()] : []),row.id,connectionId]);
         result.push(decode({
           ...row, status: 'running', attempts: row.attempts + 1,
@@ -165,7 +228,24 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
         }));
       }
       return result;
-    });
+      });
+    } catch (error) {
+      if (error?.code !== 'commit_unknown') throw error;
+      if (!claimed.ids.length) {
+        log('warning','storage_claim_recovery','empty',{code:'commit_unknown',reason:error.reason,
+          errorCode:error.errorCode,errno:error.errno,sqlState:error.sqlState,
+          stage:table === 'bridge_jobs' ? 'claim_jobs' : 'claim_outbox',kind:input.kind,
+          durationMs:Math.max(0,now()-claimed.startedAt)});
+        return [];
+      }
+      claimed.error = error;
+      pendingClaims.set(pendingKey, claimed);
+      const recovered = await recover(claimed);
+      if (recovered) return recovered;
+      // A confirmed rollback remains a failed poll. Let the communication
+      // runtime apply its bounded retry/backoff budget before claiming again.
+      throw error;
+    }
   }
   const operations = {
     ...resourceOperations({ read, write, now, decode, connectionId }),

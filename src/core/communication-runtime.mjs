@@ -9,7 +9,8 @@ import { databaseError } from '../storage/errors.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
 const sleep=milliseconds=>new Promise(resolve=>{const timer=setTimeout(resolve,milliseconds);timer.unref?.();});
-const TRANSIENT_STORE_ERRORS=new Set(['store_unavailable','store_contention','store_timeout']);
+// Only claim polling is retried here; no hook or platform send has started.
+const TRANSIENT_STORE_ERRORS=new Set(['store_unavailable','store_contention','store_timeout','commit_unknown']);
 const POLL_RETRY_BASE_MS=1000;
 const POLL_RETRY_MAX_MS=10000;
 const POLL_FAILURE_LIMIT=6;
@@ -177,7 +178,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       const withinWindow=failedAt<failureDeadline;
       const willRetry=transient&&withinCount&&withinWindow;
       degraded=willRetry;
-      log(willRetry?'warning':'error','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,
+      log(willRetry?'warning':'error','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,
         durationMs:Math.max(0,failedAt-startedAt),consecutiveFailures,willRetry});
       if(!willRetry){healthy=false;return null;}
       const remaining=Math.max(0,failureDeadline-now());
@@ -185,6 +186,30 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       return null;
     }
   }
-  async function loop(){while(!stopping&&healthy){if(active.size<8){const jobs=await claim('claim_jobs',()=>store.claimJobs({kind:'hook',owner,leaseMs,limit:1}));if(!healthy)break;if(jobs===null)continue;for(const job of jobs)launch(hook(job));const rows=await claim('claim_outbox',()=>store.claimOutbox({owner,leaseMs,limit:1}));if(!healthy)break;if(rows===null)continue;for(const row of rows)launch(deliver(row));if(consecutiveFailures){consecutiveFailures=0;failureDeadline=0;lastFailureStage='';lastErrorClass='';degraded=false;}}if(!stopping&&healthy)await pause(100);}}
+  async function loop() {
+    let idleDelayMs = 100;
+    while (!stopping && healthy) {
+      let busy = false;
+      if (active.size < 8) {
+        const jobs = await claim('claim_jobs', () => store.claimJobs({ kind: 'hook', owner, leaseMs, limit: 1 }));
+        if (!healthy) break;
+        if (jobs === null) continue;
+        for (const job of jobs) launch(hook(job));
+        const rows = await claim('claim_outbox', () => store.claimOutbox({ owner, leaseMs, limit: 1 }));
+        if (!healthy) break;
+        if (rows === null) continue;
+        for (const row of rows) launch(deliver(row));
+        busy ||= jobs.length > 0 || rows.length > 0;
+        if (consecutiveFailures) {
+          consecutiveFailures = 0; failureDeadline = 0; lastFailureStage = ''; lastErrorClass = ''; degraded = false;
+        }
+      }
+      // Avoid 20 empty transactions/second per idle bot. Newly claimed work keeps
+      // the short cadence; an idle outbox is picked up within one second.
+      if (busy) idleDelayMs = 100;
+      if (!stopping && healthy) await pause(idleDelayMs);
+      if (!busy) idleDelayMs = Math.min(1000, idleDelayMs * 2);
+    }
+  }
   return Object.freeze({ingest,ingestCardAction,status:()=>({running:started&&!stopping&&healthy,healthy,degraded,consecutiveFailures}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;wakeWait?.();await worker;await Promise.allSettled(active);}});
 }
