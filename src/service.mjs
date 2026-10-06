@@ -5,6 +5,7 @@ import * as sdk from '@larksuiteoapi/node-sdk';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { ConfigError } from './config.mjs';
 import { createPoolFromEnvironment, storageConnectionReferences } from './storage/connection.mjs';
+import { attachStorageDiagnostics } from './storage/diagnostics.mjs';
 import { createMysqlStore } from './storage/store.mjs';
 import { StoreError, databaseError } from './storage/errors.mjs';
 import { migrate } from './storage/migrations.mjs';
@@ -93,6 +94,7 @@ export async function startService({ config, configPath, env = process.env, log,
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
   const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, businessCardAction: createBusinessCardAction, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
   const pool = factories.pool(storageConnectionReferences(config.storage), env);
+  const storageDiagnostics = attachStorageDiagnostics(pool, { log });
   let store, executor, userInput, businessCardAction, feishu, communication, forward, catchup, http, media, outbound;
   const cardOperations = new Set();
   let acceptCardOperations = true;
@@ -153,6 +155,7 @@ export async function startService({ config, configPath, env = process.env, log,
     for (const operation of [() => media?.release?.(), () => outbound?.close?.()]) {
       try { await operation(); } catch { failures.push(true); }
     }
+    try { await storageDiagnostics.close(); } catch { failures.push(true); }
     for (const operation of [() => store ? store.close() : pool.end(), () => reporter?.close()]) {
       try { await operation(); } catch { failures.push(true); }
     }

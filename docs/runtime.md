@@ -223,3 +223,37 @@ On macOS, use `ProcessType=Standard` for the bridge and its local MySQL service.
 and I/O resource restrictions; it is a poor fit for a database serving short
 request deadlines. Keep normal MySQL durability settings. Do not disable flushes
 or drop transaction protection to work around deadline failures.
+
+
+### Storage diagnostic events
+
+All service-owned storage calls using `withConnection` produce a
+`storage_operation` warning when they fail or take at least 500 ms. Fast
+successful calls stay quiet. Each event has a random `operation_id`, current or
+failed `stage`, available MySQL `db_connection_id`, total `durationMs`, configured
+`timeout_ms`, and stage durations (`pool_wait_ms`, `setup_ms`, `begin_ms`,
+`operation_ms`, `commit_ms`, `rollback_ms`). Durations use a monotonic clock.
+`operation_ms` includes all SQL and application work inside the callback; it is
+not a per-statement server execution timer. `timeout_overshoot_ms` shows how late
+the JavaScript deadline callback ran. A timeout emits once even if acquisition
+or COMMIT resolves later. Existing safe error class/code/errno/SQLSTATE remain.
+
+At most 20 detailed operation events per bot are emitted per minute. Suppressed
+event counts appear in the next `storage_snapshot`. Snapshots run every 60 seconds
+and on a slow/failing operation at most once per 30 seconds, with only one probe
+in flight. They include event-loop delay (20 ms sampling resolution), process
+RSS and CPU-time deltas, host load, available pool total/free/queued counts, and
+allowlisted MySQL global counters: running/connected threads, buffer reads,
+pending read/write/fsync, log waits, current row-lock waits, cumulative row-lock
+time and server uptime. Server counters cover the whole MySQL instance; compare
+deltas within one uptime epoch, not raw values across restarts. The diagnostic
+query has a 1500 ms deadline and does not recursively instrument itself.
+
+Snapshots and operation phases are evidence for narrowing a bottleneck, not
+proof that a particular SSD or scheduler event caused it. A delayed JavaScript
+callback can inflate observed client-side SQL/COMMIT time. Correlate operation
+time, deadline overshoot, event-loop/process load and server counters before
+attributing a failure. No SQL text, parameters, user content, raw driver errors,
+stack traces, account names or credentials are included. Observer failures and
+rate limits never alter the transaction result; shutdown removes diagnostic
+timers and waits only for the bounded probe already in flight.

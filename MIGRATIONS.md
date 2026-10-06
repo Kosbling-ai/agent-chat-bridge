@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.26`
+Application version: `0.2.27`
+
+Version 0.2.27 adds storage timing diagnostics and periodic read-only server counter snapshots. No configuration or schema change is required. No SQL text or bound parameters are logged.
 
 Version 0.2.26 keeps runtime database outages degraded and retrying without restarting all active tasks. `storage.claimTimeoutMs` defaults to 15000 ms (1000–30000 allowed); existing configs need no change. Readiness can return `degraded` details with HTTP 503 while the process remains live. Fatal schema errors and confirmed task lease loss remain protected. No database migration is needed. Downgrading requires removing the new optional config field if explicitly set.
 

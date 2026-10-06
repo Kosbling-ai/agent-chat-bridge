@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.27] — Unreleased
+
+- Record bounded, content-free timings for slow and failed storage operations, including connection acquisition, setup, BEGIN, application SQL, COMMIT, rollback and deadline overshoot. Include operation and MySQL connection IDs for timestamp correlation.
+- Add rate-limited event-loop, process, pool and MySQL counter snapshots to distinguish application stalls, connection pressure and server-side waits. Diagnostics cannot change transaction outcomes and never log SQL, parameters, messages or credentials.
+
+No database migration or additional database privilege is required.
+
 ## [0.2.26] — Unreleased
 
 - Keep transient storage failures in a visible degraded state with capped retry backoff and automatic recovery, instead of stopping polling and restarting active Codex turns after a fixed failure count. Readiness reports degradation; fatal schema/worker errors still use the restart watchdog.
