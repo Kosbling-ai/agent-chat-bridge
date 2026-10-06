@@ -22,7 +22,7 @@ function limit(value = 50) { if (!Number.isInteger(value) || value < 1 || value 
 function scope(input) { return [text(input.connectionId, 128), text(input.conversationId)]; }
 function lease(input) { text(input.id, 36); text(input.leaseToken, 36); }
 
-export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, claimTimeoutMs = 5000, onWriterLost, now = Date.now,
+export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, claimTimeoutMs = 15000, onWriterLost, now = Date.now,
   writerProbeIntervalMs, writerProbeTimeoutMs, writerProbeMaxMisses, log }) {
   text(connectionId, 128);
   log = safeObserver(log);

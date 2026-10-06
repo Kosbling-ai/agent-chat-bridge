@@ -12,9 +12,8 @@ const sleep=milliseconds=>new Promise(resolve=>{const timer=setTimeout(resolve,m
 // Only claim polling is retried here; no hook or platform send has started.
 const TRANSIENT_STORE_ERRORS=new Set(['store_unavailable','store_contention','store_timeout','commit_unknown']);
 const POLL_RETRY_BASE_MS=1000;
-const POLL_RETRY_MAX_MS=10000;
-const POLL_FAILURE_LIMIT=6;
-const POLL_FAILURE_WINDOW_MS=30000;
+const POLL_RETRY_MAX_MS=30000;
+const DEGRADED_LOG_INTERVAL_MS=5*60*1000;
 function mergeContextEntries(...groups) {
   const seen=new Set();
   return groups.flat().map(entry=>({...entry,prompt:String(entry?.prompt??entry?.text??'').trim()}))
@@ -32,7 +31,7 @@ function deliveryErrorCode(error) {
 
 export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,botAppId='',hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
-  let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,failureDeadline=0,lastFailureStage='',lastErrorClass='',wakeWait; const active=new Set(); const processing=new Set();
+  let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,lastFailureLogAt=0,lastLoggedFailureStage='',wakeWait; const active=new Set(); const processing=new Set(); const successfulClaimStages=new Set();
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
   const maxEventAgeMs=Number(config.codex.maxEventAgeMs??10*60*1000);
   const contextLimit=Number(config.codex.groupContextMessageLimit??50);
@@ -152,37 +151,90 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       payload:event,semanticPayload:event,policyVersion:config.routing.version,passiveContext:false,
       hooks:[{hookId,payload:event}]});
   }
-  async function deliver(row){let result;try{const payload=parse(row.payload);if(row.kind==='reply')result=await chat.replyMessage({...payload,uuid:row.platformUuid});else if(row.kind==='create')result=await chat.sendMessage({...payload,conversationId:row.conversationId,uuid:row.platformUuid});else if(row.kind==='reaction')result=payload.reactionId?await chat.removeReaction(payload):await chat.addReaction(payload);else if(row.kind==='upload')result=payload.mediaType==='image'?await chat.uploadImage({bytes:Buffer.from(payload.base64,'base64')}):await chat.uploadFile({bytes:Buffer.from(payload.base64,'base64'),fileName:payload.fileName});else if(row.kind==='artifact_upload'&&outbound)result=await outbound.upload(payload);else if(row.kind==='artifact_send'&&outbound){const effect=await store.getOutbox({id:row.id});if(effect?.predecessorStatus!=='sent')throw Object.assign(new Error('artifact_predecessor_unconfirmed'),{outcome:'failed'});result=await outbound.send({...payload,uploadResult:parse(effect.predecessorResult),uuid:row.platformUuid});}else throw Object.assign(new Error('unsupported_delivery'),{outcome:'failed'});await settle(row,{status:'sent',result});}catch(error){const status=error?.outcome==='failed'?'failed':'unknown';const code=deliveryErrorCode(error);await settle(row,{status,errorCode:code,nextAttemptAt:Date.now()+5000});log('warning','chat_delivery',status==='failed'?'failed':'unconfirmed',{code});}}
-  async function settle(row,outcome){try{await store.settleOutbox({id:row.id,leaseToken:row.leaseToken,...outcome});}catch{const recorded=await store.getOutbox({id:row.id});if(recorded?.status!=='sent')log('warning','chat_delivery','pending',{code:'delivery_settlement_unconfirmed'});}}
-  async function hook(job){const definition=config.hooks.find(item=>item.id===job.hookId);try{if(!definition)throw new Error('hook_removed');const response=await fetchImpl(definition.url,{method:'POST',redirect:'error',signal:AbortSignal.timeout(3000),headers:{'content-type':'application/json',authorization:`Bearer ${hookTokens[definition.id]}`,'idempotency-key':job.id},body:JSON.stringify({deliveryId:job.id,event:parse(job.payload)})});await response.body?.cancel();if(response.status!==204)throw new Error('hook_unacknowledged');await store.finishJobWithOutbox({id:job.id,leaseToken:job.leaseToken,result:{accepted:true}});}catch{await store.retryJob({id:job.id,leaseToken:job.leaseToken,terminal:!definition||job.attempts>=8,errorCode:'hook_unacknowledged',nextAttemptAt:Date.now()+Math.min(60000,1000*2**job.attempts)});log(job.attempts>=8?'error':'warning','hook_delivery','unacknowledged',{code:'hook_unacknowledged'});}}
-  function launchForward(operation){const promise=operation.catch(error=>{log('error','forward_ingress','failed',{code:error?.code||'forward_ingress_failed'});}).finally(()=>active.delete(promise));active.add(promise);}
-  function launch(operation){const promise=operation.catch(error=>{healthy=false;degraded=false;log('error','communication_worker','failed',{code:'worker_failed',errorClass:databaseError(error).code});}).finally(()=>active.delete(promise));active.add(promise);}
-  async function claim(stage,operation){
-    if(consecutiveFailures&&now()>=failureDeadline){
-      healthy=false;degraded=false;
-      log('error','communication_worker','failed',{code:'worker_poll_failed',reason:'retry_deadline',stage:lastFailureStage||stage,
-        errorClass:lastErrorClass||'store_timeout',durationMs:0,consecutiveFailures,willRetry:false});
-      return null;
+  async function deliver(row){
+    let result;
+    let payload;
+    try { payload=parse(row.payload); }
+    catch(error) {
+      const status=error?.outcome==='failed'?'failed':'unknown';const code=deliveryErrorCode(error);
+      await settle(row,{status,errorCode:code,nextAttemptAt:Date.now()+5000});
+      log('warning','chat_delivery',status==='failed'?'failed':'unconfirmed',{code});
+      return;
     }
+    // This read is storage work, before any platform effect. Let the worker's
+    // storage classifier handle it instead of recording a delivery outcome.
+    const predecessor=row.kind==='artifact_send'&&outbound?await store.getOutbox({id:row.id}):null;
+    try {
+      if(row.kind==='reply')result=await chat.replyMessage({...payload,uuid:row.platformUuid});
+      else if(row.kind==='create')result=await chat.sendMessage({...payload,conversationId:row.conversationId,uuid:row.platformUuid});
+      else if(row.kind==='reaction')result=payload.reactionId?await chat.removeReaction(payload):await chat.addReaction(payload);
+      else if(row.kind==='upload')result=payload.mediaType==='image'?await chat.uploadImage({bytes:Buffer.from(payload.base64,'base64')}):await chat.uploadFile({bytes:Buffer.from(payload.base64,'base64'),fileName:payload.fileName});
+      else if(row.kind==='artifact_upload'&&outbound)result=await outbound.upload(payload);
+      else if(row.kind==='artifact_send'&&outbound){if(predecessor?.predecessorStatus!=='sent')throw Object.assign(new Error('artifact_predecessor_unconfirmed'),{outcome:'failed'});result=await outbound.send({...payload,uploadResult:parse(predecessor.predecessorResult),uuid:row.platformUuid});}
+      else throw Object.assign(new Error('unsupported_delivery'),{outcome:'failed'});
+    } catch(error) {
+      const status=error?.outcome==='failed'?'failed':'unknown';const code=deliveryErrorCode(error);
+      await settle(row,{status,errorCode:code,nextAttemptAt:Date.now()+5000});
+      log('warning','chat_delivery',status==='failed'?'failed':'unconfirmed',{code});
+      return;
+    }
+    // Settlement is deliberately outside the delivery catch. If storage is
+    // uncertain after the platform effect, the durable lease and platform UUID
+    // reconcile it; this invocation must not turn around and record a retry.
+    await settle(row,{status:'sent',result});
+  }
+  async function settle(row,outcome){
+    try { await store.settleOutbox({id:row.id,leaseToken:row.leaseToken,...outcome}); }
+    catch(error) {
+      try { const recorded=await store.getOutbox({id:row.id});if(recorded?.status!=='sent')log('warning','chat_delivery','pending',{code:'delivery_settlement_unconfirmed'}); }
+      catch { /* The original classified error is the useful worker signal. */ }
+      throw error;
+    }
+  }
+  async function hook(job){
+    const definition=config.hooks.find(item=>item.id===job.hookId);
+    try {
+      if(!definition)throw new Error('hook_removed');
+      const response=await fetchImpl(definition.url,{method:'POST',redirect:'error',signal:AbortSignal.timeout(3000),headers:{'content-type':'application/json',authorization:`Bearer ${hookTokens[definition.id]}`,'idempotency-key':job.id},body:JSON.stringify({deliveryId:job.id,event:parse(job.payload)})});
+      await response.body?.cancel();if(response.status!==204)throw new Error('hook_unacknowledged');
+    } catch {
+      await store.retryJob({id:job.id,leaseToken:job.leaseToken,terminal:!definition||job.attempts>=8,errorCode:'hook_unacknowledged',nextAttemptAt:Date.now()+Math.min(60000,1000*2**job.attempts)});
+      log(job.attempts>=8?'error':'warning','hook_delivery','unacknowledged',{code:'hook_unacknowledged'});
+      return;
+    }
+    // A storage failure after HTTP 204 is uncertain. Leave the durable lease to
+    // reconcile it instead of immediately issuing the hook again.
+    await store.finishJobWithOutbox({id:job.id,leaseToken:job.leaseToken,result:{accepted:true}});
+  }
+  function launchForward(operation){const promise=operation.catch(error=>{log('error','forward_ingress','failed',{code:error?.code||'forward_ingress_failed'});}).finally(()=>active.delete(promise));active.add(promise);}
+  function recordStorageFailure(stage,error,durationMs=0) {
+    const normalized=databaseError(error);const failedAt=now();consecutiveFailures+=1;successfulClaimStages.clear();
+    const transient=TRANSIENT_STORE_ERRORS.has(normalized.code);
+    if(!transient){healthy=false;degraded=false;log('error','communication_worker','failed',{code:'worker_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:false});return false;}
+    degraded=true;
+    const shouldLog=consecutiveFailures===1||stage!==lastLoggedFailureStage||failedAt-lastFailureLogAt>=DEGRADED_LOG_INTERVAL_MS;
+    if(shouldLog){lastFailureLogAt=failedAt;lastLoggedFailureStage=stage;log('warning','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:true});}
+    return true;
+  }
+  function launch(operation,stage){const promise=operation.catch(error=>{recordStorageFailure(stage,error);}).finally(()=>active.delete(promise));active.add(promise);}
+  function claimSucceeded(stage) {
+    if(!degraded)return;
+    successfulClaimStages.add(stage);
+    if(successfulClaimStages.size<2)return;
+    const recoveredFailures=consecutiveFailures;
+    consecutiveFailures=0;lastFailureLogAt=0;lastLoggedFailureStage='';degraded=false;successfulClaimStages.clear();
+    log('info','communication_worker','recovered',{code:'worker_recovered',consecutiveFailures:recoveredFailures});
+  }
+  async function claim(stage,operation){
     const startedAt=now();
     try {
-      return await operation();
+      const result=await operation();claimSucceeded(stage);return result;
     } catch(error) {
-      const normalized=databaseError(error);
       const failedAt=now();
-      if(!consecutiveFailures)failureDeadline=failedAt+POLL_FAILURE_WINDOW_MS;
-      consecutiveFailures+=1;
-      lastFailureStage=stage;lastErrorClass=normalized.code;
-      const transient=TRANSIENT_STORE_ERRORS.has(normalized.code);
-      const withinCount=consecutiveFailures<POLL_FAILURE_LIMIT;
-      const withinWindow=failedAt<failureDeadline;
-      const willRetry=transient&&withinCount&&withinWindow;
-      degraded=willRetry;
-      log(willRetry?'warning':'error','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,
-        durationMs:Math.max(0,failedAt-startedAt),consecutiveFailures,willRetry});
-      if(!willRetry){healthy=false;return null;}
-      const remaining=Math.max(0,failureDeadline-now());
-      await pause(Math.min(remaining,POLL_RETRY_MAX_MS,POLL_RETRY_BASE_MS*2**(consecutiveFailures-1)));
+      const willRetry=recordStorageFailure(stage,error,Math.max(0,failedAt-startedAt));
+      if(!willRetry)return null;
+      const exponent=Math.min(5,Math.max(0,consecutiveFailures-1));
+      await pause(Math.min(POLL_RETRY_MAX_MS,POLL_RETRY_BASE_MS*2**exponent));
       return null;
     }
   }
@@ -194,15 +246,12 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
         const jobs = await claim('claim_jobs', () => store.claimJobs({ kind: 'hook', owner, leaseMs, limit: 1 }));
         if (!healthy) break;
         if (jobs === null) continue;
-        for (const job of jobs) launch(hook(job));
+        for (const job of jobs) launch(hook(job),'active_hook');
         const rows = await claim('claim_outbox', () => store.claimOutbox({ owner, leaseMs, limit: 1 }));
         if (!healthy) break;
         if (rows === null) continue;
-        for (const row of rows) launch(deliver(row));
+        for (const row of rows) launch(deliver(row),'active_outbox');
         busy ||= jobs.length > 0 || rows.length > 0;
-        if (consecutiveFailures) {
-          consecutiveFailures = 0; failureDeadline = 0; lastFailureStage = ''; lastErrorClass = ''; degraded = false;
-        }
       }
       // Avoid 20 empty transactions/second per idle bot. Newly claimed work keeps
       // the short cadence; an idle outbox is picked up within one second.

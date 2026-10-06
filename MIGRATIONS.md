@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.25`
+Application version: `0.2.26`
+
+Version 0.2.26 keeps runtime database outages degraded and retrying without restarting all active tasks. `storage.claimTimeoutMs` defaults to 15000 ms (1000–30000 allowed); existing configs need no change. Readiness can return `degraded` details with HTTP 503 while the process remains live. Fatal schema errors and confirmed task lease loss remain protected. No database migration is needed. Downgrading requires removing the new optional config field if explicitly set.
 
 Version 0.2.25 adds an explicit current-turn app approval option. Grants are in memory only and expire with the live turn or disconnect; no database migration or permanent permission is introduced.
 

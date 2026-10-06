@@ -148,52 +148,48 @@ test('communication poll marks non-transient store errors unhealthy immediately'
   await runtime.stop();
 });
 
-test('communication poll retry limit transitions a persistently failing worker to unhealthy', async () => {
+test('communication poll remains degraded through a persistent transient failure with capped backoff', async () => {
   let clock = 0;
   const logs = [];
   const waits = [];
+  let blocked = false;
   const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock, log: (...entry) => logs.push(entry),
     store: {
       async claimJobs() { throw new StoreError('store_timeout'); },
       async claimOutbox() { throw new Error('unexpected'); },
     },
-    wait: async milliseconds => { waits.push(milliseconds); clock += milliseconds; },
+    wait: async milliseconds => { waits.push(milliseconds); clock += milliseconds; if (waits.length === 8) { blocked = true; await new Promise(() => {}); } },
   });
   runtime.start();
-  while (runtime.status().running) await immediate();
-  assert.equal(runtime.status().consecutiveFailures, 6);
-  assert.deepEqual(waits, [1000, 2000, 4000, 8000, 10000]);
-  assert.equal(logs.filter(([level]) => level === 'warning').length, 5);
-  assert.equal(logs.filter(([level]) => level === 'error').length, 1);
-  assert.equal(logs.at(-1)[3].willRetry, false);
+  while (!blocked) await immediate();
+  assert.deepEqual(runtime.status(), { running: true, healthy: true, degraded: true, consecutiveFailures: 8 });
+  assert.deepEqual(waits, [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][3].willRetry, true);
   await runtime.stop();
 });
 
-test('communication poll deadline prevents a sixth claim after slow failures', async () => {
+test('communication poll logs persistent degradation periodically without stopping', async () => {
   let clock = 0;
   let claims = 0;
-  const waits = [];
   const logs = [];
+  let blocked = false;
   const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock, log: (...entry) => logs.push(entry),
     store: {
       async claimJobs() {
         claims += 1;
-        clock += 1800;
-        if (claims <= 5) throw new StoreError('store_timeout');
-        return [];
+        throw new StoreError('store_timeout');
       },
       async claimOutbox() { return []; },
     },
-    wait: async milliseconds => { waits.push(milliseconds); clock += milliseconds; },
+    wait: async () => { clock += 30000; if (claims === 11) { blocked = true; await new Promise(() => {}); } },
   });
   runtime.start();
-  while (runtime.status().running) await immediate();
-  assert.equal(claims, 5);
-  assert.deepEqual(waits, [1000, 2000, 4000, 8000, 7800]);
-  assert.equal(clock, 31800);
-  assert.equal(logs.at(-1)[0], 'error');
-  assert.equal(logs.at(-1)[3].reason, 'retry_deadline');
-  assert.equal(logs.at(-1)[3].willRetry, false);
+  while (!blocked) await immediate();
+  assert.equal(runtime.status().healthy, true);
+  assert.equal(runtime.status().degraded, true);
+  assert.equal(logs.length, 2);
+  assert.deepEqual(logs.map(entry => entry[3].consecutiveFailures), [1, 11]);
   await runtime.stop();
 });
 
@@ -266,16 +262,98 @@ test('uncertain claim commit recovers without stopping the communication worker'
   await runtime.stop(); releaseIdle();
 });
 
-test('persistently uncertain claims still exhaust the bounded retry budget', async () => {
-  let clock = 0;
-  const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock,
-    store: { async claimJobs() { throw new StoreError('commit_unknown'); } },
-    wait: async ms => { clock += ms; },
+test('degraded status clears only after both claim paths succeed', async () => {
+  let outboxClaims = 0, releaseRetry, releaseOutbox, releaseIdle;
+  const logs = [];
+  const runtime = createCommunicationRuntime({ config, chat: {}, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() { return []; },
+      async claimOutbox() {
+        outboxClaims += 1;
+        if (outboxClaims === 1) throw new StoreError('store_contention');
+        if (outboxClaims === 2) await new Promise(resolve => { releaseOutbox = resolve; });
+        return [];
+      },
+    },
+    wait: async ms => {
+      if (ms === 1000) await new Promise(resolve => { releaseRetry = resolve; });
+      else await new Promise(resolve => { releaseIdle = resolve; });
+    },
   });
   runtime.start();
-  while (runtime.status().running) await immediate();
-  assert.equal(runtime.status().healthy, false);
-  assert.equal(runtime.status().consecutiveFailures, 6);
+  while (!releaseRetry) await immediate();
+  releaseRetry();
+  while (!releaseOutbox) await immediate();
+  assert.equal(runtime.status().degraded, true);
+  assert.equal(runtime.status().consecutiveFailures, 1);
+  releaseOutbox();
+  while (!releaseIdle) await immediate();
+  assert.equal(runtime.status().degraded, false);
+  assert.equal(runtime.status().consecutiveFailures, 0);
+  assert.equal(logs.filter(([, operation, status]) => operation === 'communication_worker' && status === 'recovered').length, 1);
+  await runtime.stop(); releaseIdle();
+});
+
+test('persistently uncertain claims remain recoverable beyond the old retry budget', async () => {
+  let clock = 0;
+  let blocked = false;
+  const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock,
+    store: { async claimJobs() { throw new StoreError('commit_unknown'); } },
+    wait: async ms => { clock += ms; if (clock >= 91000) { blocked = true; await new Promise(() => {}); } },
+  });
+  runtime.start();
+  while (!blocked) await immediate();
+  assert.equal(runtime.status().healthy, true);
+  assert.equal(runtime.status().degraded, true);
+  assert.ok(runtime.status().consecutiveFailures > 6);
+  await runtime.stop();
+});
+
+test('transient hook completion failure degrades without replaying the hook or stopping the worker', async () => {
+  let jobClaims = 0, hookRequests = 0, completions = 0, releaseIdle;
+  const logs = [];
+  const runtime = createCommunicationRuntime({
+    config: { ...config, hooks: [{id:'hook',url:'https://example.invalid'}] }, chat: {}, hookTokens: {hook:'synthetic'}, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() { return ++jobClaims === 1 ? [{id:'job',hookId:'hook',payload:{},leaseToken:'lease',attempts:1}] : []; },
+      async claimOutbox() { return []; },
+      async finishJobWithOutbox() { completions += 1; throw new StoreError('store_timeout'); },
+    },
+    fetchImpl: async () => { hookRequests += 1; return {status:204}; },
+    wait: async () => { await new Promise(resolve => { releaseIdle = resolve; }); },
+  });
+  runtime.start();
+  while (!releaseIdle || !runtime.status().degraded) await immediate();
+  assert.deepEqual({hookRequests, completions}, {hookRequests:1, completions:1});
+  assert.equal(runtime.status().healthy, true);
+  assert.equal(logs.find(([, operation]) => operation === 'communication_worker')[3].stage, 'active_hook');
+  releaseIdle();
+  while (runtime.status().degraded) await immediate();
+  assert.equal(hookRequests, 1);
+  await runtime.stop();
+});
+
+test('transient outbox settlement failure does not record a second outcome or replay the platform effect', async () => {
+  let outboxClaims = 0, sends = 0, settlements = 0, releaseIdle;
+  const logs = [];
+  const runtime = createCommunicationRuntime({ config, log: (...entry) => logs.push(entry),
+    chat: { async replyMessage() { sends += 1; return {messageId:'sent'}; } },
+    store: {
+      async claimJobs() { return []; },
+      async claimOutbox() { return ++outboxClaims === 1 ? [{id:'outbox',kind:'reply',payload:{},platformUuid:'uuid',leaseToken:'lease'}] : []; },
+      async settleOutbox() { settlements += 1; throw new StoreError('commit_unknown'); },
+      async getOutbox() { return {status:'leased'}; },
+    },
+    wait: async () => { await new Promise(resolve => { releaseIdle = resolve; }); },
+  });
+  runtime.start();
+  while (!releaseIdle || !runtime.status().degraded) await immediate();
+  assert.deepEqual({sends, settlements}, {sends:1, settlements:1});
+  assert.equal(runtime.status().healthy, true);
+  assert.equal(logs.find(([, operation]) => operation === 'communication_worker')[3].stage, 'active_outbox');
+  releaseIdle();
+  while (runtime.status().degraded) await immediate();
+  assert.deepEqual({sends, settlements}, {sends:1, settlements:1});
   await runtime.stop();
 });
 

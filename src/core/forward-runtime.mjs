@@ -5,6 +5,8 @@ import { matchSilentReply } from './silent-reply.mjs';
 
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED', 'CODEX_USAGE_LIMIT_EXCEEDED'].includes(error?.code);
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
+const TRANSIENT_LEASE_ERRORS = new Set(['store_unavailable', 'store_contention', 'store_timeout', 'commit_unknown']);
+const DEFINITIVE_LEASE_ERRORS = new Set(['stale_lease', 'forward_lease_lost']);
 const retryableError = error => {
   if (isBusy(error)) return false;
   if (terminalTurnError(error)) return false;
@@ -156,25 +158,113 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
 
   async function withLease(job, operation) {
     let lost = false;
+    let closed = false;
+    let leaseDeadline = Number.isSafeInteger(job.leaseExpiresAt) ? job.leaseExpiresAt : undefined;
+    let heartbeatTimer;
+    let expiryTimer;
+    let consecutiveFailures = 0;
+    let degraded = false;
     const controller = new AbortController();
-    leaseControllers.add(controller);
-    const lose = () => { lost = true; controller.abort(); };
     const heartbeatMs = Number(config.heartbeatMs || Math.max(1000, Math.floor(leaseMs / 3)));
-    let timer;
+    const clearTimers = () => {
+      clearTimeout(heartbeatTimer);
+      clearTimeout(expiryTimer);
+      heartbeatTimer = undefined;
+      expiryTimer = undefined;
+    };
+    const lose = () => {
+      if (lost) return;
+      lost = true;
+      clearTimers();
+      controller.abort();
+    };
+    const stopLease = () => {
+      closed = true;
+      clearTimers();
+      controller.abort();
+    };
+    leaseControllers.add(stopLease);
+    const assertOwned = () => {
+      if (!lost && leaseDeadline !== undefined && now() >= leaseDeadline) lose();
+      if (lost) throw Object.assign(new Error('forward_lease_lost'), { code: 'forward_lease_lost' });
+      if (stopping) throw Object.assign(new Error('forward_runtime_stopping'), { code: 'forward_runtime_stopping' });
+    };
+    const armExpiry = () => {
+      clearTimeout(expiryTimer);
+      const remaining = leaseDeadline - now();
+      if (remaining <= 0) { lose(); return; }
+      expiryTimer = setTimeout(lose, remaining);
+      expiryTimer.unref?.();
+    };
+    const scheduleHeartbeat = (delay = heartbeatMs) => {
+      clearTimeout(heartbeatTimer);
+      if (closed || lost) return;
+      heartbeatTimer = setTimeout(heartbeat, Math.max(0, Math.min(delay, leaseDeadline - now())));
+      heartbeatTimer.unref?.();
+    };
+    const renewed = requestStarted => {
+      const completedAt = now();
+      if (closed || lost) return false;
+      // Once the previously confirmed lease has expired, a late success cannot
+      // prove that another worker did not own the task in the meantime.
+      if ((leaseDeadline !== undefined && completedAt >= leaseDeadline)
+        || completedAt >= requestStarted + leaseMs) {
+        lose();
+        return false;
+      }
+      leaseDeadline = requestStarted + leaseMs;
+      armExpiry();
+      if (degraded) {
+        log('info', 'forward_lease', 'recovered', {
+          code: 'lease_renew_recovered', runId: job.id, consecutiveFailures,
+        });
+      }
+      degraded = false;
+      consecutiveFailures = 0;
+      scheduleHeartbeat(Math.max(0, requestStarted + heartbeatMs - completedAt));
+      return true;
+    };
+    async function heartbeat() {
+      heartbeatTimer = undefined;
+      if (closed || lost) return;
+      if (now() >= leaseDeadline) { lose(); return; }
+      const requestStarted = now();
+      try {
+        await jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs });
+        renewed(requestStarted);
+      } catch (error) {
+        if (closed || lost) return;
+        if (DEFINITIVE_LEASE_ERRORS.has(error?.code) || !TRANSIENT_LEASE_ERRORS.has(error?.code)) {
+          lose();
+          return;
+        }
+        if (now() >= leaseDeadline) { lose(); return; }
+        consecutiveFailures += 1;
+        if (!degraded) {
+          degraded = true;
+          log('warning', 'forward_lease', 'degraded', {
+            code: 'lease_renew_failed', runId: job.id, errorClass: error.code,
+            consecutiveFailures, willRetry: true,
+          });
+        }
+        const retryBaseMs = Math.max(1, Math.min(1000, Math.floor(heartbeatMs / 2)));
+        const backoffMs = Math.min(heartbeatMs, retryBaseMs * 2 ** Math.min(consecutiveFailures - 1, 10));
+        scheduleHeartbeat(Math.min(backoffMs, Math.max(0, leaseDeadline - now())));
+      }
+    }
     try {
+      assertOwned();
+      const requestStarted = now();
       await jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs });
-      timer = setInterval(() => jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs }).catch(lose), heartbeatMs);
-      timer.unref?.();
-      const assertOwned = () => {
-        if (lost) throw Object.assign(new Error('forward_lease_lost'), { code: 'forward_lease_lost' });
-        if (stopping) throw Object.assign(new Error('forward_runtime_stopping'), { code: 'forward_runtime_stopping' });
-      };
+      renewed(requestStarted);
+      assertOwned();
       const result = await operation({ signal: controller.signal, assertOwned, assertLease: assertOwned });
       assertOwned();
       return result;
     } finally {
-      clearInterval(timer);
-      leaseControllers.delete(controller);
+      closed = true;
+      clearTimers();
+      leaseControllers.delete(stopLease);
     }
   }
 
@@ -396,7 +486,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   function beginStop() {
     stopping = true;
     wakeWorker?.();
-    for (const controller of leaseControllers) controller.abort();
+    for (const stopLease of leaseControllers) stopLease();
   }
   return Object.freeze({
     handleMessage, registerEvent, getEvent, recover,

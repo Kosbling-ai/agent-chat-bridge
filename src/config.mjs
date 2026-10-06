@@ -146,8 +146,10 @@ function validateRuntime(raw) {
     return { components: {} };
   }
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
-  object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv', 'writer'], 'invalid_storage_fields');
+  object(raw.storage, ['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv', 'writer', 'claimTimeoutMs'], 'invalid_storage_fields');
   const storage = Object.fromEntries(['hostEnv', 'portEnv', 'userEnv', 'passwordEnv', 'databaseEnv'].map(key => [key, reference(raw.storage[key])]));
+  storage.claimTimeoutMs = raw.storage.claimTimeoutMs === undefined ? 15_000 : raw.storage.claimTimeoutMs;
+  if (!Number.isSafeInteger(storage.claimTimeoutMs) || storage.claimTimeoutMs < 1000 || storage.claimTimeoutMs > 30_000) throw new ConfigError('invalid_storage_claim_timeout');
   const rawWriter = raw.storage.writer ?? {};
   object(rawWriter, ['probeIntervalMs', 'probeTimeoutMs', 'probeMaxMisses', 'lostShutdownMs'], 'invalid_storage_writer_fields');
   const writer = {

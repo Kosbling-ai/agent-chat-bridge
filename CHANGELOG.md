@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.26] — Unreleased
+
+- Keep transient storage failures in a visible degraded state with capped retry backoff and automatic recovery, instead of stopping polling and restarting active Codex turns after a fixed failure count. Readiness reports degradation; fatal schema/worker errors still use the restart watchdog.
+- Reconcile uncertain claims with their original IDs and lease tokens before execution. Reduce empty polling and expose a configurable background `storage.claimTimeoutMs` (default 15000, range 1000–30000 ms); ingress deadlines are unchanged.
+- Retry transient lease renewals only within the last confirmed ownership window. Definitive lease loss or expiry still interrupts the affected task; no external side effect is blindly replayed.
+- Preserve safe commit timeout/driver diagnostics and document macOS service scheduling.
+
+No database migration is needed.
+
 ## [0.2.25] — Unreleased
 
 - Offer explicit current-turn Computer Use app approval to avoid a separate card for every keypress, paste and window read. Keep one-request approval and denial available.

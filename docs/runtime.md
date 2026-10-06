@@ -178,7 +178,11 @@ Migration is explicit; startup only checks the migration ledger. `/health/live` 
 
 The bridge uses the MySQL connection pool for storage operations. Reads use a normal pooled connection. Writes use a short transaction only when several changes must commit together; single-row updates rely on atomic SQL predicates. Unique keys provide idempotency for message, job and outbox keys, while row leases protect claimable work. Every runtime table is scoped by `connection_id`, so independent bot processes do not need a process-wide advisory lock or a dedicated long-lived database connection.
 
-`storage.writer` settings are accepted as deprecated compatibility fields and have no runtime effect. Existing configurations can retain them while migrating; new configurations should omit them. Communication polling treats normalized `store_unavailable`, `store_contention`, `store_timeout`, and claim-only `commit_unknown` failures as transient: it remains running in a visible degraded state and retries with bounded exponential backoff from 1 second through 10 seconds. The final backoff is truncated at a hard deadline 30 seconds after the first failure, and no new claim starts at or after that deadline. Six consecutive failures or the deadline, whichever comes first, makes the worker unhealthy; non-transient errors do so immediately. `runtime.unhealthyExitMs` (default 30000 ms) then applies to the Store and unhealthy communication workers through the existing fail-closed non-zero exit path. Codex and Feishu still affect readiness, but their existing restart and reconnect lifecycles are not overridden by this watchdog.
+`storage.writer` fields remain accepted for compatibility; the advisory writer lock is no longer used. Communication polling treats normalized `store_unavailable`, `store_contention`, `store_timeout`, and claim-only `commit_unknown` failures as transient. It remains running but degraded, retries with capped exponential backoff, and recovers automatically. There is no total outage timer or failure count that turns a transient database outage into a fatal worker error. Shutdown interrupts retry waits. Logs report transitions and rate-limit persistent failures.
+
+Readiness reports unavailable storage or degraded workers as not ready, with optional `degraded` details; this does not imply process death. The watchdog separates degradation from fatal errors. `runtime.unhealthyExitMs` still applies to schema mismatches and stopped/faulted workers, not temporary storage connectivity or slow queries. Codex and Feishu continue to affect readiness through their existing lifecycles.
+
+An active task can retry a transient lease-renewal failure only until the end of its last confirmed lease. It never extends ownership based on an uncertain COMMIT, and a definitive lost lease or expiry interrupts that task. Database failure is not permission to perform unowned external side effects.
 
 Restart does not clear queues, replay ambiguous deliveries, change leases, or bypass existing idempotency. The normal durable claim, lease, and deduplication rules decide what work is eligible after the supervisor starts a replacement process.
 
@@ -203,9 +207,9 @@ as a safe new send. An unresolved claim stays pending for reconciliation rather
 than being replaced by a new claim. Recovery verifies scope, owner, token and
 lease expiry under row locks.
 
-Background claims have a 5-second storage deadline. The short ingress deadline
-is unchanged. A transient failure uses the bounded polling retry policy above;
-a persistent database failure still becomes unhealthy. Idle communication
+`storage.claimTimeoutMs` sets the background-claim deadline (default 15000 ms, allowed 1000–30000 ms). The short ingress deadline
+is unchanged. A transient failure uses the capped polling backoff above;
+a persistent database outage remains degraded and continues recovery probes. Idle communication
 polling backs off from 100 ms to 1 second, and returns to 100 ms when a poll claims
 work. Long-running model turns do not keep empty polling at the fast cadence. This bounds idle pickup latency without continuous empty transactions.
 
