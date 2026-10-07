@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.23] — Unreleased
+
+- Add the optional card text key `commandTitleTemplate` (default `{name}`, placeholders `{name}` and `{label}`) for execution-card command lines that have no recognised action (read, search, list files, skill). `{name}` is the program name (for example `node` or `git status`) and `{label}` is `toolCommandExecutionLabel` (default `执行命令`), so `{label}` shows 「执行命令」 instead of the bare program name. Lines with a recognised action keep showing the action. The default keeps the 0.2.22 output.
+
+No database migration and no configuration format change. Rollback to 0.2.22: first remove `commandTitleTemplate` from every card text file, because 0.2.22 rejects unknown fields and would ignore the whole file.
+
 ## [0.2.22] — Unreleased
 
 - Compact the execution card to the shared Feishu card layout. The visible area holds only key content and the process folds into at most one collapsed panel, never nested panels. A running card shows the latest public commentary (or `received`), the progress-unavailable notice when it applies, the status line, one panel titled by `toolGroup` whose single Markdown block lists one line per tool (`- {toolItem}`, without durations, exit codes or tool names), and the stop button. Completed, failed, interrupted and deferred cards show the final answer and status line first, then one `N 个工具调用 · 已结束` panel (titled by the new card text key `processGroup`, default `执行过程`, when there was commentary but no tool call) with all retained commentary (`· ` prefix) and tool lines in time order, then the fork button on a failed busy card; a card without commentary or tools has no panel. Silent completion shows only `silentReply` and the status line. Per-tool panels and separate duration/tool-name rows are gone.

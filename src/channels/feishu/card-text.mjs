@@ -22,7 +22,7 @@ export const CARD_TEXT_TEMPLATES = Object.freeze({
   toolGroup: ['count', 'running', 'activity'], toolGroupRunning: ['running'],
   toolItem: ['title', 'status'], cardSummary: ['title', 'status'], statusFooter: ['status'], fallbackSuffix: ['fallback'],
   inputSummary: ['title'], inputTitle: ['title'],
-  toolTitleTemplate: ['name', 'label'], fieldTemplate: ['label', 'value'],
+  toolTitleTemplate: ['name', 'label'], commandTitleTemplate: ['name', 'label'], fieldTemplate: ['label', 'value'],
   readTargetTemplate: ['action', 'target'], readFallbackTemplate: ['action', 'file'],
   skillReadTemplate: ['action', 'skill', 'skillLabel'], actionTargetTemplate: ['action', 'target'],
   durationTemplate: ['label', 'seconds', 'unit'],

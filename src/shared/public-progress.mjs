@@ -18,7 +18,7 @@ export const DEFAULT_TOOL_COPY = Object.freeze({
   actionReadLabel: '读取', actionListFilesLabel: '列出文件', actionSearchLabel: '搜索',
   skillLabel: '技能', fileLabel: '文件', durationLabel: '耗时', secondsLabel: '秒',
   exitCodeLabel: '退出码', commandLabel: '命令', toolLabel: '工具',
-  toolTitleTemplate: '{name} · {label}', fieldTemplate: '{label}：{value}',
+  toolTitleTemplate: '{name} · {label}', commandTitleTemplate: '{name}', fieldTemplate: '{label}：{value}',
   readTargetTemplate: '{action} {target}', readFallbackTemplate: '{action}{file}',
   skillReadTemplate: '{action} {skill} {skillLabel}', actionTargetTemplate: '{action}：{target}',
   durationTemplate: '{label}：{seconds} {unit}',
@@ -133,7 +133,7 @@ export function renderPublicToolEntry(entry, copy = {}) {
     const actions = data.actions.slice(0, 4).map((action) => action && typeof action === 'object' ? renderAction(action, merged) : '').filter(Boolean);
     if (!programs.length) return { title: publicText(entry?.title, 100), summary: publicText(entry?.summary, 500) };
     const name = programs.join(' / ');
-    title = actions[0] || name;
+    title = actions[0] || formatText(merged.commandTitleTemplate, { name, label: merged.toolCommandExecutionLabel });
     details.push(formatText(merged.fieldTemplate, { label: merged.commandLabel, value: name }), ...actions);
   } else {
     return { title: publicText(entry?.title, 100), summary: publicText(entry?.summary, 500) };

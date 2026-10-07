@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.22`
+Application version: `0.2.23`
+
+Version 0.2.23 does not add a database migration. It adds the optional card text key `commandTitleTemplate` (default `{name}`); the default output is unchanged. There is no configuration format change; see the note below.
 
 Version 0.2.22 does not add a database migration. It compacts the execution-card layout: the answer (or latest progress while running) and the status line stay visible, and the process folds into at most one collapsed, non-nested panel. There is no configuration change, no card text key was removed or renamed (one optional key, `processGroup`, was added), and stored card state keeps its format; see the note below.
 
@@ -33,6 +35,12 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.23 command title template
+
+No database migration, no config `schemaVersion` change, no new configuration field and no new environment variable. The optional card text key `commandTitleTemplate` (placeholders `{name}` and `{label}`, default `{name}`) sets the title of an execution-card command line that has no recognised action; `{label}` is `toolCommandExecutionLabel`. Without the key the card is identical to 0.2.22. See [card text](docs/card-text.md).
+
+Upgrade: switch the binary and restart once. Rollback to 0.2.22: first remove `commandTitleTemplate` from every card text file, because 0.2.22 rejects unknown fields and would fall back to default wording for the whole file; then switch the binary back and restart once.
 
 ## 0.2.22 compact execution card
 
