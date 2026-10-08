@@ -264,10 +264,10 @@ export async function startService({ config, configPath, env = process.env, log,
       outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
       // Keyed by external Feishu chat id; a Map keeps ids such as "__proto__" inert.
-      // A group cwd is absolute (validated) and normalized here like the global cwd.
+      // A group cwd arrives validated and normalized from the configuration.
       groupCodexOverrides: new Map(config.routing.groups
         .filter(group => group.capabilities.includes('bridge') && group.codex)
-        .map(group => [group.conversationId, group.codex.cwd ? { ...group.codex, cwd: resolve(group.codex.cwd) } : group.codex])),
+        .map(group => [group.conversationId, group.codex])),
     };
     const groupInstructions=createGroupInstructions({groups:config.routing.groups.filter(group=>group.capabilities.includes('bridge')),configDir:root,log});
     executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,groupInstructions,

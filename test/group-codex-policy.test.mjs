@@ -55,6 +55,7 @@ test('a bridge group may set its own absolute Codex cwd, alone or with permissio
   assert.deepEqual(groupCodexOf({ cwd: '/srv/agent/workspace', approvalPolicy: 'never', sandbox: 'danger-full-access' }),
     { cwd: '/srv/agent/workspace', approvalPolicy: 'never', sandbox: 'danger-full-access' });
   assert.equal(validateConfig(withGroup({ codex: { cwd: '/srv/agent/workspace' } })).codex.cwd, './workspace', 'the global cwd is unchanged');
+  assert.deepEqual(groupCodexOf({ cwd: '/srv/agent/../agent/workspace/' }), { cwd: '/srv/agent/workspace' }, 'the stored cwd is normalized');
 });
 
 test('a group Codex cwd must be a non-empty absolute path string', () => {

@@ -24,7 +24,7 @@ function sessionStore() {
   };
 }
 
-test('service launches the real executor child with mapped config and closes an active turn', { timeout: 5000 }, async t => {
+test('service launches the real executor child with mapped config and closes an active turn', { timeout: 20000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-service-executor-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   let service;

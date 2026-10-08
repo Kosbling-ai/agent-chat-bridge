@@ -117,8 +117,9 @@ function silentReply(value, { partial = false } = {}) {
 // thread and business-event threads whose result chat is this group). Each
 // field replaces the global value and may grant more or less than it; model
 // stays global. Permission values are the app-server protocol enums, compared
-// exactly (no trimming). `cwd` must be an absolute path; startup and
-// check-config verify the directory with the same checks as the global cwd.
+// exactly (no trimming). `cwd` must be an absolute path and is stored
+// normalized; startup and check-config verify the directory with the same
+// checks as the global cwd.
 const GROUP_APPROVAL_POLICIES = Object.freeze(['untrusted', 'on-request', 'never']);
 const GROUP_APPROVALS_REVIEWERS = Object.freeze(['user', 'auto_review', 'guardian_subagent']);
 const GROUP_SANDBOX_MODES = Object.freeze(['read-only', 'workspace-write', 'danger-full-access']);
@@ -128,7 +129,8 @@ function groupCodex(value) {
   if (value.cwd !== undefined) {
     if (typeof value.cwd !== 'string' || !value.cwd || value.cwd !== value.cwd.trim() || value.cwd.length > 1024
       || !isAbsolute(value.cwd) || /[\u0000-\u001f\u007f]/u.test(value.cwd)) throw new ConfigError('invalid_group_codex_cwd');
-    result.cwd = value.cwd;
+    // Normalized once here so the preflight check and the executor use the same value.
+    result.cwd = resolve(value.cwd);
   }
   if (value.approvalPolicy !== undefined) {
     if (!GROUP_APPROVAL_POLICIES.includes(value.approvalPolicy)) throw new ConfigError('invalid_group_codex_approval_policy');
