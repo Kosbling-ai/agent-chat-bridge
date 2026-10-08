@@ -100,7 +100,7 @@ test('delta coalescer keeps interleaved items independent', async () => {
   assert.deepEqual(writes, { first: ['a', 'ab'], second: ['x', 'xy'] });
 });
 
-test('communication poll retries a transient store error and recovers', async () => {
+for (const errorCode of ['store_unavailable', 'commit_unknown']) test(`communication poll recovers from ${errorCode} without stopping the worker`, async () => {
   let claims = 0;
   let releaseIdle;
   let releaseRetry;
@@ -108,7 +108,7 @@ test('communication poll retries a transient store error and recovers', async ()
   const logs = [];
   const runtime = createCommunicationRuntime({ config, chat: {}, log: (...entry) => logs.push(entry),
     store: {
-      async claimJobs() { claims += 1; if (claims === 1) throw new StoreError('store_unavailable'); return []; },
+      async claimJobs() { claims += 1; if (claims === 1) throw new StoreError(errorCode); return []; },
       async claimOutbox() { return []; },
     },
     wait: async milliseconds => {
@@ -148,13 +148,13 @@ test('communication poll marks non-transient store errors unhealthy immediately'
   await runtime.stop();
 });
 
-test('communication poll retry limit transitions a persistently failing worker to unhealthy', async () => {
+for (const errorCode of ['store_timeout', 'commit_unknown']) test(`persistent ${errorCode} still exhausts the retry budget`, async () => {
   let clock = 0;
   const logs = [];
   const waits = [];
   const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock, log: (...entry) => logs.push(entry),
     store: {
-      async claimJobs() { throw new StoreError('store_timeout'); },
+      async claimJobs() { throw new StoreError(errorCode); },
       async claimOutbox() { throw new Error('unexpected'); },
     },
     wait: async milliseconds => { waits.push(milliseconds); clock += milliseconds; },
@@ -242,4 +242,27 @@ test('service executor log adapter forwards only diagnostic allowlist fields', (
     operation: 'persist_delta', status: 'failed', consecutive_failures: 2, durationMs: 23,
     stage: 'write', error_class: 'store_contention', errno: 1205, sql_state: 'HY000', will_retry: true,
   });
+});
+
+for (const stage of ['claimJobs', 'claimOutbox']) test(`uncertain ${stage} acknowledgement does not launch an unconfirmed effect`, async () => {
+  let attempts = 0;
+  let releaseRetry, releaseIdle;
+  let effects = 0;
+  const runtime = createCommunicationRuntime({ config, chat: { sendMessage: async () => { effects++; } },
+    store: {
+      async claimJobs() { if (stage === 'claimJobs' && ++attempts === 1) throw new StoreError('commit_unknown'); return []; },
+      async claimOutbox() { if (stage === 'claimOutbox' && ++attempts === 1) throw new StoreError('commit_unknown'); return []; },
+    },
+    wait: async ms => { if (ms === 1000) await new Promise(r => { releaseRetry = r; }); if (ms === 100) await new Promise(r => { releaseIdle = r; }); },
+  });
+  runtime.start();
+  while (!releaseRetry) await immediate();
+  assert.equal(runtime.status().running, true);
+  assert.equal(runtime.status().degraded, true);
+  releaseRetry();
+  while (!releaseIdle) await immediate();
+  assert.equal(runtime.status().degraded, false);
+  assert.equal(effects, 0);
+  releaseIdle();
+  await runtime.stop();
 });

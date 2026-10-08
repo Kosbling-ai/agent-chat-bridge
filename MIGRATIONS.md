@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.23`
+Application version: `0.2.24`
+
+Version 0.2.24 adds bounded retries only for claim-stage `commit_unknown`. Unconfirmed claim results are discarded; persisted leases fence work, and existing expiry/idempotency rules apply. No business run is replayed by this retry. Persistent errors still exhaust the six-attempt/30-second budget and trigger health recovery. No database or configuration migration. Upgrade by deploying this version and restarting the bridge through its supervisor during an idle window; verify readiness and worker diagnostics. Roll back to 0.2.23 through the same lifecycle; no stored state is changed.
 
 Version 0.2.23 does not add a database migration. It adds the optional card text key `commandTitleTemplate` (default `{name}`); the default output is unchanged. There is no configuration format change; see the note below.
 
