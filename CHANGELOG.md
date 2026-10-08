@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.24] - 2026-10-08
+
+- Treat an uncertain queue-claim COMMIT as a bounded poll failure. Discard its result and respect durable leases instead of stopping the whole bridge immediately and disconnecting active Codex turns.
+- Preserve fail-closed behavior for persistent failures and invalid input. No schema/config migration or automatic replay of failed business runs.
+
 ## [0.2.23] — Unreleased
 
 - Add the optional card text key `commandTitleTemplate` (default `{name}`, placeholders `{name}` and `{label}`) for execution-card command lines that have no recognised action (read, search, list files, skill). `{name}` is the program name (for example `node` or `git status`) and `{label}` is `toolCommandExecutionLabel` (default `执行命令`), so `{label}` shows 「执行命令」 instead of the bare program name. Lines with a recognised action keep showing the action. The default keeps the 0.2.22 output.

@@ -9,7 +9,10 @@ import { databaseError } from '../storage/errors.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
 const sleep=milliseconds=>new Promise(resolve=>{const timer=setTimeout(resolve,milliseconds);timer.unref?.();});
-const TRANSIENT_STORE_ERRORS=new Set(['store_unavailable','store_contention','store_timeout']);
+// Claim acknowledgements can be lost after COMMIT. Discard the unknown result
+// and poll again: persisted leases prevent executing an unconfirmed claim.
+// This does not retry business execution or outbound delivery.
+const TRANSIENT_STORE_ERRORS=new Set(['store_unavailable','store_contention','store_timeout','commit_unknown']);
 const POLL_RETRY_BASE_MS=1000;
 const POLL_RETRY_MAX_MS=10000;
 const POLL_FAILURE_LIMIT=6;
