@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.24`
+Application version: `0.2.25`
+
+Version 0.2.25 does not add a database migration or change the config `schemaVersion`. It adds the optional per-group working directory `routing.groups[].codex.cwd` and announces the result-file directory as an absolute path; see [0.2.25 per-group Codex working directory](#0225-per-group-codex-working-directory).
 
 Version 0.2.24 adds bounded retries only for claim-stage `commit_unknown`. Unconfirmed claim results are discarded; persisted leases fence work, and existing expiry/idempotency rules apply. No business run is replayed by this retry. Persistent errors still exhaust the six-attempt/30-second budget and trigger health recovery. No database or configuration migration. Upgrade by deploying this version and restarting the bridge through its supervisor during an idle window; verify readiness and worker diagnostics. Roll back to 0.2.23 through the same lifecycle; no stored state is changed.
 
@@ -37,6 +39,25 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.25 per-group Codex working directory
+
+No database migration, no config `schemaVersion` change and no new environment variable. `routing.groups[].codex.cwd` is optional, must be an absolute path (`invalid_group_codex_cwd` otherwise) and is stored normalized. Startup and `check-config` require an existing directory owned by the bridge user that is not world-writable, the same rules as the global `codex.cwd`, and fail with `invalid_group_codex_workspace`. The group's human thread and business-event threads delivering to the group use it on `thread/start`, `thread/resume`, `thread/fork` and every `turn/start`; other groups and private chats keep the global cwd. Bridge-owned paths stay under the global cwd. Prompts now name the result-file directory as `<global codex.cwd>/data/feishu-outbox/...` for every conversation; business-event threads therefore receive their system-task preamble once more.
+
+Existing threads of a group that gets a `cwd` move to a new thread on their next turn: Codex keeps the cwd recorded at `thread/start`, so the executor replaces a thread whose recorded cwd differs through the normal rollover path and logs `thread_rollover` with `reason` `cwd_changed`. The new thread receives the full first-turn context. Codex reads `AGENTS.md` from the cwd when a thread is created, so edits to the workspace `AGENTS.md` take effect for new threads. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions).
+
+To enable it:
+
+1. Create the group workspace: `mkdir -p <parent-dir>`, then `mkdir -m 700 <workspace-dir>`, and add its `AGENTS.md` (for example `ln -s <source>/AGENTS.md <workspace-dir>/AGENTS.md`). Verify that `stat -f '%Su %Lp' <workspace-dir>` prints the bridge user and `700`. A directory outside any git repository gives project-less Codex threads, which read only the Codex home `AGENTS.md` and the directory's own `AGENTS.md`.
+2. Deploy 0.2.25 by fast-forward: `git -C <bridge-checkout> fetch origin`, then `git -C <bridge-checkout> merge --ff-only origin/main`. The running bridge keeps the old code until its restart.
+3. Back up the private configuration (`cp -p <bridge.json> <bridge.json>.bak-0.2.25-<timestamp>`), then add `"cwd": "<workspace-dir>"` to each target group's `codex` object. Keep the group's `instructionFiles` unchanged, including an entry that points at the same `AGENTS.md`: the human thread then also receives it as group instructions, which are re-injected when the file changes, while business-event threads read it only from the cwd when the thread is created.
+4. Run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>` from the updated checkout; it must log `check_config` `succeeded`.
+5. Confirm that no turn is running: the bridge log must show `"operation":"app_server_close","status":"succeeded"` after the last activity (the Codex child closes only when idle), with no newer activity.
+6. In that idle window restart only the bridge: `kill -TERM <bridge-pid>`, and let its supervisor start it again. Find the pid with `ps -axo pid,command | grep '[a]gent-chat-bridge.mjs start'` or in the supervisor's `logs/status.json` (`services["agent-chat-bridge"].pid`). Do not restart other services.
+7. Verify: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` returns `{"live":true}` and `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/ready` returns HTTP 200 with `"ready":true`. The bridge log must not contain `invalid_group_codex_workspace`. On their next turn, the group's existing threads log `thread_rollover` with `reason` `cwd_changed` once each.
+8. Rollback: restore the backup (or remove `cwd`), run `check-config`, then repeat steps 5–6. To return to 0.2.24, remove every `codex.cwd` first: 0.2.24 rejects the key with `invalid_group_codex_fields` at startup. Threads already moved keep the workspace as their recorded cwd (their turns run in the global cwd) until their next rollover.
+
+Warning: the group workspace is checked at every start. If the directory is deleted, becomes world-writable or changes owner, the next bridge start fails as a whole (`invalid_group_codex_workspace`), which stops every group and private chat until the directory is restored or `cwd` is removed.
 
 ## 0.2.23 command title template
 

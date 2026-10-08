@@ -168,6 +168,12 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   const resolvedUserInputs = new Set();
   const loadedThreads = new Set();
   const injectedContext = new Map();
+  // Thread id -> cwd Codex reported for it on start or resume (bounded). Codex
+  // keeps the cwd a thread recorded at start; thread/resume does not move it.
+  const threadCwds = new Map();
+  // Group cwds for which a newly started thread reported another cwd; such a
+  // mismatch cannot be fixed by a new thread, so cwd rollover stops for them.
+  const unconfirmedCwds = new Set();
   let memoryTimer;
   let closing = false;
   let restartPending = '';
@@ -210,15 +216,25 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     return { feishuOpenId, chatId, chatType };
   }
 
-  // A configured group may switch the Codex approval and sandbox settings for
-  // every thread bound to that group chat: the human group thread and
-  // business-event threads whose result chat is the group. Only group bindings
-  // match, so a private chat whose id equals a configured group id keeps the
-  // global settings.
+  // A configured group may switch the Codex working directory, approval and
+  // sandbox settings for every thread bound to that group chat: the human group
+  // thread and business-event threads whose result chat is the group. Only
+  // group bindings match, so a private chat whose id equals a configured group
+  // id keeps the global settings.
   const groupCodexOverrides = new Map(config.groupCodexOverrides || []);
+  const groupCwdFor = (binding) => (binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId)?.cwd : undefined) || '';
+  const sameCwd = (left, right) => resolve(left) === resolve(right);
+  function rememberThreadCwd(threadId, value) {
+    const cwd = trim(value);
+    if (!threadId || !cwd) return;
+    threadCwds.delete(threadId);
+    threadCwds.set(threadId, cwd);
+    if (threadCwds.size > 2000) threadCwds.delete(threadCwds.keys().next().value);
+  }
   function codexPolicyFor(binding) {
     const override = binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId) : undefined;
     return {
+      cwd: override?.cwd || config.cwd,
       approvalPolicy: normalizeApprovalPolicy(override?.approvalPolicy || config.approvalPolicy),
       approvalsReviewer: normalizeApprovalsReviewer(override?.approvalsReviewer || config.approvalsReviewer),
       sandbox: override?.sandbox || config.sandbox || 'workspace-write',
@@ -228,15 +244,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   // turn/start has no `sandbox` parameter (its `sandboxPolicy` is a structured
   // policy object). The sandbox chosen on thread start, resume or fork stays in
   // force for later turns, and every turn runs on a thread this app-server
-  // child started, resumed or forked through threadDefaults.
+  // child started, resumed or forked through threadDefaults. The cwd is sent on
+  // every turn as well, because thread/resume does not move the cwd a thread
+  // recorded when it started.
   function turnPolicyFor(binding) {
-    const { approvalPolicy, approvalsReviewer } = codexPolicyFor(binding);
-    return { approvalPolicy, approvalsReviewer };
+    const { cwd, approvalPolicy, approvalsReviewer } = codexPolicyFor(binding);
+    return { cwd, approvalPolicy, approvalsReviewer };
   }
 
   function threadDefaults(extra = {}, binding) {
     return {
-      cwd: config.cwd,
       ...codexPolicyFor(binding),
       ...(config.model ? { model: config.model } : {}),
       ...extra,
@@ -252,6 +269,13 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     const threadId = trim(response?.thread?.id);
     if (!threadId) throw coded('Codex did not return a thread id', 'CODEX_THREAD_START_UNCONFIRMED', { outcome: 'unknown' });
     loadedThreads.add(threadId);
+    const reportedCwd = trim(response?.thread?.cwd);
+    rememberThreadCwd(threadId, reportedCwd);
+    const groupCwd = groupCwdFor(actor);
+    if (groupCwd && reportedCwd && !sameCwd(reportedCwd, groupCwd) && !unconfirmedCwds.has(resolve(groupCwd))) {
+      unconfirmedCwds.add(resolve(groupCwd));
+      log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'thread_rollover', status: 'skipped', reason: 'cwd_unconfirmed', chat_id: actor.chatId });
+    }
     return { threadId, threadName: buildThreadName(actor) };
   }
 
@@ -276,6 +300,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       response = await client.request('thread/resume', threadDefaults({ threadId: binding.codexSessionId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      rememberThreadCwd(binding.codexSessionId, response?.thread?.cwd);
     } catch (error) {
       if (error?.code === 'CODEX_THREAD_BUSY' && error.outcome === 'rejected') {
         error.phase = 'pre_admission';
@@ -427,7 +452,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   // Replace-mode instructions supersede the default group wording only once the
   // thread actually holds them; otherwise the default wording stays.
   async function initialPrompt(binding, input, instructionMode = '') {
-    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
+    // The result-file directory is announced as an absolute path under the
+    // global workspace, where collectOutboxAttachments scans it, so it stays
+    // correct whatever cwd the thread runs in.
+    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
     if (!isScheduledBinding(binding.feishuOpenId)) return { prompt: buildInitialPrompt(options) };
     const hash = fingerprint(systemTaskPreamble(options));
     let present = false;
@@ -753,7 +781,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       let admission = startAdmission(binding.codexSessionId, normalized.messageId);
       try {
         response = await client.request('turn/start', {
-          threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
+          threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments),
           ...turnPolicyFor(binding),
           ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
         });
@@ -768,7 +796,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           await persistUser(binding, normalized, 'user', prompt);
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
-            threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
+            threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments),
             ...turnPolicyFor(binding),
             ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
           }).catch((failure) => { startingByThread.delete(admission.threadId); admission.reject(failure); throw failure; });
@@ -810,13 +838,33 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function ensureBindingThreadReadyWithArchiveRecovery(binding, messageId) {
-    try { await ensureThreadReady(binding); return binding; }
+    let ready = binding;
+    try { await ensureThreadReady(binding); }
     catch (error) {
       if (error?.code !== 'CODEX_THREAD_ARCHIVED') throw error;
-      const next = await rolloverArchivedBinding(binding, messageId, error);
-      await ensureThreadReady(next);
-      return next;
+      ready = await rolloverArchivedBinding(binding, messageId, error);
+      await ensureThreadReady(ready);
     }
+    return rolloverForCwdChange(ready, messageId);
+  }
+
+  // A thread of a group with its own cwd that Codex recorded under another cwd
+  // (for example, started before the group cwd was configured) moves to a new
+  // thread before its next turn, so the work runs in, and AGENTS.md is read
+  // from, the configured directory. The new thread receives the full first-turn
+  // context. Groups without a cwd and private chats never take this path. A
+  // known-turn resume only records the cwd; the move happens on the next turn
+  // admission so an observed turn keeps its thread.
+  async function rolloverForCwdChange(binding, messageId) {
+    const expected = groupCwdFor(binding);
+    const recorded = threadCwds.get(binding.codexSessionId);
+    if (!expected || !recorded || sameCwd(recorded, expected) || unconfirmedCwds.has(resolve(expected))) return binding;
+    const next = await rollover(binding, messageId, 'cwd_changed', {
+      outText: 'Codex 工作目录已调整，后续飞书消息承接到新 Codex 会话。',
+      inText: '因 Codex 工作目录已调整，本会话开始承接后续飞书消息。',
+    });
+    log('info', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'thread_rollover', status: 'succeeded', reason: 'cwd_changed', chat_id: binding.chatId });
+    return next;
   }
 
   function rolloverArchivedBinding(binding, messageId, error) {
@@ -842,6 +890,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      rememberThreadCwd(resume.threadId, response?.thread?.cwd);
       snapshot = exactTurnSnapshot(response?.thread, resume.turnId);
       const otherActiveIds = inProgressTurnIds(response?.thread).filter((turnId) => turnId !== resume.turnId);
       if (snapshot.status !== 'unknown' && otherActiveIds.length === 0) loadedThreads.add(resume.threadId);
@@ -944,7 +993,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       const thread = response?.thread;
       const targetThreadId = trim(thread?.id);
-      if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(config.cwd)
+      if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(codexPolicyFor(actor).cwd)
         || thread?.ephemeral === true || (thread?.forkedFromId && thread.forkedFromId !== sourceThreadId)) {
         throw coded('fork response could not be verified', 'CODEX_FORK_UNCONFIRMED', { outcome: 'unknown' });
       }

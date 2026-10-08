@@ -636,7 +636,7 @@ test('actual turn/start and steer requests keep text first and add only download
   await executor.execute({bindingOpenId:'human',chatId:'chat',chatType:'p2p',messageId:'second',prompt:'second prompt',attachments});
   const start=calls.find(call=>call.method==='turn/start').params.input;
   const steer=calls.find(call=>call.method==='turn/steer').params.input;
-  assert.deepEqual(start,[{type:'text',text:'【飞书私聊会话】\nchat_id：chat\n对方 open_id：human\n回发文件目录：data/feishu-outbox/chat\n说明：需要回发本机图片或文件时，必须复制或写入该目录；只在 Markdown 中引用本机路径不会上传。\n\nfirst prompt',text_elements:[]},{type:'localImage',path:'/tmp/image.png'}]);
+  assert.deepEqual(start,[{type:'text',text:'【飞书私聊会话】\nchat_id：chat\n对方 open_id：human\n回发文件目录：/tmp/data/feishu-outbox/chat\n说明：需要回发本机图片或文件时，必须复制或写入该目录；只在 Markdown 中引用本机路径不会上传。\n\nfirst prompt',text_elements:[]},{type:'localImage',path:'/tmp/image.png'}]);
   assert.deepEqual(steer,[{type:'text',text:'second prompt',text_elements:[]},{type:'localImage',path:'/tmp/image.png'}]);
   child.send({method:'turn/completed',params:{threadId:'thread-1',turnId:'turn-1',turn:{id:'turn-1',status:'completed',items:[{type:'agentMessage',phase:'final_answer',text:'done'}]}}});
   await first;await executor.close();

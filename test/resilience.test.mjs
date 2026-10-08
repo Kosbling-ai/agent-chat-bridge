@@ -242,6 +242,11 @@ test('service executor log adapter forwards only diagnostic allowlist fields', (
     operation: 'persist_delta', status: 'failed', consecutive_failures: 2, durationMs: 23,
     stage: 'write', error_class: 'store_contention', errno: 1205, sql_state: 'HY000', will_retry: true,
   });
+  adapter('info', { operation: 'thread_rollover', status: 'succeeded', reason: 'cwd_changed', chat_id: 'oc_chat', chatId: 'ignored', cwd: '/must/not/appear', oldThreadId: 'thread-old' });
+  assert.deepEqual(events[1], {
+    timestamp: events[1].timestamp, level: 'info', module: 'bridge', component: 'service',
+    operation: 'thread_rollover', status: 'succeeded', reason: 'cwd_changed', chat_id: 'oc_chat',
+  });
 });
 
 for (const stage of ['claimJobs', 'claimOutbox']) test(`uncertain ${stage} acknowledgement does not launch an unconfirmed effect`, async () => {

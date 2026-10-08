@@ -3,14 +3,14 @@ import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { stopCardTurn } from '../src/agents/codex/card-stop.mjs';
 import { codexThreadCreatedAtMs, shouldRolloverForRules } from '../src/agents/codex/codex-rules-rollover.mjs';
 import { inProgressTurnIds, isCodexTurnPredecessor, isCodexTurnSuccessor, isNoActiveTurnError, parseActiveTurnMismatch, steerTurnWithMismatchRecovery, TurnRecoverySupersededError } from '../src/agents/codex/codex-turn-recovery.mjs';
 import { closeOwnedChild, resolveSharedHome } from '../src/agents/codex/idle-lifecycle.mjs';
 import { canDeliverOutboxAttachments, parseOutboundGroupChatIds } from '../src/agents/codex/outbox-policy.mjs';
 import { codexBindingOpenId } from '../src/agents/codex/thread-scope.mjs';
-import { buildInitialPrompt } from '../src/agents/codex/prompt.mjs';
+import { buildInitialPrompt, outboxPromptDirectory } from '../src/agents/codex/prompt.mjs';
 import { collectOutboxAttachments } from '../src/agents/codex/outbound-files.mjs';
 
 const OLD = '01a00f75-2d21-7163-912d-bdfb80d328b4';
@@ -83,14 +83,27 @@ test('continued p2p turns repeat the current outbox without repeating identity',
   assert.doesNotMatch(prompt, /chat_id：|对方 open_id：/);
 });
 
+test('the announced result directory is absolute under the bridge workspace for every conversation kind', () => {
+  const workspace = '/srv/bridge-workspace';
+  const p2p = buildInitialPrompt({ binding: { feishuOpenId: 'human', chatId: 'private', chatType: 'p2p', created: false }, prompt: 'work', workspace });
+  assert.match(p2p, /\n回发文件目录：\/srv\/bridge-workspace\/data\/feishu-outbox\/private\n/);
+  const group = buildInitialPrompt({ binding: { feishuOpenId: 'group:chat', chatId: 'oc_group', chatType: 'group', created: false }, prompt: 'work', workspace, allowedGroupChatIds: new Set(['oc_group']) });
+  assert.match(group, /^【飞书群聊文件回传】\n回发文件目录：\/srv\/bridge-workspace\/data\/feishu-outbox\/oc_group\n/);
+  const system = buildInitialPrompt({ binding: { feishuOpenId: 'system:fixture', chatId: 'oc_group', chatType: 'group', created: true }, prompt: 'work', workspace, outboxRelativeRoot: 'data/other-outbox' });
+  assert.match(system, /\n回发文件目录：\/srv\/bridge-workspace\/data\/other-outbox\/system-[0-9a-f]{24}\/oc_group\n/);
+  assert.equal(outboxPromptDirectory({ workspace: '/srv/bridge-workspace/', chatId: 'a/b', bindingOpenId: 'human' }), '/srv/bridge-workspace/data/feishu-outbox/ab');
+  assert.equal(outboxPromptDirectory({ workspace: 'relative', chatId: 'chat', bindingOpenId: 'human' }), 'data/feishu-outbox/chat', 'a relative workspace is never joined');
+});
+
 test('prompt and attachment scan isolate system directories and enforce file/byte budgets', () => {
   const root = mkdtempSync(join(tmpdir(), 'bridge-outbox-'));
   try {
     const binding = { feishuOpenId: 'system:fixture', chatId: 'same-chat', chatType: 'group', created: true };
-    const prompt = buildInitialPrompt({ binding, prompt: 'work' });
+    const prompt = buildInitialPrompt({ binding, prompt: 'work', workspace: root });
     assert.match(prompt, /【独立系统任务】/);
-    const relative = prompt.match(/回发文件目录：([^\n]+)/)[1];
-    const directory = join(root, relative); mkdirSync(directory, { recursive: true });
+    const directory = prompt.match(/回发文件目录：([^\n]+)/)[1];
+    assert.ok(isAbsolute(directory) && directory.startsWith(`${root}/`), 'the announced directory is the scanned directory');
+    mkdirSync(directory, { recursive: true });
     for (let index = 0; index < 4; index++) writeFileSync(join(directory, `${index}.txt`), '1234');
     const files = collectOutboxAttachments(binding, 0, { workspace: root, allowedGroupChatIds: new Set(['same-chat']), maxFiles: 3, maxBytes: 8 });
     assert.equal(files.length, 2);
