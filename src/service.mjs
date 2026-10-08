@@ -394,5 +394,7 @@ export function createExecutorLogAdapter(log) {
     durationMs: event.durationMs,
     consecutiveFailures: event.consecutiveFailures,
     willRetry: event.willRetry,
+    reason: event.reason,
+    chatId: event.chat_id,
   });
 }

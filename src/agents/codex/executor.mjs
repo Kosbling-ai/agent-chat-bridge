@@ -168,6 +168,12 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   const resolvedUserInputs = new Set();
   const loadedThreads = new Set();
   const injectedContext = new Map();
+  // Thread id -> cwd Codex reported for it on start or resume (bounded). Codex
+  // keeps the cwd a thread recorded at start; thread/resume does not move it.
+  const threadCwds = new Map();
+  // Group cwds for which a newly started thread reported another cwd; such a
+  // mismatch cannot be fixed by a new thread, so cwd rollover stops for them.
+  const unconfirmedCwds = new Set();
   let memoryTimer;
   let closing = false;
   let restartPending = '';
@@ -216,6 +222,15 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   // group bindings match, so a private chat whose id equals a configured group
   // id keeps the global settings.
   const groupCodexOverrides = new Map(config.groupCodexOverrides || []);
+  const groupCwdFor = (binding) => (binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId)?.cwd : undefined) || '';
+  const sameCwd = (left, right) => resolve(left) === resolve(right);
+  function rememberThreadCwd(threadId, value) {
+    const cwd = trim(value);
+    if (!threadId || !cwd) return;
+    threadCwds.delete(threadId);
+    threadCwds.set(threadId, cwd);
+    if (threadCwds.size > 2000) threadCwds.delete(threadCwds.keys().next().value);
+  }
   function codexPolicyFor(binding) {
     const override = binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId) : undefined;
     return {
@@ -254,6 +269,13 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     const threadId = trim(response?.thread?.id);
     if (!threadId) throw coded('Codex did not return a thread id', 'CODEX_THREAD_START_UNCONFIRMED', { outcome: 'unknown' });
     loadedThreads.add(threadId);
+    const reportedCwd = trim(response?.thread?.cwd);
+    rememberThreadCwd(threadId, reportedCwd);
+    const groupCwd = groupCwdFor(actor);
+    if (groupCwd && reportedCwd && !sameCwd(reportedCwd, groupCwd) && !unconfirmedCwds.has(resolve(groupCwd))) {
+      unconfirmedCwds.add(resolve(groupCwd));
+      log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'thread_rollover', status: 'skipped', reason: 'cwd_unconfirmed', chat_id: actor.chatId });
+    }
     return { threadId, threadName: buildThreadName(actor) };
   }
 
@@ -278,6 +300,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       response = await client.request('thread/resume', threadDefaults({ threadId: binding.codexSessionId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      rememberThreadCwd(binding.codexSessionId, response?.thread?.cwd);
     } catch (error) {
       if (error?.code === 'CODEX_THREAD_BUSY' && error.outcome === 'rejected') {
         error.phase = 'pre_admission';
@@ -815,13 +838,33 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function ensureBindingThreadReadyWithArchiveRecovery(binding, messageId) {
-    try { await ensureThreadReady(binding); return binding; }
+    let ready = binding;
+    try { await ensureThreadReady(binding); }
     catch (error) {
       if (error?.code !== 'CODEX_THREAD_ARCHIVED') throw error;
-      const next = await rolloverArchivedBinding(binding, messageId, error);
-      await ensureThreadReady(next);
-      return next;
+      ready = await rolloverArchivedBinding(binding, messageId, error);
+      await ensureThreadReady(ready);
     }
+    return rolloverForCwdChange(ready, messageId);
+  }
+
+  // A thread of a group with its own cwd that Codex recorded under another cwd
+  // (for example, started before the group cwd was configured) moves to a new
+  // thread before its next turn, so the work runs in, and AGENTS.md is read
+  // from, the configured directory. The new thread receives the full first-turn
+  // context. Groups without a cwd and private chats never take this path. A
+  // known-turn resume only records the cwd; the move happens on the next turn
+  // admission so an observed turn keeps its thread.
+  async function rolloverForCwdChange(binding, messageId) {
+    const expected = groupCwdFor(binding);
+    const recorded = threadCwds.get(binding.codexSessionId);
+    if (!expected || !recorded || sameCwd(recorded, expected) || unconfirmedCwds.has(resolve(expected))) return binding;
+    const next = await rollover(binding, messageId, 'cwd_changed', {
+      outText: 'Codex 工作目录已调整，后续飞书消息承接到新 Codex 会话。',
+      inText: '因 Codex 工作目录已调整，本会话开始承接后续飞书消息。',
+    });
+    log('info', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'thread_rollover', status: 'succeeded', reason: 'cwd_changed', chat_id: binding.chatId });
+    return next;
   }
 
   function rolloverArchivedBinding(binding, messageId, error) {
@@ -847,6 +890,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      rememberThreadCwd(resume.threadId, response?.thread?.cwd);
       snapshot = exactTurnSnapshot(response?.thread, resume.turnId);
       const otherActiveIds = inProgressTurnIds(response?.thread).filter((turnId) => turnId !== resume.turnId);
       if (snapshot.status !== 'unknown' && otherActiveIds.length === 0) loadedThreads.add(resume.threadId);

@@ -118,9 +118,11 @@ function memoryStore(initial = []) {
   };
 }
 
-function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false, turnItemsFor = () => [] } = {}) {
+function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false, turnItemsFor = () => [], resumeCwds = new Map(), startCwd = (params) => params.cwd } = {}) {
   let threadNumber = 0; let turnNumber = 0;
   const children = []; const calls = []; const envs = []; const args = [];
+  // The cwd Codex reports on resume: an explicit fixture value, else the cwd the thread started with.
+  const recordedCwds = new Map(resumeCwds);
   const spawnImpl = (_bin, childArgs, options) => {
     args.push(childArgs); envs.push(options.env);
     const loaded = new Set();
@@ -139,10 +141,14 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkTh
         instance.send({ id: message.id, error: { code: -32602, message: 'SYNTHETIC_SECRET invalid approvalsReviewer' } });
       }
       else if (message.method === 'thread/start') {
-        const id = `thread-${++threadNumber}`; loaded.add(id); respond({ thread: { id } });
+        const id = `thread-${++threadNumber}`; loaded.add(id);
+        const cwd = startCwd(message.params);
+        if (cwd) recordedCwds.set(id, cwd);
+        respond({ thread: { id, ...(cwd ? { cwd } : {}) } });
       } else if (message.method === 'thread/resume') {
         if (archiveResumeThreadIds.has(message.params.threadId)) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: `session ${message.params.threadId} is archived` } })); return; }
-        loaded.add(message.params.threadId); respond({ thread: { id: message.params.threadId, turns: resumeTurns } }, resumeDelayMs);
+        const cwd = recordedCwds.get(message.params.threadId);
+        loaded.add(message.params.threadId); respond({ thread: { id: message.params.threadId, turns: resumeTurns, ...(cwd ? { cwd } : {}) } }, resumeDelayMs);
       }
       else if (message.method === 'thread/read') respond({ thread: { ...readThread, id: message.params.threadId, turns: readTurns } });
       else if (message.method === 'thread/fork') {
@@ -1321,6 +1327,117 @@ test('a group codex override reaches thread/start and turn/start of the human an
     }
     const privateTurn = runtime.calls.filter((call) => call.method === 'turn/start').at(-1).params;
     assert.match(privateTurn.input[0].text, new RegExp(`\\n回发文件目录：${escapeRegExp(cwd)}/data/feishu-outbox/chat-custom\\n`), 'a private result directory is absolute');
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+const cwdRolloverLogs = (logs) => logs.filter(([, event]) => event.operation === 'thread_rollover');
+const groupInputFor = (binding, messageId, prompt = 'work') => ({ bindingOpenId: binding.feishuOpenId, chatId: binding.chatId, chatType: binding.chatType, messageId,
+  senderOpenId: 'ou-human', senderName: 'User', prompt, busyPolicy: 'steer', groupChatContext: { chatId: binding.chatId, name: '群名' } });
+
+test('a group thread recorded under another cwd moves once to a new thread that receives the full first-turn context', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old', threadName: 'group', created: false };
+    const event = { feishuOpenId: 'system:0123456789abcdef0123456789abcdef', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old-event', threadName: 'event', created: false };
+    const store = memoryStore([group, event]);
+    const logs = [];
+    const provider = { configured: (chatId) => chatId === 'chat-custom', forChat: async () => ({ text: 'group rules', hash: 'rules-1', mode: 'append', bytes: 11, sources: 1 }) };
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-old', cwd], ['thread-old-event', cwd]]) });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, groupInstructions: provider, log: (...entry) => logs.push(entry) });
+    const callsOf = (method) => runtime.calls.filter((call) => call.method === method).map((call) => call.params);
+
+    await executor.execute(groupInputFor(group, 'm1'));
+    assert.deepEqual(callsOf('thread/resume').map(({ threadId, cwd: value }) => ({ threadId, cwd: value })), [{ threadId: 'thread-old', cwd: groupCwdOf(cwd) }]);
+    assert.deepEqual(callsOf('thread/start').map(({ cwd: value }) => value), [groupCwdOf(cwd)]);
+    assert.deepEqual(callsOf('turn/start').map(({ threadId, cwd: value }) => ({ threadId, cwd: value })), [{ threadId: 'thread-1', cwd: groupCwdOf(cwd) }]);
+    assert.deepEqual(callsOf('thread/inject_items').map(({ threadId }) => threadId), ['thread-1'], 'group instructions are injected into the new thread');
+    assert.match(turnText(runtime, 0), /^【飞书群聊上下文】\n群名称：群名\n/, 'the new thread receives the first-turn group context');
+    assert.equal((await store.loadBinding(group)).codexSessionId, 'thread-1');
+    assert.ok(store.events.some((row) => row.event_type === 'session_rollover' && JSON.parse(row.detail_json).reason === 'cwd_changed'));
+    assert.deepEqual(cwdRolloverLogs(logs).map(([level, entry]) => [level, entry.status, entry.reason, entry.chat_id]), [['info', 'succeeded', 'cwd_changed', 'chat-custom']]);
+    assert.doesNotMatch(JSON.stringify([logs, store.events.filter((row) => row.event_type === 'session_rollover')]), new RegExp(escapeRegExp(cwd)), 'no path is logged or stored');
+
+    // The next turn stays on the new thread.
+    await executor.execute(groupInputFor(group, 'm2'));
+    assert.equal(callsOf('thread/start').length, 1);
+    assert.equal(callsOf('turn/start').at(-1).threadId, 'thread-1');
+
+    // A business-event thread of the group moves the same way and receives its preamble.
+    await executor.execute(groupInputFor(event, 'e1', '【业务事件】\ntype：mail.inbound'));
+    assert.equal(callsOf('thread/start').length, 2);
+    assert.equal(callsOf('turn/start').at(-1).threadId, 'thread-2');
+    assert.match(turnText(runtime, 2), /^【独立系统任务】\n/);
+    assert.equal((await store.loadBinding(event)).codexSessionId, 'thread-2');
+    await executor.close();
+
+    // After a restart the new threads resume in the configured cwd and are not moved again.
+    const restartedRuntime = fakeRuntime({ resumeCwds: new Map([['thread-1', groupCwdOf(cwd)], ['thread-2', groupCwdOf(cwd)]]) });
+    const restarted = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: store, spawnImpl: restartedRuntime.spawnImpl, groupInstructions: provider, log: (...entry) => logs.push(entry) });
+    await restarted.execute(groupInputFor(group, 'm3'));
+    await restarted.execute(groupInputFor(event, 'e2', '【业务事件】\ntype：mail.inbound'));
+    assert.equal(restartedRuntime.calls.filter((call) => call.method === 'thread/start').length, 0);
+    assert.deepEqual(restartedRuntime.calls.filter((call) => call.method === 'turn/start').map((call) => call.params.threadId), ['thread-1', 'thread-2']);
+    assert.equal(cwdRolloverLogs(logs).length, 2, 'one move each for the human and the event thread, none after the restart');
+    await restarted.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('cwd rollover never applies to a matching cwd, a group without its own cwd or a private chat', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const bindings = [
+      { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-same', threadName: 'same', created: false },
+      { feishuOpenId: 'ou-human', chatId: 'chat-other', chatType: 'group', codexSessionId: 'thread-other', threadName: 'other', created: false },
+      { feishuOpenId: 'ou-human', chatId: 'chat-reviewer', chatType: 'group', codexSessionId: 'thread-reviewer', threadName: 'reviewer', created: false },
+      { feishuOpenId: 'ou-private', chatId: 'chat-custom', chatType: 'p2p', codexSessionId: 'thread-private', threadName: 'private', created: false },
+    ];
+    const logs = [];
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-same', `${groupCwdOf(cwd)}/`], ['thread-other', '/elsewhere'], ['thread-reviewer', '/elsewhere'], ['thread-private', '/elsewhere']]) });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore(bindings), spawnImpl: runtime.spawnImpl, log: (...entry) => logs.push(entry) });
+    for (const [index, binding] of bindings.entries()) await executor.execute(groupInputFor(binding, `m${index}`));
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 0);
+    assert.deepEqual(runtime.calls.filter((call) => call.method === 'turn/start').map((call) => call.params.threadId), bindings.map((binding) => binding.codexSessionId));
+    assert.equal(cwdRolloverLogs(logs).length, 0);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('a known-turn resume keeps observing the old thread and the cwd move happens at the next turn', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old', threadName: 'group', created: false };
+    const store = memoryStore([group]);
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-old', cwd]]), resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    const result = await executor.execute(groupInputFor(group, 'job'), { resume: { threadId: 'thread-old', turnId: 'known', startedAt: Date.now() - 5_000 } });
+    assert.equal(result.answer, 'known');
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 0, 'the observed turn keeps its thread');
+    assert.equal((await store.loadBinding(group)).codexSessionId, 'thread-old');
+    await executor.execute(groupInputFor(group, 'next'));
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/resume').length, 1, 'the loaded thread is not resumed again');
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 1);
+    assert.equal(runtime.calls.find((call) => call.method === 'turn/start').params.threadId, 'thread-1');
+    assert.equal((await store.loadBinding(group)).codexSessionId, 'thread-1');
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('a new thread that reports another cwd stops cwd rollover for that group instead of looping', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old', threadName: 'group', created: false };
+    const event = { feishuOpenId: 'system:0123456789abcdef0123456789abcdef', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old-event', threadName: 'event', created: false };
+    const logs = [];
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-old', cwd], ['thread-old-event', cwd]]), startCwd: () => '/reported/elsewhere' });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore([group, event]), spawnImpl: runtime.spawnImpl, log: (...entry) => logs.push(entry) });
+    await executor.execute(groupInputFor(group, 'm1'));
+    await executor.execute(groupInputFor(group, 'm2'));
+    await executor.execute(groupInputFor(event, 'e1', '【业务事件】\ntype：mail.inbound'));
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 1);
+    assert.deepEqual(runtime.calls.filter((call) => call.method === 'turn/start').map((call) => call.params.threadId), ['thread-1', 'thread-1', 'thread-old-event']);
+    assert.deepEqual(cwdRolloverLogs(logs).map(([level, entry]) => [level, entry.status, entry.reason, entry.chat_id]),
+      [['warning', 'skipped', 'cwd_unconfirmed', 'chat-custom'], ['info', 'succeeded', 'cwd_changed', 'chat-custom']]);
     await executor.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
