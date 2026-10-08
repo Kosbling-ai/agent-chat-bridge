@@ -1,3 +1,5 @@
+import { isAbsolute } from 'node:path';
+
 // Preserved pure response/source-label logic from the existing bridge.
 function extractFinalAnswer(turn) {
   const items = Array.isArray(turn?.items) ? turn.items : [];
@@ -67,8 +69,11 @@ function isGroupMessage(message) {
 
 export { extractFinalAnswer, codexMessageText, buildCodexForwardPrompt };
 
-export function buildConversationPrompt({ event, text, context = [], newThread = false, group = {}, outboxDir }) {
+export function buildConversationPrompt({ event, text, context = [], newThread = false, group = {}, outboxDir: rawOutboxDir }) {
   if (!event) return text; // Trusted background run prompt is already complete.
+  // Only an absolute result-file directory is announced; a cwd-relative one
+  // would point elsewhere when the thread runs in another working directory.
+  const outboxDir = typeof rawOutboxDir === 'string' && isAbsolute(rawOutboxDir) ? rawOutboxDir : '';
   const groupChat = event.conversationType !== 'p2p';
   let sourcePrompt = buildCodexForwardPrompt({ chat_type: event.conversationType }, {
     currentPrompt: text, mergedPrompt: text,

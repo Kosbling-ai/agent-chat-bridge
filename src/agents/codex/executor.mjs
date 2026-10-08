@@ -210,15 +210,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     return { feishuOpenId, chatId, chatType };
   }
 
-  // A configured group may switch the Codex approval and sandbox settings for
-  // every thread bound to that group chat: the human group thread and
-  // business-event threads whose result chat is the group. Only group bindings
-  // match, so a private chat whose id equals a configured group id keeps the
-  // global settings.
+  // A configured group may switch the Codex working directory, approval and
+  // sandbox settings for every thread bound to that group chat: the human group
+  // thread and business-event threads whose result chat is the group. Only
+  // group bindings match, so a private chat whose id equals a configured group
+  // id keeps the global settings.
   const groupCodexOverrides = new Map(config.groupCodexOverrides || []);
   function codexPolicyFor(binding) {
     const override = binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId) : undefined;
     return {
+      cwd: override?.cwd || config.cwd,
       approvalPolicy: normalizeApprovalPolicy(override?.approvalPolicy || config.approvalPolicy),
       approvalsReviewer: normalizeApprovalsReviewer(override?.approvalsReviewer || config.approvalsReviewer),
       sandbox: override?.sandbox || config.sandbox || 'workspace-write',
@@ -228,15 +229,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   // turn/start has no `sandbox` parameter (its `sandboxPolicy` is a structured
   // policy object). The sandbox chosen on thread start, resume or fork stays in
   // force for later turns, and every turn runs on a thread this app-server
-  // child started, resumed or forked through threadDefaults.
+  // child started, resumed or forked through threadDefaults. The cwd is sent on
+  // every turn as well, because thread/resume does not move the cwd a thread
+  // recorded when it started.
   function turnPolicyFor(binding) {
-    const { approvalPolicy, approvalsReviewer } = codexPolicyFor(binding);
-    return { approvalPolicy, approvalsReviewer };
+    const { cwd, approvalPolicy, approvalsReviewer } = codexPolicyFor(binding);
+    return { cwd, approvalPolicy, approvalsReviewer };
   }
 
   function threadDefaults(extra = {}, binding) {
     return {
-      cwd: config.cwd,
       ...codexPolicyFor(binding),
       ...(config.model ? { model: config.model } : {}),
       ...extra,
@@ -427,7 +429,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   // Replace-mode instructions supersede the default group wording only once the
   // thread actually holds them; otherwise the default wording stays.
   async function initialPrompt(binding, input, instructionMode = '') {
-    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
+    // The result-file directory is announced as an absolute path under the
+    // global workspace, where collectOutboxAttachments scans it, so it stays
+    // correct whatever cwd the thread runs in.
+    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
     if (!isScheduledBinding(binding.feishuOpenId)) return { prompt: buildInitialPrompt(options) };
     const hash = fingerprint(systemTaskPreamble(options));
     let present = false;
@@ -753,7 +758,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       let admission = startAdmission(binding.codexSessionId, normalized.messageId);
       try {
         response = await client.request('turn/start', {
-          threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
+          threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments),
           ...turnPolicyFor(binding),
           ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
         });
@@ -768,7 +773,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           await persistUser(binding, normalized, 'user', prompt);
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
-            threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
+            threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments),
             ...turnPolicyFor(binding),
             ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
           }).catch((failure) => { startingByThread.delete(admission.threadId); admission.reject(failure); throw failure; });
@@ -944,7 +949,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       const thread = response?.thread;
       const targetThreadId = trim(thread?.id);
-      if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(config.cwd)
+      if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(codexPolicyFor(actor).cwd)
         || thread?.ephemeral === true || (thread?.forkedFromId && thread.forkedFromId !== sourceThreadId)) {
         throw coded('fork response could not be verified', 'CODEX_FORK_UNCONFIRMED', { outcome: 'unknown' });
       }

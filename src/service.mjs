@@ -31,6 +31,7 @@ import { listCatchupConversations } from './core/conversations.mjs';
 import { startServer } from './server.mjs';
 import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
 import { resolveSharedHome } from './agents/codex/idle-lifecycle.mjs';
+import { checkCodexWorkspace, checkGroupCodexWorkspaces } from './agents/codex/workspace.mjs';
 
 function secret(env, key) {
   if (typeof env[key] !== 'string' || !env[key]) throw new ConfigError('required_environment_missing');
@@ -67,11 +68,14 @@ export async function startService({ config, configPath, env = process.env, log,
   const bin = resolve(root, config.codex.bin);
   const cardTextProvider = createCardTextProvider({ file: config.feishu.cardTextFile ? resolve(cwd, config.feishu.cardTextFile) : undefined, root: cwd, log });
   try {
-    const [workspace, executable] = await Promise.all([stat(cwd), stat(bin)]);
-    if (!workspace.isDirectory() || !executable.isFile() || (workspace.mode & 0o002) || (executable.mode & 0o002)
-      || (process.getuid && workspace.uid !== process.getuid())) throw new Error('unsafe_workspace');
+    const [workspaceProblem, executable] = await Promise.all([checkCodexWorkspace(cwd), stat(bin)]);
+    if (workspaceProblem || !executable.isFile() || (executable.mode & 0o002)) throw new Error('unsafe_workspace');
     await access(bin, constants.X_OK);
   } catch { throw new ConfigError('invalid_codex_workspace_or_executable'); }
+  // A per-group cwd must pass the same checks as the global cwd before anything starts.
+  const groupWorkspaceProblems = await checkGroupCodexWorkspaces(config.routing.groups);
+  for (const problem of groupWorkspaceProblems) log('warning', 'codex_workspace', 'failed', { code: 'invalid_group_codex_workspace', ...problem });
+  if (groupWorkspaceProblems.length) throw new ConfigError('invalid_group_codex_workspace');
   const proxyEnv = config.codex.proxyEnv ?? {};
   const childEnv = Object.fromEntries(config.codex.envNames.filter(name => !Object.hasOwn(proxyEnv, name)).map(name => [name, secret(env, name)]));
   // Custom source names avoid changing the SDK's ambient proxy environment.
@@ -260,9 +264,10 @@ export async function startService({ config, configPath, env = process.env, log,
       outboxRelativeRoot: 'data/feishu-outbox',
       allowedGroupChatIds,
       // Keyed by external Feishu chat id; a Map keeps ids such as "__proto__" inert.
+      // A group cwd is absolute (validated) and normalized here like the global cwd.
       groupCodexOverrides: new Map(config.routing.groups
         .filter(group => group.capabilities.includes('bridge') && group.codex)
-        .map(group => [group.conversationId, group.codex])),
+        .map(group => [group.conversationId, group.codex.cwd ? { ...group.codex, cwd: resolve(group.codex.cwd) } : group.codex])),
     };
     const groupInstructions=createGroupInstructions({groups:config.routing.groups.filter(group=>group.capabilities.includes('bridge')),configDir:root,log});
     executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,groupInstructions,
