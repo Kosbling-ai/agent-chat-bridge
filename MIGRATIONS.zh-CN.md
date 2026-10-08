@@ -2,7 +2,9 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.23`（未发布开发版）。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.25`。英文 `MIGRATIONS.md` 是完整主契约。
+
+0.2.25 不增加数据库迁移、不改配置 `schemaVersion`、不新增环境变量。`routing.groups[].codex` 新增可选 `cwd`（必须是绝对路径，否则报 `invalid_group_codex_cwd`）；启动与 `check-config` 按全局 `codex.cwd` 的同一规则检查（目录存在、属主为 bridge 运行用户、其他人不可写），不合规报 `invalid_group_codex_workspace`（日志只含 `chat_id` 与 `reason`，不含路径）。该群人类群线程与结果投递到该群的业务事件线程在 `thread/start`、`thread/resume`、`thread/fork` 和每次 `turn/start` 上使用该 cwd；其它群与私聊仍用全局 cwd，bridge 自身路径（卡片文案文件、`.agent-chat-bridge/`、`data/feishu-outbox`、媒体收件目录、`codex.rulesFiles`）仍按全局 cwd 解析。提示词里的「回发文件目录」对所有会话改为绝对路径 `<全局 codex.cwd>/data/feishu-outbox/...`，回收逻辑不变；业务事件线程因此会在下一轮再收到一次系统任务头。Codex 0.153.4 的 `thread/resume` 不改线程启动时记录的 cwd，老线程沿用原 cwd（每轮仍带新 cwd），新线程（首条消息、闲置或规则轮换、归档替换、fork）用新 cwd，bridge 不强制轮换。启用：① 建目录（属主 bridge 运行用户、权限 700），放入或软链 `AGENTS.md`；目录不在任何 git 仓库内时 Codex 线程为无项目线程；② 备份私有 bridge.json，在对应群的 `codex` 加 `"cwd": "<工作区目录>"`，若 `instructionFiles` 注入的是同一份 `AGENTS.md` 则删去该项；③ 运行 `node bin/agent-chat-bridge.mjs check-config --config <路径>`；④ 只重启 bridge 进程（`kill -TERM <bridge-pid>`，由守护进程拉起），用 `curl --noproxy '*'` 验 `/health/live` 与 `/health/ready`。关闭：删掉 `cwd` 后 `check-config` 并重启 bridge。回退到 0.2.24：先删掉所有 `codex.cwd`（0.2.24 会以 `invalid_group_codex_fields` 拒绝启动），再切换版本并重启一次。
 
 0.2.23 不增加数据库迁移、不改配置 `schemaVersion`、不新增配置字段或环境变量。新增可选卡片文案键 `commandTitleTemplate`（占位符 `{name}`、`{label}`，缺省 `{name}`），用于没有可识别动作的执行卡命令行标题，`{label}` 即 `toolCommandExecutionLabel`（缺省「执行命令」）；不配置时卡片与 0.2.22 完全一致。升级：切换版本并重启一次。回退到 0.2.22：先从所有卡片文案文件删掉 `commandTitleTemplate`（0.2.22 会拒绝未知字段，整个文件被忽略），再切回旧版本并重启一次。
 

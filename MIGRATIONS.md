@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.24`
+Application version: `0.2.25`
+
+Version 0.2.25 does not add a database migration or change the config `schemaVersion`. It adds the optional per-group working directory `routing.groups[].codex.cwd` and announces the result-file directory as an absolute path; see [0.2.25 per-group Codex working directory](#0225-per-group-codex-working-directory).
 
 Version 0.2.24 adds bounded retries only for claim-stage `commit_unknown`. Unconfirmed claim results are discarded; persisted leases fence work, and existing expiry/idempotency rules apply. No business run is replayed by this retry. Persistent errors still exhaust the six-attempt/30-second budget and trigger health recovery. No database or configuration migration. Upgrade by deploying this version and restarting the bridge through its supervisor during an idle window; verify readiness and worker diagnostics. Roll back to 0.2.23 through the same lifecycle; no stored state is changed.
 
@@ -37,6 +39,19 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.25 per-group Codex working directory
+
+No database migration, no config `schemaVersion` change and no new environment variable. `routing.groups[].codex.cwd` is optional and must be an absolute path (`invalid_group_codex_cwd` otherwise). Startup and `check-config` require an existing directory owned by the bridge user that is not world-writable, the same rules as the global `codex.cwd`, and fail with `invalid_group_codex_workspace`. The group's human thread and business-event threads delivering to the group use it on `thread/start`, `thread/resume`, `thread/fork` and every `turn/start`; other groups and private chats keep the global cwd. Bridge-owned paths stay under the global cwd. Prompts now name the result-file directory as `<global codex.cwd>/data/feishu-outbox/...` for every conversation; business-event threads therefore receive their system-task preamble once more. Existing threads keep the cwd Codex recorded at their start; new threads use the group cwd. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions).
+
+To enable it:
+
+1. Create the directory with mode `700`, owned by the bridge user, and place its `AGENTS.md` there (file or symbolic link). A directory outside any git repository gives project-less Codex threads.
+2. Back up the private bridge.json, then add `"cwd": "<workspace-dir>"` to the group's `codex` object. Remove an `instructionFiles` entry that injects the same `AGENTS.md` the directory now provides.
+3. Run `node bin/agent-chat-bridge.mjs check-config --config <path>` and fix any reported code.
+4. Restart only the bridge process (`kill -TERM <bridge-pid>`; its supervisor starts it again), then check `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`.
+
+To turn it off on 0.2.25, remove `cwd`, run `check-config` and restart the bridge once. Rollback to 0.2.24: remove every `codex.cwd` first, because 0.2.24 rejects the key with `invalid_group_codex_fields`; then switch the binary and restart once.
 
 ## 0.2.23 command title template
 

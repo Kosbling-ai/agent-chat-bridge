@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.25] - 2026-10-08
+
+- Add the optional per-group working directory `routing.groups[].codex.cwd` (an absolute path; relative paths, empty strings, non-strings, surrounding whitespace and control characters fail with `invalid_group_codex_cwd`). It may be set alone or together with `approvalPolicy`, `approvalsReviewer` and `sandbox`, and applies to the same threads: the group's human thread and business-event threads whose hook `inbound.defaultChatId` is the group. The executor sends it on `thread/start`, `thread/resume`, `thread/fork` and every `turn/start` of those threads; other groups and private chats keep the global `codex.cwd`. The app-server child, `feishu.cardTextFile`, `.agent-chat-bridge/` outbox and spool, `data/feishu-outbox`, the media inbox and `codex.rulesFiles` stay relative to the global `codex.cwd`.
+- Startup and `check-config` apply the global workspace rules to every group `cwd` (existing directory, owned by the bridge user, not world-writable) and fail with `invalid_group_codex_workspace`; the log carries `chat_id` and `reason` (`missing`, `not_directory`, `world_writable`, `not_owned`, `unreadable`), never the path.
+- The result-file directory (`回发文件目录`) in prompts is now an absolute path, `<global codex.cwd>/data/feishu-outbox/...`, for every conversation, so it stays correct in any thread cwd. Collection is unchanged. Because the `【独立系统任务】` preamble contains this path, each business-event thread receives the preamble once more on its next turn.
+- The busy-card fork verifies the native `thread.cwd` against the thread's own cwd (the group `cwd` when configured).
+- Codex 0.153.4 keeps the cwd a thread recorded when it started: `thread/resume` with another cwd leaves `thread.cwd` unchanged. Existing threads therefore keep their recorded cwd (turns still receive the new `cwd`), and new threads (first message, idle or rules rollover, archived replacement, fork) start in the group `cwd`. The bridge forces no rollover.
+
+No database migration and no config `schemaVersion` change. Without `codex.cwd` the Codex request parameters are unchanged except for the absolute result-file directory.
+
+Operator checklist (use the real values only in the private bridge.json):
+
+1. Create the group workspace: `mkdir -m 700 <workspace-dir>`, then add its `AGENTS.md` (for example `ln -s <source>/AGENTS.md <workspace-dir>/AGENTS.md`). Verify `stat -f '%Su %Lp' <workspace-dir>` prints the bridge user and `700`. Codex treats a cwd outside any git repository as project-less and reads only the Codex home `AGENTS.md` plus the cwd's own `AGENTS.md`.
+2. Back up the private configuration: `cp -p <bridge.json> <bridge.json>.bak-0.2.25-<timestamp>`.
+3. For each target group add `"cwd": "<workspace-dir>"` to its `codex` object. If `instructionFiles` injects the same `AGENTS.md` that the workspace now provides, remove that entry (keep the other files) so the human thread does not receive it twice.
+4. Deploy 0.2.25 and run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>`; it must log `check_config` `succeeded`.
+5. Restart only the bridge: send `kill -TERM <bridge-pid>` to the running bridge process and let its supervisor start it again. Do not restart other services.
+6. Verify: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` returns `{"live":true}`, and `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/ready` returns HTTP 200 with `"ready":true`. The bridge log must not contain `invalid_group_codex_workspace`. A new thread of the group records `<workspace-dir>` as its cwd.
+7. Rollback: restore the backup (or remove `cwd` and restore the `instructionFiles` entry), run `check-config`, then `kill -TERM <bridge-pid>` again. To return to 0.2.24, remove every `codex.cwd` first: 0.2.24 rejects the key with `invalid_group_codex_fields` at startup.
+
 ## [0.2.24] - 2026-10-08
 
 - Treat an uncertain queue-claim COMMIT as a bounded poll failure. Discard its result and respect durable leases instead of stopping the whole bridge immediately and disconnecting active Codex turns.
