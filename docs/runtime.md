@@ -6,7 +6,7 @@ The implementation is validated with synthetic providers and disposable MySQL. I
 
 ## Routing
 
-Private Agent messages require `routing.privateUserIds` by default. Set `routing.allowAllPrivateUsers: true` to accept any identifiable human sender in a private chat, relying on the Feishu application’s access restrictions. This option defaults to `false`; omitting it preserves the existing allowlist behavior. It does not admit bot/self messages, open unlisted groups, or change hook authentication or Codex execution approvals. Private execution-card actions remain restricted to the original sender. Every authorized group is listed in `routing.groups`; unlisted groups stay closed. `routing.groups[].capabilities` accepts only `bridge` and `hook`, removes duplicates, and defaults to both when omitted. An empty list disables both routes for that group.
+Private Agent messages require `routing.privateUserIds` by default. Set `routing.allowAllPrivateUsers: true` to accept any identifiable human sender in a private chat, relying on the Feishu application’s access restrictions. This option defaults to `false`; omitting it preserves the existing allowlist behavior. It does not admit bot/self messages, open unlisted groups, or change hook authentication or Codex execution approvals. Instead of either list, a bot may ask a business endpoint per sender with [`routing.privateAdmission`](#private-chat-admission-callback). Private execution-card actions remain restricted to the original sender. Every authorized group is listed in `routing.groups`; unlisted groups stay closed. `routing.groups[].capabilities` accepts only `bridge` and `hook`, removes duplicates, and defaults to both when omitted. An empty list disables both routes for that group.
 
 The `bridge` capability permits Agent routing. The existing `trigger` (`mention` or `all`) and optional `userIds` then decide whether a human message starts Codex. The `hook` capability permits hook subscriptions for that group and does not depend on Agent mentions, member filtering, execution, or replies. A message that qualifies for both routes may register both under the same canonical receipt; neither route consumes the other. Replay keeps each target idempotent. A live human mention of the bot in a group that is absent from `routing.groups` receives a fixed reply naming the group `chat_id`, rate-limited per group and speaker; adjust or disable it with `routing.unlistedGroupReply` (`enabled`, `text`, `cooldownMs`).
 
@@ -17,6 +17,62 @@ Set `routing.silentReply` (`tokens`, default `[]`; `card`, `"delete"` or `"compl
 Recalls of the bot's own messages are filtered for every group: a live `im.message.recalled_v1` event, or a history catch-up message returned as deleted, whose message ID is a recorded bot outbound message (execution card or reply in `assistant_inbound_messages`) is accepted and tombstoned but not delivered to hooks and never used as group context. Feishu recall events carry no operator, so a failed lookup logs a `recall_filter` warning and keeps hook delivery.
 
 Groups previously present only in `hooks[].conversationIds` must now also appear in `routing.groups`; use `capabilities:["hook"]` for a hook-only group. P2P rules are unchanged.
+
+### Private-chat admission callback
+
+`routing.privateAdmission` (optional, since 0.2.26) lets one bot admit private senders by asking a business HTTP endpoint instead of a static list. Without the key private chats behave exactly as before.
+
+```json
+"routing": {
+  "allowAllPrivateUsers": false,
+  "privateUserIds": [],
+  "privateAdmission": {
+    "url": "http://127.0.0.1:18820/api/internal/feishu-admission",
+    "tokenEnv": "DASHBOARD_FEISHU_ADMISSION_TOKEN",
+    "timeoutMs": 1000,
+    "allowCacheMs": 300000,
+    "denyCacheMs": 60000,
+    "denyText": "…",
+    "unavailableText": "…"
+  }
+}
+```
+
+| Key | Required | Default | Rule |
+|---|---|---|---|
+| `url` | yes | — | `http://` or `https://`, no user name, password or `#fragment` (`invalid_private_admission_url`) |
+| `tokenEnv` | yes | — | uppercase environment variable name (`invalid_environment_reference`); startup fails with `required_environment_missing` when the variable is missing or empty. `check-config` does not resolve it |
+| `timeoutMs` | no | `1000` | integer 100–5000 (`invalid_private_admission_timeout`) |
+| `allowCacheMs` | no | `300000` | integer 0–86400000 (`invalid_private_admission_cache`) |
+| `denyCacheMs` | no | `60000` | integer 0–86400000; also used for "unavailable" |
+| `denyText` | yes | — | non-empty after trimming, at most 2000 characters (`invalid_private_admission_text`) |
+| `unavailableText` | no | `denyText` | same rule as `denyText` |
+
+Unknown keys fail with `invalid_private_admission_fields`. `allowAllPrivateUsers: true` together with `privateAdmission` fails with `private_admission_conflicts_with_allow_all`. The bridge does not reload its configuration; restart it after a change.
+
+**Who is checked.** Only human messages in private (p2p) chats. A sender listed in `privateUserIds` is admitted without a request. Group messages, business-event jobs and every other route are unaffected. On an admission-configured bot, private events without an identifiable human sender are not stored either; this covers Feishu recalls, which carry no operator. Private execution-card actions (stop, fork, answer) are authorized by the same cached decision, in addition to the existing original-sender rule.
+
+**Request.** Before anything is written to the Store the bridge sends
+
+```
+POST <url>
+Authorization: Bearer <value of env[tokenEnv]>
+Content-Type: application/json
+
+{"connectionId":"<feishu.connectionId>","chatId":"<chat_id>","sender":{"openId":"ou_…","unionId":"on_…"|null,"userId":"…"|null}}
+```
+
+with `redirect: "error"` and a timeout of `timeoutMs`. For a live event the timeout is further limited to the 2000 ms ingest deadline minus 250 ms; with no budget left the message is refused as unavailable (`reason: "deadline"`) without a request and without caching. The request uses Node's global `fetch`, which does not apply `HTTP_PROXY`/`HTTPS_PROXY` unless `NODE_USE_ENV_PROXY` is set; keep the URL on loopback.
+
+**Response.** HTTP 200 with a JSON object whose `allowed` is a boolean decides: `true` admits, `false` refuses. `reason` (for example `active`, `not_enabled`, `not_registered`, `no_union_id`) is only logged; `colleagueId` is ignored. Any other status, a timeout, a network error, a body over 4096 characters, invalid JSON or a non-boolean `allowed` is "unavailable" and refuses the message (fail-closed; there is no fail-open option).
+
+**Cache.** Results are kept in memory per open_id: admitted for `allowCacheMs`, refused and unavailable for `denyCacheMs`. Concurrent checks for one sender share one request. Senders with an existing thread are checked on every message through this cache, so disabling someone takes effect within the cache period; jobs already registered still finish. The bridge remembers the open_id → union_id pair of live events (private or group) and uses it for events that carry none (history catch-up, card actions); without either the request sends `"unionId": null` and the endpoint decides (normally `no_union_id`). A result obtained without a union_id is not reused once a union_id is known. Caches are lost on restart.
+
+**Refusal.** A refused or unavailable message is not stored, creates no hook job, starts no Codex thread and does not make the private chat known to history catch-up. For a live message the bridge replies once with `denyText` or `unavailableText` per cache entry, directly through the Feishu message reply API: no retry, no outbox row, and a uuid derived from the message ID so Feishu drops a second send of the same reply within an hour. A failed reply logs `private_admission` `reply_failed`. Refusals seen by history catch-up get no reply. The refused message ID is remembered in memory so a later catch-up observation or redelivery of the same message is never admitted after the decision changes; the sender sends a new message instead.
+
+**Logs.** Each real request and each refusal (including cached ones) writes one `info` line with `operation: "private_admission"`, `status` equal to `decision` (`allow`, `deny` or `unavailable`), `reason`, `cached` (`true`/`false`) and `openId` reduced to its first six characters; real requests add `durationMs` and, for a non-200 response, `status_code`. Cached admissions are not logged. Unavailable reasons are `http_status`, `invalid_response`, `timeout`, `network_error` and `deadline`; bridge-side refusals use `sender_unidentified` and `open_id_missing`. Logs never contain the token, the union_id or message text.
+
+**Boundary.** The bridge knows only the URL, the token reference, the timings and the two texts. Which people are registered, enabled or allowed is decided by the endpoint from its own data; the bridge reads no business database and stores no business identity. The endpoint must answer quickly, read-only and with exactly this response shape.
 
 ### Per-group Codex permissions
 

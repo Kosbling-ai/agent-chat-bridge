@@ -14,6 +14,8 @@
 
 私聊 Agent 消息缺省仍要求发送者出现在 `routing.privateUserIds`。显式设置 `routing.allowAllPrivateUsers:true` 后，bridge 会接受飞书应用权限范围内任何身份明确的人类私聊发送者；该选项缺省为 `false`，不会放行 bot/self 消息、未登记群聊，也不改变 hook 认证或 Codex 执行审批。私聊执行卡片动作仍只允许原消息发送者操作。
 
+0.2.26 起可选 `routing.privateAdmission`（键 `url`、`tokenEnv` 必填，`timeoutMs` 缺省 1000、范围 100–5000，`allowCacheMs` 缺省 300000，`denyCacheMs` 缺省 60000，`denyText` 必填，`unavailableText` 缺省同 `denyText`）：人类私聊消息在写入 Store 之前，先以 `POST <url>`、`Authorization: Bearer <env[tokenEnv]>` 询问业务接口，body 为 `{"connectionId","chatId","sender":{"openId","unionId"|null,"userId"|null}}`；只有 HTTP 200 且 `allowed` 为布尔值才算判定，其它状态、超时、网络错误、JSON 不合法一律视为「不可用」并拒绝（fail-closed）。`privateUserIds` 命中直接放行不请求；群消息与业务事件不受影响；与 `allowAllPrivateUsers:true` 同时出现报 `private_admission_conflicts_with_allow_all`。结果按 open_id 在内存缓存（放行 `allowCacheMs`，拒绝与不可用 `denyCacheMs`），同一 open_id 并发只发一次请求；实时事件的 union_id 记在内存，供 catch-up 和卡片动作使用，都没有时发 `unionId:null`。被拒或不可用的消息不落库、不起线程、不让该私聊进入 catch-up；实时消息每个缓存周期只直接回复一次对应话术（不重试、不进 outbox），catch-up 看到的拒绝不回话术，被拒消息之后不会再被放行。实时请求的超时不超过 2000 ms ingest 期限减 250 ms。私聊卡片动作（停止、fork、回答）也按同一缓存判定。每次真实请求与每次拒绝写一条 `private_admission` info 日志（`decision`、`reason`、`cached`、`openId` 前 6 位），不记 token、union_id 与正文。bridge 只知道 URL、token 引用、时长和两句话术，谁能用由业务接口按自己的数据判定。详见英文 [docs/runtime.md](../runtime.md#private-chat-admission-callback)。
+
 群授权必须显式出现在 `routing.groups`。`capabilities` 只允许 `bridge`、`hook`，缺省两者都开，`[]` 表示两者都关。`bridge` 仍继续检查 @/all trigger 和可选 `userIds`；`hook` 只按自己的群授权与订阅过滤，不参加 Agent 路由、执行或回复。旧配置中只写在 `hooks[].conversationIds` 的群，需要补入 `routing.groups`，纯 hook 群可写 `capabilities:["hook"]`。
 
 hook 只是带稳定 chat/message/event 标识的轻量通知。业务仍以 lark-cli 等自身查询接口为数据真源，并保留业务轮询兜底及双入口 messageId 去重；bridge 不迁入业务回补、历史同步、缓存或 cron，也不让业务另建飞书 WebSocket。

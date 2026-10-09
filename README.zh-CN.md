@@ -8,6 +8,8 @@
 
 这是独立的飞书 + Codex bridge。一个进程持有一套飞书 bot/WebSocket 和一个 Codex app-server/executor；MySQL 使用 bridge 自己的 schema。communication worker 负责 hook 和已登记消息 outbox，唯一的 forward worker 负责 Codex 执行、恢复、卡片、Typing、停止和答案/附件投递。
 
+私聊准入三选一：`routing.privateUserIds` 名单、`routing.allowAllPrivateUsers: true` 全放开，或可选的 `routing.privateAdmission` 每条私聊先问配置的业务接口；被拒或接口不可用的消息不落库、不起线程，只回一句固定话术。键、请求/响应形状、缓存与失败语义见英文[私聊准入回调](docs/runtime.md#private-chat-admission-callback)。
+
 群必须显式列在 `routing.groups`。`capabilities` 缺省为 `['bridge','hook']`，也可写 `['bridge']`、`['hook']` 或 `[]`。hook 按自己的订阅过滤，不依赖 Agent 的 @、成员过滤、执行或回复。业务继续以 lark-cli 等查询接口为数据真源，自己负责轮询兜底和 messageId 去重；hook 只是带稳定事件/群/消息标识的轻量通知。
 
 业务系统只通过 hook 接入 bridge，并继续使用自己的原生 SDK、Codex、调度与消息投递链路。bridge 不公开 run、event、resource、upload 或消息投递接口；HTTP 监听器只提供健康检查。bridge 内部仍为人类飞书会话发送执行卡、Typing、答案和附件，并把未知原生或投递结果保留为待核对状态，不自动重跑模型或重发不确定效果。
