@@ -84,7 +84,7 @@ test('user-input card customizes fixed copy without changing questions or submis
 });
 
 function fixture({config={}}={}){
-  const job={id:'run-1',callerId:'live',status:'running',chatId:'chat',chatType:'p2p',senderOpenId:'actor',messageId:'source',result:{execution:{threadId:'thread',turnId:'turn'}}};
+  const job={id:'run-1',callerId:'live',status:'running',chatId:'chat',chatType:'p2p',senderOpenId:'actor',senderUnionId:'union-actor',messageId:'source',result:{execution:{threadId:'thread',turnId:'turn'}}};
   const creates=[];const patches=[];const asyncOps=[];let nativeCalls=0;
   const cardClient={im:{v1:{message:{async create(input){creates.push(input);return{code:0,data:{message_id:'card'}};},async patch(input){patches.push(input);return{code:0};}}}}};
   const executor={async answerUserInput(){nativeCalls++;return{status:'submitted'};}};
@@ -111,6 +111,7 @@ test('user-input runtime authenticates exact card identity and submits once asyn
   assert.equal((await f.runtime.handleCardAction({...payload,operator:{open_id:'other'}})).toast.content,'该提问已失效');
   assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答正在提交');
   assert.equal(f.authorization.conversationType,'p2p');
+  assert.deepEqual(f.authorization.actor,{openId:'actor',unionId:'union-actor'});
   await Promise.allSettled(f.asyncOps);assert.equal(f.nativeCalls,1);assert.equal(f.job.result.userInput.status,'submitted');assert.equal(f.patches.length,1);
   assert.equal((await f.runtime.handleCardAction(payload)).toast.content,'回答已提交');assert.equal(f.nativeCalls,1);
   await f.runtime.close();

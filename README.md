@@ -2,7 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.25` adds the optional per-group Codex working directory `routing.groups[].codex.cwd` (absolute path, checked like the global `codex.cwd` by startup and `check-config`) for a `bridge` group's human thread and business-event threads delivering to it, moves a thread recorded under another cwd to a new thread on its next turn, and announces the result-file directory as an absolute path for every conversation. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). No database migration.
+Version: `0.2.26` adds the optional private-chat admission callback `routing.privateAdmission`: a bot asks a configured business endpoint whether a private sender may use the Agent before storing the message, caches the answer per open_id, fails closed and replies once with a fixed text to refused senders. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback). No database migration; configurations without the key are unchanged.
+
+Version `0.2.25` adds the optional per-group Codex working directory `routing.groups[].codex.cwd` (absolute path, checked like the global `codex.cwd` by startup and `check-config`) for a `bridge` group's human thread and business-event threads delivering to it, moves a thread recorded under another cwd to a new thread on its next turn, and announces the result-file directory as an absolute path for every conversation. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). No database migration.
 
 Version `0.2.24` adds bounded recovery for uncertain queue-claim commits without replaying business execution. No schema/config migration.
 
@@ -31,6 +33,8 @@ Configure explicit environment references and an owned workspace before migratio
 For an Agent reply that needs to notify someone, write `<at user_id="ou_example1"></at>`, `<at open_id="ou_example1"></at>`, or `@{ou_example1}` in the answer. The bridge sends each valid open_id (`ou_` followed by lowercase letters or digits) as a Feishu post `at` element, including when `feishu.replyAsPost` is `false`. Invalid IDs remain literal text. To let a specific group use `<at user_id="all"></at>`, set `allowMentionAll: true` on that group's `routing.groups[]` entry; the default is `false`, and private chats cannot use it. Interactive cards are unchanged.
 
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
+
+Private chats admit senders listed in `routing.privateUserIds`, everyone with `routing.allowAllPrivateUsers: true`, or, with the optional `routing.privateAdmission`, whoever a configured business endpoint approves; refused messages are not stored and get one fixed reply. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback).
 
 For an authorized group, set `routing.groups[].replyTriggers` to `true` to trigger the Agent when a human replies to a message from this bot without `@` (default `false`). Text and cards both qualify; `trigger: "all"` remains unchanged. See [routing and reply context](docs/runtime.md).
 

@@ -245,7 +245,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       if (!job || !operator || job.chatId !== data?.context?.open_chat_id || job.senderOpenId !== operator
         || job.result?.executionCard?.messageId !== cardMessageId || job.status !== 'failed'
         || job.last_error !== 'CODEX_THREAD_BUSY' || candidate?.sourceThreadId !== value.expectedSourceThreadId) return toast('该卡片已失效');
-      if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator }, conversationId: job.chatId, conversationType: job.chatType, operation: 'fork' }))) {
+      if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator, unionId: job.senderUnionId || '' }, conversationId: job.chatId, conversationType: job.chatType, operation: 'fork' }))) {
         return toast('没有切换该会话的权限', 'error');
       }
       const begun = await jobs.beginFork({ id: job.id, sourceThreadId: candidate.sourceThreadId,
@@ -289,7 +289,9 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     if (!job.senderOpenId.startsWith('system:') && !job.senderOpenId.startsWith('group:') && job.senderOpenId !== operator) {
       return toast('只有本次任务的发起者可以停止执行', 'error');
     }
-    if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator }, conversationId: job.chatId, conversationType: job.chatType, operation: 'stop' }))) {
+    // The recorded union_id belongs to the job sender; it is passed only when the operator is that sender.
+    if (!(await authorize({ source: 'card', callerId: job.callerId, actor: { openId: operator, unionId: job.senderOpenId === operator ? job.senderUnionId || '' : '' },
+      conversationId: job.chatId, conversationType: job.chatType, operation: 'stop' }))) {
       return toast('没有停止该任务的权限', 'error');
     }
     const execution = job.result?.execution || {};
