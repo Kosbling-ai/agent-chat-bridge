@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateConfig } from '../src/config.mjs';
@@ -8,6 +9,8 @@ import { createLogger } from '../src/logger.mjs';
 import { createCardAuthorize, startService } from '../src/service.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { admissionReplyUuid, createPrivateAdmission } from '../src/core/private-admission.mjs';
+import { normalizeFeishuEvent, RECALL } from '../src/channels/feishu/normalize.mjs';
+import { createMysqlStore } from '../src/storage/store.mjs';
 
 const URL_ = 'http://127.0.0.1:18820/api/internal/feishu-admission';
 const ADMISSION = { url: URL_, tokenEnv: 'TEST_ADMISSION_TOKEN', denyText: '请先在看板注册', unavailableText: '暂时无法核对' };
@@ -34,7 +37,7 @@ function privateEvent({ openId = 'ou_sender_1', unionId = 'on_sender_1', source 
     message: { kind: 'text', content: '{"text":"private message body"}', mentions: [] }, ...overrides };
 }
 
-function harness({ raw = base, reply = ALLOW, replyMessage } = {}) {
+function harness({ raw = base, reply = ALLOW, replyMessage, findSenderUnionId } = {}) {
   let time = 1_000_000;
   const calls = []; const accepted = []; const forwarded = []; const replies = []; const logs = [];
   const fetchImpl = async (url, init) => { calls.push({ url, init, body: JSON.parse(init.body) }); return reply(calls.length, init); };
@@ -44,7 +47,7 @@ function harness({ raw = base, reply = ALLOW, replyMessage } = {}) {
     token: TOKEN, fetchImpl, log, now: () => time });
   const chat = { replyMessage: replyMessage ?? (async input => { replies.push(input); return { message_id: 'om_reply' }; }) };
   const store = { acceptInbound: async input => { accepted.push(input); return { duplicate: false }; },
-    recordOutbox: async () => { throw new Error('admission replies must not use the outbox'); } };
+    recordOutbox: async () => { throw new Error('admission replies must not use the outbox'); }, ...(findSenderUnionId ? { findSenderUnionId } : {}) };
   const runtime = createCommunicationRuntime({ config, store, chat, privateAdmission: admission, now: () => time, log,
     forward: { handleMessage: async input => { forwarded.push(input); return { accepted: true }; } } });
   return { runtime, admission, calls, accepted, forwarded, replies, logs, advance: ms => { time += ms; }, now: () => time };
@@ -159,7 +162,7 @@ test('allowed sender is stored and starts the Agent thread', async () => {
   assert.equal(admissionLogs(logs).length, 1);
   const [level, , status, fields] = admissionLogs(logs)[0];
   assert.equal(level, 'info'); assert.equal(status, 'allow');
-  assert.deepEqual({ ...fields, durationMs: undefined }, { decision: 'allow', reason: 'active', cached: false, openId: 'ou_sender_1', durationMs: undefined });
+  assert.deepEqual({ ...fields, durationMs: undefined }, { decision: 'allow', reason: 'active', cached: false, openId: 'ou_sender_1', messageId: 'om_allowed', durationMs: undefined });
 });
 
 test('denied sender is not stored, gets the deny text once and is cached for denyCacheMs', async () => {
@@ -178,8 +181,8 @@ test('denied sender is not stored, gets the deny text once and is cached for den
   assert.equal(calls.length, 1, 'the cached denial does not call the endpoint');
   assert.equal(replies.length, 1, 'the deny text is sent once per cache period');
   assert.equal(accepted.length, 0);
-  assert.deepEqual(admissionLogs(logs).map(([, , status, { reason, cached }]) => [status, reason, cached]),
-    [['deny', 'not_enabled', false], ['deny', 'not_enabled', true]]);
+  assert.deepEqual(admissionLogs(logs).map(([, , status, { reason, cached, messageId }]) => [status, reason, cached, messageId]),
+    [['deny', 'not_enabled', false, 'om_denied_1'], ['deny', 'not_enabled', true, 'om_denied_2']]);
   advance(1);
   await runtime.ingest(privateEvent({ messageId: 'om_denied_3' }));
   await flush();
@@ -332,8 +335,8 @@ test('a refused message stays refused when history catch-up observes it again', 
   assert.equal(calls.length, 1, 'a remembered refusal needs no request');
   assert.equal(accepted.length, 0);
   assert.equal(replies.length, 1);
-  assert.deepEqual(admissionLogs(logs).slice(1).map(([, , status, { reason, cached }]) => [status, reason, cached]),
-    [['deny', 'not_enabled', true], ['deny', 'not_enabled', true]]);
+  assert.deepEqual(admissionLogs(logs).slice(1).map(([, , status, { reason, cached, messageId }]) => [status, reason, cached, messageId]),
+    [['deny', 'not_enabled', true, 'om_refused'], ['deny', 'not_enabled', true, 'om_refused']]);
   await runtime.ingest(privateEvent({ messageId: 'om_new' }));
   await flush();
   assert.equal(calls.length, 2);
@@ -341,17 +344,155 @@ test('a refused message stays refused when history catch-up observes it again', 
   assert.equal(forwarded.length, 1);
 });
 
-test('private events without an identifiable human sender are not stored', async () => {
-  const { runtime, calls, accepted, replies, logs } = harness();
-  const recall = privateEvent({ type: 'message.recalled', actor: { type: 'unknown', openId: '', userId: '', unionId: '' } });
-  assert.deepEqual(await runtime.ingest(recall), { admitted: false, decision: 'deny' });
-  assert.deepEqual(await runtime.ingest(privateEvent({ isApp: true })), { admitted: false, decision: 'deny' });
-  assert.deepEqual(await runtime.ingest(privateEvent({ actor: { type: 'user', openId: '', unionId: 'on_x', userId: '' } })), { admitted: false, decision: 'deny' });
+test('a recall of an explicitly denied message is dropped; other recalls are stored as before', async () => {
+  let status = 'deny';
+  const { runtime, accepted, logs } = harness({ reply: () => (status === 'deny' ? DENY() : respond(503, {})) });
+  // Feishu im.message.recalled_v1 carries neither chat_type nor operator.
+  const recall = (messageId, eventId) => normalizeFeishuEvent(RECALL, { schema: '2.0',
+    header: { event_id: eventId, event_type: 'im.message.recalled_v1', create_time: '1760000000000', app_id: 'cli_synthetic', tenant_key: 'tenant' },
+    event: { message_id: messageId, chat_id: 'oc_p2p_ou_sender_1', recall_time: '1760000000000', recall_type: 'message_owner' } },
+  { connectionId: 'kosbling-auth', botOpenId: 'ou_bot' });
+  const shape = recall('om_shape', 'ev_shape');
+  assert.equal(shape.conversationType, 'unknown');
+  assert.equal(shape.actor.type, 'unknown');
+  await runtime.ingest(privateEvent({ messageId: 'om_recalled_denied' }));
+  status = 'unavailable';
+  await runtime.ingest(privateEvent({ openId: 'ou_other', messageId: 'om_recalled_unavailable' }));
+  assert.deepEqual(await runtime.ingest(recall('om_recalled_denied', 'ev_1')), { admitted: false, decision: 'deny' });
+  assert.equal(accepted.length, 0, 'the recall of a denied message writes no inbox row or tombstone');
+  const denied = admissionLogs(logs).find(([, , , fields]) => fields.reason === 'recalled_refused');
+  assert.deepEqual(denied[3], { decision: 'deny', reason: 'recalled_refused', cached: true, messageId: 'om_recalled_denied' });
+  await runtime.ingest(recall('om_recalled_unavailable', 'ev_2'));
+  await runtime.ingest(recall('om_never_seen', 'ev_3'));
+  assert.deepEqual(accepted.map(item => [item.eventType, item.recalledMessageId, item.conversationType]),
+    [['message.recalled', 'om_recalled_unavailable', 'unknown'], ['message.recalled', 'om_never_seen', 'unknown']]);
+});
+
+test('non-human private events are not gated and keep the previous behavior', async () => {
+  const { runtime, calls, accepted, forwarded, logs } = harness({ reply: DENY });
+  await runtime.ingest(privateEvent({ isApp: true, actor: { type: 'app', openId: '', unionId: '', userId: '' } }));
   await flush();
   assert.equal(calls.length, 0);
-  assert.equal(accepted.length, 0);
+  assert.equal(accepted.length, 1);
+  assert.equal(forwarded.length, 0);
+  assert.deepEqual(admissionLogs(logs), []);
+});
+
+test('a live private message without open_id is refused without a request', async () => {
+  const { runtime, calls, accepted, replies, logs } = harness();
+  assert.deepEqual(await runtime.ingest(privateEvent({ messageId: 'om_no_open_id', actor: { type: 'user', openId: '', unionId: 'on_x', userId: '' } })),
+    { admitted: false, decision: 'deny' });
+  await flush();
+  assert.equal(calls.length + accepted.length + replies.length, 0);
+  assert.deepEqual(admissionLogs(logs).map(([, , , fields]) => fields), [{ decision: 'deny', reason: 'open_id_missing', cached: false, messageId: 'om_no_open_id' }]);
+});
+
+test('only explicit business denials are remembered per message', () => {
+  const admission = createPrivateAdmission({ settings: validateConfig(base).routing.privateAdmission, connectionId: 'kosbling-auth', token: TOKEN, fetchImpl: ALLOW });
+  const cases = [['om_deny', 'deny', 'not_enabled', true], ['om_unspecified', 'deny', 'unspecified', true], ['om_no_union', 'deny', 'no_union_id', false],
+    ['om_no_open_id', 'deny', 'open_id_missing', false], ['om_status', 'unavailable', 'http_status', false], ['om_timeout', 'unavailable', 'timeout', false],
+    ['om_network', 'unavailable', 'network_error', false], ['om_invalid', 'unavailable', 'invalid_response', false], ['om_deadline', 'unavailable', 'deadline', false]];
+  for (const [messageId, decision, reason] of cases) admission.refuseMessage(messageId, { decision, reason });
+  for (const [messageId, decision, reason, remembered] of cases)
+    assert.deepEqual(admission.refused(messageId), remembered ? { decision, reason } : undefined, messageId);
+});
+
+test('unavailable and no_union_id refusals are re-checked when history catch-up sees the message again', async () => {
+  let up = false;
+  const { runtime, calls, accepted, forwarded, replies, advance } = harness({
+    reply: (_call, init) => (!up ? respond(503, {}) : JSON.parse(init.body).sender.unionId ? ALLOW() : respond(200, { allowed: false, reason: 'no_union_id', colleagueId: null })) });
+  await runtime.ingest(privateEvent({ messageId: 'om_while_down' }));
+  up = true;
+  advance(60_000);
+  await runtime.ingest(privateEvent({ messageId: 'om_while_down', unionId: '', source: 'history_catchup' }));
+  await runtime.ingest(privateEvent({ openId: 'ou_new', unionId: '', messageId: 'om_no_union' }));
+  await runtime.ingest(privateEvent({ openId: 'ou_new', unionId: 'on_new', conversationId: 'oc_group', conversationType: 'group' }));
+  await runtime.ingest(privateEvent({ openId: 'ou_new', unionId: '', messageId: 'om_no_union', source: 'history_catchup' }));
+  await flush();
+  assert.equal(calls.length, 4);
+  assert.deepEqual(calls.map(call => call.body.sender.unionId), ['on_sender_1', 'on_sender_1', null, 'on_new']);
+  assert.deepEqual(accepted.map(item => item.messageId).filter(id => id.startsWith('om_while') || id === 'om_no_union'), ['om_while_down', 'om_no_union']);
+  assert.deepEqual(forwarded.map(item => item.message.messageId), ['om_while_down', 'om_no_union']);
+  assert.deepEqual(replies.map(item => item.content.text), ['暂时无法核对', '请先在看板注册']);
+});
+
+test('history catch-up recovers a missing union_id from the bridge Store', async () => {
+  const lookups = [];
+  const { runtime, calls } = harness({ findSenderUnionId: async input => { lookups.push(input); return input.openId === 'ou_db' ? 'on_db' : ''; } });
+  await runtime.ingest(privateEvent({ openId: 'ou_db', unionId: '', source: 'history_catchup' }));
+  await runtime.ingest(privateEvent({ openId: 'ou_db', unionId: '', source: 'history_catchup' }));
+  await runtime.ingest(privateEvent({ openId: 'ou_live', unionId: '' }));
+  await runtime.ingest(privateEvent({ openId: 'ou_known', unionId: 'on_known', source: 'history_catchup' }));
+  assert.deepEqual(lookups, [{ connectionId: 'kosbling-auth', chatId: 'oc_p2p_ou_db', openId: 'ou_db' }]);
+  assert.deepEqual(calls.map(call => [call.body.sender.openId, call.body.sender.unionId]), [['ou_db', 'on_db'], ['ou_live', null], ['ou_known', 'on_known']]);
+});
+
+test('a failed or empty Store union lookup counts as unknown and is retried after a minute', async () => {
+  let attempts = 0;
+  const failure = Object.assign(new Error('synthetic database detail'), { code: 'ER_LOCK_WAIT_TIMEOUT', errno: 1205 });
+  const { runtime, calls, logs, advance } = harness({ reply: () => respond(200, { allowed: false, reason: 'no_union_id', colleagueId: null }),
+    findSenderUnionId: async () => { attempts++; if (attempts === 1) throw failure; return ''; } });
+  await runtime.ingest(privateEvent({ unionId: '', source: 'history_catchup' }));
+  await runtime.ingest(privateEvent({ unionId: '', source: 'history_catchup' }));
+  assert.equal(attempts, 1);
+  assert.equal(calls[0].body.sender.unionId, null);
+  const warning = logs.find(([level]) => level === 'warning');
+  assert.equal(warning[1], 'private_admission'); assert.equal(warning[2], 'union_lookup_failed'); assert.equal(typeof warning[3].code, 'string');
+  assert.equal(JSON.stringify(logs).includes('synthetic database detail'), false);
+  advance(60_000);
+  await runtime.ingest(privateEvent({ unionId: '', source: 'history_catchup' }));
+  assert.equal(attempts, 2);
+  assert.equal(calls.at(-1).body.sender.unionId, null);
+});
+
+test('Store union lookup is read-only, chat-scoped and returns the latest non-empty value', async () => {
+  const migrations = await Promise.all(['001-initial', '002-codex-sessions', '003-forward-runtime', '004-bot-connection', '005-sender-union-id'].map(async (name, index) => ({
+    version: index + 1, checksum: createHash('sha256').update(await readFile(new URL(`../src/storage/migrations/${name}.sql`, import.meta.url), 'utf8')).digest('hex') })));
+  const executed = []; let rows = [{ sender_union_id: 'on_latest' }];
+  const connection = {
+    async query(sql) { return sql.startsWith('SELECT version') ? [migrations] : [[]]; },
+    async execute(sql, params) { executed.push({ sql, params }); return [rows]; },
+    async beginTransaction() { throw new Error('a lookup must not open a transaction'); },
+    release() {}, destroy() {},
+  };
+  const store = await createMysqlStore({ pool: { async getConnection() { return connection; } }, connectionId: 'kosbling-auth' });
+  assert.equal(await store.findSenderUnionId({ connectionId: 'kosbling-auth', chatId: 'oc_chat', openId: 'ou_x' }), 'on_latest');
+  rows = [];
+  assert.equal(await store.findSenderUnionId({ connectionId: 'kosbling-auth', chatId: 'oc_chat', openId: 'ou_x' }), '');
+  const [{ sql, params }] = executed;
+  assert.match(sql, /^SELECT sender_union_id FROM assistant_codex_forward_jobs\s+WHERE connection_id=\? AND chat_id=\? AND sender_open_id=\? AND sender_union_id IS NOT NULL AND sender_union_id<>''\s+ORDER BY created_at DESC, id DESC LIMIT 1$/);
+  assert.deepEqual(params, ['kosbling-auth', 'oc_chat', 'ou_x']);
+  await assert.rejects(store.findSenderUnionId({ connectionId: 'kosbling-auth', chatId: '', openId: 'ou_x' }), { code: 'invalid_store_input' });
+});
+
+test('an expired refusal never produces a reply', async () => {
+  const { runtime, replies, advance, now } = harness({ reply: () => respond(503, {}) });
+  await runtime.ingest(privateEvent({ messageId: 'om_history', source: 'history_catchup' }));
+  advance(60_001);
+  assert.deepEqual(await runtime.ingest(privateEvent({ messageId: 'om_live_late' }), { deadlineAt: now() + 100 }), { admitted: false, decision: 'unavailable' });
+  await flush();
   assert.equal(replies.length, 0);
-  assert.deepEqual(admissionLogs(logs).map(([, , , { reason }]) => reason), ['sender_unidentified', 'sender_unidentified', 'open_id_missing']);
+  let clock = 0;
+  const admission = createPrivateAdmission({ settings: validateConfig(base).routing.privateAdmission, connectionId: 'kosbling-auth', token: TOKEN,
+    fetchImpl: DENY, now: () => clock });
+  await admission.check({ openId: 'ou_expiry', chatId: 'oc_expiry' });
+  clock = 60_001;
+  assert.equal(admission.replyFor('ou_expiry', 'deny'), '');
+});
+
+test('no admission reply starts while the runtime is stopping', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { runtime, calls, replies } = harness({ reply: async () => { await gate; return DENY(); } });
+  const pending = runtime.ingest(privateEvent({ messageId: 'om_stopping' }));
+  await flush();
+  assert.equal(calls.length, 1);
+  const stopped = runtime.stop();
+  release();
+  assert.deepEqual(await pending, { admitted: false, decision: 'deny' });
+  await stopped;
+  await flush();
+  assert.equal(replies.length, 0);
 });
 
 test('reply failure is logged once and never retried or queued', async () => {
@@ -391,12 +532,12 @@ test('admission logs carry decision, reason, cached and a six-character open_id 
   const log = createLogger({ write: line => lines.push(line) });
   const admission = createPrivateAdmission({ settings: validateConfig(base).routing.privateAdmission, connectionId: 'kosbling-auth', token: TOKEN, log,
     fetchImpl: async () => respond(200, { allowed: false, reason: 'not_registered', colleagueId: 'colleague-secret' }) });
-  await admission.check({ openId: 'ou_abcdef123456', unionId: 'on_union_secret_value', chatId: 'oc_chat' });
-  await admission.check({ openId: 'ou_abcdef123456', chatId: 'oc_chat' });
+  await admission.check({ openId: 'ou_abcdef123456', unionId: 'on_union_secret_value', chatId: 'oc_chat', messageId: 'om_first' });
+  await admission.check({ openId: 'ou_abcdef123456', chatId: 'oc_chat', messageId: 'om_second' });
   const events = lines.map(line => JSON.parse(line));
-  assert.deepEqual(events.map(({ operation, status, decision, reason, cached, openId, level }) => ({ operation, status, decision, reason, cached, openId, level })), [
-    { operation: 'private_admission', status: 'deny', decision: 'deny', reason: 'not_registered', cached: false, openId: 'ou_abc', level: 'info' },
-    { operation: 'private_admission', status: 'deny', decision: 'deny', reason: 'not_registered', cached: true, openId: 'ou_abc', level: 'info' },
+  assert.deepEqual(events.map(({ operation, status, decision, reason, cached, openId, message_id, level }) => ({ operation, status, decision, reason, cached, openId, message_id, level })), [
+    { operation: 'private_admission', status: 'deny', decision: 'deny', reason: 'not_registered', cached: false, openId: 'ou_abc', message_id: 'om_first', level: 'info' },
+    { operation: 'private_admission', status: 'deny', decision: 'deny', reason: 'not_registered', cached: true, openId: 'ou_abc', message_id: 'om_second', level: 'info' },
   ]);
   const text = lines.join('');
   for (const secret of [TOKEN, 'on_union_secret_value', 'ou_abcdef', 'colleague-secret']) assert.equal(text.includes(secret), false, secret);
@@ -424,6 +565,18 @@ test('private card actions follow the admission decision; other card rules are u
   assert.equal(await unconfigured({ actor: { openId: 'ou_card' }, conversationId: 'oc_p2p', conversationType: 'p2p' }), false);
   const allowAll = createCardAuthorize({ routing: validateConfig({ ...base, routing: { ...routing, allowAllPrivateUsers: true } }).routing });
   assert.equal(await allowAll({ actor: { openId: 'ou_card' }, conversationId: 'oc_p2p', conversationType: 'p2p' }), true);
+});
+
+test('a card action after restart sends the job sender union_id to an empty admission cache', async () => {
+  const bodies = [];
+  const config = validateConfig(base);
+  const admission = createPrivateAdmission({ settings: config.routing.privateAdmission, connectionId: 'kosbling-auth', token: TOKEN,
+    fetchImpl: async (_url, init) => { const body = JSON.parse(init.body); bodies.push(body);
+      return body.sender.unionId ? ALLOW() : respond(200, { allowed: false, reason: 'no_union_id', colleagueId: null }); } });
+  const authorize = createCardAuthorize({ routing: config.routing, privateAdmission: admission });
+  assert.equal(await authorize({ actor: { openId: 'ou_restart', unionId: 'on_restart' }, conversationId: 'oc_p2p_restart', conversationType: 'p2p' }), true);
+  assert.deepEqual(bodies, [{ connectionId: 'kosbling-auth', chatId: 'oc_p2p_restart', sender: { openId: 'ou_restart', unionId: 'on_restart', userId: null } }]);
+  assert.equal(await authorize({ actor: { openId: 'ou_no_union', unionId: '' }, conversationId: 'oc_p2p_other', conversationType: 'p2p' }), false);
 });
 
 test('without privateAdmission private chats never call the callback or log admission', async () => {

@@ -9,6 +9,11 @@ import { createHash } from 'node:crypto';
 const DECISION_LIMIT = 1000;
 const UNION_LIMIT = 10000;
 const MESSAGE_LIMIT = 10000;
+const LOOKUP_LIMIT = 10000;
+const UNION_LOOKUP_RETRY_MS = 60000;
+// Bridge-side refusals and refusals that may change once the sender is
+// identified or the endpoint recovers are never remembered per message.
+const TRANSIENT_DENY_REASONS = new Set(['no_union_id', 'open_id_missing']);
 const DEADLINE_MARGIN_MS = 250;
 const MAX_RESPONSE_CHARS = 4096;
 const REASON = /^[A-Za-z0-9_]{1,64}$/;
@@ -30,11 +35,13 @@ export function createPrivateAdmission({ settings, connectionId, token, fetchImp
     || typeof fetchImpl !== 'function') throw new Error('invalid_private_admission_dependencies');
   const decisions = new Map(); // open_id -> { decision, reason, unionId, expiresAt, replied }
   const unions = new Map(); // open_id -> union_id seen on a live event
-  const messages = new Map(); // message_id -> { decision, reason } of a refused message
+  const messages = new Map(); // message_id -> { decision, reason } of an explicit business denial
+  const lookups = new Map(); // open_id -> time before which no Store union lookup is repeated
   const inFlight = new Map();
 
-  function report({ decision, reason, cached, durationMs, statusCode }, openId) {
-    log('info', 'private_admission', decision, { decision, reason, cached, openId,
+  function report({ decision, reason, cached, durationMs, statusCode }, { openId, messageId } = {}) {
+    log('info', 'private_admission', decision, { decision, reason, cached,
+      ...(openId ? { openId } : {}), ...(messageId ? { messageId } : {}),
       ...(durationMs === undefined ? {} : { durationMs }), ...(statusCode === undefined ? {} : { statusCode }) });
   }
   function learn(actor = {}) {
@@ -69,10 +76,10 @@ export function createPrivateAdmission({ settings, connectionId, token, fetchImp
   }
   // Resolves to { decision: 'allow'|'deny'|'unavailable', reason, cached }.
   // Fails closed: every failure is 'unavailable', which is never an admission.
-  async function check({ openId, unionId = '', userId = '', chatId = '', deadlineAt } = {}) {
+  async function check({ openId, unionId = '', userId = '', chatId = '', deadlineAt, messageId } = {}) {
     if (typeof openId !== 'string' || !openId) {
       const result = { decision: 'deny', reason: 'open_id_missing', cached: false };
-      report(result);
+      report(result, { messageId });
       return result;
     }
     learn({ openId, unionId });
@@ -81,7 +88,7 @@ export function createPrivateAdmission({ settings, connectionId, token, fetchImp
     // A result obtained without a union_id is not reused once one is known.
     if (entry && entry.expiresAt > now() && !(entry.unionId === '' && knownUnion)) {
       const result = { decision: entry.decision, reason: entry.reason, cached: true };
-      if (result.decision !== 'allow') report(result, openId);
+      if (result.decision !== 'allow') report(result, { openId, messageId });
       return result;
     }
     const key = JSON.stringify([openId, knownUnion]);
@@ -89,7 +96,7 @@ export function createPrivateAdmission({ settings, connectionId, token, fetchImp
     if (pending) {
       const outcome = await pending;
       const result = { decision: outcome.decision, reason: outcome.reason, cached: true };
-      if (result.decision !== 'allow') report(result, openId);
+      if (result.decision !== 'allow') report(result, { openId, messageId });
       return result;
     }
     const operation = (async () => {
@@ -103,7 +110,7 @@ export function createPrivateAdmission({ settings, connectionId, token, fetchImp
         remember(decisions, openId, { decision: outcome.decision, reason: outcome.reason, unionId: knownUnion, replied: false,
           expiresAt: now() + (outcome.decision === 'allow' ? settings.allowCacheMs : settings.denyCacheMs) }, DECISION_LIMIT);
       }
-      report({ ...outcome, cached: false }, openId);
+      report({ ...outcome, cached: false }, { openId, messageId });
       return outcome;
     })();
     inFlight.set(key, operation);
@@ -112,24 +119,29 @@ export function createPrivateAdmission({ settings, connectionId, token, fetchImp
       return { decision: outcome.decision, reason: outcome.reason, cached: false };
     } finally { if (inFlight.get(key) === operation) inFlight.delete(key); }
   }
-  // Returns the reply text once per refused cache entry, then ''.
+  // Returns the reply text once per refused, unexpired cache entry, then ''.
   function replyFor(openId, decision) {
     const entry = decisions.get(openId);
-    if (!entry || entry.decision === 'allow' || entry.decision !== decision || entry.replied) return '';
+    if (!entry || entry.decision === 'allow' || entry.decision !== decision || entry.replied || entry.expiresAt < now()) return '';
     entry.replied = true;
     return decision === 'deny' ? settings.denyText : settings.unavailableText;
   }
-  // A refused message stays refused: later observations (history catch-up,
-  // redelivery) never admit it after the decision changes.
+  // A message the endpoint explicitly denied stays refused: later observations
+  // (history catch-up, redelivery) never admit it after the decision changes.
+  // Unavailable, deadline and no_union_id refusals are re-checked instead.
   function refuseMessage(messageId, { decision, reason }) {
+    if (decision !== 'deny' || TRANSIENT_DENY_REASONS.has(reason)) return;
     if (typeof messageId === 'string' && messageId) remember(messages, messageId, { decision, reason }, MESSAGE_LIMIT);
   }
-  function refusedMessage(messageId, openId) {
-    const refused = messages.get(messageId);
-    if (!refused) return undefined;
-    const result = { decision: refused.decision, reason: refused.reason, cached: true };
-    report(result, openId);
-    return result;
+  function refused(messageId) {
+    const entry = messages.get(messageId);
+    return entry ? { decision: entry.decision, reason: entry.reason } : undefined;
   }
-  return Object.freeze({ learn, check, replyFor, refuseMessage, refusedMessage });
+  // True at most once per UNION_LOOKUP_RETRY_MS for a sender whose union_id is unknown.
+  function shouldLookupUnion(openId) {
+    if (typeof openId !== 'string' || !openId || unions.has(openId) || (lookups.get(openId) || 0) > now()) return false;
+    remember(lookups, openId, now() + UNION_LOOKUP_RETRY_MS, LOOKUP_LIMIT);
+    return true;
+  }
+  return Object.freeze({ learn, check, replyFor, refuseMessage, refused, shouldLookupUnion, report });
 }

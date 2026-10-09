@@ -84,25 +84,41 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       ...(Number.isSafeInteger(error?.platformCode)?{platformCode:error.platformCode}:{})})).finally(()=>notices.delete(task));
     notices.add(task);
   }
+  // History events carry no union_id. Recover the sender's last known one from
+  // this bot's own forward jobs (read-only); a failure counts as "unknown".
+  async function recoverUnion(event) {
+    if(typeof store?.findSenderUnionId!=='function'||!admission.shouldLookupUnion(event.actor.openId))return;
+    try {
+      const unionId=await store.findSenderUnionId({connectionId,chatId:event.conversationId,openId:event.actor.openId});
+      if(unionId)admission.learn({openId:event.actor.openId,unionId});
+    } catch(error) { log('warning','private_admission','union_lookup_failed',{code:databaseError(error).code}); }
+  }
   // Runs before any Store write. undefined means the callback does not apply
-  // (group chats, listed private users); otherwise the result decides.
+  // (groups, non-human events, listed private users, ordinary recalls).
   async function admitPrivate(event,context) {
     admission.learn(event.actor);
-    if(event.conversationType!=='p2p')return undefined;
-    // Recalls carry no operator, so they cannot be attributed to an admitted sender.
-    if(event.isApp||event.isSelf||event.actor?.type!=='user'){
-      const result={decision:'deny',reason:'sender_unidentified',cached:false};
-      log('info','private_admission',result.decision,result);
+    // Feishu recalls carry neither chat type nor operator; drop only the recall
+    // of a message this bot refused, so it leaves no tombstone or inbox row.
+    if(event.type==='message.recalled'){
+      if(!admission.refused(event.messageId))return undefined;
+      const result={decision:'deny',reason:'recalled_refused',cached:true};
+      admission.report(result,{messageId:event.messageId});
       return result;
     }
+    if(event.conversationType!=='p2p'||event.isApp||event.isSelf||event.actor?.type!=='user')return undefined;
     if(config.routing.privateUserIds.includes(event.actor.openId))return undefined;
-    const refused=admission.refusedMessage(event.messageId,event.actor.openId);
-    if(refused)return refused;
+    const known=admission.refused(event.messageId);
+    if(known){
+      const result={...known,cached:true};
+      admission.report(result,{openId:event.actor.openId,messageId:event.messageId});
+      return result;
+    }
+    if(event.source==='history_catchup'&&!event.actor.unionId)await recoverUnion(event);
     const result=await admission.check({openId:event.actor.openId,unionId:event.actor.unionId,userId:event.actor.userId,
-      chatId:event.conversationId,deadlineAt:context.deadlineAt});
+      chatId:event.conversationId,deadlineAt:context.deadlineAt,messageId:event.messageId});
     if(result.decision==='allow')return result;
     if(event.type==='message.received')admission.refuseMessage(event.messageId,result);
-    if(event.source==='live'&&event.type==='message.received'){const text=admission.replyFor(event.actor.openId,result.decision);if(text)replyAdmission(event,text);}
+    if(!stopping&&event.source==='live'&&event.type==='message.received'){const text=admission.replyFor(event.actor.openId,result.decision);if(text)replyAdmission(event,text);}
     return result;
   }
   function stale(event,createdAt) {

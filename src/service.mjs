@@ -69,7 +69,7 @@ export function createCardAuthorize({ routing, privateAdmission }) {
     if (actor?.openId && (routing.privateUserIds.includes(actor.openId) || (conversationType === 'p2p' && routing.allowAllPrivateUsers === true)
       || (group?.capabilities.includes('bridge') && (group.userIds === undefined || group.userIds.includes(actor.openId))))) return true;
     if (!routing.privateAdmission || !privateAdmission || conversationType !== 'p2p' || !actor?.openId) return false;
-    return (await privateAdmission.check({ openId: actor.openId, chatId: conversationId })).decision === 'allow';
+    return (await privateAdmission.check({ openId: actor.openId, unionId: actor.unionId || '', chatId: conversationId })).decision === 'allow';
   };
 }
 export async function startService({ config, configPath, env = process.env, log, signal, onRestartRequired = async () => {}, dependencies = {} }) {

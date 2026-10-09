@@ -262,6 +262,17 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
         return {items,nextCursor:rows.length>take ? items.at(-1).conversationId : null};
       });
     },
+    // Read-only: the latest non-empty union_id recorded for this sender's
+    // forward jobs in one chat. Uses idx_forward_chat_created; for a private
+    // chat these are exactly the sender's own jobs.
+    findSenderUnionId(input) {
+      return read(async (c) => {
+        const [[row]] = await c.execute(`SELECT sender_union_id FROM assistant_codex_forward_jobs
+          WHERE connection_id=? AND chat_id=? AND sender_open_id=? AND sender_union_id IS NOT NULL AND sender_union_id<>''
+          ORDER BY created_at DESC, id DESC LIMIT 1`, [text(input.connectionId, 128), text(input.chatId, 191), text(input.openId, 191)]);
+        return typeof row?.sender_union_id === 'string' ? row.sender_union_id : '';
+      });
+    },
     enqueueJob: (input) => write((c)=>insertJob(c,input)),
     recordOutbox: (input) => write((c)=>insertOutbox(c,input)),
     claimJobs: (input) => claim('bridge_jobs',input),
