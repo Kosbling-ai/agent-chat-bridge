@@ -147,6 +147,31 @@ function groupCodex(value) {
   if (Object.keys(result).length === 0) throw new ConfigError('invalid_group_codex_fields');
   return Object.freeze(result);
 }
+// Optional per-instance private-chat admission callback. The bridge only knows
+// the URL, the token environment name, timings and two fixed reply texts; the
+// business decision stays behind the callback.
+const PRIVATE_ADMISSION_MAX_TEXT = 2000;
+function privateAdmissionText(value) {
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > PRIVATE_ADMISSION_MAX_TEXT) throw new ConfigError('invalid_private_admission_text');
+  return value.trim();
+}
+function privateAdmission(value) {
+  object(value, ['url', 'tokenEnv', 'timeoutMs', 'allowCacheMs', 'denyCacheMs', 'denyText', 'unavailableText'], 'invalid_private_admission_fields');
+  let url;
+  try { url = new URL(typeof value.url === 'string' && value.url.length <= 2048 ? value.url : ''); } catch { throw new ConfigError('invalid_private_admission_url'); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_private_admission_url');
+  const tokenEnv = reference(value.tokenEnv);
+  const timeoutMs = value.timeoutMs === undefined ? 1000 : value.timeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 5000) throw new ConfigError('invalid_private_admission_timeout');
+  const allowCacheMs = value.allowCacheMs === undefined ? 300000 : value.allowCacheMs;
+  const denyCacheMs = value.denyCacheMs === undefined ? 60000 : value.denyCacheMs;
+  for (const ttl of [allowCacheMs, denyCacheMs]) {
+    if (!Number.isSafeInteger(ttl) || ttl < 0 || ttl > 86_400_000) throw new ConfigError('invalid_private_admission_cache');
+  }
+  const denyText = privateAdmissionText(value.denyText);
+  const unavailableText = value.unavailableText === undefined ? denyText : privateAdmissionText(value.unavailableText);
+  return Object.freeze({ url: url.href, tokenEnv, timeoutMs, allowCacheMs, denyCacheMs, denyText, unavailableText });
+}
 function validateRuntime(raw) {
   const enabled = ['runtime', 'storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
@@ -269,7 +294,7 @@ function validateRuntime(raw) {
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
   if (raw.feishu.outputBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.outputBudgetBytes) || raw.feishu.outputBudgetBytes < 28 * 1024 * 1024 || raw.feishu.outputBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_output_budget');
   feishu.outputBudgetBytes = raw.feishu.outputBudgetBytes ?? 512 * 1024 * 1024;
-  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
+  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'privateAdmission', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
     object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'codex'], 'invalid_group_fields');
@@ -295,6 +320,9 @@ function validateRuntime(raw) {
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
   if (typeof allowAllPrivateUsers !== 'boolean' || raw.routing.allowAllPrivateUsers === null) throw new ConfigError('invalid_private_access_policy');
+  // Admitting every private sender would make the callback meaningless.
+  if (raw.routing.privateAdmission !== undefined && allowAllPrivateUsers === true) throw new ConfigError('private_admission_conflicts_with_allow_all');
+  const admission = raw.routing.privateAdmission === undefined ? undefined : privateAdmission(raw.routing.privateAdmission);
   const unlisted = raw.routing.unlistedGroupReply === undefined ? {} : raw.routing.unlistedGroupReply;
   object(unlisted, ['enabled', 'text', 'cooldownMs'], 'invalid_unlisted_group_reply_fields');
   const unlistedGroupReply = { enabled: unlisted.enabled ?? true, text: unlisted.text ?? '这个群暂时还没有 Kosbling Agent 使用权限。如果需要开通，请联系管理员，并提供 chat_id={{chat_id}}。', cooldownMs: unlisted.cooldownMs ?? 600000 };
@@ -303,7 +331,7 @@ function validateRuntime(raw) {
       || unlistedGroupReply.cooldownMs < 0 || unlistedGroupReply.cooldownMs > 86_400_000) throw new ConfigError('invalid_unlisted_group_reply');
   unlistedGroupReply.text = unlistedGroupReply.text.trim();
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups, unlistedGroupReply,
-    silentReply: silentReply(raw.routing.silentReply === undefined ? {} : raw.routing.silentReply) };
+    silentReply: silentReply(raw.routing.silentReply === undefined ? {} : raw.routing.silentReply), ...(admission ? { privateAdmission: admission } : {}) };
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
     object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds', 'inbound'], 'invalid_hook_fields');

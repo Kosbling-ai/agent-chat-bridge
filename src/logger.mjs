@@ -8,7 +8,7 @@ export function safeObserver(callback = () => {}) {
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
   return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, windowMinutes, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
     hookId, eventId, eventType, scopePrefix, statusCode, platformCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
-    component: eventComponent } = {}) => {
+    decision, cached, openId, component: eventComponent } = {}) => {
     const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
     const boundedInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
     const event = {
@@ -43,6 +43,10 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       ...(identifier(messageId, 128) !== undefined ? { message_id: messageId } : {}),
       ...(identifier(kind, 64) !== undefined ? { kind } : {}),
       ...(identifier(errorCode, 64) !== undefined ? { error_code: errorCode } : {}),
+      ...(['allow', 'deny', 'unavailable'].includes(decision) ? { decision } : {}),
+      ...(typeof cached === 'boolean' ? { cached } : {}),
+      // A sender is logged only as the first six characters of its open_id.
+      ...(identifier(openId, 512) !== undefined ? { openId: openId.slice(0, 6) } : {}),
     };
     stream.write(`${JSON.stringify(event)}\n`);
     if (level === 'error' && reportError) {

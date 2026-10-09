@@ -19,6 +19,7 @@ import { createOutboundMedia } from './channels/feishu/outbound-media.mjs';
 import { createProcessingTyping } from './channels/feishu/typing.mjs';
 import { createForwardRuntime } from './core/forward-runtime.mjs';
 import { createCommunicationRuntime } from './core/communication-runtime.mjs';
+import { createPrivateAdmission } from './core/private-admission.mjs';
 import { createCardTextProvider } from './channels/feishu/card-text.mjs';
 import { createExecutionFeedback } from './channels/feishu/execution-feedback.mjs';
 import { createUserInputRuntime } from './channels/feishu/user-input-runtime.mjs';
@@ -59,6 +60,18 @@ export function boundedFeishuHttp(base, { proxyAgent, mediaDownloadTimeoutMs = 1
   for (const method of ['post', 'put', 'patch']) http[method] = (url, data, value) => base[method](url, data, options(value, url));
   return http;
 }
+// Execution-card actions (stop, fork, answer) in addition require the original
+// sender, checked by the card handlers. A private chat of an admission-configured
+// bot follows the same (cached) admission decision as its messages.
+export function createCardAuthorize({ routing, privateAdmission }) {
+  return async ({ actor, conversationId, conversationType }) => {
+    const group = routing.groups.find(item => item.conversationId === conversationId);
+    if (actor?.openId && (routing.privateUserIds.includes(actor.openId) || (conversationType === 'p2p' && routing.allowAllPrivateUsers === true)
+      || (group?.capabilities.includes('bridge') && (group.userIds === undefined || group.userIds.includes(actor.openId))))) return true;
+    if (!routing.privateAdmission || !privateAdmission || conversationType !== 'p2p' || !actor?.openId) return false;
+    return (await privateAdmission.check({ openId: actor.openId, chatId: conversationId })).decision === 'allow';
+  };
+}
 export async function startService({ config, configPath, env = process.env, log, signal, onRestartRequired = async () => {}, dependencies = {} }) {
   log = safeObserver(log);
   if (signal?.aborted) throw new ConfigError('startup_cancelled');
@@ -92,10 +105,13 @@ export async function startService({ config, configPath, env = process.env, log,
   if (new Set(Object.values(inboundTokens)).size !== Object.keys(inboundTokens).length) {
     throw new ConfigError('duplicate_inbound_token');
   }
+  const admissionToken = config.routing.privateAdmission ? secret(env, config.routing.privateAdmission.tokenEnv) : undefined;
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
   if (reporter) log = createLogger(process.stdout, { reportError: reporter.report });
-  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, businessCardAction: createBusinessCardAction, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
+  const factories = { pool: createPoolFromEnvironment, store: createMysqlStore, executor: createCodexExecutor, sessions: createCodexSessionStore, jobs: createForwardJobStore, inbound: createInboundMessageStore, feedback: createExecutionFeedback, userInput: createUserInputRuntime, businessCardAction: createBusinessCardAction, replies: createFeishuReplies, typing: createProcessingTyping, communication: createCommunicationRuntime, privateAdmission: createPrivateAdmission, forward: createForwardRuntime, feishu: createFeishuAdapter, chat: createFeishuChatClient, media: createFeishuMedia, outbound: createOutboundMedia, catchup: createCatchup, server: startServer, feishuProxyAgent: createFeishuProxyAgent, sdk, ...dependencies };
+  const privateAdmission = config.routing.privateAdmission ? factories.privateAdmission({ settings: config.routing.privateAdmission,
+    connectionId: config.feishu.connectionId, token: admissionToken, log }) : undefined;
   const pool = factories.pool(storageConnectionReferences(config.storage), env);
   let store, executor, userInput, businessCardAction, feishu, communication, forward, catchup, http, media, outbound;
   const cardOperations = new Set();
@@ -305,7 +321,7 @@ export async function startService({ config, configPath, env = process.env, log,
     const replies=factories.replies({chat,outbound,jobs,inbound,botOpenId:config.feishu.botOpenId,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,mentionAllGroupChatIds,
       sendAttachment: input => sendOutboundAttachment({ client, ...input }),
       replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,log});
-    const stopAuthorize=async({actor,conversationId,conversationType})=>{const group=config.routing.groups.find(item=>item.conversationId===conversationId);return Boolean(actor?.openId&&(config.routing.privateUserIds.includes(actor.openId)||(conversationType==='p2p'&&config.routing.allowAllPrivateUsers===true)||(group?.capabilities.includes('bridge')&&(group.userIds===undefined||group.userIds.includes(actor.openId)))));};
+    const stopAuthorize=createCardAuthorize({routing:config.routing,privateAdmission});
     userInput=factories.userInput({jobs,executor,cardClient:client,authorize:stopAuthorize,
       runAsync:runCardOperation,config:{displayName:config.feishu.displayName,cardTextProvider},log});
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
@@ -320,7 +336,7 @@ export async function startService({ config, configPath, env = process.env, log,
       executeTimeoutMs:config.codex.turnTimeoutMs+10_000,
       silentReply:job=>resolveSilentReplyPolicy(config.routing,job),
     },jobs,sessions,inbound,media,executor,feedback,replies,authorize:async()=>true,log});
-    communication=factories.communication({config,store,inbound,forward,chat,outbound,botAppId:credentials.appId,hookTokens,log});
+    communication=factories.communication({config,store,inbound,forward,chat,outbound,botAppId:credentials.appId,hookTokens,privateAdmission,log});
     businessCardAction=factories.businessCardAction({hooks:config.hooks,connectionId:config.feishu.connectionId,
       ingest:communication.ingestCardAction,
       runAsync:runCardOperation,log});
