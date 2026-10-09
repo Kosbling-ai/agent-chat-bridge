@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.26] - 2026-10-09
+
+- Add the optional per-instance private-chat admission callback `routing.privateAdmission` (`url`, `tokenEnv`, `denyText` required; `timeoutMs` 100–5000, default 1000; `allowCacheMs` and `denyCacheMs` 0–86400000, defaults 300000 and 60000; `unavailableText` defaults to `denyText`). Before any Store write, a human private message from a sender not in `privateUserIds` is checked with `POST <url>`, `Authorization: Bearer <env[tokenEnv]>` and the body `{"connectionId","chatId","sender":{"openId","unionId"|null,"userId"|null}}`. HTTP 200 with a boolean `allowed` decides; any other status, a timeout, a network error or invalid JSON is "unavailable" and refuses the message (fail-closed).
+- Results are cached per open_id in memory (admitted for `allowCacheMs`, refused and unavailable for `denyCacheMs`); concurrent checks for one sender share one request. The union_id of live events is remembered for catch-up events and card actions. Live requests stay inside the 2000 ms ingest deadline minus 250 ms.
+- A refused message is not stored, creates no hook job, starts no Codex thread and does not make the private chat known to history catch-up. A live refusal gets one direct reply (`denyText` or `unavailableText`) per cache entry, without retry or outbox row; catch-up refusals get none, and a refused message ID is never admitted later. On an admission-configured bot, private events without an identifiable human sender (recalls) are not stored, and private execution-card actions follow the cached decision.
+- Each real request and each refusal logs one `info` line with `operation: "private_admission"`, `decision`, `reason`, `cached` and the first six characters of the open_id; the logger accepts these three new fields. No token, union_id or message text is logged.
+- Validation errors: `invalid_private_admission_fields`, `invalid_private_admission_url`, `invalid_environment_reference`, `invalid_private_admission_timeout`, `invalid_private_admission_cache`, `invalid_private_admission_text`, and `private_admission_conflicts_with_allow_all` when `allowAllPrivateUsers` is `true`. Startup fails with `required_environment_missing` when the token variable is missing or empty; `check-config` does not resolve it.
+
+No database migration, no config `schemaVersion` change and no new dependency. Without `routing.privateAdmission` behavior and log output are unchanged.
+
+Operator checklist (use the real values only in the private bridge.json and the supervisor's secret store):
+
+1. Deploy the business endpoint first and give the bridge process the token under the `tokenEnv` name. Verify only that the variable is present; never print it.
+2. Back up the private configuration: `cp -p <bridge.json> <bridge.json>.bak-0.2.26-<timestamp>`.
+3. Set `"allowAllPrivateUsers": false` (or remove it) and add the `privateAdmission` object to `routing`.
+4. Deploy 0.2.26 and run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>`; it must log `check_config` `succeeded`.
+5. Restart only that bridge: `kill -TERM <bridge-pid>` and let its supervisor start it again. Instances without `privateAdmission` sharing the checkout behave as on 0.2.25 after their next restart.
+6. Verify: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`; the log has no `required_environment_missing`. A private message from an admitted person logs `private_admission` `allow` and is answered; one from a person who is not admitted logs `deny` and receives `denyText` once, with no execution card.
+7. Rollback: restore the backup, run `check-config`, then `kill -TERM <bridge-pid>` again. To return to 0.2.25, remove `privateAdmission` first: 0.2.25 rejects the key with `invalid_routing_fields`.
+
 ## [0.2.25] - 2026-10-08
 
 - Add the optional per-group working directory `routing.groups[].codex.cwd`. It must be an absolute path; relative paths, empty strings, non-strings, surrounding whitespace and control characters fail with `invalid_group_codex_cwd`. The value is stored normalized. It may be set alone or together with `approvalPolicy`, `approvalsReviewer` and `sandbox`, and applies to the same threads: the group's human thread and business-event threads whose hook `inbound.defaultChatId` is the group. The executor sends it on `thread/start`, `thread/resume`, `thread/fork` and every `turn/start` of those threads; other groups and private chats keep the global `codex.cwd`. The app-server child, `feishu.cardTextFile`, `.agent-chat-bridge/` outbox and spool, `data/feishu-outbox`, the media inbox and `codex.rulesFiles` stay relative to the global `codex.cwd`.

@@ -2,7 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.25` adds the optional per-group Codex working directory `routing.groups[].codex.cwd` (absolute path, checked like the global `codex.cwd` by startup and `check-config`) for a `bridge` group's human thread and business-event threads delivering to it, moves a thread recorded under another cwd to a new thread on its next turn, and announces the result-file directory as an absolute path for every conversation. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). No database migration.
+Version: `0.2.26` adds the optional private-chat admission callback `routing.privateAdmission`: a bot asks a configured business endpoint whether a private sender may use the Agent before storing the message, caches the answer per open_id, fails closed and replies once with a fixed text to refused senders. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback). No database migration; configurations without the key are unchanged.
+
+Version `0.2.25` adds the optional per-group Codex working directory `routing.groups[].codex.cwd` (absolute path, checked like the global `codex.cwd` by startup and `check-config`) for a `bridge` group's human thread and business-event threads delivering to it, moves a thread recorded under another cwd to a new thread on its next turn, and announces the result-file directory as an absolute path for every conversation. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). No database migration.
 
 Version `0.2.24` adds bounded recovery for uncertain queue-claim commits without replaying business execution. No schema/config migration.
 

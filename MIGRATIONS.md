@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.25`
+Application version: `0.2.26`
+
+Version 0.2.26 does not add a database migration, change the config `schemaVersion` or add a dependency. It adds the optional, backward-compatible routing key `routing.privateAdmission` (a private-chat admission callback); configurations without it behave as before. See [0.2.26 private-chat admission callback](#0226-private-chat-admission-callback).
 
 Version 0.2.25 does not add a database migration or change the config `schemaVersion`. It adds the optional per-group working directory `routing.groups[].codex.cwd` and announces the result-file directory as an absolute path; see [0.2.25 per-group Codex working directory](#0225-per-group-codex-working-directory).
 
@@ -39,6 +41,19 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.26 private-chat admission callback
+
+No database migration, no config `schemaVersion` change and no storage change. `routing.privateAdmission` is optional; without it private chats keep the `privateUserIds` / `allowAllPrivateUsers` rules and logs are unchanged. When configured, its `tokenEnv` names a new required environment variable for that bot only (startup fails with `required_environment_missing` without it), and it cannot be combined with `allowAllPrivateUsers: true` (`private_admission_conflicts_with_allow_all`). Refused and unavailable private messages are not stored; caches live only in memory. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback).
+
+To enable it:
+
+1. Deploy the admission endpoint and provide the token to the bridge process under the `tokenEnv` name.
+2. Back up the private bridge.json, set `allowAllPrivateUsers` to `false` (or remove it) and add `routing.privateAdmission`.
+3. Run `node bin/agent-chat-bridge.mjs check-config --config <path>` and fix any reported code.
+4. Restart only that bridge process (`kill -TERM <bridge-pid>`; its supervisor starts it again), then check `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`, and one admitted and one refused private message.
+
+To turn it off on 0.2.26, restore the previous routing (remove `privateAdmission`), run `check-config` and restart the bridge once. Rollback to 0.2.25: remove `privateAdmission` first, because 0.2.25 rejects the key with `invalid_routing_fields`; then switch the binary and restart once.
 
 ## 0.2.25 per-group Codex working directory
 
