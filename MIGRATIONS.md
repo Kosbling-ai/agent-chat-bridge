@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.26`
+Application version: `0.2.27`
+
+Version 0.2.27 does not add a database migration, change the config `schemaVersion`, change storage or add a dependency. It adds the optional, backward-compatible key `codex.permissionProfile` (a named Codex permission profile per instance); configurations without it behave, and send Codex the same parameters, as before. See [0.2.27 named Codex permission profile](#0227-named-codex-permission-profile).
 
 Version 0.2.26 does not add a database migration, change the config `schemaVersion` or add a dependency. It adds the optional, backward-compatible routing key `routing.privateAdmission` (a private-chat admission callback); configurations without it behave as before. See [0.2.26 private-chat admission callback](#0226-private-chat-admission-callback).
 
@@ -41,6 +43,19 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.27 named Codex permission profile
+
+No database migration, no config `schemaVersion` change, no storage change and no new environment variable. `codex.permissionProfile` is optional and has no default; without it thread, turn and launch parameters and logs are those of 0.2.26. When set, thread start, resume and fork send `permissions` instead of `sandbox`, a thread is used only when Codex reports the same `activePermissionProfile.id` (`codex_permission_profile_mismatch` otherwise), and the app-server starts without the legacy `sandbox_workspace_write.network_access` flag. The key cannot be combined with `codex.sandbox` (`codex_permission_profile_conflicts_with_sandbox`), `codex.networkAccess` (`codex_permission_profile_conflicts_with_network_access`) or a group `codex.sandbox` (`group_codex_sandbox_conflicts_with_permission_profile`). The instance's Codex home `config.toml` must set `default_permissions` and define `[permissions.<id>]`. It relies on the app-server experimental API of codex-cli 0.153.4. See [named permission profile per instance](docs/runtime.md#named-permission-profile-per-instance).
+
+To enable it:
+
+1. Define the profile in the instance's Codex home `config.toml` (`default_permissions = "<id>"` and the `[permissions.<id>]` tables, without `sandbox_mode` / `[sandbox_workspace_write]`).
+2. Back up the private bridge.json, remove `codex.sandbox`, `codex.networkAccess` and any group `codex.sandbox`, and add `codex.permissionProfile`.
+3. Run `node bin/agent-chat-bridge.mjs check-config --config <path>` and fix any reported code.
+4. Restart only that bridge process (`kill -TERM <bridge-pid>`; its supervisor starts it again), then check `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`, the `app_server_start` line with `permissionProfile` and, after one message, a `thread_start` or `thread_resume` line with `status` `succeeded` and `activePermissionProfile` equal to the id.
+
+To turn it off on 0.2.27, restore the backup (or remove `codex.permissionProfile`), run `check-config` and restart the bridge once. Rollback to 0.2.26: remove `codex.permissionProfile` first, because 0.2.26 rejects the key with `invalid_codex_fields`; then switch the binary and restart once.
 
 ## 0.2.26 private-chat admission callback
 

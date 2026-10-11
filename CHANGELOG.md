@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.27] - 2026-10-11
+
+- Add the optional per-instance key `codex.permissionProfile`: the id of a named Codex permission profile (`[permissions.<id>]` in the Codex home `config.toml`, or a built-in such as `:workspace`). The value is trimmed and must be 1–128 characters matching `^:?[A-Za-z0-9][A-Za-z0-9._-]*$`, otherwise `invalid_codex_permission_profile`. It has no default.
+- With the key set, `thread/start`, both `thread/resume` paths and `thread/fork` send `permissions: "<id>"` and no `sandbox` key; `turn/start` is unchanged (no `permissions`, no `sandboxPolicy`). Each of those responses must report `activePermissionProfile.id` equal to the id; otherwise the request fails with `codex_permission_profile_mismatch` and the thread is not bound, loaded, given a turn or committed as a fork (fail-closed). Every check logs `thread_start`, `thread_resume` or `thread_fork` with `rpc_method`, `permissionProfile` and `activePermissionProfile` (`info` `succeeded`, or `error` `failed` with the code); the logger accepts these two fields.
+- With the key set, the app-server child starts without `-c sandbox_workspace_write.network_access=…` (the profile's network table applies); the other launch arguments are unchanged and the `app_server_start` line carries `permissionProfile`.
+- Validation errors: `codex_permission_profile_conflicts_with_sandbox` and `codex_permission_profile_conflicts_with_network_access` when `codex.sandbox` or `codex.networkAccess` appear next to the key, `group_codex_sandbox_conflicts_with_permission_profile` for any `routing.groups[].codex.sandbox`. Group `approvalPolicy`, `approvalsReviewer` and `cwd` overrides stay allowed. `check-config` does not ask Codex whether the profile exists.
+- Requires codex-cli 0.153.4 app-server experimental API (`permissions`, `activePermissionProfile`; the bridge already sends `experimentalApi: true`) and a Codex home `config.toml` with `default_permissions = "<id>"` and the `[permissions.<id>]` tables.
+
+No database migration, no config `schemaVersion` change, no storage change and no new dependency. Without `codex.permissionProfile` thread, turn and launch parameters and log output are byte-for-byte those of 0.2.26.
+
+Operator checklist (only for an instance that adopts a profile; other instances sharing the checkout behave as on 0.2.26 after their next restart):
+
+1. Define the profile in that instance's Codex home `config.toml`: `default_permissions = "<id>"` and `[permissions.<id>.filesystem]` / `[permissions.<id>.network]`; remove `sandbox_mode` and `[sandbox_workspace_write]` from that file.
+2. Back up the private configuration: `cp -p <bridge.json> <bridge.json>.bak-0.2.27-<timestamp>`.
+3. In the private bridge.json remove `codex.sandbox`, `codex.networkAccess` and any group `codex.sandbox`, and add `"permissionProfile": "<id>"` to `codex`.
+4. Deploy 0.2.27 and run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>`; it must log `check_config` `succeeded`.
+5. Restart only that bridge: `kill -TERM <bridge-pid>` and let its supervisor start it again.
+6. Verify: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`; the log shows `app_server_start` with `permissionProfile` once Codex starts, and after a message a `thread_start` or `thread_resume` line with `status` `succeeded` and `activePermissionProfile` equal to the id. A `codex_permission_profile_mismatch` error means the Codex home does not define or select that profile.
+7. Rollback: restore the backup (and the previous `config.toml`), run `check-config`, then `kill -TERM <bridge-pid>` again. To return to 0.2.26, remove `codex.permissionProfile` first: 0.2.26 rejects the key with `invalid_codex_fields`.
+
 ## [0.2.26] - 2026-10-09
 
 - Add the optional per-instance private-chat admission callback `routing.privateAdmission` (`url`, `tokenEnv`, `denyText` required; `timeoutMs` 100–5000, default 1000; `allowCacheMs` and `denyCacheMs` 0–86400000, defaults 300000 and 60000; `unavailableText` defaults to `denyText`). Before any Store write, a human private message from a sender not in `privateUserIds` is checked with `POST <url>`, `Authorization: Bearer <env[tokenEnv]>` and the body `{"connectionId","chatId","sender":{"openId","unionId"|null,"userId"|null}}`. HTTP 200 with a boolean `allowed` decides; any other status, a timeout, a network error or invalid JSON is "unavailable" and refuses the message (fail-closed).
