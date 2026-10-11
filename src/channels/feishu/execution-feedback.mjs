@@ -18,6 +18,24 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
   executor, workspace, runAsync = operation => { Promise.resolve().then(operation).catch(() => {}); }, config = {}, log = () => {}, now = Date.now } = {}) {
   const bindingOpenId = (job, result = job.result || {}) => result.execution?.bindingOpenId
     || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType });
+  const textReplyPolicy = typeof config.textReply === 'function' ? config.textReply : () => null;
+  // Group text mode: no execution card and no processing Typing. A job that
+  // already has a card (started before the switch) still finishes on it.
+  const textReply = (job, result = job.result) => job.deliveryMode === 'bridge' && !result?.executionCard
+    ? textReplyPolicy(job) : null;
+
+  // Optional text-mode acknowledgement: one reaction that is never removed.
+  async function acknowledge(job, emojiType) {
+    if (!job.sourceMessageId) return;
+    try {
+      if (typeof chat?.addReaction !== 'function') throw Object.assign(new Error('reaction unavailable'), { code: 'reaction_unavailable' });
+      await chat.addReaction({ messageId: job.sourceMessageId, emojiType });
+      log('info', 'reply_ack', 'succeeded', { runId: job.id });
+    } catch (error) {
+      log('warning', 'reply_ack', 'failed', { code: safeCode(error, 'reply_ack_failed'), runId: job.id,
+        ...(Number.isInteger(error?.platformCode) ? { platformCode: error.platformCode } : {}) });
+    }
+  }
 
   function stateFor(job, control = {}) {
     return { result: structuredClone(job.result || {}), control, card: null, observer: null, typing: null };
@@ -89,6 +107,11 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
   async function start(job, control = {}) {
     if (job.deliveryMode === 'caller') return null;
     const state = stateFor(job, control);
+    const text = textReply(job, state.result);
+    if (text) {
+      if (text.ack === 'reaction') await acknowledge(job, text.ackEmoji);
+      return state;
+    }
     state.card = cardFor(job, state, state.result.executionCard);
     state.typing = await typing?.start?.(job) || null;
     return state;
@@ -119,7 +142,9 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
   async function restore(job, control = {}) {
     if (job.deliveryMode === 'caller') return null;
     const state = stateFor(job, control);
+    // Also in text mode: an earlier card-mode attempt may have left Typing.
     await typing?.cleanup?.(job).catch(() => {});
+    if (textReply(job, state.result)) return state;
     state.card = cardFor(job, state, state.result.executionCard);
     if (state.result.executionCard?.messageId) {
       state.card?.push({ kind: 'started', turnId: state.result.execution?.turnId });
@@ -130,7 +155,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
   function restoreWaiting(job, control = {}) {
     if (job.deliveryMode === 'caller') return null;
     const state = stateFor(job, control);
-    state.card = cardFor(job, state, state.result.executionCard);
+    if (!textReply(job, state.result)) state.card = cardFor(job, state, state.result.executionCard);
     return state;
   }
 
@@ -149,7 +174,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     if (state.result.executionCard?.status !== 'retrying' && state.card) {
       state.result.executionCard = await state.card.pause();
     }
-    await typing?.cleanup?.(job, state.typing).catch(() => {});
+    if (state.typing || !textReply(job, state.result)) await typing?.cleanup?.(job, state.typing).catch(() => {});
   }
 
   async function prepare(job, result, state) {
@@ -329,8 +354,11 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
 
   async function cleanup(job, control = {}) {
     if (job.deliveryMode === 'caller' || !job.sourceMessageId) return;
+    const reaction = control.reaction || job.result?.processingReaction || null;
+    // Text mode adds no processing reaction; only a recorded one is removed.
+    if (!reaction && textReply(job)) return;
     control.assertOwned?.();
-    await typing?.cleanup?.(job, control.reaction || job.result?.processingReaction || null);
+    await typing?.cleanup?.(job, reaction);
     control.assertOwned?.();
   }
 

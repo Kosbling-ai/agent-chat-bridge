@@ -1,6 +1,8 @@
 # Versions and migrations
 
-Application version: `0.2.27`
+Application version: `0.2.28`
+
+Version 0.2.28 does not add a database migration, change the config `schemaVersion`, change storage or add a dependency. It adds the optional, backward-compatible per-group key `routing.groups[].reply` (`mode` `card`/`text`, `ack`, `ackEmoji`); groups without it behave as before. See [0.2.28 group text replies](#0228-group-text-replies).
 
 Version 0.2.27 does not add a database migration, change the config `schemaVersion`, change storage or add a dependency. It adds the optional, backward-compatible key `codex.permissionProfile` (a named Codex permission profile per instance); configurations without it behave, and send Codex the same parameters, as before. See [0.2.27 named Codex permission profile](#0227-named-codex-permission-profile).
 
@@ -43,6 +45,21 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.28 group text replies
+
+No database migration, no config `schemaVersion` change, no storage change and no new environment variable. `routing.groups[].reply` is optional; without it, or with `mode: "card"`, the execution card, Typing and fallback replies are those of 0.2.27. With `mode: "text"` that group's human turns create no execution card and no Typing reaction, answer with a reply to the triggering message (text for one plain line, post otherwise), send one short text line on failure and nothing for a `silentReply` token. `ack: "reaction"` leaves one `ackEmoji` reaction (default `GLANCE`) on each triggering message. `trigger: "all"` is unchanged. See [group text replies and trigger all](docs/runtime.md#group-text-replies-and-trigger-all).
+
+To enable it for a group:
+
+1. Back up the private configuration: `cp -p <bridge.json> <bridge.json>.bak-0.2.28-<timestamp>`.
+2. Make sure the group has `silentReply.tokens` (directly or from `routing.silentReply`) if its Agent answers a sentinel such as `NO_REPLY`; otherwise that answer is sent as text.
+3. Add `"reply": { "mode": "text" }` to the group (optionally `"ack": "reaction"`); for a group that should answer every human message set `"trigger": "all"`.
+4. Deploy 0.2.28 and run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>`; it must log `check_config` `succeeded`.
+5. Restart only that bridge: `kill -TERM <bridge-pid>` and let its supervisor start it again.
+6. Verify: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`; mention the bot in the group and check that the answer arrives as a reply to that message with no execution card.
+
+To turn it off on 0.2.28, remove `reply` (or set `"mode": "card"`), run `check-config` and restart the bridge once. Rollback to 0.2.27: remove every `routing.groups[].reply` first, because 0.2.27 rejects the key with `invalid_group_fields`; then switch the binary and restart once. Jobs finished in text mode need no cleanup.
 
 ## 0.2.27 named Codex permission profile
 

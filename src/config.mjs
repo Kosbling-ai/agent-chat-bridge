@@ -113,6 +113,35 @@ function silentReply(value, { partial = false } = {}) {
   }
   return Object.freeze(result);
 }
+// Per-group reply style for human group turns. `mode: "card"` (default) keeps
+// the execution card; `mode: "text"` never creates one and replies to the
+// triggering message with a post or text. `ack: "reaction"` (text mode only)
+// leaves one reaction on the triggering message when the turn starts.
+const GROUP_REPLY_MODES = Object.freeze(['card', 'text']);
+const GROUP_REPLY_ACKS = Object.freeze(['none', 'reaction']);
+const DEFAULT_REPLY_ACK_EMOJI = 'GLANCE';
+function groupReply(value, { processingReactionEmoji } = {}) {
+  object(value, ['mode', 'ack', 'ackEmoji'], 'invalid_group_reply_fields');
+  const mode = value.mode === undefined ? 'card' : value.mode;
+  if (!GROUP_REPLY_MODES.includes(mode)) throw new ConfigError('invalid_group_reply_mode');
+  if (value.ack !== undefined && !GROUP_REPLY_ACKS.includes(value.ack)) throw new ConfigError('invalid_group_reply_ack');
+  if (value.ackEmoji !== undefined && (typeof value.ackEmoji !== 'string' || !/^[A-Za-z0-9_]{1,80}$/.test(value.ackEmoji))) {
+    throw new ConfigError('invalid_group_reply_ack_emoji');
+  }
+  if (mode !== 'text') {
+    if (value.ack !== undefined || value.ackEmoji !== undefined) throw new ConfigError('group_reply_ack_requires_text_mode');
+    return Object.freeze({ mode });
+  }
+  const ack = value.ack ?? 'none';
+  if (ack !== 'reaction') {
+    if (value.ackEmoji !== undefined) throw new ConfigError('group_reply_ack_emoji_requires_reaction');
+    return Object.freeze({ mode, ack });
+  }
+  const ackEmoji = value.ackEmoji ?? DEFAULT_REPLY_ACK_EMOJI;
+  // The processing cleanup removes every app reaction with that emoji.
+  if (ackEmoji === processingReactionEmoji) throw new ConfigError('group_reply_ack_emoji_conflicts_with_processing_reaction');
+  return Object.freeze({ mode, ack, ackEmoji });
+}
 // Per-group Codex switch for threads bound to that group chat (the human group
 // thread and business-event threads whose result chat is this group). Each
 // field replaces the global value and may grant more or less than it; model
@@ -313,7 +342,7 @@ function validateRuntime(raw) {
   object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'privateAdmission', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'codex'], 'invalid_group_fields');
+    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'reply', 'codex'], 'invalid_group_fields');
     const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
     if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
@@ -322,7 +351,7 @@ function validateRuntime(raw) {
     const capabilities=group.capabilities===undefined?['bridge','hook']:strings(group.capabilities);
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
     if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined || group.replyTriggers === true
-      || group.silentReply !== undefined || group.codex !== undefined)) throw new ConfigError('group_context_requires_bridge');
+      || group.silentReply !== undefined || group.reply !== undefined || group.codex !== undefined)) throw new ConfigError('group_context_requires_bridge');
     return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, replyTriggers: group.replyTriggers ?? false, passiveContext: group.passiveContext, capabilities,
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }),
       ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
@@ -331,6 +360,7 @@ function validateRuntime(raw) {
       allowMentionAll: group.allowMentionAll ?? false,
       ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }),
       ...(group.silentReply === undefined ? {} : { silentReply: silentReply(group.silentReply, { partial: true }) }),
+      ...(group.reply === undefined ? {} : { reply: groupReply(group.reply, { processingReactionEmoji: feishu.processingReactionEmoji }) }),
       ...(group.codex === undefined ? {} : { codex: groupCodex(group.codex, { permissionProfile: codex.permissionProfile }) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');

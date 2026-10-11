@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.28] - 2026-10-11
+
+- Add the optional per-group key `routing.groups[].reply` for `bridge` groups: `mode` (`"card"` default, or `"text"`), `ack` (`"none"` default, or `"reaction"`, text mode only) and `ackEmoji` (Feishu `emoji_type` matching `[A-Za-z0-9_]{1,80}`, default `GLANCE`, only with `ack: "reaction"`). Without the key, or with `mode: "card"`, behaviour, outbound requests and logs are byte-for-byte those of 0.2.27.
+- `mode: "text"`: no execution card and no processing Typing reaction or `processingFallbackText` for that group's human turns. The final answer is a reply to the triggering message (`reply_in_thread: false`, deterministic `uuid`): a `text` message for one plain line, otherwise a `post` (mentions, line breaks, links, Markdown), in 3000-character chunks that all reply to the same message. Failed and interrupted turns send exactly one `text` line of at most 200 characters. A `silentReply` token answer sends nothing (`result.silentReply.card = "none"`). A reply rejected by Feishu (for example a recalled trigger) is created in the chat once (`forward_reply` `reply_rejected`, `code` `reply_target_rejected`); an unconfirmed reply is retried as a reply only.
+- Text mode also accepts `<at user_id="ou_x">Name</at>` and sends it as a post `at` element with `user_id` and `user_name`; the open_id is never printed. The card-mode fallback conversion is unchanged.
+- `ack: "reaction"` adds one reaction (`ackEmoji`) to the triggering message when its turn starts and never removes it; a failure logs `reply_ack` `failed` and the turn continues.
+- A job that already has an execution card when its group switches to text mode finishes on that card; business-event jobs and private chats are unchanged.
+- Validation codes: `invalid_group_reply_fields`, `invalid_group_reply_mode`, `invalid_group_reply_ack`, `invalid_group_reply_ack_emoji`, `group_reply_ack_requires_text_mode`, `group_reply_ack_emoji_requires_reaction`, `group_reply_ack_emoji_conflicts_with_processing_reaction`, and `group_context_requires_bridge` for a hook-only group with `reply`. `check-config` reports them.
+- `trigger: "all"` is unchanged and now documented with text replies: every authorized human message starts a turn; bot, app and self messages never do; messages older than `codex.maxEventAgeMs` (default 10 minutes) never do.
+
+No database migration, no config `schemaVersion` change, no storage change, no new dependency or environment variable.
+
 ## [0.2.27] - 2026-10-11
 
 - Add the optional per-instance key `codex.permissionProfile`: the id of a named Codex permission profile (`[permissions.<id>]` in the Codex home `config.toml`, or a built-in such as `:workspace`). The value is trimmed and must be 1–128 characters matching `^:?[A-Za-z0-9][A-Za-z0-9._-]*$`, otherwise `invalid_codex_permission_profile`. It has no default.
