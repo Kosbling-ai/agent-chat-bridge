@@ -297,7 +297,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
     patchFeedback(input) {
       const [id, owner] = leaseArgs(input);
       const key = required(input.key, 32);
-      if (!['executionCard', 'typing', 'stop', 'delivery'].includes(key)) throw new StoreError('invalid_store_input');
+      if (!['executionCard', 'typing', 'stop', 'delivery', 'replyMode'].includes(key)) throw new StoreError('invalid_store_input');
       return write(async connection => {
         const at = now();
         const updatesCleanup = key === 'typing';

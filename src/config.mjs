@@ -119,7 +119,8 @@ function silentReply(value, { partial = false } = {}) {
 // leaves one reaction on the triggering message when the turn starts.
 const GROUP_REPLY_MODES = Object.freeze(['card', 'text']);
 const GROUP_REPLY_ACKS = Object.freeze(['none', 'reaction']);
-const DEFAULT_REPLY_ACK_EMOJI = 'GLANCE';
+// Feishu has no eyes reaction; OnIt ("on it") is the neutral acknowledgement.
+const DEFAULT_REPLY_ACK_EMOJI = 'OnIt';
 function groupReply(value, { processingReactionEmoji } = {}) {
   object(value, ['mode', 'ack', 'ackEmoji'], 'invalid_group_reply_fields');
   const mode = value.mode === undefined ? 'card' : value.mode;
@@ -378,6 +379,10 @@ function validateRuntime(raw) {
   unlistedGroupReply.text = unlistedGroupReply.text.trim();
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups, unlistedGroupReply,
     silentReply: silentReply(raw.routing.silentReply === undefined ? {} : raw.routing.silentReply), ...(admission ? { privateAdmission: admission } : {}) };
+  // A text-mode group has no card to recall, so its "no reply" sentinel must be configured.
+  if (groups.some(group => group.reply?.mode === 'text' && !(group.silentReply?.tokens ?? routing.silentReply.tokens).length)) {
+    throw new ConfigError('group_text_reply_requires_silent_reply');
+  }
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
     object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds', 'inbound'], 'invalid_hook_fields');

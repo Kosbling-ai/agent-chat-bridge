@@ -48,18 +48,18 @@ Application versions, config `schemaVersion` and numbered database migrations ar
 
 ## 0.2.28 group text replies
 
-No database migration, no config `schemaVersion` change, no storage change and no new environment variable. `routing.groups[].reply` is optional; without it, or with `mode: "card"`, the execution card, Typing and fallback replies are those of 0.2.27. With `mode: "text"` that group's human turns create no execution card and no Typing reaction, answer with a reply to the triggering message (text for one plain line, post otherwise), send one short text line on failure and nothing for a `silentReply` token. `ack: "reaction"` leaves one `ackEmoji` reaction (default `GLANCE`) on each triggering message. `trigger: "all"` is unchanged. See [group text replies and trigger all](docs/runtime.md#group-text-replies-and-trigger-all).
+No database migration, no config `schemaVersion` change and no new environment variable; the job store additionally accepts the `replyMode` key inside the existing `result_json`. `routing.groups[].reply` is optional; without it, or with `mode: "card"`, the execution card, Typing and fallback replies are those of 0.2.27. With `mode: "text"` that group's human turns create no execution card and no Typing reaction, answer with a reply to the triggering message (text for one plain line, post otherwise), send one short text line on failure and nothing for a `silentReply` token; open_ids are never shown as text. A text-mode group must have effective `silentReply.tokens` (`group_text_reply_requires_silent_reply` otherwise). `ack: "reaction"` leaves one `ackEmoji` reaction (default `OnIt`) on each triggering message. `trigger: "all"` is unchanged. See [group text replies and trigger all](docs/runtime.md#group-text-replies-and-trigger-all).
 
 To enable it for a group:
 
 1. Back up the private configuration: `cp -p <bridge.json> <bridge.json>.bak-0.2.28-<timestamp>`.
-2. Make sure the group has `silentReply.tokens` (directly or from `routing.silentReply`) if its Agent answers a sentinel such as `NO_REPLY`; otherwise that answer is sent as text.
+2. Make sure the group has `silentReply.tokens` (directly or from `routing.silentReply`) and that its Agent rules answer that exact token when nothing needs to be said.
 3. Add `"reply": { "mode": "text" }` to the group (optionally `"ack": "reaction"`); for a group that should answer every human message set `"trigger": "all"`.
 4. Deploy 0.2.28 and run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>`; it must log `check_config` `succeeded`.
 5. Restart only that bridge: `kill -TERM <bridge-pid>` and let its supervisor start it again.
 6. Verify: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`; mention the bot in the group and check that the answer arrives as a reply to that message with no execution card.
 
-To turn it off on 0.2.28, remove `reply` (or set `"mode": "card"`), run `check-config` and restart the bridge once. Rollback to 0.2.27: remove every `routing.groups[].reply` first, because 0.2.27 rejects the key with `invalid_group_fields`; then switch the binary and restart once. Jobs finished in text mode need no cleanup.
+To turn it off on 0.2.28, first set every group that was switched to `"trigger": "all"` back to `"mention"`, then remove `reply` (or set `"mode": "card"`), run `check-config` and restart the bridge once. Rollback to an earlier version: first set those groups back to `"trigger": "mention"` and remove every `routing.groups[].reply` (0.2.27 and earlier reject the key with `invalid_group_fields`), run `check-config`, then switch the binary and restart once. Jobs finished in text mode need no cleanup; a recorded `replyMode` is ignored by earlier versions.
 
 ## 0.2.27 named Codex permission profile
 

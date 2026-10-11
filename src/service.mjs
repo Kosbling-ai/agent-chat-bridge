@@ -28,7 +28,7 @@ import { createFeishuReplies } from './channels/feishu/replies.mjs';
 import { createCatchup } from './core/catchup.mjs';
 import { createGroupInstructions } from './core/group-instructions.mjs';
 import { resolveSilentReplyPolicy } from './core/silent-reply.mjs';
-import { resolveTextReplyPolicy } from './core/reply-mode.mjs';
+import { resolveReplyPolicy } from './core/reply-mode.mjs';
 import { listCatchupConversations } from './core/conversations.mjs';
 import { startServer } from './server.mjs';
 import { createLogger, createErrorReporter, safeObserver } from './logger.mjs';
@@ -320,17 +320,17 @@ export async function startService({ config, configPath, env = process.env, log,
     }
     outbound = createdOutbound;
     checkCancelled();
-    const textReply=job=>resolveTextReplyPolicy(config.routing,job);
+    const replyPolicy=job=>resolveReplyPolicy(config.routing,job);
     const replies=factories.replies({chat,outbound,jobs,inbound,botOpenId:config.feishu.botOpenId,connectionId:config.feishu.connectionId,workspace:cwd,allowedGroupChatIds,mentionAllGroupChatIds,
       sendAttachment: input => sendOutboundAttachment({ client, ...input }),
-      replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,textReply,log});
+      replyAsPost:config.feishu.replyAsPost,maxOutputChars:config.feishu.maxOutputChars,replyPolicy,log});
     const stopAuthorize=createCardAuthorize({routing:config.routing,privateAdmission});
     userInput=factories.userInput({jobs,executor,cardClient:client,authorize:stopAuthorize,
       runAsync:runCardOperation,config:{displayName:config.feishu.displayName,cardTextProvider},log});
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
       emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
     const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,inbound,botOpenId:config.feishu.botOpenId,authorize:stopAuthorize,executor,workspace:cwd,
-      runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName,cardTextProvider,textReply},log});
+      runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName,cardTextProvider,replyPolicy},log});
     forward=factories.forward({config:{
       steering:config.codex.steering,
       pollMs:config.codex.jobPollMs,
