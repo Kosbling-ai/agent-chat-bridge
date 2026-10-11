@@ -2,7 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.26` adds the optional private-chat admission callback `routing.privateAdmission`: a bot asks a configured business endpoint whether a private sender may use the Agent before storing the message, caches the answer per open_id, fails closed and replies once with a fixed text to refused senders. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback). No database migration; configurations without the key are unchanged.
+Version: `0.2.27` adds the optional per-instance Codex permission profile `codex.permissionProfile`: thread start, resume and fork send `permissions` instead of `sandbox`, and a thread is used only when Codex reports that profile as active (fail-closed). See [named permission profile per instance](docs/runtime.md#named-permission-profile-per-instance). No database migration; configurations without the key are unchanged.
+
+Version `0.2.26` adds the optional private-chat admission callback `routing.privateAdmission`: a bot asks a configured business endpoint whether a private sender may use the Agent before storing the message, caches the answer per open_id, fails closed and replies once with a fixed text to refused senders. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback). No database migration; configurations without the key are unchanged.
 
 Version `0.2.25` adds the optional per-group Codex working directory `routing.groups[].codex.cwd` (absolute path, checked like the global `codex.cwd` by startup and `check-config`) for a `bridge` group's human thread and business-event threads delivering to it, moves a thread recorded under another cwd to a new thread on its next turn, and announces the result-file directory as an absolute path for every conversation. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). No database migration.
 
@@ -35,6 +37,8 @@ For an Agent reply that needs to notify someone, write `<at user_id="ou_example1
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
 
 Private chats admit senders listed in `routing.privateUserIds`, everyone with `routing.allowAllPrivateUsers: true`, or, with the optional `routing.privateAdmission`, whoever a configured business endpoint approves; refused messages are not stored and get one fixed reply. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback).
+
+An instance may run its Codex threads under a named Codex permission profile with the optional `codex.permissionProfile` instead of `codex.sandbox`; the bridge then sends `permissions` instead of `sandbox` and uses a thread only when Codex reports that profile as active. See [named permission profile per instance](docs/runtime.md#named-permission-profile-per-instance).
 
 For an authorized group, set `routing.groups[].replyTriggers` to `true` to trigger the Agent when a human replies to a message from this bot without `@` (default `false`). Text and cards both qualify; `trigger: "all"` remains unchanged. See [routing and reply context](docs/runtime.md).
 

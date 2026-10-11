@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.27] - 2026-10-11
+
+- Add the optional per-instance key `codex.permissionProfile`: the id of a named Codex permission profile (`[permissions.<id>]` in the Codex home `config.toml`, or a built-in such as `:workspace`). The value is trimmed and must be 1–128 characters matching `^:?[A-Za-z0-9][A-Za-z0-9._-]*$`, otherwise `invalid_codex_permission_profile`. It has no default.
+- With the key set, `thread/start`, both `thread/resume` paths and `thread/fork` send `permissions: "<id>"` and no `sandbox` key; `turn/start` is unchanged (no `permissions`, no `sandboxPolicy`). Each of those responses must report `activePermissionProfile.id` equal to the id; otherwise the request fails with `CODEX_PERMISSION_PROFILE_MISMATCH` and the thread is not bound, loaded, given a turn or committed as a fork (fail-closed; the unused fork is recorded as the fork target). The error message is the fixed text `permission profile mismatch`, so no id can make the failure retryable; the ids are error fields and log fields. `/health/tasks` counts the failure under that code. Every check logs `thread_start`, `thread_resume` or `thread_fork` with `rpc_method`, `permissionProfile` and `activePermissionProfile` (`info` `succeeded`, or `error` `failed` with the code); the logger accepts these two fields.
+- With the key set, the app-server child starts without `-c sandbox_workspace_write.network_access=…` (the profile's network table applies; a built-in id such as `:workspace` follows Codex's built-in network default). The other launch arguments are unchanged, and the `app_server_start` line carries `permissionProfile`.
+- Validation errors: `codex_permission_profile_conflicts_with_sandbox` and `codex_permission_profile_conflicts_with_network_access` when `codex.sandbox` or `codex.networkAccess` appear next to the key, `group_codex_sandbox_conflicts_with_permission_profile` for any `routing.groups[].codex.sandbox`. Group `approvalPolicy`, `approvalsReviewer` and `cwd` overrides stay allowed. `check-config` does not ask Codex whether the profile exists.
+- Requires codex-cli 0.153.4 app-server experimental API (`permissions`, `activePermissionProfile`; the bridge already sends `experimentalApi: true`) and a Codex home `config.toml` with `default_permissions = "<id>"` and the `[permissions.<id>]` tables.
+- Failure signals (codex-cli 0.153.4):
+  - An undefined id is rejected by Codex and logged as `rpc_request` `rejected` `CODEX_RPC_REJECTED`, not as a mismatch.
+  - `CODEX_PERMISSION_PROFILE_MISMATCH` means Codex accepted the request but did not apply or report the profile.
+  - A missing `default_permissions` next to profile tables gives the bridge no error: the profile is applied because the bridge sends `permissions`. Codex's startup `configWarning` is not logged by the bridge. Check the Codex home with `codex sandbox -P <id> -C <codex.cwd> -- /bin/echo ok` and `codex features list` (see [runtime](docs/runtime.md#checking-the-codex-home-and-reading-failures)).
+
+No database migration, no config `schemaVersion` change, no storage change and no new dependency. Without `codex.permissionProfile` thread, turn and launch parameters and log output are byte-for-byte those of 0.2.26.
+
+Operator checklist (only for an instance that adopts a profile; other instances sharing the checkout behave as on 0.2.26 after their next restart):
+
+1. Deploy (fast-forward) 0.2.27 first. Instances without the key behave as on 0.2.26, and a restart during the next steps works with either the old or the new private configuration.
+2. Define the profile in that instance's Codex home `config.toml`: `default_permissions = "<id>"` and `[permissions.<id>.filesystem]` / `[permissions.<id>.network]`; remove `sandbox_mode` and `[sandbox_workspace_write]` from that file. From `codex.cwd` with the same `CODEX_HOME`, check that `codex sandbox -P <id> -C <codex.cwd> -- /bin/echo ok` prints `ok` and `codex features list > /dev/null` exits 0. Do steps 2–5 in one window.
+3. Back up the private configuration: `cp -p <bridge.json> <bridge.json>.bak-0.2.27-<timestamp>`. In the private bridge.json remove `codex.sandbox`, `codex.networkAccess` and any group `codex.sandbox`, and add `"permissionProfile": "<id>"` to `codex`.
+4. Run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>` with the 0.2.27 code; it must log `check_config` `succeeded`.
+5. Restart only that bridge: `kill -TERM <bridge-pid>` and let its supervisor start it again.
+6. Verify:
+   - `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`.
+   - The log shows `app_server_start` with `permissionProfile` once Codex starts. After a message it shows a `thread_start` or `thread_resume` line with `status` `succeeded` and `activePermissionProfile` equal to the id.
+   - `rpc_request` `rejected` `CODEX_RPC_REJECTED` on thread requests usually means an undefined id.
+   - `CODEX_PERMISSION_PROFILE_MISMATCH` means Codex did not apply the profile; remove the key and check the Codex version.
+7. Rollback: restore the backup (and the previous `config.toml`), run `check-config`, then `kill -TERM <bridge-pid>` again. To return to 0.2.26, remove `codex.permissionProfile` first: 0.2.26 rejects the key with `invalid_codex_fields`.
+
 ## [0.2.26] - 2026-10-09
 
 - Add the optional per-instance private-chat admission callback `routing.privateAdmission` (`url`, `tokenEnv`, `denyText` required; `timeoutMs` 100–5000, default 1000; `allowCacheMs` and `denyCacheMs` 0–86400000, defaults 300000 and 60000; `unavailableText` defaults to `denyText`). Before any Store write, a human private message from a sender not in `privateUserIds` is checked with `POST <url>`, `Authorization: Bearer <env[tokenEnv]>` and the body `{"connectionId","chatId","sender":{"openId","unionId"|null,"userId"|null}}`. HTTP 200 with a boolean `allowed` decides; any other status, a timeout, a network error or invalid JSON is "unavailable" and refuses the message (fail-closed).

@@ -264,6 +264,7 @@ export async function startService({ config, configPath, env = process.env, log,
       reasoningEffort: config.codex.reasoningEffort,
       networkAccess: config.codex.networkAccess,
       requestUserInput: config.codex.requestUserInput,
+      permissionProfile: config.codex.permissionProfile,
       threadNamePrefix: config.codex.threadNamePrefix,
       idleCloseMs: config.codex.idleCloseMs,
       closeGraceMs: config.codex.closeGraceMs,
@@ -412,5 +413,7 @@ export function createExecutorLogAdapter(log) {
     willRetry: event.willRetry,
     reason: event.reason,
     chatId: event.chat_id,
+    permissionProfile: event.permissionProfile,
+    activePermissionProfile: event.activePermissionProfile,
   });
 }

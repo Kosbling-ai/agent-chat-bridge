@@ -5,10 +5,12 @@ function emitLog(log, level, operation, status, detail = {}) {
   try { log?.(level, { module: 'agent-chat-bridge', component: 'codex-app-server', operation, status, ...detail }); } catch { /* logging is observational */ }
 }
 
+// With a named permission profile the profile's own network rule applies, so
+// the legacy workspace-write network flag is not passed.
 export function codexAppServerArgs(config = {}, { requestUserInputFeature = false } = {}) {
   return [
     'app-server', '--listen', 'stdio://',
-    '-c', `sandbox_workspace_write.network_access=${config.networkAccess === false ? 'false' : 'true'}`,
+    ...(config.permissionProfile ? [] : ['-c', `sandbox_workspace_write.network_access=${config.networkAccess === false ? 'false' : 'true'}`]),
     '-c', 'shell_environment_policy.inherit=all',
     ...(requestUserInputFeature ? ['-c', `features.default_mode_request_user_input=${config.requestUserInput === true ? 'true' : 'false'}`] : []),
   ];
@@ -101,7 +103,7 @@ export class CodexAppServerClient {
     if (this.child !== child) throw new Error('codex app-server child changed during initialize');
     this.ready = true;
     this.fault = null;
-    emitLog(this.log, 'info', 'app_server_start', 'succeeded');
+    emitLog(this.log, 'info', 'app_server_start', 'succeeded', this.config.permissionProfile ? { permissionProfile: this.config.permissionProfile } : {});
   }
 
   async request(method, params = {}, { skipStart = false, timeoutMs } = {}) {

@@ -118,8 +118,11 @@ function memoryStore(initial = []) {
   };
 }
 
-function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false, turnItemsFor = () => [], resumeCwds = new Map(), startCwd = (params) => params.cwd } = {}) {
+function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false, turnItemsFor = () => [], resumeCwds = new Map(), startCwd = (params) => params.cwd,
+  // The profile Codex reports on thread/start|resume|fork; by default it echoes `permissions` and adds nothing without it.
+  activeProfile = (params) => (params.permissions ? { id: params.permissions, extends: null } : undefined) } = {}) {
   let threadNumber = 0; let turnNumber = 0;
+  const profileOf = (params) => { const value = activeProfile(params); return value === undefined ? {} : { activePermissionProfile: value }; };
   const children = []; const calls = []; const envs = []; const args = [];
   // The cwd Codex reports on resume: an explicit fixture value, else the cwd the thread started with.
   const recordedCwds = new Map(resumeCwds);
@@ -144,16 +147,16 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkTh
         const id = `thread-${++threadNumber}`; loaded.add(id);
         const cwd = startCwd(message.params);
         if (cwd) recordedCwds.set(id, cwd);
-        respond({ thread: { id, ...(cwd ? { cwd } : {}) } });
+        respond({ thread: { id, ...(cwd ? { cwd } : {}) }, ...profileOf(message.params) });
       } else if (message.method === 'thread/resume') {
         if (archiveResumeThreadIds.has(message.params.threadId)) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: `session ${message.params.threadId} is archived` } })); return; }
         const cwd = recordedCwds.get(message.params.threadId);
-        loaded.add(message.params.threadId); respond({ thread: { id: message.params.threadId, turns: resumeTurns, ...(cwd ? { cwd } : {}) } }, resumeDelayMs);
+        loaded.add(message.params.threadId); respond({ thread: { id: message.params.threadId, turns: resumeTurns, ...(cwd ? { cwd } : {}) }, ...profileOf(message.params) }, resumeDelayMs);
       }
       else if (message.method === 'thread/read') respond({ thread: { ...readThread, id: message.params.threadId, turns: readTurns } });
       else if (message.method === 'thread/fork') {
         const id = `fork-${++threadNumber}`; loaded.add(id);
-        respond({ thread: forkThread === undefined ? { id, cwd: message.params.cwd, ephemeral: message.params.ephemeral, forkedFromId: message.params.threadId, turns: [] } : forkThread });
+        respond({ thread: forkThread === undefined ? { id, cwd: message.params.cwd, ephemeral: message.params.ephemeral, forkedFromId: message.params.threadId, turns: [] } : forkThread, ...profileOf(message.params) });
       }
       else if (message.method === 'turn/start') {
         if (strictThreadLoading && !loaded.has(message.params.threadId)) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: 'thread was not loaded by this child' } })); return; }
@@ -1518,5 +1521,215 @@ test('a group codex override reaches both thread/resume paths and thread/fork, n
       assert.equal(commits, accepted ? 1 : 0);
       await executor.close();
     }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+// 0.2.27 codex.permissionProfile: a named profile replaces the legacy sandbox on thread requests only.
+const PROFILE_START_KEYS = ['approvalPolicy', 'approvalsReviewer', 'config', 'cwd', 'model', 'permissions', 'serviceName', 'threadSource'];
+const PROFILE_RESUME_KEYS = ['approvalPolicy', 'approvalsReviewer', 'config', 'cwd', 'model', 'permissions', 'threadId'];
+const PROFILE_FORK_KEYS = ['approvalPolicy', 'approvalsReviewer', 'config', 'cwd', 'deferGoalContinuation', 'ephemeral', 'model', 'permissions', 'threadId'];
+// The service still maps the default sandbox and network values next to a profile; the executor must ignore them.
+const profileConfig = (cwd) => ({ ...overrideConfig(cwd), permissionProfile: 'operator' });
+const THREAD_OPERATIONS = ['thread_start', 'thread_resume', 'thread_fork'];
+const profileInputFor = (binding, messageId) => ({ bindingOpenId: binding.feishuOpenId, chatId: binding.chatId, chatType: binding.chatType, messageId,
+  senderOpenId: binding.feishuOpenId, senderName: 'User', prompt: 'work', busyPolicy: 'steer' });
+const paramsOf = (runtime, method, threadId) => runtime.calls.find((call) => call.method === method && (threadId === undefined || call.params.threadId === threadId))?.params;
+
+test('a permission profile drops only the legacy network flag from the app-server arguments', () => {
+  assert.deepEqual(codexAppServerArgs({ networkAccess: false, requestUserInput: true }, { requestUserInputFeature: true }),
+    ['app-server', '--listen', 'stdio://', '-c', 'sandbox_workspace_write.network_access=false', '-c', 'shell_environment_policy.inherit=all', '-c', 'features.default_mode_request_user_input=true']);
+  assert.deepEqual(codexAppServerArgs({}), ['app-server', '--listen', 'stdio://', '-c', 'sandbox_workspace_write.network_access=true', '-c', 'shell_environment_policy.inherit=all']);
+  assert.deepEqual(codexAppServerArgs({ permissionProfile: 'operator', networkAccess: false, requestUserInput: true }, { requestUserInputFeature: true }),
+    ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all', '-c', 'features.default_mode_request_user_input=true']);
+  assert.deepEqual(codexAppServerArgs({ permissionProfile: ':workspace', networkAccess: true }), ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all']);
+});
+
+test('a configured permission profile replaces the sandbox on thread/start, both thread/resume paths and thread/fork, never on turn/start', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-profile-'));
+  const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-group', threadName: 'group', created: false };
+  const privateChat = { feishuOpenId: 'ou-private', chatId: 'chat-private', chatType: 'p2p', codexSessionId: 'thread-private', threadName: 'private', created: false };
+  const assertProfileParams = (params, keys, label) => {
+    assert.deepEqual(Object.keys(params).sort(), keys, label);
+    assert.equal(params.permissions, 'operator', label);
+    assert.equal('sandbox' in params, false, `${label} carries no sandbox key`);
+    assert.deepEqual(params.config, { model_reasoning_effort: 'medium' }, label);
+  };
+  try {
+    // thread/start of a new private chat, then its turn.
+    const logs = [];
+    const startRuntime = fakeRuntime();
+    const starter = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore(), spawnImpl: startRuntime.spawnImpl, log: (...entry) => logs.push(entry) });
+    await starter.execute({ ...profileInputFor({ ...privateChat, chatId: 'chat-new' }, 'm1'), prompt: 'hello' });
+    assertProfileParams(paramsOf(startRuntime, 'thread/start'), PROFILE_START_KEYS, 'thread/start');
+    assert.equal(paramsOf(startRuntime, 'thread/start').approvalPolicy, 'on-request');
+    assert.deepEqual(Object.keys(paramsOf(startRuntime, 'turn/start')).sort(), TURN_START_KEYS, 'turn/start keeps the 0.2.20 key set');
+    assert.deepEqual(startRuntime.args[0], ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all']);
+    assert.deepEqual(logs.filter(([, event]) => event.operation === 'app_server_start'), [['info', { module: 'agent-chat-bridge', component: 'codex-app-server',
+      operation: 'app_server_start', status: 'succeeded', permissionProfile: 'operator' }]]);
+    assert.deepEqual(logs.filter(([, event]) => THREAD_OPERATIONS.includes(event.operation)), [['info', { module: 'agent-chat-bridge', component: 'codex-executor',
+      operation: 'thread_start', rpc_method: 'thread/start', permissionProfile: 'operator', activePermissionProfile: 'operator', status: 'succeeded' }]]);
+    await starter.close();
+
+    // thread/resume before a new turn: the group keeps its approval and cwd overrides, never its sandbox.
+    const readyRuntime = fakeRuntime();
+    const ready = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([group, privateChat]), spawnImpl: readyRuntime.spawnImpl });
+    await ready.execute(profileInputFor(group, 'm2'));
+    await ready.execute(profileInputFor(privateChat, 'm3'));
+    assertProfileParams(paramsOf(readyRuntime, 'thread/resume', 'thread-group'), PROFILE_RESUME_KEYS, 'group thread/resume');
+    assert.equal(paramsOf(readyRuntime, 'thread/resume', 'thread-group').approvalPolicy, 'never');
+    assert.equal(paramsOf(readyRuntime, 'thread/resume', 'thread-group').cwd, groupCwdOf(cwd));
+    assertProfileParams(paramsOf(readyRuntime, 'thread/resume', 'thread-private'), PROFILE_RESUME_KEYS, 'private thread/resume');
+    for (const threadId of ['thread-group', 'thread-private']) {
+      const turn = paramsOf(readyRuntime, 'turn/start', threadId);
+      assert.deepEqual(Object.keys(turn).sort(), TURN_START_KEYS, threadId);
+      assert.equal('permissions' in turn || 'sandboxPolicy' in turn || 'sandbox' in turn, false, threadId);
+    }
+    assert.equal(readyRuntime.calls.filter((call) => call.method === 'thread/start').length, 0);
+    await ready.close();
+
+    // thread/resume of a known turn after a restart.
+    const knownRuntime = fakeRuntime({ resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+    const known = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([privateChat]), spawnImpl: knownRuntime.spawnImpl });
+    const result = await known.execute(profileInputFor(privateChat, 'job'), { resume: { threadId: 'thread-private', turnId: 'known', startedAt: Date.now() - 5_000 } });
+    assert.equal(result.answer, 'known');
+    assertProfileParams(paramsOf(knownRuntime, 'thread/resume', 'thread-private'), PROFILE_RESUME_KEYS, 'known-turn thread/resume');
+    assert.equal(knownRuntime.calls.some((call) => call.method === 'turn/start'), false);
+    await known.close();
+
+    // thread/fork.
+    const forkLogs = [];
+    const forkRuntime = fakeRuntime();
+    const forker = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([group]), spawnImpl: forkRuntime.spawnImpl, log: (...entry) => forkLogs.push(entry) });
+    const forked = await forker.forkBinding({ binding: group, expectedSourceThreadId: 'thread-group', onForked: async () => ({ outcome: 'succeeded' }) });
+    assert.equal(forked.targetThreadId, 'fork-1');
+    assertProfileParams(paramsOf(forkRuntime, 'thread/fork'), PROFILE_FORK_KEYS, 'thread/fork');
+    assert.equal(paramsOf(forkRuntime, 'thread/fork').cwd, groupCwdOf(cwd));
+    assert.deepEqual(forkLogs.filter(([, event]) => THREAD_OPERATIONS.includes(event.operation)).map(([level, event]) => [level, event.operation, event.activePermissionProfile]),
+      [['info', 'thread_fork', 'operator']]);
+    await forker.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('a thread whose reported permission profile differs or is missing is never bound, loaded or given a turn', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-profile-'));
+  const existing = { feishuOpenId: 'ou-human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', threadName: 'p2p', created: false };
+  const turnStarts = (runtime) => runtime.calls.filter((call) => call.method === 'turn/start').length;
+  try {
+    // 'network-timeout' would match the forward runtime's retry words if an id ever reached the message.
+    for (const [reported, actual] of [[{ id: 'other', extends: null }, 'other'], [undefined, ''], [null, ''], [{ id: 'operator ' }, 'operator '], [{ id: 'network-timeout' }, 'network-timeout']]) {
+      const label = JSON.stringify(reported) ?? 'missing';
+      const mismatch = (error) => {
+        assert.equal(error.code, 'CODEX_PERMISSION_PROFILE_MISMATCH', label);
+        return true;
+      };
+      // The message is fixed and carries no id; the ids are fields of the error.
+      const mismatchWithIds = (error) => {
+        mismatch(error);
+        assert.equal(error.message, 'permission profile mismatch', label);
+        assert.equal(error.expected, 'operator', label);
+        assert.equal(error.actual, actual || null, label);
+        return true;
+      };
+      const failureLog = (logs, operation) => {
+        const entries = logs.filter(([, event]) => THREAD_OPERATIONS.includes(event.operation));
+        assert.equal(entries.length, 1, label);
+        const [level, event] = entries[0];
+        assert.equal(level, 'error', label);
+        assert.deepEqual(event, { module: 'agent-chat-bridge', component: 'codex-executor', operation, rpc_method: operation.replace('_', '/'), permissionProfile: 'operator',
+          ...(actual ? { activePermissionProfile: actual } : {}), status: 'failed', error_code: 'CODEX_PERMISSION_PROFILE_MISMATCH' }, label);
+      };
+
+      // thread/start: the new thread is not bound.
+      const startLogs = [];
+      const startRuntime = fakeRuntime({ activeProfile: () => reported });
+      const startStore = memoryStore();
+      const starter = createCodexExecutor({ config: profileConfig(cwd), sessionStore: startStore, spawnImpl: startRuntime.spawnImpl, log: (...entry) => startLogs.push(entry) });
+      await assert.rejects(starter.execute(profileInputFor({ ...existing, chatId: 'chat-new' }, 'm1')), mismatchWithIds);
+      assert.equal(turnStarts(startRuntime), 0, label);
+      assert.equal(startStore.bindings.size, 0, `${label}: no binding is saved`);
+      failureLog(startLogs, 'thread_start');
+      await starter.close();
+
+      // thread/resume before a new turn: the binding is kept but the thread is not used.
+      const resumeLogs = [];
+      const resumeRuntime = fakeRuntime({ activeProfile: () => reported });
+      const resumeStore = memoryStore([existing]);
+      const resumer = createCodexExecutor({ config: profileConfig(cwd), sessionStore: resumeStore, spawnImpl: resumeRuntime.spawnImpl, log: (...entry) => resumeLogs.push(entry) });
+      await assert.rejects(resumer.execute(profileInputFor(existing, 'm2')), mismatchWithIds);
+      assert.equal(turnStarts(resumeRuntime), 0, label);
+      assert.equal(resumeStore.bindings.get('ou-human:chat').codexSessionId, 'thread-existing', label);
+      failureLog(resumeLogs, 'thread_resume');
+      await resumer.close();
+
+      // thread/resume of a known turn.
+      const knownRuntime = fakeRuntime({ activeProfile: () => reported, resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+      const known = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([existing]), spawnImpl: knownRuntime.spawnImpl });
+      await assert.rejects(known.execute(profileInputFor(existing, 'job'), { resume: { threadId: 'thread-existing', turnId: 'known', startedAt: Date.now() - 5_000 } }), mismatch);
+      assert.equal(turnStarts(knownRuntime), 0, label);
+      await known.close();
+
+      // thread/fork: the fork is not committed to the binding.
+      const forkLogs = [];
+      const forkRuntime = fakeRuntime({ activeProfile: () => reported });
+      const forker = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([existing]), spawnImpl: forkRuntime.spawnImpl, log: (...entry) => forkLogs.push(entry) });
+      let commits = 0;
+      await assert.rejects(forker.forkBinding({ binding: existing, expectedSourceThreadId: 'thread-existing', onForked: async () => { commits += 1; return { outcome: 'succeeded' }; } }), (error) => {
+        mismatchWithIds(error);
+        assert.equal(error.outcome, undefined, `${label}: a rejected fork is reported as failed, not unknown`);
+        assert.equal(error.forkTargetThreadId, 'fork-1', `${label}: the unused native fork is recorded`);
+        return true;
+      });
+      assert.equal(commits, 0, label);
+      failureLog(forkLogs, 'thread_fork');
+      await forker.close();
+    }
+
+    // The rejected thread was never marked loaded: the next message resumes and checks it again.
+    let reported = { id: 'other' };
+    const runtime = fakeRuntime({ activeProfile: () => reported });
+    // One long-lived child, so a second resume can only come from the executor not marking the thread loaded.
+    const executor = createCodexExecutor({ config: { ...profileConfig(cwd), idleCloseMs: 60_000 }, sessionStore: memoryStore([existing]), spawnImpl: runtime.spawnImpl });
+    await assert.rejects(executor.execute(profileInputFor(existing, 'm1')), { code: 'CODEX_PERMISSION_PROFILE_MISMATCH' });
+    reported = { id: 'operator', extends: null };
+    const result = await executor.execute(profileInputFor(existing, 'm2'));
+    assert.equal(result.threadId, 'thread-existing');
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/resume' && call.params.threadId === 'thread-existing').length, 2);
+    assert.equal(turnStarts(runtime), 1);
+    assert.equal(runtime.children.length, 1);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('without a permission profile thread, turn and launch parameters are byte-for-byte those of 0.2.26 and nothing is added to the logs', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-legacy-'));
+  const existing = { feishuOpenId: 'ou-human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', threadName: 'p2p', created: false };
+  const knownBinding = { ...existing, chatId: 'chat-known', codexSessionId: 'thread-known' };
+  const policy = { cwd, approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', sandbox: 'workspace-write', model: 'gpt-test' };
+  const effort = { config: { model_reasoning_effort: 'medium' } };
+  try {
+    const logs = [];
+    const runtime = fakeRuntime({ resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+    const executor = createCodexExecutor({ config: { ...config(cwd), idleCloseMs: 60_000 }, sessionStore: memoryStore([existing, knownBinding]), spawnImpl: runtime.spawnImpl, log: (...entry) => logs.push(entry) });
+    await executor.execute(profileInputFor({ ...existing, chatId: 'chat-new' }, 'm1'));
+    await executor.execute(profileInputFor(existing, 'm2'));
+    await executor.execute(profileInputFor(knownBinding, 'job'), { resume: { threadId: 'thread-known', turnId: 'known', startedAt: Date.now() - 5_000 } });
+    await executor.forkBinding({ binding: existing, expectedSourceThreadId: 'thread-existing', onForked: async () => ({ outcome: 'succeeded' }) });
+    const wire = (method, threadId) => JSON.stringify(paramsOf(runtime, method, threadId));
+    assert.equal(wire('thread/start'), JSON.stringify({ ...policy, serviceName: 'Agent Chat Bridge', threadSource: 'user', ...effort }));
+    assert.equal(wire('thread/resume', 'thread-existing'), JSON.stringify({ ...policy, threadId: 'thread-existing', ...effort }));
+    assert.equal(wire('thread/resume', 'thread-known'), JSON.stringify({ ...policy, threadId: 'thread-known', ...effort }));
+    assert.equal(wire('thread/fork', 'thread-existing'), JSON.stringify({ ...policy, threadId: 'thread-existing', ephemeral: false, deferGoalContinuation: true, ...effort }));
+    for (const turn of runtime.calls.filter((call) => call.method === 'turn/start')) {
+      assert.deepEqual(Object.keys(turn.params), ['threadId', 'input', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'model', 'effort']);
+    }
+    assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 2);
+    assert.deepEqual(runtime.args, [['app-server', '--listen', 'stdio://', '-c', 'sandbox_workspace_write.network_access=false', '-c', 'shell_environment_policy.inherit=all']]);
+    // The complete log output, captured from 0.2.26 running this same sequence: any extra line of any name fails.
+    assert.deepEqual(logs, [['info', { module: 'agent-chat-bridge', component: 'codex-app-server', operation: 'app_server_start', status: 'succeeded' }]]);
+    await executor.close();
+    assert.deepEqual(logs.map(([level, event]) => [level, event.operation, event.status]), [
+      ['info', 'app_server_start', 'succeeded'], ['info', 'app_server_close', 'started'], ['info', 'app_server_close', 'succeeded'],
+    ]);
+    assert.equal(logs.some(([, event]) => THREAD_OPERATIONS.includes(event.operation) || 'permissionProfile' in event || 'activePermissionProfile' in event), false);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });

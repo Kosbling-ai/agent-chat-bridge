@@ -231,19 +231,51 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     threadCwds.set(threadId, cwd);
     if (threadCwds.size > 2000) threadCwds.delete(threadCwds.keys().next().value);
   }
+  // A named permission profile (`codex.permissionProfile`) replaces the legacy
+  // sandbox on every thread of this instance. The app-server rejects
+  // `permissions` together with `sandbox`, and a `sandbox` alone would select
+  // the legacy mode instead of the profile, so the key is left out entirely.
+  const permissionProfile = trim(config.permissionProfile);
   function codexPolicyFor(binding) {
     const override = binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId) : undefined;
-    return {
+    const policy = {
       cwd: override?.cwd || config.cwd,
       approvalPolicy: normalizeApprovalPolicy(override?.approvalPolicy || config.approvalPolicy),
       approvalsReviewer: normalizeApprovalsReviewer(override?.approvalsReviewer || config.approvalsReviewer),
-      sandbox: override?.sandbox || config.sandbox || 'workspace-write',
     };
+    if (permissionProfile) policy.permissions = permissionProfile;
+    else policy.sandbox = override?.sandbox || config.sandbox || 'workspace-write';
+    return policy;
+  }
+
+  // With a profile configured, a started, resumed or forked thread is used only
+  // when Codex reports that profile as active; otherwise the thread is not
+  // loaded, bound or given a turn (fail-closed). Without a profile nothing is
+  // checked or logged.
+  function confirmPermissionProfile(rpcMethod, response) {
+    if (!permissionProfile) return;
+    const reported = response?.activePermissionProfile?.id;
+    // Compared untruncated; only the logged and reported copy is bounded.
+    const active = typeof reported === 'string' ? reported.slice(0, 128) : '';
+    const event = { module: 'agent-chat-bridge', component: 'codex-executor', operation: rpcMethod.replace('/', '_'), rpc_method: rpcMethod,
+      permissionProfile, ...(active ? { activePermissionProfile: active } : {}) };
+    if (reported === permissionProfile) {
+      try { log('info', { ...event, status: 'succeeded' }); } catch { /* logging is observational */ }
+      return;
+    }
+    try { log('error', { ...event, status: 'failed', error_code: 'CODEX_PERMISSION_PROFILE_MISMATCH' }); } catch { /* logging is observational */ }
+    // A fixed message: retry classification matches words in messages, and a
+    // profile id must never turn this rejection into a retry. The ids travel as fields.
+    const error = coded('permission profile mismatch', 'CODEX_PERMISSION_PROFILE_MISMATCH');
+    error.expected = permissionProfile;
+    error.actual = active || null;
+    throw error;
   }
 
   // turn/start has no `sandbox` parameter (its `sandboxPolicy` is a structured
-  // policy object). The sandbox chosen on thread start, resume or fork stays in
-  // force for later turns, and every turn runs on a thread this app-server
+  // policy object) and never carries `permissions`. The sandbox or permission
+  // profile chosen on thread start, resume or fork stays in force for later
+  // turns, and every turn runs on a thread this app-server
   // child started, resumed or forked through threadDefaults. The cwd is sent on
   // every turn as well, because thread/resume does not move the cwd a thread
   // recorded when it started.
@@ -268,6 +300,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }, actor));
     const threadId = trim(response?.thread?.id);
     if (!threadId) throw coded('Codex did not return a thread id', 'CODEX_THREAD_START_UNCONFIRMED', { outcome: 'unknown' });
+    confirmPermissionProfile('thread/start', response);
     loadedThreads.add(threadId);
     const reportedCwd = trim(response?.thread?.cwd);
     rememberThreadCwd(threadId, reportedCwd);
@@ -300,6 +333,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       response = await client.request('thread/resume', threadDefaults({ threadId: binding.codexSessionId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      confirmPermissionProfile('thread/resume', response);
       rememberThreadCwd(binding.codexSessionId, response?.thread?.cwd);
     } catch (error) {
       if (error?.code === 'CODEX_THREAD_BUSY' && error.outcome === 'rejected') {
@@ -890,6 +924,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      confirmPermissionProfile('thread/resume', response);
       rememberThreadCwd(resume.threadId, response?.thread?.cwd);
       snapshot = exactTurnSnapshot(response?.thread, resume.turnId);
       const otherActiveIds = inProgressTurnIds(response?.thread).filter((turnId) => turnId !== resume.turnId);
@@ -996,6 +1031,12 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(codexPolicyFor(actor).cwd)
         || thread?.ephemeral === true || (thread?.forkedFromId && thread.forkedFromId !== sourceThreadId)) {
         throw coded('fork response could not be verified', 'CODEX_FORK_UNCONFIRMED', { outcome: 'unknown' });
+      }
+      try { confirmPermissionProfile('thread/fork', response); }
+      catch (error) {
+        // The native fork exists but is not used; record it for the operator like a failed commit.
+        error.forkTargetThreadId = targetThreadId;
+        throw error;
       }
       let committed;
       try { committed = await onForked({ sourceThreadId, targetThreadId }); }
