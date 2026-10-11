@@ -18,6 +18,39 @@ Recalls of the bot's own messages are filtered for every group: a live `im.messa
 
 Groups previously present only in `hooks[].conversationIds` must now also appear in `routing.groups`; use `capabilities:["hook"]` for a hook-only group. P2P rules are unchanged.
 
+### Group text replies and trigger all
+
+`routing.groups[].reply` (optional, since 0.2.28) selects how a `bridge` group's human turns are answered. Without the key, or with `"mode": "card"`, nothing changes: Typing, the execution card and the card-failure fallback behave as described under [Input and execution](#input-and-execution).
+
+```json
+{ "conversationId": "oc_example", "trigger": "all", "passiveContext": true, "capabilities": ["bridge", "hook"],
+  "silentReply": { "tokens": ["NO_REPLY"] },
+  "reply": { "mode": "text", "ack": "reaction" } }
+```
+
+| Key | Values | Default | Meaning |
+|---|---|---|---|
+| `reply.mode` | `"card"`, `"text"` | `"card"` | `"text"` never creates an execution card and does not add the processing Typing reaction or send `feishu.processingFallbackText`. A text-mode group must have effective `silentReply.tokens` (its own or `routing.silentReply`), otherwise validation and `check-config` fail with `group_text_reply_requires_silent_reply`. |
+| `reply.ack` | `"none"`, `"reaction"` | `"none"` | Text mode only. `"reaction"` adds one reaction to the triggering message when the turn starts (also for a message that is steered into a running turn) and never removes it. It sends no message. |
+| `reply.ackEmoji` | Feishu `emoji_type`, `[A-Za-z0-9_]{1,80}` | `"OnIt"` | Only with `ack: "reaction"`. `OnIt` is Feishu's "on it" reaction: seen and being handled. Feishu has no eyes reaction; `GLANCE` or `Get` are alternatives. It must differ from `feishu.processingReactionEmoji`, whose cleanup removes every app reaction with that emoji. |
+
+The style is recorded on the job as `result.replyMode` when its turn starts (only for a group that has the key) and is reused by retries, recovery after a restart and reply delivery, so a configuration change never switches a job half way. A job without a recorded style that already has an execution card (it started before the group switched to text mode) finishes on that card.
+
+In text mode the final answer is sent as a reply to the triggering message (`im/v1/messages/:message_id/reply`, `reply_in_thread: false`, deterministic `uuid`):
+
+- A completed answer that is one plain line is a `text` message; a line break, a mention, a Markdown link `[label](url)` or Markdown that the post conversion changes (bold, heading, inline code) makes it a `post` built with the same Markdown conversion as the fallback reply. A bare URL is plain text. Long answers are split into 3000-character chunks, each a reply to the same triggering message, still capped by `feishu.maxOutputChars`. `feishu.replyAsPost` does not apply.
+- Mentions: every `<at id|user_id|open_id = "ou_x">Name</at>` spelling (quotes optional, single or double, spaces around `=` allowed, name optional and without `<` or a line break) and `@{ou_x}` become post `at` elements with `user_id` = the open_id and `user_name` = the name when one is given, including inside code blocks. The ID must match `ou_[A-Za-z0-9_-]+`. `<at user_id="all"></at>` still needs `allowMentionAll: true`. A tag that does not match (for example a name containing `<` or a line break) stays text, and any remaining open_id-like token `ou_[A-Za-z0-9_-]{8,}` that is not part of a longer word is replaced with `@成员` in post text, link text and text messages, so an open_id is never shown. A name that is itself an open_id is dropped. The card-mode fallback conversion is unchanged.
+- A failed or interrupted turn sends exactly one `text` line: the bridge failure text with whitespace collapsed and open_ids masked, at most 200 characters.
+- A completed answer equal to a configured `silentReply` token sends nothing; with no card to close the job finishes with `result.silentReply = { status: "silent", card: "none" }` and a `forward_reply` `silent` log with `reason` `card_none`. With `ack: "none"` the turn leaves no trace in the chat; with `ack: "reaction"` only the reaction remains.
+- Only a reply that Feishu rejects because the triggering message was recalled (platform code `230011`) is sent as a new chat message instead, once, logged as a `forward_reply` `reply_rejected` warning with `code` `reply_target_gone`. Every other rejection is not re-sent: it is logged once as `forward_reply` `reply_failed` with the real `code`, `platformCode` and `stage` (`reply`, or `create` with `replyPlatformCode` when the fallback itself failed) and the job returns to `reply_pending`. An unconfirmed reply (timeout, transport error) is not re-sent as a create either; it is retried as the same reply with the same `uuid`.
+- Sent replies are recorded as bot messages, so `replyTriggers` and the recall filter treat them like any other bot reply. Outbox attachments and the attachment-failure notice are unchanged.
+- Business-event jobs, private chats and groups without the key are unchanged.
+- Known limits: there is no stop button and no busy-session fork button in text mode (the busy failure is the one-line text); progress is not shown while the turn runs.
+
+`trigger: "all"` already exists and is unchanged: every message from an authorized human (`actor.type` `user`, matching `userIds` when set) in that group starts a turn without a mention. Messages from bots, other apps and this bot itself never trigger; a message older than `codex.maxEventAgeMs` (default 10 minutes) when processed never triggers, including history catch-up; `replyTriggers` is ignored for such a group. Triggering messages are not stored as passive context for later turns because each one is already its own turn (or is steered into the running one). Combine it with `silentReply` tokens and a workspace rule that answers the exact token when nothing needs to be said.
+
+The bridge contains no business rule for either key; which groups use them is configuration.
+
 ### Private-chat admission callback
 
 `routing.privateAdmission` (optional, since 0.2.26) lets one bot admit private senders by asking a business HTTP endpoint instead of a static list. Without the key private chats behave exactly as before.
@@ -247,7 +280,7 @@ The execution card keeps key content visible and folds the process into at most 
 
 The card sidecar stores the original message ID, status, bounded progress entries and stop identity. A transient progress-read failure is retried with bounded exponential backoff without replaying the Codex turn or discarding the cursor. After three consecutive failures the running card indicates that progress is temporarily unavailable; a successful read removes that notice. Lease loss, runtime shutdown and cancellation stop observation, while final-answer delivery remains independent. Card create or patch failure follows the original fallback path; a saved message ID is patched on reply recovery. Legacy unconfirmed card effects written by the previous controller remain held without another platform write.
 
-Ordinary fallback replies use chat create rather than source-message reply. Post mode is the default and uses the production Markdown-to-Feishu conversion with 3000-character chunks; optional text mode uses 1900-character chunks. Both apply `feishu.maxOutputChars` (default 3500) and deterministic UUIDs. Legacy unconfirmed text effects remain held. Live Agent work awaits the production Typing add; a failed add sends `feishu.processingFallbackText`, and final cleanup is best effort. Recovery removes reaction IDs recorded in `assistant_message_events` and app-owned reactions from the first returned page for the configured emoji without replaying an unconfirmed add.
+Ordinary fallback replies use chat create rather than source-message reply (a group with [`reply.mode: "text"`](#group-text-replies-and-trigger-all) replies to the source message instead and has no card). Post mode is the default and uses the production Markdown-to-Feishu conversion with 3000-character chunks; optional text mode uses 1900-character chunks. Both apply `feishu.maxOutputChars` (default 3500) and deterministic UUIDs. Legacy unconfirmed text effects remain held. Live Agent work awaits the production Typing add; a failed add sends `feishu.processingFallbackText`, and final cleanup is best effort. Recovery removes reaction IDs recorded in `assistant_message_events` and app-owned reactions from the first returned page for the configured emoji without replaying an unconfirmed add.
 
 Bridge delivery consumes the executor's attachment paths directly. P2P is allowed; group delivery uses the configured `bridge` capability. Every file is capped at 28 MiB. A successful upload and send removes that file; an individual failure keeps it for manual follow-up and does not block the text reply or other attachments. Legacy unconfirmed attachment intents are not replayed. The final result retains the display answer and `rawAnswer` as internal recovery state; neither results nor attachment files are exposed through HTTP.
 
