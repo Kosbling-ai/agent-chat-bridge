@@ -48,6 +48,23 @@ test('group codex overrides reject unknown fields, values outside the protocol e
   assert.throws(() => validateConfig(withGroup({ capabilities: ['hook'], codex: { sandbox: 'danger-full-access' } })), { code: 'group_context_requires_bridge' });
 });
 
+test('with a global permission profile a group may not override the sandbox but may still switch approval, reviewer and cwd', () => {
+  const withProfile = codex => ({ ...withGroup({ codex }), codex: { ...base.codex, permissionProfile: 'operator' } });
+  for (const codex of [{ sandbox: 'read-only' }, { sandbox: 'workspace-write' }, { sandbox: 'danger-full-access' },
+    { approvalPolicy: 'never', sandbox: 'danger-full-access' }, { cwd: '/srv/agent/workspace', sandbox: 'workspace-write' }]) {
+    assert.throws(() => validateConfig(withProfile(codex)), { code: 'group_codex_sandbox_conflicts_with_permission_profile' }, JSON.stringify(codex));
+  }
+  for (const codex of [{ approvalPolicy: 'never' }, { approvalsReviewer: 'user' }, { cwd: '/srv/agent/workspace' },
+    { approvalPolicy: 'never', approvalsReviewer: 'guardian_subagent', cwd: '/srv/agent/workspace' }]) {
+    const config = validateConfig(withProfile(codex));
+    assert.deepEqual(config.routing.groups[0].codex, codex, JSON.stringify(codex));
+    assert.equal(config.codex.permissionProfile, 'operator');
+  }
+  // Groups without codex overrides are unaffected, and the group sandbox stays valid without a profile.
+  assert.equal(validateConfig({ ...base, codex: { ...base.codex, permissionProfile: 'operator' } }).routing.groups[0].codex, undefined);
+  assert.deepEqual(groupCodexOf({ sandbox: 'danger-full-access' }), { sandbox: 'danger-full-access' });
+});
+
 const bin = fileURLToPath(new URL('../bin/agent-chat-bridge.mjs', import.meta.url));
 
 test('a bridge group may set its own absolute Codex cwd, alone or with permissions', () => {

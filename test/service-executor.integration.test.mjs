@@ -137,6 +137,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(executorConfig.approvalsReviewer, 'auto_review');
   assert.equal(executorConfig.sandbox, 'workspace-write');
   assert.equal(executorConfig.networkAccess, true);
+  assert.equal(executorConfig.permissionProfile, undefined);
   assert.equal(executorConfig.rolloverCheckTimeoutMs, 30_000);
   assert.equal(executorConfig.memoryCheckIntervalMs, 60_000);
   assert.equal(executorConfig.memoryMaxRssBytes, 1536 * 1024 * 1024);
@@ -159,6 +160,76 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const rpcLog = logEvents.find(event => event.operation === 'rpc_request');
   assert.deepEqual({code:rpcLog.code,rpcMethod:rpcLog.rpc_method}, {code:'CODEX_THREAD_BUSY',rpcMethod:'thread/resume'});
   assert.equal(JSON.stringify(logEvents).includes('SYNTHETIC_SECRET'), false);
+  assert.equal(logEvents.some(event => 'permissionProfile' in event || 'activePermissionProfile' in event), false, 'no profile, no profile log fields');
   await service.close();
   assert.equal((await active).code,'CODEX_OBSERVATION_LOST');
+});
+
+test('service maps codex.permissionProfile to the executor, the app-server arguments, thread requests and the logs', { timeout: 20000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-profile-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let service;
+  t.after(async () => service?.close());
+  const child = join(directory, 'codex-fixture.mjs');
+  const observed = join(directory, 'observed.jsonl');
+  // The fixture reports `permissions` back as the active profile, like app-server 0.153.4 with experimentalApi.
+  // It rejects turn/start after recording it, so no completion notification can race the turn registration.
+  await writeFile(child, `#!/usr/bin/env node
+import readline from 'node:readline';
+import { appendFileSync } from 'node:fs';
+const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
+if(process.argv[2]==='app-server') appendFileSync(process.env.OBSERVED_FILE,JSON.stringify({argv:process.argv.slice(2)})+'\\n');
+readline.createInterface({input:process.stdin}).on('line',line=>{
+ const message=JSON.parse(line);
+ if(message.method!=='initialize') appendFileSync(process.env.OBSERVED_FILE,JSON.stringify({method:message.method,params:message.params})+'\\n');
+ const profile=message.params?.permissions?{activePermissionProfile:{id:message.params.permissions,extends:null}}:{};
+ if(message.method==='thread/start') send({id:message.id,result:{thread:{id:'thread-1',cwd:message.params.cwd},...profile}});
+ else if(message.method==='turn/start') send({id:message.id,error:{code:-32000,message:'synthetic turn rejection'}});
+ else send({id:message.id,result:{}});
+});
+`);
+  await chmod(child, 0o755);
+  const raw = {
+    schemaVersion: 1,
+    listen: { host: '127.0.0.1', port: 0 },
+    storage: { hostEnv: 'DB_HOST', portEnv: 'DB_PORT', userEnv: 'DB_USER', passwordEnv: 'DB_PASSWORD', databaseEnv: 'DB_DATABASE' },
+    codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], permissionProfile: 'operator' },
+    feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot', catchup: false },
+    routing: { version: '1', privateUserIds: ['human'], groups: [] },
+    hooks: [],
+  };
+  const env = { DB_HOST: 'unused', DB_PORT: '3306', DB_USER: 'unused', DB_PASSWORD: 'unused', DB_DATABASE: 'unused',
+    APP_ID: 'app', APP_SECRET: 'secret', PATH: process.env.PATH, HOME: directory, OBSERVED_FILE: observed };
+  let executorConfig;
+  let executorInstance;
+  const logEvents = [];
+  const inertWorker = { start() {}, beginStop() {}, async ingestCardAction() {}, async stop() {}, status: () => ({ running: true }) };
+  service = await startService({ config: validateConfig(raw), configPath: join(directory, 'bridge.json'), env,
+    log: createLogger({ write(value) { logEvents.push(JSON.parse(value)); } }), dependencies: {
+    pool: () => ({ async query() {}, async end() {} }),
+    store: async () => ({ async assertCurrent() {}, async close() {} }),
+    sessions: () => sessionStore(),
+    jobs: () => ({}), inbound: () => ({}), feedback: () => ({}), replies: () => ({}),
+    communication: () => inertWorker, forward: () => inertWorker,
+    executor: input => { executorConfig = input.config; executorInstance = createCodexExecutor(input); return executorInstance; },
+    media: async () => ({}), typing: () => ({}), outbound: async () => ({}), chat: () => ({}),
+    sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} },
+    feishu: () => ({ async start() {}, async stop() {}, status: () => ({ connected: true }) }),
+  } });
+  assert.equal(executorConfig.permissionProfile, 'operator');
+  await assert.rejects(executorInstance.execute({ bindingOpenId: 'human', chatId: 'chat-private', chatType: 'p2p', messageId: 'message-1', prompt: 'work', busyPolicy: 'reject' }),
+    { code: 'CODEX_TURN_START_UNCONFIRMED', rpcMethod: 'turn/start' }, 'the thread passed the profile check and reached turn/start');
+  const records = (await readFile(observed, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line));
+  assert.deepEqual(records.find(record => record.argv).argv, ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all']);
+  const start = records.find(record => record.method === 'thread/start').params;
+  assert.equal(start.permissions, 'operator');
+  assert.equal('sandbox' in start, false);
+  const turn = records.find(record => record.method === 'turn/start').params;
+  assert.deepEqual(Object.keys(turn).sort(), ['approvalPolicy', 'approvalsReviewer', 'cwd', 'input', 'threadId']);
+  const started = logEvents.find(event => event.operation === 'app_server_start');
+  assert.deepEqual({ status: started.status, permissionProfile: started.permissionProfile }, { status: 'succeeded', permissionProfile: 'operator' });
+  const confirmed = logEvents.find(event => event.operation === 'thread_start');
+  assert.deepEqual({ level: confirmed.level, status: confirmed.status, rpcMethod: confirmed.rpc_method, permissionProfile: confirmed.permissionProfile,
+    activePermissionProfile: confirmed.activePermissionProfile }, { level: 'info', status: 'succeeded', rpcMethod: 'thread/start', permissionProfile: 'operator', activePermissionProfile: 'operator' });
+  await service.close();
 });

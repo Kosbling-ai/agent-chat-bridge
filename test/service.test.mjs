@@ -67,6 +67,29 @@ test('runtime configuration is explicit and rejects scope/secret overrides', () 
     { ...config, errorReporting: { url: 'file:///tmp/report', tokenEnv: 'TEST_REPORT' } },
   ]) assert.throws(() => validateConfig(invalid));
 });
+test('codex.permissionProfile is optional, validated, and excludes the legacy sandbox and network keys', () => {
+  const withCodex = fields => ({ ...config, codex: { ...config.codex, ...fields } });
+  assert.equal(Object.hasOwn(validateConfig(config).codex, 'permissionProfile'), false, 'no default profile');
+  assert.equal(validateConfig(config).codex.sandbox, 'workspace-write');
+  assert.equal(validateConfig(config).codex.networkAccess, true);
+  for (const [value, expected] of [['operator', 'operator'], [':workspace', ':workspace'], ['  operator\t', 'operator'], ['a.b_c-1', 'a.b_c-1'], ['A9', 'A9'], ['x'.repeat(128), 'x'.repeat(128)]]) {
+    assert.equal(validateConfig(withCodex({ permissionProfile: value })).codex.permissionProfile, expected, JSON.stringify(value));
+  }
+  const profiled = validateConfig(withCodex({ permissionProfile: 'operator', approvalPolicy: 'never', approvalsReviewer: 'user' })).codex;
+  assert.deepEqual([profiled.permissionProfile, profiled.approvalPolicy, profiled.approvalsReviewer], ['operator', 'never', 'user']);
+  for (const value of ['', '   ', 'bad id', 'op/erator', '-operator', '.operator', '_operator', '::workspace', ':', ':-x', 'op:erator', 'опер', 'x'.repeat(129), 5, true, null, [], {}, ['operator']]) {
+    assert.throws(() => validateConfig(withCodex({ permissionProfile: value })), { code: 'invalid_codex_permission_profile' }, JSON.stringify(value));
+  }
+  for (const sandbox of ['workspace-write', 'read-only', 'danger-full-access']) {
+    assert.throws(() => validateConfig(withCodex({ permissionProfile: 'operator', sandbox })), { code: 'codex_permission_profile_conflicts_with_sandbox' }, sandbox);
+  }
+  for (const networkAccess of [true, false]) {
+    assert.throws(() => validateConfig(withCodex({ permissionProfile: 'operator', networkAccess })), { code: 'codex_permission_profile_conflicts_with_network_access' }, String(networkAccess));
+  }
+  assert.throws(() => validateConfig(withCodex({ permissionProfile: 'operator', sandbox: 'workspace-write', networkAccess: true })), { code: 'codex_permission_profile_conflicts_with_sandbox' });
+  // Without a profile the legacy keys keep their 0.2.26 meaning.
+  assert.equal(validateConfig(withCodex({ sandbox: 'read-only', networkAccess: false })).codex.sandbox, 'read-only');
+});
 test('media download timeout accepts positive integers above the default', () => {
   assert.equal(validateConfig({ ...config, feishu: { ...config.feishu, mediaDownloadTimeoutMs: 120001 } }).feishu.mediaDownloadTimeoutMs, 120001);
 });

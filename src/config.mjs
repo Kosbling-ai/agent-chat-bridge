@@ -119,11 +119,12 @@ function silentReply(value, { partial = false } = {}) {
 // stays global. Permission values are the app-server protocol enums, compared
 // exactly (no trimming). `cwd` must be an absolute path and is stored
 // normalized; startup and check-config verify the directory with the same
-// checks as the global cwd.
+// checks as the global cwd. A group sandbox cannot be combined with an
+// instance-wide named permission profile (`codex.permissionProfile`).
 const GROUP_APPROVAL_POLICIES = Object.freeze(['untrusted', 'on-request', 'never']);
 const GROUP_APPROVALS_REVIEWERS = Object.freeze(['user', 'auto_review', 'guardian_subagent']);
 const GROUP_SANDBOX_MODES = Object.freeze(['read-only', 'workspace-write', 'danger-full-access']);
-function groupCodex(value) {
+function groupCodex(value, { permissionProfile } = {}) {
   object(value, ['approvalPolicy', 'approvalsReviewer', 'sandbox', 'cwd'], 'invalid_group_codex_fields');
   const result = {};
   if (value.cwd !== undefined) {
@@ -145,7 +146,21 @@ function groupCodex(value) {
     result.sandbox = value.sandbox;
   }
   if (Object.keys(result).length === 0) throw new ConfigError('invalid_group_codex_fields');
+  if (permissionProfile !== undefined && result.sandbox !== undefined) throw new ConfigError('group_codex_sandbox_conflicts_with_permission_profile');
   return Object.freeze(result);
+}
+// Optional named Codex permission profile for the whole instance: the id of a
+// `[permissions.<id>]` table in the Codex home config.toml, or a built-in such
+// as `:workspace`. It replaces the legacy sandbox, so the legacy keys may not
+// appear next to it.
+const PERMISSION_PROFILE_PATTERN = /^:?[A-Za-z0-9][A-Za-z0-9._-]*$/;
+function permissionProfile(codex) {
+  if (typeof codex.permissionProfile !== 'string') throw new ConfigError('invalid_codex_permission_profile');
+  const id = codex.permissionProfile.trim();
+  if (!id || id.length > 128 || !PERMISSION_PROFILE_PATTERN.test(id)) throw new ConfigError('invalid_codex_permission_profile');
+  if (codex.sandbox !== undefined) throw new ConfigError('codex_permission_profile_conflicts_with_sandbox');
+  if (codex.networkAccess !== undefined) throw new ConfigError('codex_permission_profile_conflicts_with_network_access');
+  return id;
 }
 // Optional per-instance private-chat admission callback. The bridge only knows
 // the URL, the token environment name, timings and two fixed reply texts; the
@@ -202,7 +217,7 @@ function validateRuntime(raw) {
   object(rawRuntime, ['unhealthyExitMs'], 'invalid_runtime_fields');
   const runtime = { unhealthyExitMs: rawRuntime.unhealthyExitMs ?? 30_000 };
   if (!Number.isSafeInteger(runtime.unhealthyExitMs) || runtime.unhealthyExitMs <= 0 || runtime.unhealthyExitMs > MAX_TIMER_MS) throw new ConfigError('invalid_runtime_unhealthy_exit');
-  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'permissionProfile', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
   if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
   if (raw.codex.proxyEnv !== undefined) {
@@ -227,6 +242,7 @@ function validateRuntime(raw) {
   if (typeof codex.networkAccess !== 'boolean') throw new ConfigError('invalid_codex_network_access');
   codex.requestUserInput = raw.codex.requestUserInput ?? false;
   if (typeof codex.requestUserInput !== 'boolean') throw new ConfigError('invalid_codex_request_user_input');
+  if (raw.codex.permissionProfile !== undefined) codex.permissionProfile = permissionProfile(raw.codex);
   codex.threadNamePrefix = raw.codex.threadNamePrefix === undefined ? 'bridge' : string(raw.codex.threadNamePrefix);
   codex.steering = raw.codex.steering ?? true;
   if (typeof codex.steering !== 'boolean') throw new ConfigError('invalid_steering_flag');
@@ -315,7 +331,7 @@ function validateRuntime(raw) {
       allowMentionAll: group.allowMentionAll ?? false,
       ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }),
       ...(group.silentReply === undefined ? {} : { silentReply: silentReply(group.silentReply, { partial: true }) }),
-      ...(group.codex === undefined ? {} : { codex: groupCodex(group.codex) }) };
+      ...(group.codex === undefined ? {} : { codex: groupCodex(group.codex, { permissionProfile: codex.permissionProfile }) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
