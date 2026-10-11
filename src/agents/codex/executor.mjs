@@ -263,9 +263,13 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       try { log('info', { ...event, status: 'succeeded' }); } catch { /* logging is observational */ }
       return;
     }
-    try { log('error', { ...event, status: 'failed', error_code: 'codex_permission_profile_mismatch' }); } catch { /* logging is observational */ }
-    throw coded(`permission profile mismatch: expected ${JSON.stringify(permissionProfile)}, actual ${active ? JSON.stringify(active) : 'none'}`,
-      'codex_permission_profile_mismatch');
+    try { log('error', { ...event, status: 'failed', error_code: 'CODEX_PERMISSION_PROFILE_MISMATCH' }); } catch { /* logging is observational */ }
+    // A fixed message: retry classification matches words in messages, and a
+    // profile id must never turn this rejection into a retry. The ids travel as fields.
+    const error = coded('permission profile mismatch', 'CODEX_PERMISSION_PROFILE_MISMATCH');
+    error.expected = permissionProfile;
+    error.actual = active || null;
+    throw error;
   }
 
   // turn/start has no `sandbox` parameter (its `sandboxPolicy` is a structured
@@ -1028,7 +1032,12 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         || thread?.ephemeral === true || (thread?.forkedFromId && thread.forkedFromId !== sourceThreadId)) {
         throw coded('fork response could not be verified', 'CODEX_FORK_UNCONFIRMED', { outcome: 'unknown' });
       }
-      confirmPermissionProfile('thread/fork', response);
+      try { confirmPermissionProfile('thread/fork', response); }
+      catch (error) {
+        // The native fork exists but is not used; record it for the operator like a failed commit.
+        error.forkTargetThreadId = targetThreadId;
+        throw error;
+      }
       let committed;
       try { committed = await onForked({ sourceThreadId, targetThreadId }); }
       catch (error) {

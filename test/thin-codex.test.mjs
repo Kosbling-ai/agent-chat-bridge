@@ -1615,11 +1615,19 @@ test('a thread whose reported permission profile differs or is missing is never 
   const existing = { feishuOpenId: 'ou-human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', threadName: 'p2p', created: false };
   const turnStarts = (runtime) => runtime.calls.filter((call) => call.method === 'turn/start').length;
   try {
-    for (const [reported, actual] of [[{ id: 'other', extends: null }, 'other'], [undefined, ''], [null, ''], [{ id: 'operator ' }, 'operator ']]) {
+    // 'network-timeout' would match the forward runtime's retry words if an id ever reached the message.
+    for (const [reported, actual] of [[{ id: 'other', extends: null }, 'other'], [undefined, ''], [null, ''], [{ id: 'operator ' }, 'operator '], [{ id: 'network-timeout' }, 'network-timeout']]) {
       const label = JSON.stringify(reported) ?? 'missing';
-      const expectedMessage = actual ? `expected "operator", actual ${JSON.stringify(actual)}` : 'expected "operator", actual none';
       const mismatch = (error) => {
-        assert.equal(error.code, 'codex_permission_profile_mismatch', label);
+        assert.equal(error.code, 'CODEX_PERMISSION_PROFILE_MISMATCH', label);
+        return true;
+      };
+      // The message is fixed and carries no id; the ids are fields of the error.
+      const mismatchWithIds = (error) => {
+        mismatch(error);
+        assert.equal(error.message, 'permission profile mismatch', label);
+        assert.equal(error.expected, 'operator', label);
+        assert.equal(error.actual, actual || null, label);
         return true;
       };
       const failureLog = (logs, operation) => {
@@ -1628,7 +1636,7 @@ test('a thread whose reported permission profile differs or is missing is never 
         const [level, event] = entries[0];
         assert.equal(level, 'error', label);
         assert.deepEqual(event, { module: 'agent-chat-bridge', component: 'codex-executor', operation, rpc_method: operation.replace('_', '/'), permissionProfile: 'operator',
-          ...(actual ? { activePermissionProfile: actual } : {}), status: 'failed', error_code: 'codex_permission_profile_mismatch' }, label);
+          ...(actual ? { activePermissionProfile: actual } : {}), status: 'failed', error_code: 'CODEX_PERMISSION_PROFILE_MISMATCH' }, label);
       };
 
       // thread/start: the new thread is not bound.
@@ -1636,11 +1644,7 @@ test('a thread whose reported permission profile differs or is missing is never 
       const startRuntime = fakeRuntime({ activeProfile: () => reported });
       const startStore = memoryStore();
       const starter = createCodexExecutor({ config: profileConfig(cwd), sessionStore: startStore, spawnImpl: startRuntime.spawnImpl, log: (...entry) => startLogs.push(entry) });
-      await assert.rejects(starter.execute(profileInputFor({ ...existing, chatId: 'chat-new' }, 'm1')), (error) => {
-        mismatch(error);
-        assert.equal(error.message, `permission profile mismatch: ${expectedMessage}`, label);
-        return true;
-      });
+      await assert.rejects(starter.execute(profileInputFor({ ...existing, chatId: 'chat-new' }, 'm1')), mismatchWithIds);
       assert.equal(turnStarts(startRuntime), 0, label);
       assert.equal(startStore.bindings.size, 0, `${label}: no binding is saved`);
       failureLog(startLogs, 'thread_start');
@@ -1651,7 +1655,7 @@ test('a thread whose reported permission profile differs or is missing is never 
       const resumeRuntime = fakeRuntime({ activeProfile: () => reported });
       const resumeStore = memoryStore([existing]);
       const resumer = createCodexExecutor({ config: profileConfig(cwd), sessionStore: resumeStore, spawnImpl: resumeRuntime.spawnImpl, log: (...entry) => resumeLogs.push(entry) });
-      await assert.rejects(resumer.execute(profileInputFor(existing, 'm2')), mismatch);
+      await assert.rejects(resumer.execute(profileInputFor(existing, 'm2')), mismatchWithIds);
       assert.equal(turnStarts(resumeRuntime), 0, label);
       assert.equal(resumeStore.bindings.get('ou-human:chat').codexSessionId, 'thread-existing', label);
       failureLog(resumeLogs, 'thread_resume');
@@ -1670,8 +1674,9 @@ test('a thread whose reported permission profile differs or is missing is never 
       const forker = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([existing]), spawnImpl: forkRuntime.spawnImpl, log: (...entry) => forkLogs.push(entry) });
       let commits = 0;
       await assert.rejects(forker.forkBinding({ binding: existing, expectedSourceThreadId: 'thread-existing', onForked: async () => { commits += 1; return { outcome: 'succeeded' }; } }), (error) => {
-        mismatch(error);
+        mismatchWithIds(error);
         assert.equal(error.outcome, undefined, `${label}: a rejected fork is reported as failed, not unknown`);
+        assert.equal(error.forkTargetThreadId, 'fork-1', `${label}: the unused native fork is recorded`);
         return true;
       });
       assert.equal(commits, 0, label);
@@ -1684,7 +1689,7 @@ test('a thread whose reported permission profile differs or is missing is never 
     const runtime = fakeRuntime({ activeProfile: () => reported });
     // One long-lived child, so a second resume can only come from the executor not marking the thread loaded.
     const executor = createCodexExecutor({ config: { ...profileConfig(cwd), idleCloseMs: 60_000 }, sessionStore: memoryStore([existing]), spawnImpl: runtime.spawnImpl });
-    await assert.rejects(executor.execute(profileInputFor(existing, 'm1')), { code: 'codex_permission_profile_mismatch' });
+    await assert.rejects(executor.execute(profileInputFor(existing, 'm1')), { code: 'CODEX_PERMISSION_PROFILE_MISMATCH' });
     reported = { id: 'operator', extends: null };
     const result = await executor.execute(profileInputFor(existing, 'm2'));
     assert.equal(result.threadId, 'thread-existing');
@@ -1719,8 +1724,12 @@ test('without a permission profile thread, turn and launch parameters are byte-f
     }
     assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 2);
     assert.deepEqual(runtime.args, [['app-server', '--listen', 'stdio://', '-c', 'sandbox_workspace_write.network_access=false', '-c', 'shell_environment_policy.inherit=all']]);
-    assert.deepEqual(logs.filter(([, event]) => event.operation === 'app_server_start'), [['info', { module: 'agent-chat-bridge', component: 'codex-app-server', operation: 'app_server_start', status: 'succeeded' }]]);
-    assert.equal(logs.some(([, event]) => THREAD_OPERATIONS.includes(event.operation) || 'permissionProfile' in event || 'activePermissionProfile' in event), false);
+    // The complete log output, captured from 0.2.26 running this same sequence: any extra line of any name fails.
+    assert.deepEqual(logs, [['info', { module: 'agent-chat-bridge', component: 'codex-app-server', operation: 'app_server_start', status: 'succeeded' }]]);
     await executor.close();
+    assert.deepEqual(logs.map(([level, event]) => [level, event.operation, event.status]), [
+      ['info', 'app_server_start', 'succeeded'], ['info', 'app_server_close', 'started'], ['info', 'app_server_close', 'succeeded'],
+    ]);
+    assert.equal(logs.some(([, event]) => THREAD_OPERATIONS.includes(event.operation) || 'permissionProfile' in event || 'activePermissionProfile' in event), false);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });

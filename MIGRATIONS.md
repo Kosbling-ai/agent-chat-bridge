@@ -46,14 +46,23 @@ Application versions, config `schemaVersion` and numbered database migrations ar
 
 ## 0.2.27 named Codex permission profile
 
-No database migration, no config `schemaVersion` change, no storage change and no new environment variable. `codex.permissionProfile` is optional and has no default; without it thread, turn and launch parameters and logs are those of 0.2.26. When set, thread start, resume and fork send `permissions` instead of `sandbox`, a thread is used only when Codex reports the same `activePermissionProfile.id` (`codex_permission_profile_mismatch` otherwise), and the app-server starts without the legacy `sandbox_workspace_write.network_access` flag. The key cannot be combined with `codex.sandbox` (`codex_permission_profile_conflicts_with_sandbox`), `codex.networkAccess` (`codex_permission_profile_conflicts_with_network_access`) or a group `codex.sandbox` (`group_codex_sandbox_conflicts_with_permission_profile`). The instance's Codex home `config.toml` must set `default_permissions` and define `[permissions.<id>]`. It relies on the app-server experimental API of codex-cli 0.153.4. See [named permission profile per instance](docs/runtime.md#named-permission-profile-per-instance).
+No database migration, no config `schemaVersion` change, no storage change and no new environment variable. `codex.permissionProfile` is optional and has no default; without it thread, turn and launch parameters and logs are those of 0.2.26. When set, thread start, resume and fork send `permissions` instead of `sandbox`, a thread is used only when Codex reports the same `activePermissionProfile.id` (`CODEX_PERMISSION_PROFILE_MISMATCH` otherwise, with a fixed error message), and the app-server starts without the legacy `sandbox_workspace_write.network_access` flag. The key cannot be combined with `codex.sandbox` (`codex_permission_profile_conflicts_with_sandbox`), `codex.networkAccess` (`codex_permission_profile_conflicts_with_network_access`) or a group `codex.sandbox` (`group_codex_sandbox_conflicts_with_permission_profile`). The instance's Codex home `config.toml` must set `default_permissions` and define `[permissions.<id>]`. It relies on the app-server experimental API of codex-cli 0.153.4. See [named permission profile per instance](docs/runtime.md#named-permission-profile-per-instance).
+
+Failure signals (codex-cli 0.153.4):
+
+- An undefined id is rejected by Codex and logged as `rpc_request` `rejected` `CODEX_RPC_REJECTED`, not as a mismatch.
+- `CODEX_PERMISSION_PROFILE_MISMATCH` means Codex accepted the request but did not apply or report the profile.
+- A missing `default_permissions` next to profile tables produces no bridge error: the profile is still applied because the bridge sends `permissions`. The only signal is Codex's startup `configWarning`, which the bridge does not log. Set `default_permissions` anyway and check the home as in step 2.
 
 To enable it:
 
-1. Define the profile in the instance's Codex home `config.toml` (`default_permissions = "<id>"` and the `[permissions.<id>]` tables, without `sandbox_mode` / `[sandbox_workspace_write]`).
-2. Back up the private bridge.json, remove `codex.sandbox`, `codex.networkAccess` and any group `codex.sandbox`, and add `codex.permissionProfile`.
-3. Run `node bin/agent-chat-bridge.mjs check-config --config <path>` and fix any reported code.
-4. Restart only that bridge process (`kill -TERM <bridge-pid>`; its supervisor starts it again), then check `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`, the `app_server_start` line with `permissionProfile` and, after one message, a `thread_start` or `thread_resume` line with `status` `succeeded` and `activePermissionProfile` equal to the id.
+1. Deploy (fast-forward) 0.2.27 first. Instances without the key behave as on 0.2.26, and a restart during the next steps works with either the old or the new private configuration.
+2. Define the profile in the instance's Codex home `config.toml` (`default_permissions = "<id>"` and the `[permissions.<id>]` tables, without `sandbox_mode` / `[sandbox_workspace_write]`). With the same `CODEX_HOME`, from `codex.cwd`, `codex sandbox -P <id> -C <codex.cwd> -- /bin/echo ok` must print `ok` (it catches an undefined id), and `codex features list > /dev/null` must exit 0 (it catches a missing `default_permissions`). Do steps 2–4 in one window.
+3. Back up the private bridge.json, remove `codex.sandbox`, `codex.networkAccess` and any group `codex.sandbox`, add `codex.permissionProfile`, then run `node bin/agent-chat-bridge.mjs check-config --config <path>` with the 0.2.27 code and fix any reported code.
+4. Restart only that bridge process (`kill -TERM <bridge-pid>`; its supervisor starts it again), then check:
+   - `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready`;
+   - the `app_server_start` line with `permissionProfile`;
+   - after one message, a `thread_start` or `thread_resume` line with `status` `succeeded` and `activePermissionProfile` equal to the id.
 
 To turn it off on 0.2.27, restore the backup (or remove `codex.permissionProfile`), run `check-config` and restart the bridge once. Rollback to 0.2.26: remove `codex.permissionProfile` first, because 0.2.26 rejects the key with `invalid_codex_fields`; then switch the binary and restart once.
 
