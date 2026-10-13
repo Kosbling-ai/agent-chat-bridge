@@ -1,6 +1,6 @@
 # Versions and migrations
 
-Application version: `0.2.28`
+Application version: `0.2.29`
 
 Version 0.2.28 does not add a database migration, change the config `schemaVersion`, change storage or add a dependency. It adds the optional, backward-compatible per-group key `routing.groups[].reply` (`mode` `card`/`text`, `ack`, `ackEmoji`); groups without it behave as before. See [0.2.28 group text replies](#0228-group-text-replies).
 
