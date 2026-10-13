@@ -506,7 +506,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }
     if (key.startsWith('error:')) {
       const detail = parseDetail(event);
-      return { failed: true, errorCode: detail.errorCode === 'CODEX_USAGE_LIMIT_EXCEEDED' ? detail.errorCode : 'CODEX_TURN_FAILED', turnStatus: detail.turnStatus === 'interrupted' ? 'interrupted' : 'failed', deferred: false, duplicate: true, reason: 'duplicate_error', threadId: binding.codexSessionId, turnId, answer: 'Codex 会话失败。' };
+      return { failed: true, errorCode: detail.turnStatus === 'interrupted' || detail.errorCode === 'CODEX_TURN_INTERRUPTED' ? 'CODEX_TURN_INTERRUPTED' : ['CODEX_USAGE_LIMIT_EXCEEDED', 'CODEX_SERVER_OVERLOADED'].includes(detail.errorCode) ? detail.errorCode : 'CODEX_TURN_FAILED', turnStatus: detail.turnStatus === 'interrupted' || detail.errorCode === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', deferred: false, duplicate: true, reason: 'duplicate_error', threadId: binding.codexSessionId, turnId, answer: 'Codex 会话失败。' };
     }
     return { deferred: true, accepted: key.startsWith('user-steer-confirmed:'), duplicate: true, reason: 'duplicate_message', threadId: binding.codexSessionId, turnId };
   }
@@ -736,7 +736,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         eventType: 'error', role: 'activity',
         title: '执行失败',
         text: error.message, createdAt: now(),
-        detail: { errorCode: error.code, turnId: state.turnId, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
+        detail: { errorCode: error.code, turnId: state.turnId, startedAt: state.startedAt, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : error.outcome === 'unknown' ? 'unknown' : 'failed' },
       };
       try { await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent); }
       catch { logObservationPersistenceFailure(state, 'event'); }
@@ -801,7 +801,21 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       let binding = await ensureBinding(actor, normalized.messageId);
       const duplicate = await sessionStore.findAcceptedMessageEvent(binding, normalized.messageId);
-      if (duplicate) return { completion: Promise.resolve(duplicateResult(binding, duplicate)) };
+      if (duplicate) {
+        const detail = parseDetail(duplicate);
+        // A disconnect records lost observation, not a native terminal failure.
+        // Re-observe the exact admitted turn; never submit the prompt a second time.
+        if (String(duplicate.event_key || '').startsWith('error:')
+            && (detail.errorCode === 'CODEX_OBSERVATION_LOST' || detail.turnStatus === 'unknown')) {
+          const turnId = trim(detail.turnId);
+          const startedAt = Number(detail.startedAt || duplicate.created_at || duplicate.createdAt);
+          if (!turnId || !Number.isFinite(startedAt) || startedAt <= 0) {
+            throw coded('persisted observation has no confirmed turn identity', 'CODEX_OBSERVATION_LOST', { retryable: true, outcome: 'unknown' });
+          }
+          return { state: await prepareKnownResume(binding, normalized, { threadId: binding.codexSessionId, turnId, startedAt }) };
+        }
+        return { completion: Promise.resolve(duplicateResult(binding, duplicate)) };
+      }
       const reconciled = await reconcileSteer(binding, normalized.messageId, normalized.prompt);
       if (reconciled) return { completion: Promise.resolve(reconciled) };
       binding = await maybeRollover(binding, normalized.messageId);
@@ -964,7 +978,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (takeover && messageId && messageId !== state.messageId) {
         await sessionStore.saveCodexRealtimeEvent(state.binding, {
           messageId, eventKey: `error:${messageId}`, eventType: 'error', role: 'activity', title: '执行失败',
-          text: error.message, createdAt: now(), detail: { errorCode: error.code, turnId: state.turnId, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
+          text: error.message, createdAt: now(), detail: { errorCode: error.code, turnId: state.turnId, startedAt: state.startedAt, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : error.outcome === 'unknown' ? 'unknown' : 'failed' },
         }).catch((_error) => {});
         await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: error.message }).catch((_error) => {});
       }

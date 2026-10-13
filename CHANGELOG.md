@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.29] - 2026-10-13
+
+- Recover persisted `CODEX_OBSERVATION_LOST` receipts by observing the exact original native turn. A restart no longer turns an unknown observation into a cached `CODEX_TURN_FAILED`. Interrupted turns retain `CODEX_TURN_INTERRUPTED`; completed turns return their original result; active turns are observed without starting, steering or interrupting another turn. Missing or unreadable turns remain retryable/unknown.
+- New observation-loss receipts retain the original start time and use `turnStatus: unknown`. Old receipts incorrectly marked failed are reconciled by error code. Duplicate terminal results preserve interruption and server-overload classifications.
+- No schema/config migration or dependency change. Existing terminal forward jobs are not automatically replayed or rewritten. Correct historical classifications only after checking native turn evidence and preserving an audit copy; an interrupted job is not proof of completed business effects.
+- Validation: executor shutdown/restart tests cover interrupted, failed, completed, active, missing and unreadable native turns, with no duplicate turn admission.
+
 ## [0.2.28] - 2026-10-11
 
 - Add the optional per-group key `routing.groups[].reply` for `bridge` groups: `mode` (`"card"` default, or `"text"`), `ack` (`"none"` default, or `"reaction"`, text mode only) and `ackEmoji` (Feishu `emoji_type` matching `[A-Za-z0-9_]{1,80}`, default `OnIt`, only with `ack: "reaction"`). Without the key, or with `mode: "card"`, behaviour, outbound requests, stored job state and logs are those of 0.2.27.

@@ -1733,3 +1733,44 @@ test('without a permission profile thread, turn and launch parameters are byte-f
     assert.equal(logs.some(([, event]) => THREAD_OPERATIONS.includes(event.operation) || 'permissionProfile' in event || 'activePermissionProfile' in event), false);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
+
+for (const status of ['interrupted', 'failed', 'completed', 'inProgress', 'missing', 'unavailable']) {
+  test(`restart observation-loss recovery reads native ${status} without replay`, { timeout: 10000 }, async t => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-restart-observation-'));
+    t.after(() => rmSync(cwd, { recursive: true, force: true }));
+    const store = memoryStore();
+    const firstRuntime = fakeRuntime({ completeStarts: false });
+    const first = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: firstRuntime.spawnImpl });
+    const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'restart-job', prompt: 'work' };
+    const pending = first.execute(input);
+    const rejected = assert.rejects(pending, { code: 'CODEX_OBSERVATION_LOST' });
+    while (!first.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+    await first.close(); await rejected;
+    const errorEvent = store.events.find(row => row.event_key === 'error:restart-job');
+    assert.equal(JSON.parse(errorEvent.detail_json).turnStatus, 'unknown');
+    // Exercise records written by old releases too: unknown was stored as failed.
+    if (status !== 'inProgress') errorEvent.detail_json = JSON.stringify({ errorCode: 'CODEX_OBSERVATION_LOST', turnId: 'turn-1', turnStatus: 'failed' });
+    const native = { id: 'turn-1', status, items: [{ id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'finished once' }] };
+    const runtime = fakeRuntime({ resumeTurns: ['missing', 'unavailable'].includes(status) ? [] : [native],
+      rejectMethods: status === 'unavailable' ? new Map([['thread/resume', { code: -32000, message: 'synthetic unavailable' }]]) : new Map() });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    t.after(() => executor.close());
+    const recovered = executor.execute(input);
+    if (status === 'inProgress') {
+      while (!executor.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+      runtime.children[0].send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1', turn: { ...native, status: 'completed' } } });
+    }
+    if (['completed', 'inProgress'].includes(status)) assert.equal((await recovered).answer, 'finished once');
+    else if (['missing', 'unavailable'].includes(status)) await assert.rejects(recovered, error => error.retryable === true && error.outcome === 'unknown');
+    else {
+      const code = status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED';
+      await assert.rejects(recovered, { code });
+      const duplicate = await executor.execute(input);
+      assert.equal(duplicate.errorCode, code);
+      assert.equal(duplicate.turnStatus, status);
+    }
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 0);
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/steer').length, 0);
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/interrupt').length, 0);
+  });
+}
