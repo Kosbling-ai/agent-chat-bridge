@@ -1001,6 +1001,13 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       throw error;
     });
+    // A caller whose signal is already aborted never observes `completion`.
+    // Without this handler, a turn already settled as interrupted or failed (a
+    // known resume after restart, with the lease lost during shutdown) rejected
+    // it unhandled and exited the process. The turn still ends through
+    // finalizeTurn, which persists its terminal error; the next attempt reads it
+    // and replies with the normal failure instead of replaying the prompt.
+    completion.catch((_error) => {});
     if (!signal) {
       try { return await completion; } finally { state.waiters.delete(waiter); }
     }

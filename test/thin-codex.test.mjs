@@ -1804,3 +1804,45 @@ for (const status of ['interrupted', 'failed', 'completed', 'inProgress', 'missi
     assert.equal(runtime.calls.filter(call => call.method === 'turn/interrupt').length, 0);
   });
 }
+
+// 0.2.29 crash: after a restart the job resumes a turn that Codex already
+// reports interrupted/failed while the caller's signal is already aborted
+// (lease lost during shutdown). The observer promise had no handler and the
+// unhandled rejection exited the process. It must end as an ordinary failure.
+for (const [path, status] of [['observation-loss duplicate', 'interrupted'], ['observation-loss duplicate', 'failed'], ['explicit resume', 'interrupted']]) {
+  test(`resuming a ${status} turn through the ${path} path with an aborted caller never leaves an unhandled rejection`, { timeout: 10000 }, async t => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-resume-unhandled-'));
+    t.after(() => rmSync(cwd, { recursive: true, force: true }));
+    const unhandled = [];
+    const onUnhandled = reason => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+    const store = memoryStore();
+    const firstRuntime = fakeRuntime({ completeStarts: false });
+    const first = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: firstRuntime.spawnImpl });
+    const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: `resume-${status}`, prompt: 'work' };
+    const pending = first.execute(input);
+    const rejected = assert.rejects(pending, { code: 'CODEX_OBSERVATION_LOST' });
+    while (!first.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+    await first.close(); await rejected;
+    const native = { id: 'turn-1', status, items: [] };
+    const runtime = fakeRuntime({ resumeTurns: [native] });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    t.after(() => executor.close());
+    const options = { signal: AbortSignal.abort() };
+    if (path === 'explicit resume') {
+      const errorEvent = store.events.find(row => row.event_key === `error:${input.messageId}`);
+      options.resume = { threadId: 'thread-1', turnId: 'turn-1', startedAt: Number(JSON.parse(errorEvent.detail_json).startedAt) };
+    }
+    await assert.rejects(executor.execute(input, options), { code: 'CODEX_WAIT_ABORTED' });
+    for (let tick = 0; tick < 5; tick += 1) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.deepEqual(unhandled.map(reason => reason?.code), []);
+    // The terminal state was persisted, so the next attempt ends through the
+    // normal failed/interrupted path instead of replaying the prompt.
+    const code = status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED';
+    const duplicate = await executor.execute(input);
+    assert.equal(duplicate.errorCode, code);
+    assert.equal(duplicate.turnStatus, status);
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 0);
+  });
+}
