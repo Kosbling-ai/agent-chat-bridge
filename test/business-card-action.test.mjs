@@ -227,3 +227,67 @@ test('business card action reports registration failure after toast', async () =
   assert.equal(events[0].error_code, 'store_unavailable');
   assert.equal(reports.length, 1); assert.deepEqual(reports[0], events[0]);
 });
+
+test('native feedback form reaches durable hook with actor and association unchanged', async () => {
+  const fixture = harness(); fixture.communication.start();
+  const input = structuredClone(payload);
+  input.action.value.kind = 'feedback';
+  input.action.form_value = { opinion: 'Please revise this option', choices: ['one'], extra: { enabled: true } };
+  const adapter = createFeishuAdapter({ sdk: { EventDispatcher: Dispatcher }, wsClient: { async start() {}, close() {} },
+    connectionId: 'fixture', onEvent: async () => {}, onCardAction: fixture.action.handleCardAction });
+  const response = await adapter.dispatcher.handlers['card.action.trigger'](input);
+  assert.equal(response.toast.content, '意见已记录，等待校验并处理，请稍后查看卡片');
+  await eventually(() => fixture.deliveries.length === 1);
+  const event = fixture.deliveries[0].body.event;
+  assert.deepEqual(event.formValue, input.action.form_value);
+  assert.equal(event.operatorOpenId, 'operator-1');
+  assert.equal(event.value.action_id, 'action-1');
+  assert.equal(event.value.version, 2);
+  assert(!JSON.stringify(fixture.logs).includes('Please revise'));
+  await fixture.communication.stop();
+});
+
+test('fallback identity includes canonical form data and dedups exact feedback replay', async () => {
+  const events = [];
+  const handler = createBusinessCardAction({ hooks: [hook], connectionId: 'fixture', ingest: async ({ event }) => events.push(event) });
+  for (const form_value of [{ opinion: 'one', count: 1 }, { count: 1, opinion: 'one' }, { opinion: 'two', count: 1 }]) {
+    await handler.handleCardAction({ ...payload, event_id: '', action: { ...payload.action, form_value } });
+  }
+  assert.equal(events[0].eventId, events[1].eventId);
+  assert.notEqual(events[1].eventId, events[2].eventId);
+});
+
+test('invalid and oversized forms are rejected without ingestion', async () => {
+  let calls = 0;
+  const handler = createBusinessCardAction({ hooks: [hook], connectionId: 'fixture', ingest: async () => { calls++; } });
+  for (const form_value of [null, [], 'text', { opinion: '文'.repeat(12000) }, { opinion: Infinity },
+    JSON.parse('{"__proto__":{"polluted":true}}'), { values: Array(300).fill('x') }, { a: { b: { c: { d: { e: { f: { g: 'x' } } } } } } }]) {
+    const response = await handler.handleCardAction({ ...payload, action: { ...payload.action, form_value } });
+    assert.equal(response.toast.type, 'error');
+  }
+  assert.equal(calls, 0);
+});
+
+test('feedback registration failure or timeout never claims successful receipt', async () => {
+  const input = { ...payload, action: { value: { ...payload.action.value, kind: 'feedback' }, form_value: { opinion: 'private' } } };
+  for (const ingest of [async () => { throw new Error('failure'); }, () => new Promise(() => {})]) {
+    const handler = createBusinessCardAction({ hooks: [hook], connectionId: 'fixture', ingest, registrationTimeoutMs: 5 });
+    const response = await handler.handleCardAction(input);
+    assert.equal(response.toast.type, 'warning');
+    assert.equal(response.toast.content, '暂未确认意见提交成功，请稍后查看卡片后重试');
+  }
+});
+
+test('adapter business failure and timeout use neutral submission wording; stop unchanged', async () => {
+  for (const onCardAction of [async () => { throw new Error('failure'); }, () => new Promise(() => {})]) {
+    const adapter = createFeishuAdapter({ sdk: { EventDispatcher: Dispatcher }, wsClient: { async start() {}, close() {} },
+      connectionId: 'fixture', onEvent: async () => {}, onCardAction });
+    const response = await adapter.dispatcher.handlers['card.action.trigger'](payload);
+    assert(response.toast.content.includes('暂未确认提交成功'));
+    assert(!response.toast.content.includes('停止'));
+  }
+  const adapter = createFeishuAdapter({ sdk: { EventDispatcher: Dispatcher }, wsClient: { async start() {}, close() {} },
+    connectionId: 'fixture', onEvent: async () => {}, onCardAction: async () => { throw new Error('failure'); } });
+  assert.equal((await adapter.dispatcher.handlers['card.action.trigger']({ action: { value: { action: 'stop_execution' } } })).toast.content,
+    '暂未确认停止，请稍后重试');
+});

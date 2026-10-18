@@ -1,6 +1,16 @@
 # Versions and migrations
 
-Application version: `0.2.29`
+Application version: `0.2.30`
+
+## 0.2.30 business-card form transport
+
+No database migration, configuration change, dependency change or business policy. Existing durable JSON payloads gain optional `formValue`. Field validation, actor authorization, card-version checks and business processing remain the hook consumer's responsibility; the bridge acknowledgement confirms registration only.
+
+1. Run `npm test`, `npm run check` and `npm run version:check` in the release checkout.
+2. Deploy the reviewed release through the instance supervisor's supported restart lifecycle; do not start a second WebSocket owner. Confirm database connectivity and readiness before acceptance.
+3. Submit a synthetic form against an authorized hook and verify durable event form values, actor/message identity, consumer receipt and exact-replay deduplication. Verify a registration failure does not show success. Never use a real business decision as a smoke test.
+4. Roll back via the supervisor to 0.2.29 if needed; no stored-state reversal is required. Old consumers may ignore the optional field; roll back any dependent feedback UI with the bridge so submissions are not silently dropped.
+
 
 Version 0.2.28 does not add a database migration, change the config `schemaVersion`, change storage or add a dependency. It adds the optional, backward-compatible per-group key `routing.groups[].reply` (`mode` `card`/`text`, `ack`, `ackEmoji`); groups without it behave as before. See [0.2.28 group text replies](#0228-group-text-replies).
 

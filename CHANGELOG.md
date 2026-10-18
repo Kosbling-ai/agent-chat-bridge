@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.30] - 2026-10-18
+
+- Forward native `action.form_value` as optional normalized `event.formValue` to business hooks. Accept JSON objects up to 32 KiB, 256 nodes and depth 6; reject invalid data without ingestion. No form text is added to logs.
+- Include canonical form content in fallback event identities while preserving old identities for events without forms. Provider event IDs remain authoritative.
+- For `kind: feedback`, acknowledge only durable registration, explicitly pending validation and processing; registration failure or timeout never claims success. Adapter-level business errors/timeouts use submission wording instead of stop-request wording. Existing action toasts remain unchanged.
+
 ## [0.2.29] - 2026-10-13
 
 - Recover persisted `CODEX_OBSERVATION_LOST` receipts by observing the exact original native turn. A restart no longer turns an unknown observation into a cached `CODEX_TURN_FAILED`. Interrupted turns retain `CODEX_TURN_INTERRUPTED`; completed turns return their original result; active turns are observed without starting, steering or interrupting another turn. Missing or unreadable turns remain retryable/unknown.
