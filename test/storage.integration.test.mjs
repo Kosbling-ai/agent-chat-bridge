@@ -84,6 +84,7 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  const start=Date.now();await assert.rejects(withConnection(pool,c=>c.query('SELECT SLEEP(5)'),{timeoutMs:50}),{code:'store_timeout'});assert.ok(Date.now()-start<1000);await assertSchemaCurrent(pool);
  const backlog=Array.from({length:105},(_,i)=>[randomUUID(),'c','chat',`expired-${i}`,'reaction','0'.repeat(64),'{}',randomUUID(),'running',clock-1,clock-1,clock-1,clock,clock]);
  await pool.query('INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,platform_uuid,status,first_attempt_at,lease_expires_at,next_attempt_at,created_at,updated_at) VALUES ?',[backlog]);
+ clock+=5000;// expired send leases are reclassified at most every 5 s (0.2.30)
  await store.claimOutbox({owner:'batch',leaseMs:1000});
  const [[remaining]]=await pool.query("SELECT COUNT(*) AS n FROM bridge_outbox WHERE connection_id='c' AND status='running'");assert.equal(Number(remaining.n),5);
  // No writer lock is held any more (fe674e3), so there is no lock connection to kill.

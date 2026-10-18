@@ -1,6 +1,5 @@
 const STORAGE_METRICS = {
   "poolWaitMs": "pool_wait_ms",
-  "setupMs": "setup_ms",
   "beginMs": "begin_ms",
   "operationMs": "operation_ms",
   "commitMs": "commit_ms",

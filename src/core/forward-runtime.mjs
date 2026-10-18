@@ -7,9 +7,15 @@ const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
 const TRANSIENT_LEASE_ERRORS = new Set(['store_unavailable', 'store_contention', 'store_timeout', 'commit_unknown']);
 const DEFINITIVE_LEASE_ERRORS = new Set(['stale_lease', 'forward_lease_lost']);
+// Normalized storage failures raised before any COMMIT was attempted. Session
+// reads now share the bounded storage deadline, so a slow or briefly
+// unavailable database retries the task (the executor de-duplicates an already
+// admitted turn) instead of failing it. commit_unknown is deliberately absent.
+const RETRYABLE_STORE_ERRORS = new Set(['store_unavailable', 'store_contention', 'store_timeout']);
 const retryableError = error => {
   if (isBusy(error)) return false;
   if (terminalTurnError(error)) return false;
+  if (RETRYABLE_STORE_ERRORS.has(error?.code)) return true;
   const value = [error?.name, error?.code, error?.cause?.code, error?.message, error?.cause?.message]
     .filter(Boolean).join(' ');
   return /\b(?:AbortError|TimeoutError|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)\b/i.test(value)

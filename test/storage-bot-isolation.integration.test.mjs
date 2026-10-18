@@ -98,7 +98,8 @@ test('two bots share one MySQL schema without sharing bindings, jobs, context, d
     assert.equal((await writerA.claimOutbox({ owner: 'a', leaseMs: 1000 }))[0].id, effectA.id);
     let [claimedB] = await writerB.claimOutbox({ owner: 'b', leaseMs: 1000 });
     assert.equal(claimedB.id, effectB.id);
-    time += 1001;
+    // Expired send leases are reclassified at most every 5 s (0.2.30).
+    time += 5000;
     assert.equal((await writerA.claimOutbox({ owner: 'a-again', leaseMs: 1000 }))[0].id, effectA.id);
     assert.equal((await writerB.getOutbox({ id: effectB.id })).status, 'running');
     [claimedB] = await writerB.claimOutbox({ owner: 'b-again', leaseMs: 1000 });

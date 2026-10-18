@@ -100,6 +100,40 @@ test('delta coalescer keeps interleaved items independent', async () => {
   assert.deepEqual(writes, { first: ['a', 'ab'], second: ['x', 'xy'] });
 });
 
+test('delta coalescer spaces full-text rewrites of one key by the minimum interval and always writes the last value', async () => {
+  let clock = 0;
+  const writes = [];
+  const sleeps = [];
+  const persist = createDeltaCoalescer({
+    now: () => clock, minIntervalMs: 500,
+    sleep: async milliseconds => { sleeps.push(milliseconds); clock += milliseconds; },
+    write: async value => { writes.push([clock, value]); clock += 10; },
+  });
+  let text = '';
+  const pending = [];
+  for (let index = 0; index < 50; index += 1) {
+    text += 'x';
+    pending.push(persist('turn:item', text));
+    if (index % 10 === 9) clock += 40;
+  }
+  await Promise.all(pending);
+  assert.equal(writes.length, 2);
+  assert.equal(writes.at(-1)[1], text);
+  for (let index = 1; index < writes.length; index += 1) assert.ok(writes[index][0] - writes[index - 1][0] >= 500);
+  // A delta that arrives just after the last write still waits for the interval.
+  clock += 100;
+  await persist('turn:item', `${text}y`);
+  assert.equal(writes.length, 3);
+  assert.ok(writes[2][0] - writes[1][0] >= 500);
+  assert.equal(writes[2][1], `${text}y`);
+  // Other keys are independent and a clock step backwards cannot stall a write.
+  clock -= 10_000;
+  await persist('turn:other', 'a');
+  await persist('turn:other', 'ab');
+  assert.deepEqual(writes.slice(3).map(entry => entry[1]), ['a', 'ab']);
+  assert.ok(sleeps.every(milliseconds => milliseconds <= 500));
+});
+
 for (const errorCode of ['store_unavailable', 'commit_unknown']) test(`communication poll recovers from ${errorCode} without stopping the worker`, async () => {
   let claims = 0;
   let releaseIdle;

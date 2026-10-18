@@ -26,15 +26,28 @@ export function createPoolFromEnvironment(references, env = process.env) {
   if (!Number.isInteger(port) || port < 1 || port > 65535 || !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(values.database)) {
     throw new StoreError('invalid_storage_environment');
   }
-  return mysql.createPool({
+  const pool = mysql.createPool({
     ...values, port, connectionLimit: 6, waitForConnections: true, queueLimit: 64,
     connectTimeout: 1000, multipleStatements: false, charset: 'utf8mb4',
     supportBigNumbers: true, bigNumberStrings: true,
   });
+  pool.on('connection', configureSession);
+  return pool;
+}
+
+// Session settings are applied once per physical connection. The pool emits
+// `connection` before handing a new connection to its first caller, so this
+// statement is queued ahead of every operation on that connection. A
+// connection whose setup fails is destroyed rather than used without it.
+export const SESSION_SETUP_SQL = 'SET SESSION innodb_lock_wait_timeout = 1';
+export function configureSession(connection) {
+  connection.query(SESSION_SETUP_SQL, error => { if (error) connection.destroy(); });
 }
 
 // Deadline owns the actual connection, including late pool acquisition. Never
-// return a timed-out/uncertain transaction to the pool or keep it running there.
+// return a timed-out/uncertain transaction to the pool or keep it running there;
+// a connection that only arrived after the deadline has run nothing and is
+// released.
 // Runtime operations are capped at 30 s. `maintenance` is reserved for the
 // explicit operator migration command, whose online index builds may be longer.
 const RUNTIME_DEADLINE_MAX_MS = 30000;
@@ -53,14 +66,13 @@ export function withConnection(pool, operation, { timeoutMs = 1800, transaction 
     const startedAt = diagnosticsEnabled ? performance.now() : 0;
     const timings = diagnosticsEnabled ? {
       poolWaitMs: 0,
-      setupMs: 0,
       beginMs: 0,
       operationMs: 0,
       commitMs: 0,
       rollbackMs: 0,
     } : undefined;
     const timingFields = {
-      acquire: 'poolWaitMs', setup: 'setupMs', begin: 'beginMs',
+      acquire: 'poolWaitMs', begin: 'beginMs',
       operation: 'operationMs', commit: 'commitMs', rollback: 'rollbackMs',
     };
     let stage = 'acquire';
@@ -121,13 +133,12 @@ export function withConnection(pool, operation, { timeoutMs = 1800, transaction 
     (async () => {
       try {
         connection = await pool.getConnection();
-        if (expired) { connection.destroy(); return; }
+        // No statement has run on a connection acquired after the deadline, so
+        // it is clean and goes back to the pool instead of forcing a reconnect.
+        if (expired) { connection.release(); return; }
         if (diagnosticsEnabled && Number.isSafeInteger(connection?.threadId) && connection.threadId >= 0) {
           dbConnectionId = connection.threadId;
         }
-        finishStage();
-        startStage('setup');
-        await connection.query('SET SESSION innodb_lock_wait_timeout = 1');
         finishStage();
         if (transaction) {
           startStage('begin');

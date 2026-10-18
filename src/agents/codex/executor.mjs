@@ -27,32 +27,46 @@ const INJECTION_STALE = Symbol('injection_stale');
 const fingerprint = (value) => createHash('sha256').update(String(value)).digest('hex');
 const humanGroupBinding = (binding) => Boolean(binding?.chatType && binding.chatType !== 'p2p' && !isScheduledBinding(binding.feishuOpenId));
 
-export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now } = {}) {
+const sleepFor = (milliseconds) => new Promise((resolve) => { const timer = setTimeout(resolve, milliseconds); timer.unref?.(); });
+// Coalesces full-text rewrites per key. With `minIntervalMs`, two writes for
+// the same key start at least that far apart; updates in between collapse into
+// the latest value, and the last value is always written.
+export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now, minIntervalMs = 0, sleep = sleepFor } = {}) {
   if (typeof write !== 'function') throw new Error('delta writer is required');
   const entries = new Map();
   return (key, value) => {
-    const current = entries.get(key);
-    if (current) {
-      current.value = value;
-      current.pending = true;
-      return current.promise;
+    let entry = entries.get(key);
+    if (entry?.running) {
+      entry.value = value;
+      entry.pending = true;
+      return entry.promise;
     }
-    const entry = { value, pending: false, promise: null };
-    entries.set(key, entry);
+    if (!entry) { entry = { lastStartedAt: undefined, idleTimer: undefined }; entries.set(key, entry); }
+    clearTimeout(entry.idleTimer);
+    entry.value = value;
+    entry.pending = true;
+    entry.running = true;
     entry.promise = (async () => {
-      while (true) {
+      while (entry.pending) {
+        // Bounded by the interval itself, so a clock step backwards cannot stall writes.
+        const remaining = entry.lastStartedAt === undefined ? 0 : Math.min(minIntervalMs, minIntervalMs - (now() - entry.lastStartedAt));
+        if (remaining > 0) await sleep(remaining);
         entry.pending = false;
         const snapshot = entry.value;
         const startedAt = now();
+        entry.lastStartedAt = startedAt;
         try { await write(snapshot); }
         catch (error) {
           try { Promise.resolve(onError(error, Math.max(0, now() - startedAt), snapshot)).catch((_observerError) => {}); }
           catch { /* observability never alters delta coalescing */ }
         }
-        if (entry.pending) continue;
-        entries.delete(key);
-        return;
       }
+      entry.running = false;
+      if (minIntervalMs <= 0) { entries.delete(key); return; }
+      // Remember the last write for one interval so a delta arriving just after
+      // a write still waits; then forget the key.
+      entry.idleTimer = setTimeout(() => { if (!entry.running && entries.get(key) === entry) entries.delete(key); }, minIntervalMs);
+      entry.idleTimer.unref?.();
     })();
     return entry.promise;
   };
@@ -180,6 +194,9 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   let restartNotified = false;
   const persistDelta = createDeltaCoalescer({
     now,
+    // A streamed agent message rewrites its full accumulated text (up to 12000
+    // characters) on each write; at most two such rewrites per second per item.
+    minIntervalMs: 500,
     write: ({ state, event }) => sessionStore.saveCodexRealtimeEvent(state.binding, event),
     onError: (error, durationMs, snapshot) => log('warning', {
       module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_delta', status: 'failed',

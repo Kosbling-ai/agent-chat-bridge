@@ -13,6 +13,7 @@ import { createExecutionFeedback } from '../src/channels/feishu/execution-feedba
 import { renderExecutionCard } from '../src/channels/feishu/execution-card.mjs';
 import { createCodexExecutor } from '../src/agents/codex/executor.mjs';
 import { createInboundMessageStore } from '../src/storage/inbound-messages.mjs';
+import { StoreError } from '../src/storage/errors.mjs';
 
 const base={schemaVersion:1,storage:Object.fromEntries(['host','port','user','password','database'].map(k=>[`${k}Env`,`TEST_${k.toUpperCase()}`])),codex:{bin:'./codex',cwd:'./workspace',envNames:[]},feishu:{connectionId:'test',appIdEnv:'TEST_APP',appSecretEnv:'TEST_SECRET',botOpenId:'bot'},routing:{version:'1',privateUserIds:[],groups:[{conversationId:'chat',trigger:'mention',passiveContext:true}]},hooks:[]};
 const flush=()=>new Promise(resolve=>setTimeout(resolve,20));
@@ -967,3 +968,39 @@ test('usage exhaustion sends one failed reply and never automatically replays, i
     assert.equal(jobs.calls.filter(([name]) => name === 'retry').length, 0);
   }
 });
+
+for (const [code, retried] of [['store_unavailable', true], ['store_contention', true], ['store_timeout', true], ['commit_unknown', false]]) {
+  test(`a ${code} storage failure during execution ${retried ? 'retries the task' : 'is not retried'}`, async () => {
+    const clock = 10_000;
+    const job = {
+      id: `store-${code}`, callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: `store-${code}`,
+      senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+      attempts: 0, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+    };
+    const retries = [];
+    let finalResults = 0;
+    const jobs = {
+      async claimReplyPending() { return []; },
+      async claim({ owner }) {
+        if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+        Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+        return [{ ...job, result: structuredClone(job.result) }];
+      },
+      async renew() {},
+      async markRetry(input) { retries.push(input); Object.assign(job, { status: 'pending', nextAttemptAt: input.nextAttemptAt, leaseOwner: '' }); },
+      async markReplyPending({ result }) { finalResults += 1; Object.assign(job, { status: 'reply_pending', result }); },
+    };
+    const runtime = createForwardRuntime({
+      config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {},
+      executor: { async execute() { throw new StoreError(code); } },
+      replies: {}, now: () => clock,
+    });
+    runtime.start();
+    await flush();
+    for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
+    await runtime.stop();
+    assert.equal(retries.length, retried ? 1 : 0);
+    assert.equal(finalResults, retried ? 0 : 1);
+    if (retried) assert.equal(retries[0].errorCode, code);
+  });
+}

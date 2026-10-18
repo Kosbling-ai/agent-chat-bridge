@@ -765,7 +765,10 @@ test('an unconfirmed turn start is reported once and never retried inside execut
 
 test('session store uses injected schema and public progress exact identity filter', async () => {
   const calls = [];
-  const pool = { async query(sql, params) { calls.push([sql, params]); return [[]]; } };
+  let released = 0;
+  const connection = { async query(sql, params) { calls.push([sql, params]); return [[]]; }, release() { released += 1; }, destroy() {} };
+  // Reads use a pooled connection under the storage deadline, not raw pool.query.
+  const pool = { async query() { throw new Error('reads must not bypass the storage deadline'); }, async getConnection() { return connection; } };
   const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7 });
   await store.readPublicProgress({ binding: { feishuOpenId: 'system:a', chatId: 'chat-a' }, threadId: 'thread-a', messageId: 'message-a', cursor: 3, limit: 999 });
   await store.readPublicProgress({ binding: { feishuOpenId: 'system:a', chatId: 'chat-a' }, threadId: 'thread-a', messageId: 'message-a', cursor: '9007199254740993', limit: 999 });
@@ -773,6 +776,33 @@ test('session store uses injected schema and public progress exact identity filt
   assert.match(calls[0][0], /feishu_open_id = \? AND chat_id = \? AND codex_session_id = \? AND message_id = \?/);
   assert.deepEqual(calls[0][1], ['fixture', 'system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '3', 250]);
   assert.deepEqual(calls[1][1], ['fixture', 'system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '9007199254740993', 250]);
+  assert.equal(released, 2);
+});
+
+test('session store bounds concurrent realtime event writes without dropping any', async () => {
+  let active = 0, peak = 0;
+  const written = [];
+  const gates = [];
+  const pool = {
+    async query(sql, params) {
+      active += 1; peak = Math.max(peak, active);
+      await new Promise(resolve => gates.push(resolve));
+      written.push(params[5]); active -= 1;
+      return [[]];
+    },
+    async getConnection() { throw new Error('unused'); },
+  };
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const writes = Array.from({ length: 6 }, (_, index) => store.saveCodexRealtimeEvent(binding, { eventKey: `event-${index}`, eventType: 'public_progress' }));
+  for (let index = 0; index < 6; index += 1) {
+    while (gates.length === 0) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(active <= 2);
+    gates.shift()();
+  }
+  await Promise.all(writes);
+  assert.equal(peak, 2);
+  assert.deepEqual(written, ['event-0', 'event-1', 'event-2', 'event-3', 'event-4', 'event-5']);
 });
 
 test('migration contains only the two first-ticket production tables', async () => {

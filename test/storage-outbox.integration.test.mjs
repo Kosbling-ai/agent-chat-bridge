@@ -53,6 +53,9 @@ test('real MySQL multipart order survives concurrent claims, restart, unknown an
     store = await createMysqlStore({connectionId:'multipart', pool, now: () => clock });
     assert.deepEqual(await claim(), []);
     clock += 1100;
+    // Expired send leases are reclassified at most every 5 s.
+    assert.deepEqual(await claim(), []);
+    clock += 3900;
     const [retried] = await claim();
     assert.equal(retried.id, first.id);
     assert.equal(retried.platformUuid, first.platformUuid);
