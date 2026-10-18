@@ -27,32 +27,46 @@ const INJECTION_STALE = Symbol('injection_stale');
 const fingerprint = (value) => createHash('sha256').update(String(value)).digest('hex');
 const humanGroupBinding = (binding) => Boolean(binding?.chatType && binding.chatType !== 'p2p' && !isScheduledBinding(binding.feishuOpenId));
 
-export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now } = {}) {
+const sleepFor = (milliseconds) => new Promise((resolve) => { const timer = setTimeout(resolve, milliseconds); timer.unref?.(); });
+// Coalesces full-text rewrites per key. With `minIntervalMs`, two writes for
+// the same key start at least that far apart; updates in between collapse into
+// the latest value, and the last value is always written.
+export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now, minIntervalMs = 0, sleep = sleepFor } = {}) {
   if (typeof write !== 'function') throw new Error('delta writer is required');
   const entries = new Map();
   return (key, value) => {
-    const current = entries.get(key);
-    if (current) {
-      current.value = value;
-      current.pending = true;
-      return current.promise;
+    let entry = entries.get(key);
+    if (entry?.running) {
+      entry.value = value;
+      entry.pending = true;
+      return entry.promise;
     }
-    const entry = { value, pending: false, promise: null };
-    entries.set(key, entry);
+    if (!entry) { entry = { lastStartedAt: undefined, idleTimer: undefined }; entries.set(key, entry); }
+    clearTimeout(entry.idleTimer);
+    entry.value = value;
+    entry.pending = true;
+    entry.running = true;
     entry.promise = (async () => {
-      while (true) {
+      while (entry.pending) {
+        // Bounded by the interval itself, so a clock step backwards cannot stall writes.
+        const remaining = entry.lastStartedAt === undefined ? 0 : Math.min(minIntervalMs, minIntervalMs - (now() - entry.lastStartedAt));
+        if (remaining > 0) await sleep(remaining);
         entry.pending = false;
         const snapshot = entry.value;
         const startedAt = now();
+        entry.lastStartedAt = startedAt;
         try { await write(snapshot); }
         catch (error) {
           try { Promise.resolve(onError(error, Math.max(0, now() - startedAt), snapshot)).catch((_observerError) => {}); }
           catch { /* observability never alters delta coalescing */ }
         }
-        if (entry.pending) continue;
-        entries.delete(key);
-        return;
       }
+      entry.running = false;
+      if (minIntervalMs <= 0) { entries.delete(key); return; }
+      // Remember the last write for one interval so a delta arriving just after
+      // a write still waits; then forget the key.
+      entry.idleTimer = setTimeout(() => { if (!entry.running && entries.get(key) === entry) entries.delete(key); }, minIntervalMs);
+      entry.idleTimer.unref?.();
     })();
     return entry.promise;
   };
@@ -180,6 +194,9 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   let restartNotified = false;
   const persistDelta = createDeltaCoalescer({
     now,
+    // A streamed agent message rewrites its full accumulated text (up to 12000
+    // characters) on each write; at most two such rewrites per second per item.
+    minIntervalMs: 500,
     write: ({ state, event }) => sessionStore.saveCodexRealtimeEvent(state.binding, event),
     onError: (error, durationMs, snapshot) => log('warning', {
       module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_delta', status: 'failed',
@@ -719,8 +736,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   function finalizeTurn(state) {
     return state.completed.then(async ({ turn }) => {
       const answer = finalAnswer(turn) || state.lastAgentMessage;
-      if (answer) await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `assistant-final:${state.messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId } });
-      await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: '' });
+      // The turn has run: its answer is returned even when the receipt or the
+      // binding touch cannot be stored (slow or unavailable storage). A storage
+      // error here must neither discard the answer nor make the caller retry,
+      // which could submit the prompt again.
+      if (answer) {
+        try { await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `assistant-final:${state.messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId } }); }
+        catch (error) { logFinalAnswerPersistenceFailure(state, 'event', error); }
+      }
+      try { await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: '' }); }
+      catch (error) { logFinalAnswerPersistenceFailure(state, 'touch', error); }
       return {
         deferred: false,
         threadId: state.threadId,
@@ -744,6 +769,17 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       catch { logObservationPersistenceFailure(state, 'touch'); }
       throw error;
     });
+  }
+
+  function logFinalAnswerPersistenceFailure(state, stage, error) {
+    try {
+      const normalized = databaseError(error);
+      log('warning', {
+        module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_final_answer', status: 'failed',
+        stage, errorClass: normalized.code, errno: normalized.errno, sqlState: normalized.sqlState,
+        threadId: state.threadId, turnId: state.turnId,
+      });
+    } catch { /* diagnostics must not replace the completed answer */ }
   }
 
   function logObservationPersistenceFailure(state, stage) {
@@ -791,6 +827,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         }
         if (normalized.messageId && normalized.messageId === active.messageId) {
           if (hasOpenWaiter(active)) return { completion: Promise.resolve({ deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId }) };
+          // Taking over the still-running turn of this message: it was submitted
+          // by an earlier attempt, so tell the caller before attaching (a later
+          // storage failure of this attempt must not be retried as a new turn).
+          await options.onStartIntent?.({ binding: active.binding, threadId: active.threadId, messageId: normalized.messageId, startedAt: active.startedAt, takeover: true });
           return { completion: waitForTurn(active, normalized.messageId, { takeover: true, signal: options.signal }) };
         }
         if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', {
@@ -984,6 +1024,13 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       throw error;
     });
+    // A caller whose signal is already aborted never observes `completion`.
+    // Without this handler, a turn already settled as interrupted or failed (a
+    // known resume after restart, with the lease lost during shutdown) rejected
+    // it unhandled and exited the process. The turn still ends through
+    // finalizeTurn, which persists its terminal error; the next attempt reads it
+    // and replies with the normal failure instead of replaying the prompt.
+    completion.catch((_error) => {});
     if (!signal) {
       try { return await completion; } finally { state.waiters.delete(waiter); }
     }

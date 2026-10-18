@@ -5,9 +5,23 @@ import { matchSilentReply } from './silent-reply.mjs';
 
 const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED', 'CODEX_USAGE_LIMIT_EXCEEDED'].includes(error?.code);
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
-const retryableError = error => {
+const TRANSIENT_LEASE_ERRORS = new Set(['store_unavailable', 'store_contention', 'store_timeout', 'commit_unknown']);
+const DEFINITIVE_LEASE_ERRORS = new Set(['stale_lease', 'forward_lease_lost']);
+// Normalized storage failures. They are retried only while the turn has not
+// been submitted: before the executor reaches turn/start (`admitted`) and
+// before execute() resolved (`executed`). Session reads that gate admission
+// fail with these codes when the database is slow or briefly unavailable, and
+// nothing has run yet, so the task is retried later. Once a turn was submitted
+// or completed, a retry could submit the prompt again: the executor's receipt
+// check only sees a non-empty final answer on the binding's current thread.
+// Such a failure keeps the 0.2.29 path (failure reply, no re-execution);
+// unlike 0.2.29, store_timeout is no longer retried there through the generic
+// /timeout/ match. commit_unknown is never retried here.
+const STORE_ERRORS = new Set(['store_unavailable', 'store_contention', 'store_timeout']);
+const retryableError = (error, { submitted = false } = {}) => {
   if (isBusy(error)) return false;
   if (terminalTurnError(error)) return false;
+  if (STORE_ERRORS.has(error?.code)) return !submitted;
   const value = [error?.name, error?.code, error?.cause?.code, error?.message, error?.cause?.message]
     .filter(Boolean).join(' ');
   return /\b(?:AbortError|TimeoutError|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)\b/i.test(value)
@@ -156,25 +170,113 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
 
   async function withLease(job, operation) {
     let lost = false;
+    let closed = false;
+    let leaseDeadline = Number.isSafeInteger(job.leaseExpiresAt) ? job.leaseExpiresAt : undefined;
+    let heartbeatTimer;
+    let expiryTimer;
+    let consecutiveFailures = 0;
+    let degraded = false;
     const controller = new AbortController();
-    leaseControllers.add(controller);
-    const lose = () => { lost = true; controller.abort(); };
     const heartbeatMs = Number(config.heartbeatMs || Math.max(1000, Math.floor(leaseMs / 3)));
-    let timer;
+    const clearTimers = () => {
+      clearTimeout(heartbeatTimer);
+      clearTimeout(expiryTimer);
+      heartbeatTimer = undefined;
+      expiryTimer = undefined;
+    };
+    const lose = () => {
+      if (lost) return;
+      lost = true;
+      clearTimers();
+      controller.abort();
+    };
+    const stopLease = () => {
+      closed = true;
+      clearTimers();
+      controller.abort();
+    };
+    leaseControllers.add(stopLease);
+    const assertOwned = () => {
+      if (!lost && leaseDeadline !== undefined && now() >= leaseDeadline) lose();
+      if (lost) throw Object.assign(new Error('forward_lease_lost'), { code: 'forward_lease_lost' });
+      if (stopping) throw Object.assign(new Error('forward_runtime_stopping'), { code: 'forward_runtime_stopping' });
+    };
+    const armExpiry = () => {
+      clearTimeout(expiryTimer);
+      const remaining = leaseDeadline - now();
+      if (remaining <= 0) { lose(); return; }
+      expiryTimer = setTimeout(lose, remaining);
+      expiryTimer.unref?.();
+    };
+    const scheduleHeartbeat = (delay = heartbeatMs) => {
+      clearTimeout(heartbeatTimer);
+      if (closed || lost) return;
+      heartbeatTimer = setTimeout(heartbeat, Math.max(0, Math.min(delay, leaseDeadline - now())));
+      heartbeatTimer.unref?.();
+    };
+    const renewed = requestStarted => {
+      const completedAt = now();
+      if (closed || lost) return false;
+      // Once the previously confirmed lease has expired, a late success cannot
+      // prove that another worker did not own the task in the meantime.
+      if ((leaseDeadline !== undefined && completedAt >= leaseDeadline)
+        || completedAt >= requestStarted + leaseMs) {
+        lose();
+        return false;
+      }
+      leaseDeadline = requestStarted + leaseMs;
+      armExpiry();
+      if (degraded) {
+        log('info', 'forward_lease', 'recovered', {
+          code: 'lease_renew_recovered', runId: job.id, consecutiveFailures,
+        });
+      }
+      degraded = false;
+      consecutiveFailures = 0;
+      scheduleHeartbeat(Math.max(0, requestStarted + heartbeatMs - completedAt));
+      return true;
+    };
+    async function heartbeat() {
+      heartbeatTimer = undefined;
+      if (closed || lost) return;
+      if (now() >= leaseDeadline) { lose(); return; }
+      const requestStarted = now();
+      try {
+        await jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs });
+        renewed(requestStarted);
+      } catch (error) {
+        if (closed || lost) return;
+        if (DEFINITIVE_LEASE_ERRORS.has(error?.code) || !TRANSIENT_LEASE_ERRORS.has(error?.code)) {
+          lose();
+          return;
+        }
+        if (now() >= leaseDeadline) { lose(); return; }
+        consecutiveFailures += 1;
+        if (!degraded) {
+          degraded = true;
+          log('warning', 'forward_lease', 'degraded', {
+            code: 'lease_renew_failed', runId: job.id, errorClass: error.code,
+            consecutiveFailures, willRetry: true,
+          });
+        }
+        const retryBaseMs = Math.max(1, Math.min(1000, Math.floor(heartbeatMs / 2)));
+        const backoffMs = Math.min(heartbeatMs, retryBaseMs * 2 ** Math.min(consecutiveFailures - 1, 10));
+        scheduleHeartbeat(Math.min(backoffMs, Math.max(0, leaseDeadline - now())));
+      }
+    }
     try {
+      assertOwned();
+      const requestStarted = now();
       await jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs });
-      timer = setInterval(() => jobs.renew({ id: job.id, leaseOwner: job.leaseOwner, leaseMs }).catch(lose), heartbeatMs);
-      timer.unref?.();
-      const assertOwned = () => {
-        if (lost) throw Object.assign(new Error('forward_lease_lost'), { code: 'forward_lease_lost' });
-        if (stopping) throw Object.assign(new Error('forward_runtime_stopping'), { code: 'forward_runtime_stopping' });
-      };
+      renewed(requestStarted);
+      assertOwned();
       const result = await operation({ signal: controller.signal, assertOwned, assertLease: assertOwned });
       assertOwned();
       return result;
     } finally {
-      clearInterval(timer);
-      leaseControllers.delete(controller);
+      closed = true;
+      clearTimers();
+      leaseControllers.delete(stopLease);
     }
   }
 
@@ -182,6 +284,10 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     let execution = { ...(job.result?.execution || {}) };
     let state;
     let needsDelivery = false;
+    // Set when the executor is about to submit the turn and when execute()
+    // resolved; after either, storage failures are not retried (see above).
+    let admitted = false;
+    let executed = false;
     try {
       const prompt = execution.inputStatus === 'ready' && typeof execution.preparedPrompt === 'string'
         ? execution.preparedPrompt : job.prompt;
@@ -199,7 +305,9 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       const timeout = AbortSignal.timeout(executeTimeoutMs);
       let result;
       try {
-        result = await executor.execute(input, { signal: AbortSignal.any([lease.signal, timeout]) });
+        result = await executor.execute(input, { signal: AbortSignal.any([lease.signal, timeout]),
+          onStartIntent: () => { admitted = true; } });
+        executed = true;
       } catch (error) {
         if (timeout.aborted && !lease.signal.aborted) throw Object.assign(new Error('forward_timeout'), { code: 'CODEX_FORWARD_TIMEOUT', retryable: true });
         throw error;
@@ -231,7 +339,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         throw error;
       }
       lease.assertOwned();
-      if (retryableError(error) && job.attempts < maxAttempts) {
+      if (retryableError(error, { submitted: admitted || executed }) && job.attempts < maxAttempts) {
         const nextRetryAt = now() + retryDelayMs;
         await feedback?.wait?.(job, state).catch(() => {});
         await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner,
@@ -396,7 +504,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   function beginStop() {
     stopping = true;
     wakeWorker?.();
-    for (const controller of leaseControllers) controller.abort();
+    for (const stopLease of leaseControllers) stopLease();
   }
   return Object.freeze({
     handleMessage, registerEvent, getEvent, recover,

@@ -133,3 +133,54 @@ test('a stalled receive is bounded and cannot checkpoint the page after its time
     assert.notEqual([...f.rows.values()][0].value.window, null);
   } finally { clearInterval(keepalive); await worker.stop(); }
 });
+
+test('an idle conversation with a completed cursor writes the cursor once per run and never loses its start', async () => {
+  let writes = 0;
+  let fail = false;
+  const requests = [];
+  let at = clock;
+  const f = fixture({ now: () => at, chat: { async listMessages(request) {
+    requests.push(request);
+    if (fail) throw new Error('synthetic history outage');
+    return { items: [], has_more: false };
+  } } });
+  const setCursor = f.options.store.setCursor;
+  f.options.store.setCursor = async input => { writes++; return setCursor(input); };
+  const worker = f.create();
+  await worker.runOnce();
+  // First run for a conversation still opens and closes its window.
+  assert.equal(writes, 2);
+  const firstThrough = [...f.rows.values()][0].value.throughMs;
+  assert.equal(firstThrough, clock);
+  at = clock + 60_000;
+  await worker.runOnce();
+  assert.equal(writes, 3);
+  assert.deepEqual([...f.rows.values()][0].value, { schemaVersion: 1, throughMs: clock + 60_000, window: null });
+  assert.equal(Number(requests[1].startTime) * 1000, clock - 300_000);
+  // A failed first page writes nothing; the next run re-derives the same start.
+  fail = true; at = clock + 120_000;
+  assert.equal((await worker.runOnce()).failed, 1);
+  assert.equal(writes, 3);
+  assert.equal([...f.rows.values()][0].value.throughMs, clock + 60_000);
+  fail = false; at = clock + 180_000;
+  await worker.runOnce(); await worker.stop();
+  assert.equal(writes, 4);
+  assert.equal(Number(requests[3].startTime) * 1000, clock + 60_000 - 300_000);
+  assert.equal(Number(requests[3].endTime) * 1000, clock + 180_000);
+  assert.equal([...f.rows.values()][0].value.throughMs, clock + 180_000);
+});
+
+test('a non-empty first page still persists its window before emitting any event', async () => {
+  const order = [];
+  let at = clock;
+  const f = fixture({ now: () => at, maxPagesPerConversation: 1,
+    chat: { async listMessages(request) { return request.pageToken ? { items: [], has_more: false } : { items: [item('a')], has_more: true, page_token: 'next' }; } },
+    onEvent: async event => { order.push(`event:${event.messageId}`); } });
+  const setCursor = f.options.store.setCursor;
+  f.options.store.setCursor = async input => { order.push(input.value.window ? `window:${input.value.window.pageToken}` : 'closed'); return setCursor(input); };
+  const worker = f.create();
+  f.rows.set(`catchup:${(await import('node:crypto')).createHash('sha256').update('chat').digest('hex')}`, { version: 1, value: { schemaVersion: 1, throughMs: clock - 60_000, window: null } });
+  at = clock + 1000;
+  assert.equal((await worker.runOnce()).incomplete, 1); await worker.stop();
+  assert.deepEqual(order, ['window:', 'event:a', 'window:next']);
+});

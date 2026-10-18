@@ -765,7 +765,10 @@ test('an unconfirmed turn start is reported once and never retried inside execut
 
 test('session store uses injected schema and public progress exact identity filter', async () => {
   const calls = [];
-  const pool = { async query(sql, params) { calls.push([sql, params]); return [[]]; } };
+  let released = 0;
+  const connection = { async query(sql, params) { calls.push([sql, params]); return [[]]; }, release() { released += 1; }, destroy() {} };
+  // Reads use a pooled connection under the storage deadline, not raw pool.query.
+  const pool = { async query() { throw new Error('reads must not bypass the storage deadline'); }, async getConnection() { return connection; } };
   const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7 });
   await store.readPublicProgress({ binding: { feishuOpenId: 'system:a', chatId: 'chat-a' }, threadId: 'thread-a', messageId: 'message-a', cursor: 3, limit: 999 });
   await store.readPublicProgress({ binding: { feishuOpenId: 'system:a', chatId: 'chat-a' }, threadId: 'thread-a', messageId: 'message-a', cursor: '9007199254740993', limit: 999 });
@@ -773,6 +776,263 @@ test('session store uses injected schema and public progress exact identity filt
   assert.match(calls[0][0], /feishu_open_id = \? AND chat_id = \? AND codex_session_id = \? AND message_id = \?/);
   assert.deepEqual(calls[0][1], ['fixture', 'system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '3', 250]);
   assert.deepEqual(calls[1][1], ['fixture', 'system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '9007199254740993', 250]);
+  assert.equal(released, 2);
+});
+
+function gatedSessionPool() {
+  const state = { active: 0, peak: 0, written: [], gates: [], released: 0 };
+  const connection = {
+    async query(sql, params) {
+      state.active += 1; state.peak = Math.max(state.peak, state.active);
+      await new Promise(resolve => state.gates.push(resolve));
+      state.written.push(params[5]); state.active -= 1;
+      return [[]];
+    },
+    release() { state.released += 1; }, destroy() {},
+  };
+  // Writes run through withConnection (deadline + normalized errors), never raw pool.query.
+  const pool = { async query() { throw new Error('writes must use the storage deadline'); }, async getConnection() { return connection; } };
+  return { pool, state };
+}
+async function drainGates(state, settled) {
+  while (!settled()) {
+    if (state.gates.length) state.gates.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+test('session store bounds concurrent realtime event writes and keeps their order', async () => {
+  const { pool, state } = gatedSessionPool();
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const writes = Array.from({ length: 6 }, (_, index) => store.saveCodexRealtimeEvent(binding, { eventKey: `item:turn:${index}`, eventType: 'agent_message' }));
+  for (let index = 0; index < 6; index += 1) {
+    while (state.gates.length === 0) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(state.active <= 2);
+    state.gates.shift()();
+  }
+  await Promise.all(writes);
+  assert.equal(state.peak, 2);
+  assert.deepEqual(state.written, [0, 1, 2, 3, 4, 5].map(index => `item:turn:${index}`));
+  assert.equal(state.released, 6);
+});
+
+test('session store drops only the oldest best-effort events beyond 200 queued and never drops receipts', async () => {
+  const { pool, state } = gatedSessionPool();
+  const logs = [];
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, log: (...entry) => logs.push(entry) });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'public_progress' });
+  const writes = [save('item:turn:held-1'), save('item:turn:held-2')];
+  while (state.active < 2) await new Promise(resolve => setImmediate(resolve));
+  writes.push(save('assistant-final:m'), save('user:m'), save('user-steer-confirmed:m'));
+  for (let index = 0; index < 205; index += 1) writes.push(save(index % 2 ? `agent-delta:turn:${index}` : `public:turn:${index}`));
+  writes.push(save('error:m'));
+  let done = 0;
+  for (const write of writes) write.then(() => { done += 1; });
+  await drainGates(state, () => done === writes.length);
+  const dropped = Array.from({ length: 5 }, (_, index) => index % 2 ? `agent-delta:turn:${index}` : `public:turn:${index}`);
+  for (const key of dropped) assert.equal(state.written.includes(key), false, key);
+  for (const key of ['assistant-final:m', 'user:m', 'user-steer-confirmed:m', 'error:m', 'public:turn:6', 'agent-delta:turn:203']) assert.ok(state.written.includes(key), key);
+  assert.equal(state.written.length, writes.length - 5);
+  assert.equal(state.peak, 2);
+  // Rate-limited: the first drop is logged at once, later ones are counted for the next log.
+  assert.equal(logs.length, 1);
+  assert.deepEqual(logs[0].slice(0, 3), ['warning', 'codex_event_write', 'dropped']);
+  assert.equal(logs[0][3].code, 'codex_event_queue_full');
+  assert.equal(logs[0][3].droppedEvents, 1);
+  assert.equal(logs[0][3].droppedEventsTotal, 1);
+});
+
+test('session store writes have a deadline that frees the slot and normalize driver errors', async () => {
+  let calls = 0;
+  const connection = {
+    async query(sql, params) {
+      calls += 1;
+      if (params[5] === 'item:turn:locked') throw Object.assign(new Error('hidden'), { code: 'ER_LOCK_WAIT_TIMEOUT', errno: 1205, sqlState: 'HY000' });
+      if (String(params[5]).startsWith('item:turn:hung')) return new Promise(() => {});
+      return [[]];
+    },
+    release() {}, destroy() {},
+  };
+  const pool = { async query() { throw new Error('unused'); }, async getConnection() { return connection; } };
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, writeTimeoutMs: 30 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'agent_message' });
+  await assert.rejects(save('item:turn:locked'), { code: 'store_contention', errorCode: 'ER_LOCK_WAIT_TIMEOUT' });
+  // Two hung writes hold both slots only until their deadline; the queued receipt then runs.
+  const hung = [save('item:turn:hung-1'), save('item:turn:hung-2')];
+  const receipt = save('assistant-final:m');
+  for (const write of hung) await assert.rejects(write, { code: 'store_timeout' });
+  await receipt;
+  assert.equal(calls, 4);
+  // params[5] of the binding upsert is thread_name.
+  await assert.rejects(store.saveCodexBinding({ feishuOpenId: 'actor', chatId: 'chat', codexSessionId: 'thread', threadName: 'item:turn:hung-3' }), { code: 'store_timeout' });
+});
+
+test('session admission reads fail with store_timeout instead of returning null', async () => {
+  const pool = { async query() { throw new Error('unused'); }, getConnection: () => new Promise(() => {}) };
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, claimTimeoutMs: 20 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  await assert.rejects(store.loadBinding({ feishuOpenId: 'actor', chatId: 'chat' }), { code: 'store_timeout' });
+  await assert.rejects(store.findAcceptedMessageEvent(binding, 'message'), { code: 'store_timeout' });
+  await assert.rejects(store.loadSteerEvents(binding, 'message'), { code: 'store_timeout' });
+  await assert.rejects(store.loadCodexEvent(binding, 'injection:system-preamble'), { code: 'store_timeout' });
+  assert.throws(() => createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', claimTimeoutMs: 60_000 }), { code: 'invalid_storage_deadline' });
+  // Execution-card progress polling keeps its own short 1800 ms deadline.
+  const progress = store.readPublicProgress({ binding, threadId: 'thread', messageId: 'message' });
+  progress.catch(() => {});
+  assert.equal(await Promise.race([progress.then(() => 'settled', () => 'settled'), new Promise(resolve => setTimeout(() => resolve('pending'), 200))]), 'pending');
+  await assert.rejects(progress, { code: 'store_timeout' });
+});
+
+test('a session read that times out propagates and never starts a second turn', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-session-timeout-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const store = memoryStore();
+  const runtime = fakeRuntime();
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'timeout-job', prompt: 'work' };
+  await executor.execute(input);
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+  // Remove the receipt so only the failing lookup stands between a retry and a second turn.
+  store.events.splice(0, store.events.length);
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  store.findAcceptedMessageEvent = async () => { throw new StoreError('store_timeout'); };
+  await assert.rejects(executor.execute(input), { code: 'store_timeout' });
+  store.loadBinding = async () => { throw new StoreError('store_timeout'); };
+  await assert.rejects(executor.execute({ ...input, messageId: 'timeout-job-2' }), { code: 'store_timeout' });
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+});
+
+test('a released write slot goes to the oldest receipt first; only best-effort events are dropped, and the counter does not drift', async () => {
+  const { pool, state } = gatedSessionPool();
+  const logs = [];
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, log: (...entry) => logs.push(entry) });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'public_progress' });
+  const holdBoth = async (prefix) => {
+    const held = [save(`item:${prefix}:hold-1`), save(`item:${prefix}:hold-2`)];
+    while (state.active < 2) await new Promise(resolve => setImmediate(resolve));
+    return held;
+  };
+  // Phase 1: 200 best-effort writes, then a receipt, then one more best-effort write.
+  const writes = await holdBoth('one');
+  for (let index = 0; index < 200; index += 1) writes.push(save(`public:turn:${index}`));
+  writes.push(save('assistant-final:m'));
+  writes.push(save('public:turn:200'));
+  let done = 0;
+  for (const write of writes) write.then(() => { done += 1; });
+  await drainGates(state, () => done === writes.length);
+  // The 201st queued best-effort write dropped the oldest best-effort one, never the receipt.
+  assert.equal(state.written.includes('public:turn:0'), false);
+  assert.ok(state.written.includes('public:turn:200'));
+  // The receipt took the first released slot, ahead of all queued progress.
+  assert.equal(state.written.indexOf('assistant-final:m'), 2);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][3].droppedEventsTotal, 1);
+  // Phase 2: after draining, nothing is queued; a new best-effort write and a
+  // receipt behind it are both written and nothing more is dropped.
+  const second = await holdBoth('two');
+  second.push(save('public:turn:after-drain'), save('error:m'));
+  let secondDone = 0;
+  for (const write of second) write.then(() => { secondDone += 1; });
+  await drainGates(state, () => secondDone === second.length);
+  assert.ok(state.written.includes('public:turn:after-drain'));
+  assert.ok(state.written.includes('error:m'));
+  assert.ok(state.written.indexOf('error:m') < state.written.indexOf('public:turn:after-drain'));
+  assert.equal(logs.length, 1);
+  assert.equal(state.peak, 2);
+});
+
+test('a completed answer is returned and logged when its receipt and binding touch cannot be stored', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-final-receipt-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  const store = memoryStore();
+  const save = store.saveCodexRealtimeEvent;
+  store.saveCodexRealtimeEvent = async (binding, event) => {
+    if (String(event.eventKey).startsWith('assistant-final:')) throw new StoreError('store_timeout');
+    return save(binding, event);
+  };
+  store.touchCodexBinding = async () => { throw new StoreError('store_contention'); };
+  const logs = [];
+  const runtime = fakeRuntime();
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, log: (level, detail) => logs.push([level, detail]) });
+  t.after(() => executor.close());
+  const result = await executor.execute({ bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'final-receipt', prompt: 'work' });
+  assert.equal(result.answer, 'answer turn-1');
+  const failures = logs.filter(([, detail]) => detail.operation === 'persist_final_answer');
+  assert.deepEqual(failures.map(([level, detail]) => [level, detail.status, detail.stage, detail.errorClass]),
+    [['warning', 'failed', 'event', 'store_timeout'], ['warning', 'failed', 'touch', 'store_contention']]);
+  assert.equal(store.events.some(row => row.event_key.startsWith('assistant-final:')), false);
+});
+
+test('a takeover of a still-running turn signals submission, so a later storage failure is not retried', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-takeover-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  const store = memoryStore();
+  const runtime = fakeRuntime({ completeStarts: false });
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'takeover-job', prompt: 'work' };
+  // Attempt 1 submits the turn, then stops waiting (its lease was lost).
+  const controller = new AbortController();
+  const first = executor.execute(input, { signal: controller.signal });
+  while (executor.status().activeTurns !== 1) await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(first, { code: 'CODEX_WAIT_ABORTED' });
+  let clock = 10_000;
+  const job = {
+    id: 'takeover-run', callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: 'takeover-job',
+    senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+    attempts: 1, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const retries = [];
+  const replies = [];
+  let replyPendingCalls = 0;
+  const jobs = {
+    async claimReplyPending() { return []; },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async markRetry(value) { retries.push(value); Object.assign(job, { status: 'pending', nextAttemptAt: value.nextAttemptAt, leaseOwner: '' }); },
+    async markReplyPending({ result }) {
+      replyPendingCalls += 1;
+      if (replyPendingCalls === 1) throw new StoreError('store_timeout');
+      replies.push(result);
+      Object.assign(job, { status: 'reply_pending', result });
+    },
+  };
+  const intents = [];
+  const forward = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {}, replies: {}, now: () => clock,
+    executor: { execute: (value, options) => executor.execute(value, { ...options, onStartIntent: intent => { intents.push(intent); return options.onStartIntent?.(intent); } }) },
+  });
+  // Attempt 2 (the forward runtime) attaches to the running turn, which then completes.
+  forward.start();
+  const until = async (condition) => { for (let i = 0; i < 1000 && !condition(); i += 1) await new Promise(resolve => setTimeout(resolve, 2)); };
+  await until(() => intents.length > 0 || executor.status().activeTurns === 0);
+  // The attempt must have attached to the running turn (no new turn) and signalled it.
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+  if (!intents.length) { await forward.stop(); assert.fail('takeover did not signal submission'); }
+  assert.equal(intents[0].takeover, true);
+  assert.equal(intents[0].messageId, 'takeover-job');
+  runtime.children[0].send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1',
+    turn: { id: 'turn-1', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'done once' }] } } });
+  await until(() => replies.length > 0 || retries.length > 0);
+  clock += 120_000;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await forward.stop();
+  assert.equal(retries.length, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].failed, true);
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
 });
 
 test('migration contains only the two first-ticket production tables', async () => {
@@ -927,16 +1187,19 @@ test('binding remains occupied through shared final persistence and cannot be ro
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
-test('successful finalization requires the binding touch and releases the binding', async () => {
+test('a failed binding touch after a completed turn still returns the answer and releases the binding', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
     const store = memoryStore();
     store.touchCodexBinding = async () => { throw new Error('synthetic session touch failure'); };
     const runtime = fakeRuntime();
-    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    const logs = [];
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, log: (level, detail) => logs.push([level, detail]) });
     const input = { bindingOpenId: 'system:x', chatId: 'chat', chatType: 'group', messageId: 'job', prompt: 'work', busyPolicy: 'reject' };
     const one = executor.execute(input); const two = executor.execute(input);
-    await assert.rejects(one, /synthetic session touch failure/);
+    // 0.2.30: the turn ran, so its answer is delivered; the touch failure is only logged.
+    assert.equal((await one).answer, 'answer turn-1');
+    assert.ok(logs.some(([level, detail]) => level === 'warning' && detail.operation === 'persist_final_answer' && detail.stage === 'touch'));
     assert.equal((await two).deferred, true);
     while (executor.status().activeTurns) await new Promise((resolve) => setImmediate(resolve));
     assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 1);
@@ -1772,5 +2035,47 @@ for (const status of ['interrupted', 'failed', 'completed', 'inProgress', 'missi
     assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 0);
     assert.equal(runtime.calls.filter(call => call.method === 'turn/steer').length, 0);
     assert.equal(runtime.calls.filter(call => call.method === 'turn/interrupt').length, 0);
+  });
+}
+
+// 0.2.29 crash: after a restart the job resumes a turn that Codex already
+// reports interrupted/failed while the caller's signal is already aborted
+// (lease lost during shutdown). The observer promise had no handler and the
+// unhandled rejection exited the process. It must end as an ordinary failure.
+for (const [path, status] of [['observation-loss duplicate', 'interrupted'], ['observation-loss duplicate', 'failed'], ['explicit resume', 'interrupted']]) {
+  test(`resuming a ${status} turn through the ${path} path with an aborted caller never leaves an unhandled rejection`, { timeout: 10000 }, async t => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-resume-unhandled-'));
+    t.after(() => rmSync(cwd, { recursive: true, force: true }));
+    const unhandled = [];
+    const onUnhandled = reason => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+    const store = memoryStore();
+    const firstRuntime = fakeRuntime({ completeStarts: false });
+    const first = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: firstRuntime.spawnImpl });
+    const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: `resume-${status}`, prompt: 'work' };
+    const pending = first.execute(input);
+    const rejected = assert.rejects(pending, { code: 'CODEX_OBSERVATION_LOST' });
+    while (!first.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+    await first.close(); await rejected;
+    const native = { id: 'turn-1', status, items: [] };
+    const runtime = fakeRuntime({ resumeTurns: [native] });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    t.after(() => executor.close());
+    const options = { signal: AbortSignal.abort() };
+    if (path === 'explicit resume') {
+      const errorEvent = store.events.find(row => row.event_key === `error:${input.messageId}`);
+      options.resume = { threadId: 'thread-1', turnId: 'turn-1', startedAt: Number(JSON.parse(errorEvent.detail_json).startedAt) };
+    }
+    await assert.rejects(executor.execute(input, options), { code: 'CODEX_WAIT_ABORTED' });
+    for (let tick = 0; tick < 5; tick += 1) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.deepEqual(unhandled.map(reason => reason?.code), []);
+    // The terminal state was persisted, so the next attempt ends through the
+    // normal failed/interrupted path instead of replaying the prompt.
+    const code = status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED';
+    const duplicate = await executor.execute(input);
+    assert.equal(duplicate.errorCode, code);
+    assert.equal(duplicate.turnStatus, status);
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 0);
   });
 }

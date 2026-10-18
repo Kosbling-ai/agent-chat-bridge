@@ -1,16 +1,19 @@
 # Versions and migrations
 
-Application version: `0.2.30`
+Application version: `0.2.31`
 
-## 0.2.30 business-card form transport
+## 0.2.31 business-card form transport
 
-No database migration, configuration change, dependency change or business policy. Existing durable JSON payloads gain optional `formValue`. Field validation, actor authorization, card-version checks and business processing remain the hook consumer's responsibility; the bridge acknowledgement confirms registration only.
+No additional database migration, configuration change, dependency change or business policy beyond 0.2.30. When upgrading from 0.2.29 or earlier, apply migration 006 and follow the 0.2.30 checklist below before starting 0.2.31. Existing durable JSON payloads gain optional `formValue`. Field validation, actor authorization, card-version checks and business processing remain the hook consumer's responsibility; the bridge acknowledgement confirms registration only.
 
 1. Run `npm test`, `npm run check` and `npm run version:check` in the release checkout.
 2. Deploy the reviewed release through the instance supervisor's supported restart lifecycle; do not start a second WebSocket owner. Confirm database connectivity and readiness before acceptance.
 3. Submit a synthetic form against an authorized hook and verify durable event form values, actor/message identity, consumer receipt and exact-replay deduplication. Verify a registration failure does not show success. Never use a real business decision as a smoke test.
-4. Roll back via the supervisor to 0.2.29 if needed; no stored-state reversal is required. Old consumers may ignore the optional field; roll back any dependent feedback UI with the bridge so submissions are not silently dropped.
+4. Roll back via the supervisor to 0.2.30 if needed; no stored-state reversal is required. Old consumers may ignore the optional field; roll back any dependent feedback UI with the bridge so submissions are not silently dropped.
 
+Version 0.2.30 adds migration 006 (four secondary indexes, built online; no table, row or existing index changes) and must be migrated before its processes start. The config `schemaVersion` stays 1; the only new key is the optional `storage.claimTimeoutMs` (default 15000 ms, 1000–30000). Transient storage failures now leave the bridge running in a degraded state instead of restarting it. Two instances that share one bridge database run the migration once. See [0.2.30 query indexes and degraded storage](#0230-query-indexes-and-degraded-storage).
+
+Version 0.2.29 does not add a database or configuration migration. It reconciles disconnected Codex turns before classifying them.
 
 Version 0.2.28 does not add a database migration, change the config `schemaVersion`, change storage or add a dependency. It adds the optional, backward-compatible per-group key `routing.groups[].reply` (`mode` `card`/`text`, `ack`, `ackEmoji`); groups without it behave as before. See [0.2.28 group text replies](#0228-group-text-replies).
 
@@ -55,6 +58,34 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.30 query indexes and degraded storage
+
+Migration `006-query-indexes.sql` adds `idx_assistant_codex_events_message`, `idx_forward_status_finished`, `jobs_conversation_open` and `outbox_unknown_recent` with `ALGORITHM=INPLACE, LOCK=NONE`. Reads and writes continue while the indexes build; on the production USB SSD the build can take tens of seconds. The migration waits at most 10 seconds for each table's metadata lock (a long open transaction makes it fail instead of queueing every reader behind it); rerunning it is safe. It skips an index that already exists with the same definition and stops with `schema_version_mismatch` if a same-named index has another definition. 0.2.30 refuses to start until the ledger records version 6, and a 0.2.29 process that is still running reports `store` not ready once version 6 is recorded; its `runtime.unhealthyExitMs` watchdog (30 s by default) then exits it with `runtime_unhealthy`. Behaviour changes are listed in the [changelog](CHANGELOG.md) and [runtime notes](docs/runtime.md#query-indexes-and-polling-cost-0230).
+
+Upgrade (two instances sharing one database; run the migration once, then restart both). Run steps 3 to 6 back-to-back: after step 3, any unplanned restart of a 0.2.29 process (a crash, or its unhealthy exit) starts 0.2.30 code against the version-5 ledger, which fails at startup with `schema_version_mismatch` and keeps restarting until step 5 has succeeded.
+
+1. Pick an idle window: no Codex turn active on either instance (the last activity in each bridge log is followed by `"operation":"app_server_close","status":"succeeded"`), and no scheduled business job is due in the next few minutes. Check that each instance has been up for at least 10 minutes: the supervisor delays the restart of a child that ran for a shorter time.
+2. 006 changes no rows. Take the routine bridge-schema backup only if the host's DDL policy requires one; rollback does not need it.
+3. Fast-forward the bridge checkout to 0.2.30: `git -C <bridge-dir> fetch origin` and `git -C <bridge-dir> merge --ff-only origin/main`. There is no dependency change. The running processes keep their loaded code until they restart.
+4. For each instance run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>`; it must log `check_config` `succeeded`.
+5. Run once, with either instance's configuration: `node bin/agent-chat-bridge.mjs migrate --config <bridge.json>`. Success is exit status 0 and `{"level":"info",…,"operation":"migration","status":"succeeded","version":6,"applied":true}` (`"applied":false` on a rerun when 006 was already recorded). A metadata-lock timeout (an open transaction on one of the four tables for more than 10 seconds) ends with exit status 1 and `{"level":"warning",…,"operation":"startup","status":"failed","code":"store_contention"}`; `store_timeout` and `store_unavailable` are reported the same way. A missing `ALTER`/`INDEX` privilege or another deterministic error logs `"code":"store_invalid"`; fix the cause (for example grant the privilege) and run step 5 again. **If step 5 fails, do not run step 6.** The 0.2.29 processes keep working: the indexes already built stay, the ledger stays at version 5, and 0.2.29 accepts that schema. Wait for the long transaction to end and run step 5 again; it skips the indexes that already exist.
+6. Immediately after a successful step 5, restart both instances through the supervisor: `kill -TERM <bridge-pid>` for each (the pids are in the supervisor's `logs/status.json`). Without this step each 0.2.29 process exits about 30 seconds later through its watchdog and restarts unplanned.
+7. Verify each instance: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready` return 200; the log has no `schema_version_mismatch`; a `storage_snapshot` line appears within 60 seconds. Optionally confirm `SELECT version FROM bridge_schema_migrations ORDER BY version` returns 1 through 6.
+8. `storage.claimTimeoutMs` is optional. Add it only to change the 15000 ms deadline, which bounds both the background hook and outbox claims and the four Codex session reads that gate a turn (binding, accepted-message check, steer events, injection marker); then run `check-config` and restart that instance.
+
+While storage is slow or unavailable, 0.2.30 stays alive with `/health/ready` returning 503 and `degraded` details, and logs `worker_poll_failed` (first failure, then at most every 5 minutes, at `error` level once the degradation has lasted 5 minutes) and `storage_operation` / `storage_snapshot` diagnostics; it no longer restarts after six failed polls. A schema ledger mismatch, a deterministic driver error (`store_invalid`, for example a missing table or denied access) or a stopped worker still restarts it after `runtime.unhealthyExitMs`.
+
+Known limits of 006: an equivalent index under another name is not detected, so 006 builds its own index next to it. While an `ALTER` waits for a metadata lock (at most 10 seconds), new statements on that table wait behind it; claims of a running 0.2.29 (1800 ms deadline) can time out in that window. If the 15-minute `migrate` deadline fires during an `ALTER`, the server may still finish that index while the ledger row is not written; a rerun skips the finished index and records version 6.
+
+Rollback to 0.2.29, symmetric to the upgrade (run steps 2 to 4 back-to-back):
+
+1. Remove `storage.claimTimeoutMs` from every bridge.json that has it (0.2.29 rejects it with `invalid_storage_fields`) and run `check-config` with the 0.2.29 code.
+2. Switch the checkout back to the 0.2.29 commit.
+3. Delete the ledger row: `DELETE FROM bridge_schema_migrations WHERE version = 6;`. This is a write to the production database and needs the user's explicit authorization. 0.2.29 accepts only versions 1–5. The four indexes can stay: 0.2.29 does not use them and a later 0.2.30 migration skips them.
+4. Immediately `kill -TERM` both instances together through the supervisor, so they restart on 0.2.29. A 0.2.30 process that is left running reports `store` not ready (`schema_version_mismatch`) and its watchdog exits it about 30 seconds later.
+
+Rolling back restores the 0.2.29 behaviour this release fixes: the process crash when a restart resumes an already interrupted or failed turn, and the communication worker's exit after six failed polls or 30 seconds of storage failures.
 
 ## 0.2.28 group text replies
 
