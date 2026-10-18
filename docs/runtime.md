@@ -357,6 +357,52 @@ Restart does not clear queues, replay ambiguous deliveries, change leases, or by
 
 Hook delivery still requires a durable consumer acknowledgement before it returns 204. Internal reply/reaction authorization, byte limits and unknown-write recovery remain enforced. The connected media and outbox components retain their current constraints in [input media](media.md) and [outbound media](outbound-media.md). [Catchup](catchup.md) describes the earlier generation implementation and is historical for the current forward execution path.
 
+### Claim deadlines and recovery
+
+A claim only reserves work; it does not call a hook or send a Feishu message. When its COMMIT acknowledgement is lost, the store resolves the original row IDs and lease token on a new connection before handing any work to a worker. It never retries an arbitrary transaction or interprets an uncertain platform send as a safe new send. An unresolved claim stays pending for reconciliation rather than being replaced by a new claim. Recovery verifies scope, owner, token and lease expiry under row locks, and logs `storage_claim_recovery` with status `recovered`, `not_committed` or `empty`.
+
+`storage.claimTimeoutMs` sets the deadline of the background hook and outbox claims (optional, default 15000 ms, allowed 1000–30000 ms; anything else fails validation with `invalid_storage_claim_timeout`). Every other storage operation, including ingress, keeps its 1800 ms deadline. A transient failure uses the capped polling backoff above (1 s doubling to 30 s); a persistent database outage stays degraded and keeps probing. `worker_poll_failed` is logged on the first failure, on a stage change and then at most every 5 minutes; two successful claim stages log `worker_recovered`. Idle communication polling backs off from 100 ms through 200, 400 and 800 ms to 1 second, and returns to 100 ms when a poll claims work, so new hook and outbox work on an idle bot is picked up within about one second.
+
+A storage failure after a hook answered 204, or after a Feishu send, is not recorded as a delivery failure or retried immediately: the durable lease and the platform UUID reconcile it, and the worker records the storage failure (degraded for transient classes).
+
+Storage diagnostics distinguish `commit_timeout` from `commit_error` and retain only safe driver code, numeric errno and SQLSTATE. Raw driver messages, SQL and credentials are never logged. Readiness is a component snapshot, not proof that a particular user message reached Feishu, entered the bridge, or completed.
+
+On macOS, use `ProcessType=Standard` for the bridge and its local MySQL service. `Background` is intended for work that yields to user activity and applies CPU and I/O resource restrictions; it is a poor fit for a database serving short request deadlines. Keep normal MySQL durability settings. Do not disable flushes or drop transaction protection to work around deadline failures.
+
+### Query indexes and polling cost (0.2.30)
+
+Migration `006-query-indexes.sql` adds four secondary indexes online (`ALGORITHM=INPLACE, LOCK=NONE`) and changes no table or existing index:
+
+| table | index | used by |
+|---|---|---|
+| `assistant_codex_events` | `idx_assistant_codex_events_message (connection_id, codex_session_id, message_id, id)` | the accepted-message check before every turn and steer |
+| `assistant_codex_forward_jobs` | `idx_forward_status_finished (connection_id, status, finished_at, id)` | `GET /health/tasks` (forced index) |
+| `bridge_jobs` | `jobs_conversation_open (connection_id, conversation_id, hook_id, kind, status, sequence)` | hook ordering in the hook claim |
+| `bridge_outbox` | `outbox_unknown_recent (connection_id, status, first_attempt_at, next_attempt_at)` | the uncertain-send branch of the outbox claim (forced index) |
+
+The migration skips an index that already exists with the same definition and stops with `schema_version_mismatch` if a same-named index has another definition. It waits at most 10 seconds for a table metadata lock, and the explicit `migrate` command may run up to 15 minutes. 0.2.30 refuses to start until the ledger records version 6.
+
+Polling and query shape:
+
+- Hook and outbox claims select only IDs under `FOR UPDATE SKIP LOCKED`, then update and read back the claimed rows. An idle claim tick (hook claim plus outbox claim) sends 6 statements in 2 short transactions instead of 9, and about 0.3 KB of result metadata instead of about 3.5 KB.
+- The hook claim checks earlier unfinished jobs of the same conversation and hook with one equality probe per non-terminal status (`pending`, `running`, `reply_pending`, `unknown`, `delivery_failed`). This is equivalent to the former `status NOT IN ('succeeded','failed','cancelled')` only while the code writes no other status; `test/storage-job-status.test.mjs` fails when a new status write appears.
+- The outbox claim is two bounded branches: due `pending` rows, and `unknown` sends of kind `create`, `reply` or `artifact_send` first attempted within the last 55 minutes. Older uncertain sends are no longer scanned or locked on every poll. Eligibility and the `created_at, id` order are unchanged.
+- Expired send leases (`running` past `lease_expires_at`) are reclassified as `unknown` at most every 5 seconds per process, and at once after a reconciled claim found its own lease expired. A send whose lease expired can therefore be retried up to 5 seconds later than before.
+- `SET SESSION innodb_lock_wait_timeout = 1` runs once when the pool opens a physical connection instead of before every operation. It now also applies to the Codex session store's connections. A connection that only arrives after an operation's deadline has run nothing, so it is returned to the pool instead of being closed.
+- Codex session reads (binding, accepted-message check, steer events, injection marker and execution-card progress) use the 1800 ms storage deadline. A forward task whose execution meets `store_timeout`, `store_unavailable` or `store_contention` is retried after `codex` `retryDelayMs` (up to `maxAttempts`) instead of failing at once; the executor's accepted-message check prevents a second turn for an already admitted message. `commit_unknown` is not retried this way.
+- Realtime Codex event writes hold at most two pool connections per process; further writes wait in order and are not dropped. A streamed agent message rewrites its full text at most every 500 ms per item, and its last text is always written.
+- Group-context bookkeeping after a turn updates by primary key and by `(connection_id, message_id)` separately instead of one `OR` across both keys.
+- History catch-up writes the cursor of an idle conversation once per run instead of twice. A conversation without a cursor still saves its first window before reading it; with a cursor, a restart re-derives the same window start from the unchanged `throughMs`, so skipping the opening write loses no message.
+- The readiness probe sends one statement instead of two.
+
+### Storage diagnostic events
+
+Storage calls that go through `withConnection` (all stores, including Codex session reads) log `operation:"storage_operation"` with `status` `slow` (`code:"storage_operation_slow"`, at least 500 ms) or `failed` (`code:"storage_operation_failed"`). Fast successful calls stay quiet. Each event has a random `operation_id`, the current or failed `stage` (`acquire`, `begin`, `operation`, `commit`, `rollback`), `transaction`, the MySQL `db_connection_id` when known, total `durationMs`, the configured `timeout_ms`, and stage durations `pool_wait_ms`, `begin_ms`, `operation_ms`, `commit_ms`, `rollback_ms`. Durations use a monotonic clock. Per-connection session setup runs once when the pool opens a connection; on a new connection its time is part of the first stage that follows acquisition. `operation_ms` includes all SQL and application work inside the callback; it is not a per-statement server execution timer. `timeout_overshoot_ms` shows how late the JavaScript deadline callback ran. A timeout emits once even if acquisition or COMMIT resolves later. Existing safe error fields remain (`error_class`, `reason`, `error_code`, `errno`, `sql_state`). Each event also carries the current pool and process context (`pool_connections`, `pool_free`, `pool_queued`, `event_loop_delay_max_ms`, `rss_mb`, `host_load1_milli`).
+
+At most 20 detailed operation events per bot are emitted per minute. Suppressed event counts appear in the next snapshot as `diagnostic_suppressed`. `operation:"storage_snapshot"` (`status` `captured`, or `unavailable` when the probe fails) runs every 60 seconds and on a slow or failing operation at most once per 30 seconds, with only one probe in flight. It reports `sample_window_ms`, `event_loop_delay_max_ms` (20 ms sampling resolution), `rss_mb`, `cpu_user_ms`, `cpu_system_ms`, `host_load1_milli`, `pool_connections`, `pool_free`, `pool_queued`, and allowlisted MySQL global counters: `db_threads_connected`, `db_threads_running`, `db_read_requests`, `db_physical_reads`, `db_pending_reads`, `db_pending_writes`, `db_pending_fsyncs`, `db_log_waits`, `db_row_lock_waits`, `db_row_lock_time_ms`, `db_uptime_seconds`. Server counters cover the whole MySQL instance (both bots on a shared server); compare deltas within one uptime epoch, not raw values across restarts. The diagnostic query (`SHOW GLOBAL STATUS`, no extra privilege) has a 1500 ms deadline and does not instrument itself.
+
+Snapshots and operation phases are evidence for narrowing a bottleneck, not proof that a particular SSD or scheduler event caused it. A delayed JavaScript callback can inflate observed client-side SQL/COMMIT time. Correlate operation time, deadline overshoot, event-loop/process load and server counters before attributing a failure. No SQL text, parameters, user content, raw driver errors, stack traces, account names or credentials are included. Observer failures and rate limits never alter the transaction result; shutdown removes diagnostic timers and waits only for the bounded probe already in flight.
+
 ## Business card actions
 
 An interactive-card callback whose `value.action` is `business` is routed directly to the hook named by `value.hook_id` when the callback chat is listed in that hook's `conversationIds`. It does not create a Codex job or enter a Codex thread. Unknown hooks and callbacks from chats outside the configured hook scope are acknowledged with `此群未接入该业务` and are not delivered.
@@ -372,63 +418,4 @@ A lost app-server connection is an unknown observation, not proof that the nativ
 
 Operator checklist: back up the configured database before correcting historical rows; deploy the reviewed 0.2.29 commit; run `npm run check` and `npm test`; use the host supervisor's supported restart lifecycle when no turn is active; verify `/health/ready` and `/health/tasks?window_minutes=120`. Rollback: restore the preceding reviewed application commit through the same lifecycle. No DDL/config migration is required. Historical terminal jobs need a separately audited correction after matching their native turn status; retain job status and business receipts, and never mark an interrupted job completed merely to clear an alert.
 
-### Claim deadlines and recovery
-
-A claim only reserves work; it does not call a hook or send a Feishu message.
-When its COMMIT acknowledgement is lost, the store resolves the original row IDs
-and lease token on a new connection before handing any work to a worker. It
-never retries an arbitrary transaction or interprets an uncertain platform send
-as a safe new send. An unresolved claim stays pending for reconciliation rather
-than being replaced by a new claim. Recovery verifies scope, owner, token and
-lease expiry under row locks.
-
-`storage.claimTimeoutMs` sets the background-claim deadline (default 15000 ms, allowed 1000–30000 ms). The short ingress deadline
-is unchanged. A transient failure uses the capped polling backoff above;
-a persistent database outage remains degraded and continues recovery probes. Idle communication
-polling backs off from 100 ms to 1 second, and returns to 100 ms when a poll claims
-work. Long-running model turns do not keep empty polling at the fast cadence. This bounds idle pickup latency without continuous empty transactions.
-
-Storage diagnostics distinguish `commit_timeout` from `commit_error` and retain
-only safe driver code, numeric errno and SQLSTATE. Raw driver messages, SQL and
-credentials are never logged. Readiness is a component snapshot, not proof that
-a particular user message reached Feishu, entered the bridge, or completed.
-
-On macOS, use `ProcessType=Standard` for the bridge and its local MySQL service.
-`Background` is intended for work that yields to user activity and applies CPU
-and I/O resource restrictions; it is a poor fit for a database serving short
-request deadlines. Keep normal MySQL durability settings. Do not disable flushes
-or drop transaction protection to work around deadline failures.
-
-
-### Storage diagnostic events
-
-All service-owned storage calls using `withConnection` produce a
-`storage_operation` warning when they fail or take at least 500 ms. Fast
-successful calls stay quiet. Each event has a random `operation_id`, current or
-failed `stage`, available MySQL `db_connection_id`, total `durationMs`, configured
-`timeout_ms`, and stage durations (`pool_wait_ms`, `setup_ms`, `begin_ms`,
-`operation_ms`, `commit_ms`, `rollback_ms`). Durations use a monotonic clock.
-`operation_ms` includes all SQL and application work inside the callback; it is
-not a per-statement server execution timer. `timeout_overshoot_ms` shows how late
-the JavaScript deadline callback ran. A timeout emits once even if acquisition
-or COMMIT resolves later. Existing safe error class/code/errno/SQLSTATE remain.
-
-At most 20 detailed operation events per bot are emitted per minute. Suppressed
-event counts appear in the next `storage_snapshot`. Snapshots run every 60 seconds
-and on a slow/failing operation at most once per 30 seconds, with only one probe
-in flight. They include event-loop delay (20 ms sampling resolution), process
-RSS and CPU-time deltas, host load, available pool total/free/queued counts, and
-allowlisted MySQL global counters: running/connected threads, buffer reads,
-pending read/write/fsync, log waits, current row-lock waits, cumulative row-lock
-time and server uptime. Server counters cover the whole MySQL instance; compare
-deltas within one uptime epoch, not raw values across restarts. The diagnostic
-query has a 1500 ms deadline and does not recursively instrument itself.
-
-Snapshots and operation phases are evidence for narrowing a bottleneck, not
-proof that a particular SSD or scheduler event caused it. A delayed JavaScript
-callback can inflate observed client-side SQL/COMMIT time. Correlate operation
-time, deadline overshoot, event-loop/process load and server counters before
-attributing a failure. No SQL text, parameters, user content, raw driver errors,
-stack traces, account names or credentials are included. Observer failures and
-rate limits never alter the transaction result; shutdown removes diagnostic
-timers and waits only for the bounded probe already in flight.
+A resumed turn that Codex already reports interrupted or failed, while its caller has stopped waiting (the lease was lost during shutdown), no longer terminates the process with an unhandled rejection (0.2.30). The turn's terminal error is persisted as before; the next attempt reads it and replies with the existing interrupted or failed message without starting another turn.

@@ -1,6 +1,10 @@
 # Versions and migrations
 
-Application version: `0.2.29`
+Application version: `0.2.30`
+
+Version 0.2.30 adds migration 006 (four secondary indexes, built online; no table, row or existing index changes) and must be migrated before its processes start. The config `schemaVersion` stays 1; the only new key is the optional `storage.claimTimeoutMs` (default 15000 ms, 1000–30000). Transient storage failures now leave the bridge running in a degraded state instead of restarting it. Two instances that share one bridge database run the migration once. See [0.2.30 query indexes and degraded storage](#0230-query-indexes-and-degraded-storage).
+
+Version 0.2.29 does not add a database or configuration migration. It reconciles disconnected Codex turns before classifying them.
 
 Version 0.2.28 does not add a database migration, change the config `schemaVersion`, change storage or add a dependency. It adds the optional, backward-compatible per-group key `routing.groups[].reply` (`mode` `card`/`text`, `ack`, `ackEmoji`); groups without it behave as before. See [0.2.28 group text replies](#0228-group-text-replies).
 
@@ -45,6 +49,25 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.30 query indexes and degraded storage
+
+Migration `006-query-indexes.sql` adds `idx_assistant_codex_events_message`, `idx_forward_status_finished`, `jobs_conversation_open` and `outbox_unknown_recent` with `ALGORITHM=INPLACE, LOCK=NONE`. Reads and writes continue while the indexes build; on the production USB SSD the build can take tens of seconds. The migration waits at most 10 seconds for each table's metadata lock (a long open transaction makes it fail instead of queueing every reader behind it); rerunning it is safe. It skips an index that already exists with the same definition and stops with `schema_version_mismatch` if a same-named index has another definition. 0.2.30 refuses to start until the ledger records version 6, and a 0.2.29 process that is still running reports `store` not ready once version 6 is recorded; its `runtime.unhealthyExitMs` watchdog (30 s by default) then exits it with `runtime_unhealthy`. Behaviour changes are listed in the [changelog](CHANGELOG.md) and [runtime notes](docs/runtime.md#query-indexes-and-polling-cost-0230).
+
+Upgrade (two instances sharing one database; run the migration once, then restart both):
+
+1. Pick an idle window: no Codex turn active on either instance (the last activity in each bridge log is followed by `"operation":"app_server_close","status":"succeeded"`), and no scheduled business job is due in the next few minutes.
+2. 006 changes no rows. Take the routine bridge-schema backup only if the host's DDL policy requires one; rollback does not need it.
+3. Fast-forward the bridge checkout to 0.2.30: `git -C <bridge-dir> fetch origin` and `git -C <bridge-dir> merge --ff-only origin/main`. There is no dependency change. The running processes keep their loaded code until they restart.
+4. For each instance run `node bin/agent-chat-bridge.mjs check-config --config <bridge.json>`; it must log `check_config` `succeeded`.
+5. Run once, with either instance's configuration: `node bin/agent-chat-bridge.mjs migrate --config <bridge.json>`. It must log `migration` `succeeded`. If it fails with `migration_failed` (for example a metadata-lock timeout), wait for the long transaction to finish and run it again.
+6. Immediately restart both instances through the supervisor: `kill -TERM <bridge-pid>` for each (the pids are in the supervisor's `logs/status.json`). Without this step each 0.2.29 process exits about 30 seconds later through its watchdog and restarts unplanned.
+7. Verify each instance: `curl --noproxy '*' -fsS http://127.0.0.1:<port>/health/live` and `/health/ready` return 200; the log has no `schema_version_mismatch`; a `storage_snapshot` line appears within 60 seconds. Optionally confirm `SELECT version FROM bridge_schema_migrations ORDER BY version` returns 1 through 6.
+8. `storage.claimTimeoutMs` is optional. Add it only to change the 15000 ms background-claim deadline, then run `check-config` and restart that instance.
+
+While storage is slow or unavailable, 0.2.30 stays alive with `/health/ready` returning 503 and `degraded` details, and logs `worker_poll_failed` (first failure, then at most every 5 minutes) and `storage_operation` / `storage_snapshot` diagnostics; it no longer restarts after six failed polls. A schema ledger mismatch or a stopped worker still restarts it after `runtime.unhealthyExitMs`.
+
+Rollback to 0.2.29: remove `storage.claimTimeoutMs` from every bridge.json that has it (0.2.29 rejects it with `invalid_storage_fields`) and run `check-config` with the 0.2.29 code; switch the checkout back to the 0.2.29 commit; delete the ledger row with `DELETE FROM bridge_schema_migrations WHERE version = 6;` (0.2.29 accepts only versions 1–5; the four indexes can stay, 0.2.29 does not use them and a later 0.2.30 migration skips them); then restart both instances at once. Do not delete the ledger row while 0.2.30 is running: its readiness would fail and its watchdog would exit it.
 
 ## 0.2.28 group text replies
 

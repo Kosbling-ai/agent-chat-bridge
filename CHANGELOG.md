@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.2.30] - 2026-10-18
+
+Requires database migration 006 before restart (index-only, online). No config `schemaVersion` change, no new dependency or environment variable. One new optional key, `storage.claimTimeoutMs`.
+
+### A. Storage outages degrade instead of restarting the bot (absorbed from the unreleased staging 0.2.26/0.2.27 work)
+
+- Transient storage failures (`store_unavailable`, `store_contention`, `store_timeout`, and claim-stage `commit_unknown`) keep the communication worker running in a visible degraded state with capped exponential backoff (1 s doubling to 30 s) and automatic recovery. The 0.2.12–0.2.29 rule that turned six failures or 30 seconds of failures into an unhealthy worker and a process exit is removed. `worker_poll_failed` is logged on the first failure, on a stage change and then at most every 5 minutes; `worker_recovered` after two successful claim stages. Non-transient storage errors still stop the worker.
+- `/health/ready` reports transient storage problems as not ready (HTTP 503) with `degraded: { store, workers }`; the process stays alive. The `runtime.unhealthyExitMs` watchdog now restarts only for fatal store errors (for example a schema ledger mismatch) and stopped workers. `storage_health` logs `degraded`, `recovered` and `failed` transitions.
+- A claim whose COMMIT acknowledgement is lost is reconciled by its original row IDs and lease token under row locks before any other claim (`storage_claim_recovery` `recovered` / `not_committed` / `empty`). Main's 0.2.24 behaviour (claim-stage `commit_unknown` is retryable) is kept.
+- New optional `storage.claimTimeoutMs`: deadline of the background hook and outbox claims, default 15000 ms, allowed 1000–30000 ms (`invalid_storage_claim_timeout` otherwise); it was 1800 ms. Ingress and all other storage operations keep 1800 ms.
+- Idle communication polling backs off from 100 ms to 1 second and returns to 100 ms after claiming work. On an idle bot new hook and outbox work is picked up within about one second instead of 100 ms.
+- A forward task retries a transient lease-renewal failure until its last confirmed lease ends (`forward_lease` `degraded` / `recovered`) instead of losing the lease on the first failed renewal. A definitive lost or expired lease still interrupts the task.
+- A storage failure after a hook answered 204 or after a Feishu send is no longer turned into an immediate hook retry or delivery-failure record; the durable lease and platform UUID reconcile it.
+- Storage timing diagnostics: `storage_operation` events (`storage_operation_slow` at 500 ms or more, `storage_operation_failed`) with pool wait, BEGIN, operation, COMMIT and rollback durations, deadline overshoot and the MySQL connection ID, at most 20 per minute; `storage_snapshot` every 60 s with event-loop delay, process and host load, pool counts and allowlisted MySQL global counters. No SQL, parameters, content or credentials are logged. Unlike the staging draft there is no `setup_ms`, because session setup no longer runs per operation (see B).
+- `worker_poll_failed` and `storage_health` carry safe `reason`, `error_code`, `errno` and `sql_state` fields. The docs add macOS `ProcessType=Standard` guidance for the bridge and its MySQL.
+
+### B. Indexes, SQL and connection pool
+
+- Migration 006 adds four indexes online: `assistant_codex_events.idx_assistant_codex_events_message`, `assistant_codex_forward_jobs.idx_forward_status_finished`, `bridge_jobs.jobs_conversation_open`, `bridge_outbox.outbox_unknown_recent`. Matching pre-existing indexes are skipped; a same-named index with another definition stops the migration. 0.2.30 does not start before 006 is applied; a still-running 0.2.29 process reports `store` not ready once the ledger records 006.
+- Hook and outbox claims select IDs first and read full rows only for claimed work. Per idle claim tick: 6 statements instead of 9, still 2 transactions, about 0.3 KB instead of 3.5 KB of result data. With the idle backoff an idle bot sends about 6 claim statements per second instead of about 85 (about 8 instead of 90 including the 500 ms readiness probe).
+- The hook-ordering check probes each non-terminal status on `jobs_conversation_open` instead of scanning the conversation's hook history with `NOT IN`. Results are unchanged while the code writes only the 8 known statuses; a test fails when a new status write appears.
+- The outbox claim runs a pending branch and a recent-uncertain branch (`FORCE INDEX (outbox_unknown_recent)`); uncertain sends older than 55 minutes are no longer scanned and locked on every poll. Eligibility and order are unchanged.
+- Expired send leases are reclassified as `unknown` at most every 5 seconds per process (at once after a reconciled claim found its own lease expired), so such a send can be retried up to 5 seconds later than before.
+- `GET /health/tasks` forces `idx_forward_status_finished` and reads only the requested window instead of every failed job.
+- Group-context bookkeeping after a turn (`markForwarded`) uses two unique-key updates instead of one `OR` update that could scan and lock all of the bot's inbound rows.
+- `SET SESSION innodb_lock_wait_timeout = 1` runs once per physical connection instead of before every operation; it now also covers the Codex session store's connections. A connection that arrives only after an operation's deadline is returned to the pool instead of being closed.
+- Codex session reads (binding, accepted-message check, steer events, injection marker, execution-card progress) have the 1800 ms storage deadline. A forward task whose execution hits `store_timeout`, `store_unavailable` or `store_contention` is retried after `retryDelayMs` (up to `maxAttempts`) instead of failing at once with the generic failure reply; `commit_unknown` is not retried this way.
+- Realtime Codex event writes use at most two pool connections per process (others queue in order, none dropped). A streamed agent message rewrites its full text at most every 500 ms per item, and the last text is always written.
+- History catch-up writes an idle conversation's cursor once per run instead of twice; conversations seen for the first time keep the previous behaviour.
+- The readiness probe sends one statement instead of two. The explicit `migrate` command may run up to 15 minutes and waits at most 10 seconds for a metadata lock during 006.
+
+### C. Restart recovery crash
+
+- Resuming a turn that Codex already reports interrupted or failed while the caller has stopped waiting (lease lost during shutdown) no longer exits the process with an unhandled `CODEX_TURN_INTERRUPTED` / `CODEX_TURN_FAILED` rejection (0.2.29 crash). The terminal state is persisted; the next attempt replies with the existing interrupted (`执行已停止。`) or failed message and starts no new turn.
+
+Tests: the integration suites were run one by one on a disposable local MySQL 9.6. Six stale integration tests were aligned with behaviour already on main (writer lock removed in fe674e3, agent jobs no longer created by `acceptInbound` since 46f87d5, MySQL 9.x default `EXPLAIN` format, stricter store and outbound-media inputs); four legacy `src/core/runtime.mjs` suites still fail exactly as on 0.2.29.
+
 ## [0.2.29] - 2026-10-13
 
 - Recover persisted `CODEX_OBSERVATION_LOST` receipts by observing the exact original native turn. A restart no longer turns an unknown observation into a cached `CODEX_TURN_FAILED`. Interrupted turns retain `CODEX_TURN_INTERRUPTED`; completed turns return their original result; active turns are observed without starting, steering or interrupting another turn. Missing or unreadable turns remain retryable/unknown.
