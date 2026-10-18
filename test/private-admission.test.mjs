@@ -446,7 +446,7 @@ test('a failed or empty Store union lookup counts as unknown and is retried afte
 });
 
 test('Store union lookup is read-only, chat-scoped and returns the latest non-empty value', async () => {
-  const migrations = await Promise.all(['001-initial', '002-codex-sessions', '003-forward-runtime', '004-bot-connection', '005-sender-union-id'].map(async (name, index) => ({
+  const migrations = await Promise.all(['001-initial', '002-codex-sessions', '003-forward-runtime', '004-bot-connection', '005-sender-union-id', '006-query-indexes'].map(async (name, index) => ({
     version: index + 1, checksum: createHash('sha256').update(await readFile(new URL(`../src/storage/migrations/${name}.sql`, import.meta.url), 'utf8')).digest('hex') })));
   const executed = []; let rows = [{ sender_union_id: 'on_latest' }];
   const connection = {

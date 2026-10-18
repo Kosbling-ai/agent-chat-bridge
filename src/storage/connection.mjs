@@ -35,8 +35,13 @@ export function createPoolFromEnvironment(references, env = process.env) {
 
 // Deadline owns the actual connection, including late pool acquisition. Never
 // return a timed-out/uncertain transaction to the pool or keep it running there.
-export function withConnection(pool, operation, { timeoutMs = 1800, transaction = false } = {}) {
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > 30000) throw new StoreError('invalid_storage_deadline');
+// Runtime operations are capped at 30 s. `maintenance` is reserved for the
+// explicit operator migration command, whose online index builds may be longer.
+const RUNTIME_DEADLINE_MAX_MS = 30000;
+const MAINTENANCE_DEADLINE_MAX_MS = 15 * 60 * 1000;
+export function withConnection(pool, operation, { timeoutMs = 1800, transaction = false, maintenance = false } = {}) {
+  const maximum = maintenance === true ? MAINTENANCE_DEADLINE_MAX_MS : RUNTIME_DEADLINE_MAX_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 10 || timeoutMs > maximum) throw new StoreError('invalid_storage_deadline');
   const diagnosticsEnabled = isStorageDiagnosticsEnabled(pool);
   return new Promise((resolve, reject) => {
     let connection;
