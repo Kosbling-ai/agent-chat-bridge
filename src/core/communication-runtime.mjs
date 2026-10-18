@@ -38,7 +38,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   // Configured admission must never silently fall back to an open private chat.
   if(config.routing.privateAdmission&&typeof privateAdmission?.check!=='function')throw new Error('private_admission_unavailable');
   const admission=config.routing.privateAdmission?privateAdmission:undefined; const notices=new Set();
-  let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,lastFailureLogAt=0,lastLoggedFailureStage='',wakeWait; const active=new Set(); const processing=new Set(); const successfulClaimStages=new Set();
+  let started=false,stopping=false,healthy=true,worker,degraded=false,degradedSince=0,lastEscalatedLogAt=-Infinity,consecutiveFailures=0,lastFailureLogAt=0,lastLoggedFailureStage='',wakeWait; const active=new Set(); const processing=new Set(); const successfulClaimStages=new Set();
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
   const maxEventAgeMs=Number(config.codex.maxEventAgeMs??10*60*1000);
   const contextLimit=Number(config.codex.groupContextMessageLimit??50);
@@ -272,9 +272,13 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const normalized=databaseError(error);const failedAt=now();consecutiveFailures+=1;successfulClaimStages.clear();
     const transient=TRANSIENT_STORE_ERRORS.has(normalized.code);
     if(!transient){healthy=false;degraded=false;log('error','communication_worker','failed',{code:'worker_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:false});return false;}
+    if(!degraded)degradedSince=failedAt;
     degraded=true;
-    const shouldLog=consecutiveFailures===1||stage!==lastLoggedFailureStage||failedAt-lastFailureLogAt>=DEGRADED_LOG_INTERVAL_MS;
-    if(shouldLog){lastFailureLogAt=failedAt;lastLoggedFailureStage=stage;log('warning','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:true});}
+    // A degradation lasting 5 minutes or more is reported at error level (so
+    // error reporting sees it), still at most once per 5 minutes.
+    const escalate=failedAt-degradedSince>=DEGRADED_LOG_INTERVAL_MS&&failedAt-lastEscalatedLogAt>=DEGRADED_LOG_INTERVAL_MS;
+    const shouldLog=escalate||consecutiveFailures===1||stage!==lastLoggedFailureStage||failedAt-lastFailureLogAt>=DEGRADED_LOG_INTERVAL_MS;
+    if(shouldLog){lastFailureLogAt=failedAt;lastLoggedFailureStage=stage;if(escalate)lastEscalatedLogAt=failedAt;log(escalate?'error':'warning','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:true});}
     return true;
   }
   function launch(operation,stage){const promise=operation.catch(error=>{recordStorageFailure(stage,error);}).finally(()=>active.delete(promise));active.add(promise);}
@@ -283,7 +287,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     successfulClaimStages.add(stage);
     if(successfulClaimStages.size<2)return;
     const recoveredFailures=consecutiveFailures;
-    consecutiveFailures=0;lastFailureLogAt=0;lastLoggedFailureStage='';degraded=false;successfulClaimStages.clear();
+    consecutiveFailures=0;lastFailureLogAt=0;lastLoggedFailureStage='';degraded=false;degradedSince=0;lastEscalatedLogAt=-Infinity;successfulClaimStages.clear();
     log('info','communication_worker','recovered',{code:'worker_recovered',consecutiveFailures:recoveredFailures});
   }
   async function claim(stage,operation){

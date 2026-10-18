@@ -249,7 +249,7 @@ export async function startService({ config, configPath, env = process.env, log,
     // The default pool has already validated this reference. Dependency-injected
     // unit stores may omit database credentials and use this inert identifier.
     const schema=typeof env[config.storage.databaseEnv]==='string'&&env[config.storage.databaseEnv]?env[config.storage.databaseEnv]:'bridge_test';
-    const sessions=pool?.query?factories.sessions({pool,schema,connectionId:config.feishu.connectionId}):{};
+    const sessions=pool?.query?factories.sessions({pool,schema,connectionId:config.feishu.connectionId,claimTimeoutMs:config.storage.claimTimeoutMs,log}):{};
     const jobs=factories.jobs({pool,connectionId:config.feishu.connectionId});
     const inbound=factories.inbound({pool,connectionId:config.feishu.connectionId});
     const allowedGroupChatIds = new Set(config.routing.groups

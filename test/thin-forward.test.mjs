@@ -436,7 +436,10 @@ test('forward runtime uses only its response waiter signal and persists caller r
   const runtime=createForwardRuntime({config:{owner:'owner',pollMs:1,leaseMs:10000},jobs,sessions:{},executor,replies:{readResource:async()=>null},feedback:null,authorize:async()=>true});runtime.start();await flush();await runtime.stop();
   assert.deepEqual(jobs.calls.map(x=>x[0]),['reply_pending','finished']);
   assert.equal(jobs.job.result.rawAnswer,'full machine answer');assert.equal(jobs.job.status,'completed');
-  assert.deepEqual(Object.keys(options[0]),['signal']);
+  // Besides its waiter signal the runtime passes only an observer that records
+  // that the turn is about to be submitted (no resume or other behaviour).
+  assert.deepEqual(Object.keys(options[0]),['signal','onStartIntent']);
+  assert.equal(typeof options[0].onStartIntent,'function');
 });
 
 test('a new unconfirmed native outcome follows the ordinary failed reply path',async()=>{
@@ -970,7 +973,7 @@ test('usage exhaustion sends one failed reply and never automatically replays, i
 });
 
 for (const [code, retried] of [['store_unavailable', true], ['store_contention', true], ['store_timeout', true], ['commit_unknown', false]]) {
-  test(`a ${code} storage failure during execution ${retried ? 'retries the task' : 'is not retried'}`, async () => {
+  test(`a ${code} storage failure before the turn is submitted ${retried ? 'retries the task' : 'is not retried'}`, async () => {
     const clock = 10_000;
     const job = {
       id: `store-${code}`, callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: `store-${code}`,
@@ -1004,3 +1007,90 @@ for (const [code, retried] of [['store_unavailable', true], ['store_contention',
     if (retried) assert.equal(retries[0].errorCode, code);
   });
 }
+
+test('a storage failure after the turn completed replies with the failure and never runs the turn again', async () => {
+  let clock = 10_000;
+  const job = {
+    id: 'store-after-turn', callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: 'store-after-turn',
+    senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+    attempts: 0, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const retries = [];
+  const replies = [];
+  let replyPendingCalls = 0;
+  const jobs = {
+    async claimReplyPending() { return []; },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async markRetry(input) { retries.push(input); Object.assign(job, { status: 'pending', nextAttemptAt: input.nextAttemptAt, leaseOwner: '' }); },
+    async markReplyPending({ result, errorCode }) {
+      replyPendingCalls += 1;
+      // The completed answer cannot be recorded: the database is slow.
+      if (replyPendingCalls === 1) throw new StoreError('store_timeout');
+      replies.push({ result, errorCode });
+      Object.assign(job, { status: 'reply_pending', result });
+    },
+  };
+  const executions = [];
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {},
+    executor: { async execute(input, options) {
+      executions.push(input.messageId);
+      await options.onStartIntent?.({ threadId: 'thread-1', messageId: input.messageId, startedAt: clock });
+      return { threadId: 'thread-1', turnId: 'turn-1', answer: 'done', rawAnswer: 'done', attachments: [] };
+    } },
+    replies: {}, now: () => clock,
+  });
+  runtime.start();
+  await flush();
+  for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
+  // Even after the retry delay has passed, nothing claims the job for another execution.
+  clock += 120_000;
+  await flush();
+  await runtime.stop();
+  assert.deepEqual(executions, ['store-after-turn']);
+  assert.equal(retries.length, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].result.failed, true);
+  assert.equal(replies[0].errorCode, 'store_timeout');
+});
+
+test('a storage failure after the turn was submitted is not retried even if execute rejects', async () => {
+  const clock = 10_000;
+  const job = {
+    id: 'store-after-admission', callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: 'store-after-admission',
+    senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+    attempts: 0, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const retries = [];
+  let finalResults = 0;
+  const jobs = {
+    async claimReplyPending() { return []; },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async markRetry(input) { retries.push(input); Object.assign(job, { status: 'pending', nextAttemptAt: input.nextAttemptAt, leaseOwner: '' }); },
+    async markReplyPending({ result }) { finalResults += 1; Object.assign(job, { status: 'reply_pending', result }); },
+  };
+  let executions = 0;
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {},
+    // The turn was submitted, then persisting its final receipt failed inside execute().
+    executor: { async execute(input, options) { executions += 1; await options.onStartIntent?.({}); throw new StoreError('store_unavailable'); } },
+    replies: {}, now: () => clock,
+  });
+  runtime.start();
+  await flush();
+  for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
+  await runtime.stop();
+  assert.equal(executions, 1);
+  assert.equal(retries.length, 0);
+  assert.equal(finalResults, 1);
+});

@@ -27,7 +27,10 @@ const STORAGE_METRICS = {
   "dbLogWaits": "db_log_waits",
   "dbRowLockWaits": "db_row_lock_waits",
   "dbRowLockTimeMs": "db_row_lock_time_ms",
-  "dbUptimeSeconds": "db_uptime_seconds"
+  "dbUptimeSeconds": "db_uptime_seconds",
+  "droppedEvents": "dropped_events",
+  "droppedEventsTotal": "dropped_events_total",
+  "queuedEvents": "queued_events"
 };
 
 // Only fixed lifecycle fields are accepted; never serialize config, requests,
@@ -40,7 +43,7 @@ export function safeObserver(callback = () => {}) {
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
   return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, windowMinutes, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
     hookId, eventId, eventType, scopePrefix, statusCode, platformCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
-    decision, cached, openId, permissionProfile, activePermissionProfile, component: eventComponent, transaction, ...diagnostics } = {}) => {
+    decision, cached, openId, permissionProfile, activePermissionProfile, component: eventComponent, transaction, version, applied, ...diagnostics } = {}) => {
     const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
     const boundedInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
     const storageMetrics = {};
@@ -88,6 +91,9 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       ...(identifier(permissionProfile, 128) !== undefined ? { permissionProfile } : {}),
       ...(identifier(activePermissionProfile, 128) !== undefined ? { activePermissionProfile } : {}),
       ...(typeof transaction === 'boolean' ? { transaction } : {}),
+      // Schema migration result: ledger version and whether a migration was applied.
+      ...(boundedInteger(version, 1, 1_000_000) !== undefined ? { version } : {}),
+      ...(typeof applied === 'boolean' ? { applied } : {}),
       ...storageMetrics,
     };
     stream.write(`${JSON.stringify(event)}\n`);

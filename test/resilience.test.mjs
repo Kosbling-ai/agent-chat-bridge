@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createDeltaCoalescer } from '../src/agents/codex/executor.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createLogger } from '../src/logger.mjs';
-import { StoreError } from '../src/storage/errors.mjs';
+import { DETERMINISTIC_DRIVER_ERRORS, StoreError, databaseError } from '../src/storage/errors.mjs';
 import { createExecutorLogAdapter } from '../src/service.mjs';
 
 const config = {
@@ -225,6 +225,69 @@ test('communication poll logs persistent degradation periodically without stoppi
   assert.equal(logs.length, 2);
   assert.deepEqual(logs.map(entry => entry[3].consecutiveFailures), [1, 11]);
   await runtime.stop();
+});
+
+test('a degradation lasting 5 minutes is logged at error level, still at most once per 5 minutes', async () => {
+  let clock = 0;
+  let claims = 0;
+  const logs = [];
+  let blocked = false;
+  const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() { claims += 1; throw new StoreError('store_unavailable'); },
+      async claimOutbox() { return []; },
+    },
+    wait: async () => { clock += 30000; if (claims === 41) { blocked = true; await new Promise(() => {}); } },
+  });
+  runtime.start();
+  while (!blocked) await immediate();
+  // t=0 warning; t=5, 10, 15 and 20 minutes error-level, nothing in between.
+  assert.deepEqual(logs.map(entry => [entry[0], entry[3].consecutiveFailures]),
+    [['warning', 1], ['error', 11], ['error', 21], ['error', 31], ['error', 41]]);
+  assert.ok(logs.every(entry => entry[3].code === 'worker_poll_failed' && entry[3].willRetry === true));
+  assert.equal(runtime.status().healthy, true);
+  await runtime.stop();
+});
+
+test('deterministic driver errors are non-transient store_invalid and stop the communication worker', async () => {
+  for (const code of ['ER_PARSE_ERROR', 'ER_BAD_FIELD_ERROR', 'ER_NO_SUCH_TABLE', 'ER_KEY_DOES_NOT_EXITS', 'ER_ACCESS_DENIED_ERROR',
+    'ER_DBACCESS_DENIED_ERROR', 'ER_TABLEACCESS_DENIED_ERROR', 'ER_WRONG_VALUE_COUNT_ON_ROW', 'ER_BAD_NULL_ERROR', 'ER_DATA_TOO_LONG']) {
+    assert.ok(DETERMINISTIC_DRIVER_ERRORS.has(code), code);
+    const normalized = databaseError(Object.assign(new Error('hidden'), { code, errno: 1, sqlState: '42000' }));
+    assert.equal(normalized.code, 'store_invalid', code);
+    assert.equal(normalized.errorCode, code);
+  }
+  assert.equal(databaseError(Object.assign(new Error('x'), { code: 'ER_LOCK_WAIT_TIMEOUT' })).code, 'store_contention');
+  assert.equal(databaseError(Object.assign(new Error('x'), { code: 'ECONNRESET' })).code, 'store_unavailable');
+  assert.equal(databaseError(new TypeError('x')).code, 'store_unavailable');
+  const logs = [];
+  const runtime = createCommunicationRuntime({ config, chat: {}, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() { throw Object.assign(new Error('hidden'), { code: 'ER_KEY_DOES_NOT_EXITS', errno: 1176, sqlState: '42000' }); },
+      async claimOutbox() { return []; },
+    }, wait: async () => {},
+  });
+  runtime.start();
+  while (runtime.status().running) await immediate();
+  assert.equal(runtime.status().healthy, false);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][0], 'error');
+  assert.equal(logs[0][3].code, 'worker_failed');
+  assert.equal(logs[0][3].errorClass, 'store_invalid');
+  assert.equal(logs[0][3].errorCode, 'ER_KEY_DOES_NOT_EXITS');
+  assert.equal(logs[0][3].willRetry, false);
+  await runtime.stop();
+});
+
+test('logger records the migration result fields', () => {
+  const events = [];
+  const log = createLogger({ write: value => events.push(JSON.parse(value)) });
+  log('info', 'migration', 'succeeded', { version: 6, applied: true });
+  log('info', 'migration', 'succeeded', { version: 6, applied: false });
+  log('info', 'migration', 'succeeded', { version: 'six', applied: 'yes' });
+  assert.deepEqual(events.map(event => [event.version, event.applied]), [[6, true], [6, false], [undefined, undefined]]);
+  log('warning', 'codex_event_write', 'dropped', { code: 'codex_event_queue_full', droppedEvents: 3, droppedEventsTotal: 9, queuedEvents: 201 });
+  assert.deepEqual([events[3].dropped_events, events[3].dropped_events_total, events[3].queued_events], [3, 9, 201]);
 });
 
 test('communication poll stop interrupts a retry backoff', async () => {

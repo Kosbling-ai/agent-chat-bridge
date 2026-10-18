@@ -13,6 +13,13 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  assert.equal((await migrate(pool)).applied,true);assert.equal((await migrate(pool)).applied,false);
  let clock=Date.now();const store=await createMysqlStore({connectionId:'c',pool,now:()=>clock,onWriterLost:async()=>{throw new Error('synthetic observer failure');}});
  try{
+ // Session setup runs once per physical connection (pool 'connection' event): every
+ // pooled connection, including ones opened concurrently, has the 1 s row-lock wait.
+ const held=await Promise.all(Array.from({length:4},()=>pool.getConnection()));
+ try{for(const c of held){const [[row]]=await c.query('SELECT @@SESSION.innodb_lock_wait_timeout AS wait');assert.equal(Number(row.wait),1);}}
+ finally{for(const c of held)c.release();}
+ const [[viaPool]]=await pool.query('SELECT @@SESSION.innodb_lock_wait_timeout AS wait');assert.equal(Number(viaPool.wait),1);
+ assert.equal(await withConnection(pool,async c=>Number((await c.query('SELECT @@SESSION.innodb_lock_wait_timeout AS wait'))[0][0].wait)),1);
  // fe674e3 removed the advisory writer lock: a second store on the same bot opens normally.
  const second=createPoolFromEnvironment(refs);await (await createMysqlStore({connectionId:'c',pool:second})).close();
  // Hold the first registration COMMIT while a second registration is in flight.

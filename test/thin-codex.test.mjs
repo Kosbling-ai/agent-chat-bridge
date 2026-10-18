@@ -779,30 +779,131 @@ test('session store uses injected schema and public progress exact identity filt
   assert.equal(released, 2);
 });
 
-test('session store bounds concurrent realtime event writes without dropping any', async () => {
-  let active = 0, peak = 0;
-  const written = [];
-  const gates = [];
-  const pool = {
+function gatedSessionPool() {
+  const state = { active: 0, peak: 0, written: [], gates: [], released: 0 };
+  const connection = {
     async query(sql, params) {
-      active += 1; peak = Math.max(peak, active);
-      await new Promise(resolve => gates.push(resolve));
-      written.push(params[5]); active -= 1;
+      state.active += 1; state.peak = Math.max(state.peak, state.active);
+      await new Promise(resolve => state.gates.push(resolve));
+      state.written.push(params[5]); state.active -= 1;
       return [[]];
     },
-    async getConnection() { throw new Error('unused'); },
+    release() { state.released += 1; }, destroy() {},
   };
+  // Writes run through withConnection (deadline + normalized errors), never raw pool.query.
+  const pool = { async query() { throw new Error('writes must use the storage deadline'); }, async getConnection() { return connection; } };
+  return { pool, state };
+}
+async function drainGates(state, settled) {
+  while (!settled()) {
+    if (state.gates.length) state.gates.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+test('session store bounds concurrent realtime event writes and keeps their order', async () => {
+  const { pool, state } = gatedSessionPool();
   const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7 });
   const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
-  const writes = Array.from({ length: 6 }, (_, index) => store.saveCodexRealtimeEvent(binding, { eventKey: `event-${index}`, eventType: 'public_progress' }));
+  const writes = Array.from({ length: 6 }, (_, index) => store.saveCodexRealtimeEvent(binding, { eventKey: `item:turn:${index}`, eventType: 'agent_message' }));
   for (let index = 0; index < 6; index += 1) {
-    while (gates.length === 0) await new Promise(resolve => setImmediate(resolve));
-    assert.ok(active <= 2);
-    gates.shift()();
+    while (state.gates.length === 0) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(state.active <= 2);
+    state.gates.shift()();
   }
   await Promise.all(writes);
-  assert.equal(peak, 2);
-  assert.deepEqual(written, ['event-0', 'event-1', 'event-2', 'event-3', 'event-4', 'event-5']);
+  assert.equal(state.peak, 2);
+  assert.deepEqual(state.written, [0, 1, 2, 3, 4, 5].map(index => `item:turn:${index}`));
+  assert.equal(state.released, 6);
+});
+
+test('session store drops only the oldest best-effort events beyond 200 queued and never drops receipts', async () => {
+  const { pool, state } = gatedSessionPool();
+  const logs = [];
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, log: (...entry) => logs.push(entry) });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'public_progress' });
+  const writes = [save('item:turn:held-1'), save('item:turn:held-2')];
+  while (state.active < 2) await new Promise(resolve => setImmediate(resolve));
+  writes.push(save('assistant-final:m'), save('user:m'), save('user-steer-confirmed:m'));
+  for (let index = 0; index < 205; index += 1) writes.push(save(index % 2 ? `agent-delta:turn:${index}` : `public:turn:${index}`));
+  writes.push(save('error:m'));
+  let done = 0;
+  for (const write of writes) write.then(() => { done += 1; });
+  await drainGates(state, () => done === writes.length);
+  const dropped = Array.from({ length: 5 }, (_, index) => index % 2 ? `agent-delta:turn:${index}` : `public:turn:${index}`);
+  for (const key of dropped) assert.equal(state.written.includes(key), false, key);
+  for (const key of ['assistant-final:m', 'user:m', 'user-steer-confirmed:m', 'error:m', 'public:turn:6', 'agent-delta:turn:203']) assert.ok(state.written.includes(key), key);
+  assert.equal(state.written.length, writes.length - 5);
+  assert.equal(state.peak, 2);
+  // Rate-limited: the first drop is logged at once, later ones are counted for the next log.
+  assert.equal(logs.length, 1);
+  assert.deepEqual(logs[0].slice(0, 3), ['warning', 'codex_event_write', 'dropped']);
+  assert.equal(logs[0][3].code, 'codex_event_queue_full');
+  assert.equal(logs[0][3].droppedEvents, 1);
+  assert.equal(logs[0][3].droppedEventsTotal, 1);
+});
+
+test('session store writes have a deadline that frees the slot and normalize driver errors', async () => {
+  let calls = 0;
+  const connection = {
+    async query(sql, params) {
+      calls += 1;
+      if (params[5] === 'item:turn:locked') throw Object.assign(new Error('hidden'), { code: 'ER_LOCK_WAIT_TIMEOUT', errno: 1205, sqlState: 'HY000' });
+      if (String(params[5]).startsWith('item:turn:hung')) return new Promise(() => {});
+      return [[]];
+    },
+    release() {}, destroy() {},
+  };
+  const pool = { async query() { throw new Error('unused'); }, async getConnection() { return connection; } };
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, writeTimeoutMs: 30 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'agent_message' });
+  await assert.rejects(save('item:turn:locked'), { code: 'store_contention', errorCode: 'ER_LOCK_WAIT_TIMEOUT' });
+  // Two hung writes hold both slots only until their deadline; the queued receipt then runs.
+  const hung = [save('item:turn:hung-1'), save('item:turn:hung-2')];
+  const receipt = save('assistant-final:m');
+  for (const write of hung) await assert.rejects(write, { code: 'store_timeout' });
+  await receipt;
+  assert.equal(calls, 4);
+  // params[5] of the binding upsert is thread_name.
+  await assert.rejects(store.saveCodexBinding({ feishuOpenId: 'actor', chatId: 'chat', codexSessionId: 'thread', threadName: 'item:turn:hung-3' }), { code: 'store_timeout' });
+});
+
+test('session admission reads fail with store_timeout instead of returning null', async () => {
+  const pool = { async query() { throw new Error('unused'); }, getConnection: () => new Promise(() => {}) };
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, claimTimeoutMs: 20 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  await assert.rejects(store.loadBinding({ feishuOpenId: 'actor', chatId: 'chat' }), { code: 'store_timeout' });
+  await assert.rejects(store.findAcceptedMessageEvent(binding, 'message'), { code: 'store_timeout' });
+  await assert.rejects(store.loadSteerEvents(binding, 'message'), { code: 'store_timeout' });
+  await assert.rejects(store.loadCodexEvent(binding, 'injection:system-preamble'), { code: 'store_timeout' });
+  assert.throws(() => createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', claimTimeoutMs: 60_000 }), { code: 'invalid_storage_deadline' });
+  // Execution-card progress polling keeps its own short 1800 ms deadline.
+  const progress = store.readPublicProgress({ binding, threadId: 'thread', messageId: 'message' });
+  progress.catch(() => {});
+  assert.equal(await Promise.race([progress.then(() => 'settled', () => 'settled'), new Promise(resolve => setTimeout(() => resolve('pending'), 200))]), 'pending');
+  await assert.rejects(progress, { code: 'store_timeout' });
+});
+
+test('a session read that times out propagates and never starts a second turn', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-session-timeout-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const store = memoryStore();
+  const runtime = fakeRuntime();
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'timeout-job', prompt: 'work' };
+  await executor.execute(input);
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+  // Remove the receipt so only the failing lookup stands between a retry and a second turn.
+  store.events.splice(0, store.events.length);
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  store.findAcceptedMessageEvent = async () => { throw new StoreError('store_timeout'); };
+  await assert.rejects(executor.execute(input), { code: 'store_timeout' });
+  store.loadBinding = async () => { throw new StoreError('store_timeout'); };
+  await assert.rejects(executor.execute({ ...input, messageId: 'timeout-job-2' }), { code: 'store_timeout' });
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
 });
 
 test('migration contains only the two first-ticket production tables', async () => {

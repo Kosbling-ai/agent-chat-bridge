@@ -75,3 +75,45 @@ test('real MySQL multipart order survives concurrent claims, restart, unknown an
     assert.deepEqual(await claim(), []);
   } finally { await store.close(); }
 });
+
+test('real MySQL outbox claim merges its pending and recent-unknown branches by created_at under one LIMIT', {
+  skip: !process.env.BRIDGE_TEST_PASSWORD, timeout: 30000,
+}, async () => {
+  const pool = createPoolFromEnvironment(refs);
+  await migrate(pool);
+  const clock = 1_800_000_000_000;
+  const { randomUUID } = await import('node:crypto');
+  // Both branches have eligible rows at once: one pending, one uncertain send of
+  // an eligible kind first attempted within the last 55 minutes.
+  async function seed(connectionId, pendingCreatedAt, unknownCreatedAt) {
+    const rows = [
+      [randomUUID(), connectionId, 'chat', `${connectionId}:pending`, 'reply', '0'.repeat(64), '{}', randomUUID(), 'pending', null, clock - 1000, pendingCreatedAt, clock],
+      [randomUUID(), connectionId, 'chat', `${connectionId}:unknown`, 'reply', '0'.repeat(64), '{}', randomUUID(), 'unknown', clock - 60_000, clock - 1000, unknownCreatedAt, clock],
+    ];
+    await pool.query(`INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,platform_uuid,status,first_attempt_at,next_attempt_at,created_at,updated_at) VALUES ?`, [rows]);
+    return { pending: rows[0][0], unknown: rows[1][0] };
+  }
+  const stores = [];
+  try {
+    for (const [connectionId, pendingCreatedAt, unknownCreatedAt] of [['union-unknown-first', clock - 5000, clock - 9000], ['union-pending-first', clock - 9000, clock - 5000]]) {
+      const ids = await seed(connectionId, pendingCreatedAt, unknownCreatedAt);
+      const store = await createMysqlStore({ connectionId, pool, now: () => clock });
+      stores.push(store);
+      const order = pendingCreatedAt < unknownCreatedAt ? [ids.pending, ids.unknown] : [ids.unknown, ids.pending];
+      const first = await store.claimOutbox({ owner: 'worker', limit: 1, leaseMs: 60_000 });
+      assert.equal(first.length, 1, connectionId);
+      assert.equal(first[0].id, order[0], connectionId);
+      const second = await store.claimOutbox({ owner: 'worker', limit: 1, leaseMs: 60_000 });
+      assert.deepEqual(second.map(row => row.id), [order[1]], connectionId);
+      assert.deepEqual(await store.claimOutbox({ owner: 'worker', limit: 1, leaseMs: 60_000 }), []);
+    }
+    // With limit 2, both come back from one claim in created_at order.
+    const ids = await seed('union-limit-two', clock - 9000, clock - 5000);
+    const store = await createMysqlStore({ connectionId: 'union-limit-two', pool, now: () => clock });
+    stores.push(store);
+    assert.deepEqual((await store.claimOutbox({ owner: 'worker', limit: 2, leaseMs: 60_000 })).map(row => row.id), [ids.pending, ids.unknown]);
+  } finally {
+    // close() also ends the shared pool; close it once.
+    if (stores.length) await stores[0].close(); else await pool.end();
+  }
+});
