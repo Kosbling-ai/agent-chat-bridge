@@ -1,6 +1,15 @@
 # Versions and migrations
 
-Application version: `0.2.30`
+Application version: `0.2.31`
+
+## 0.2.31 business-card form transport
+
+No additional database migration, configuration change, dependency change or business policy beyond 0.2.30. When upgrading from 0.2.29 or earlier, apply migration 006 and follow the 0.2.30 checklist below before starting 0.2.31. Existing durable JSON payloads gain optional `formValue`. Field validation, actor authorization, card-version checks and business processing remain the hook consumer's responsibility; the bridge acknowledgement confirms registration only.
+
+1. Run `npm test`, `npm run check` and `npm run version:check` in the release checkout.
+2. Deploy the reviewed release through the instance supervisor's supported restart lifecycle; do not start a second WebSocket owner. Confirm database connectivity and readiness before acceptance.
+3. Submit a synthetic form against an authorized hook and verify durable event form values, actor/message identity, consumer receipt and exact-replay deduplication. Verify a registration failure does not show success. Never use a real business decision as a smoke test.
+4. Roll back via the supervisor to 0.2.30 if needed; no stored-state reversal is required. Old consumers may ignore the optional field; roll back any dependent feedback UI with the bridge so submissions are not silently dropped.
 
 Version 0.2.30 adds migration 006 (four secondary indexes, built online; no table, row or existing index changes) and must be migrated before its processes start. The config `schemaVersion` stays 1; the only new key is the optional `storage.claimTimeoutMs` (default 15000 ms, 1000–30000). Transient storage failures now leave the bridge running in a degraded state instead of restarting it. Two instances that share one bridge database run the migration once. See [0.2.30 query indexes and degraded storage](#0230-query-indexes-and-degraded-storage).
 

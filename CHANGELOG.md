@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.31] - 2026-10-18
+
+- Forward native `action.form_value` as optional normalized `event.formValue` to business hooks. Accept JSON objects up to 32 KiB, 256 nodes and depth 6; reject invalid data without ingestion. No form text is added to logs.
+- Include canonical form content in fallback event identities while preserving old identities for events without forms. Provider event IDs remain authoritative.
+- For `kind: feedback`, acknowledge only durable registration, explicitly pending validation and processing; registration failure or timeout never claims success. Adapter-level business errors/timeouts use submission wording instead of stop-request wording. Existing action toasts remain unchanged.
+
+This release includes 0.2.30 storage recovery and query indexes; migration 006 is still required when upgrading from 0.2.29 or earlier. No additional migration beyond 0.2.30.
+
 ## [0.2.30] - 2026-10-18
 
 Requires database migration 006 before restart (index-only, online). No config `schemaVersion` change, no new dependency or environment variable. One new optional key, `storage.claimTimeoutMs`.

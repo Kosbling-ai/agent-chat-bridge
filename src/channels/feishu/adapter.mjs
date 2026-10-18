@@ -76,13 +76,14 @@ export function createFeishuAdapter({ sdk, wsClient, connectionId, botOpenId = '
     if (state === 'stopped') throw new FeishuIngressError('feishu_stopped');
     if (typeof onCardAction !== 'function') return {};
     let timer;
+    const business = payload?.action?.value?.action === 'business';
     try {
       return await Promise.race([
         Promise.resolve().then(() => onCardAction(payload)),
-        new Promise(resolve => { timer = setTimeout(() => resolve({ toast: { type: 'info', content: '正在确认停止请求，请稍后查看卡片' } }), 2500); }),
+        new Promise(resolve => { timer = setTimeout(() => resolve({ toast: { type: 'info', content: business ? '暂未确认提交成功，请稍后查看卡片后重试' : '正在确认停止请求，请稍后查看卡片' } }), 2500); }),
       ]);
     } catch {
-      return { toast: { type: 'error', content: '暂未确认停止，请稍后重试' } };
+      return { toast: { type: 'error', content: business ? '暂未确认提交成功，请稍后重试' : '暂未确认停止，请稍后重试' } };
     } finally { clearTimeout(timer); }
   }
   const dispatcher = new sdk.EventDispatcher({}).register({
