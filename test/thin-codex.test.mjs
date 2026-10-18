@@ -906,6 +906,135 @@ test('a session read that times out propagates and never starts a second turn', 
   assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
 });
 
+test('a released write slot goes to the oldest receipt first; only best-effort events are dropped, and the counter does not drift', async () => {
+  const { pool, state } = gatedSessionPool();
+  const logs = [];
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, log: (...entry) => logs.push(entry) });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'public_progress' });
+  const holdBoth = async (prefix) => {
+    const held = [save(`item:${prefix}:hold-1`), save(`item:${prefix}:hold-2`)];
+    while (state.active < 2) await new Promise(resolve => setImmediate(resolve));
+    return held;
+  };
+  // Phase 1: 200 best-effort writes, then a receipt, then one more best-effort write.
+  const writes = await holdBoth('one');
+  for (let index = 0; index < 200; index += 1) writes.push(save(`public:turn:${index}`));
+  writes.push(save('assistant-final:m'));
+  writes.push(save('public:turn:200'));
+  let done = 0;
+  for (const write of writes) write.then(() => { done += 1; });
+  await drainGates(state, () => done === writes.length);
+  // The 201st queued best-effort write dropped the oldest best-effort one, never the receipt.
+  assert.equal(state.written.includes('public:turn:0'), false);
+  assert.ok(state.written.includes('public:turn:200'));
+  // The receipt took the first released slot, ahead of all queued progress.
+  assert.equal(state.written.indexOf('assistant-final:m'), 2);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][3].droppedEventsTotal, 1);
+  // Phase 2: after draining, nothing is queued; a new best-effort write and a
+  // receipt behind it are both written and nothing more is dropped.
+  const second = await holdBoth('two');
+  second.push(save('public:turn:after-drain'), save('error:m'));
+  let secondDone = 0;
+  for (const write of second) write.then(() => { secondDone += 1; });
+  await drainGates(state, () => secondDone === second.length);
+  assert.ok(state.written.includes('public:turn:after-drain'));
+  assert.ok(state.written.includes('error:m'));
+  assert.ok(state.written.indexOf('error:m') < state.written.indexOf('public:turn:after-drain'));
+  assert.equal(logs.length, 1);
+  assert.equal(state.peak, 2);
+});
+
+test('a completed answer is returned and logged when its receipt and binding touch cannot be stored', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-final-receipt-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  const store = memoryStore();
+  const save = store.saveCodexRealtimeEvent;
+  store.saveCodexRealtimeEvent = async (binding, event) => {
+    if (String(event.eventKey).startsWith('assistant-final:')) throw new StoreError('store_timeout');
+    return save(binding, event);
+  };
+  store.touchCodexBinding = async () => { throw new StoreError('store_contention'); };
+  const logs = [];
+  const runtime = fakeRuntime();
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, log: (level, detail) => logs.push([level, detail]) });
+  t.after(() => executor.close());
+  const result = await executor.execute({ bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'final-receipt', prompt: 'work' });
+  assert.equal(result.answer, 'answer turn-1');
+  const failures = logs.filter(([, detail]) => detail.operation === 'persist_final_answer');
+  assert.deepEqual(failures.map(([level, detail]) => [level, detail.status, detail.stage, detail.errorClass]),
+    [['warning', 'failed', 'event', 'store_timeout'], ['warning', 'failed', 'touch', 'store_contention']]);
+  assert.equal(store.events.some(row => row.event_key.startsWith('assistant-final:')), false);
+});
+
+test('a takeover of a still-running turn signals submission, so a later storage failure is not retried', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-takeover-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  const store = memoryStore();
+  const runtime = fakeRuntime({ completeStarts: false });
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'takeover-job', prompt: 'work' };
+  // Attempt 1 submits the turn, then stops waiting (its lease was lost).
+  const controller = new AbortController();
+  const first = executor.execute(input, { signal: controller.signal });
+  while (executor.status().activeTurns !== 1) await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(first, { code: 'CODEX_WAIT_ABORTED' });
+  let clock = 10_000;
+  const job = {
+    id: 'takeover-run', callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: 'takeover-job',
+    senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+    attempts: 1, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const retries = [];
+  const replies = [];
+  let replyPendingCalls = 0;
+  const jobs = {
+    async claimReplyPending() { return []; },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async markRetry(value) { retries.push(value); Object.assign(job, { status: 'pending', nextAttemptAt: value.nextAttemptAt, leaseOwner: '' }); },
+    async markReplyPending({ result }) {
+      replyPendingCalls += 1;
+      if (replyPendingCalls === 1) throw new StoreError('store_timeout');
+      replies.push(result);
+      Object.assign(job, { status: 'reply_pending', result });
+    },
+  };
+  const intents = [];
+  const forward = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {}, replies: {}, now: () => clock,
+    executor: { execute: (value, options) => executor.execute(value, { ...options, onStartIntent: intent => { intents.push(intent); return options.onStartIntent?.(intent); } }) },
+  });
+  // Attempt 2 (the forward runtime) attaches to the running turn, which then completes.
+  forward.start();
+  const until = async (condition) => { for (let i = 0; i < 1000 && !condition(); i += 1) await new Promise(resolve => setTimeout(resolve, 2)); };
+  await until(() => intents.length > 0 || executor.status().activeTurns === 0);
+  // The attempt must have attached to the running turn (no new turn) and signalled it.
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+  if (!intents.length) { await forward.stop(); assert.fail('takeover did not signal submission'); }
+  assert.equal(intents[0].takeover, true);
+  assert.equal(intents[0].messageId, 'takeover-job');
+  runtime.children[0].send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1',
+    turn: { id: 'turn-1', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'done once' }] } } });
+  await until(() => replies.length > 0 || retries.length > 0);
+  clock += 120_000;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await forward.stop();
+  assert.equal(retries.length, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].failed, true);
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+});
+
 test('migration contains only the two first-ticket production tables', async () => {
   const { readFile } = await import('node:fs/promises');
   const sql = await readFile(new URL('../src/storage/migrations/002-codex-sessions.sql', import.meta.url), 'utf8');
@@ -1058,16 +1187,19 @@ test('binding remains occupied through shared final persistence and cannot be ro
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
-test('successful finalization requires the binding touch and releases the binding', async () => {
+test('a failed binding touch after a completed turn still returns the answer and releases the binding', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
     const store = memoryStore();
     store.touchCodexBinding = async () => { throw new Error('synthetic session touch failure'); };
     const runtime = fakeRuntime();
-    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    const logs = [];
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, log: (level, detail) => logs.push([level, detail]) });
     const input = { bindingOpenId: 'system:x', chatId: 'chat', chatType: 'group', messageId: 'job', prompt: 'work', busyPolicy: 'reject' };
     const one = executor.execute(input); const two = executor.execute(input);
-    await assert.rejects(one, /synthetic session touch failure/);
+    // 0.2.30: the turn ran, so its answer is delivered; the touch failure is only logged.
+    assert.equal((await one).answer, 'answer turn-1');
+    assert.ok(logs.some(([level, detail]) => level === 'warning' && detail.operation === 'persist_final_answer' && detail.stage === 'touch'));
     assert.equal((await two).deferred, true);
     while (executor.status().activeTurns) await new Promise((resolve) => setImmediate(resolve));
     assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 1);

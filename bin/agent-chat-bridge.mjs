@@ -8,8 +8,9 @@ import { checkGroupInstructions } from '../src/core/group-instructions.mjs';
 import { checkGroupCodexWorkspaces } from '../src/agents/codex/workspace.mjs';
 
 const SAFE_MIGRATION_CODES = new Set(['legacy_connection_id_required', 'legacy_connection_id_mismatch', 'invalid_legacy_connection_id', 'writer_busy', 'migration_busy', 'schema_version_mismatch',
-  // Normalized storage failures, e.g. a metadata-lock wait timeout during an online index build (store_contention).
-  'store_contention', 'store_timeout', 'store_unavailable']);
+  // Normalized storage failures, e.g. a metadata-lock wait timeout during an online index build (store_contention),
+  // or a deterministic error such as a missing ALTER/INDEX privilege (store_invalid).
+  'store_contention', 'store_timeout', 'store_unavailable', 'store_invalid']);
 const HELP = `agent-chat-bridge
 
 Usage:

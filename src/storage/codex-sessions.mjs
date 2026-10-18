@@ -79,11 +79,14 @@ export function createCodexSessionStore({ pool, schema, connectionId, now = Date
       }
     });
   };
-  // Hand the slot straight to the oldest waiter so the bound is never exceeded.
-  // The write deadline guarantees every slot is released.
+  // Hand the slot straight to a waiter so the bound is never exceeded: the
+  // oldest non-best-effort write (receipts, user:, user-steer-*, item:, ...)
+  // first, otherwise the oldest best-effort one, so receipts never wait behind
+  // queued progress. The write deadline guarantees every slot is released.
   const releaseEventWrite = () => {
-    const next = eventWriteQueue.shift();
-    if (!next) { eventWritesActive -= 1; return; }
+    if (!eventWriteQueue.length) { eventWritesActive -= 1; return; }
+    const priority = eventWriteQueue.findIndex(entry => !entry.bestEffort);
+    const [next] = eventWriteQueue.splice(priority >= 0 ? priority : 0, 1);
     if (next.bestEffort) queuedBestEffort -= 1;
     next.resolve(true);
   };

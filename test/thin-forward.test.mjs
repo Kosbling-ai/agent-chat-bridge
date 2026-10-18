@@ -1094,3 +1094,48 @@ test('a storage failure after the turn was submitted is not retried even if exec
   assert.equal(retries.length, 0);
   assert.equal(finalResults, 1);
 });
+
+test('a storage failure after execute resolved is not retried even without a start-intent signal', async () => {
+  let clock = 10_000;
+  const job = {
+    id: 'store-after-resolve', callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: 'store-after-resolve',
+    senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+    attempts: 0, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const retries = [];
+  const replies = [];
+  let replyPendingCalls = 0;
+  const jobs = {
+    async claimReplyPending() { return []; },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async markRetry(input) { retries.push(input); Object.assign(job, { status: 'pending', nextAttemptAt: input.nextAttemptAt, leaseOwner: '' }); },
+    async markReplyPending({ result, errorCode }) {
+      replyPendingCalls += 1;
+      if (replyPendingCalls === 1) throw new StoreError('store_timeout');
+      replies.push({ result, errorCode });
+      Object.assign(job, { status: 'reply_pending', result });
+    },
+  };
+  let executions = 0;
+  const runtime = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {},
+    // A duplicate or resumed result: execute resolves without signalling a new submission.
+    executor: { async execute() { executions += 1; return { threadId: 'thread-1', turnId: 'turn-1', answer: 'done', rawAnswer: 'done', attachments: [] }; } },
+    replies: {}, now: () => clock,
+  });
+  runtime.start();
+  await flush();
+  for (let count = 0; count < 100 && job.status === 'running'; count += 1) await new Promise(resolve => setImmediate(resolve));
+  clock += 120_000;
+  await flush();
+  await runtime.stop();
+  assert.equal(executions, 1);
+  assert.equal(retries.length, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].result.failed, true);
+});

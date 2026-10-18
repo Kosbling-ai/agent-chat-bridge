@@ -736,8 +736,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   function finalizeTurn(state) {
     return state.completed.then(async ({ turn }) => {
       const answer = finalAnswer(turn) || state.lastAgentMessage;
-      if (answer) await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `assistant-final:${state.messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId } });
-      await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: '' });
+      // The turn has run: its answer is returned even when the receipt or the
+      // binding touch cannot be stored (slow or unavailable storage). A storage
+      // error here must neither discard the answer nor make the caller retry,
+      // which could submit the prompt again.
+      if (answer) {
+        try { await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `assistant-final:${state.messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId } }); }
+        catch (error) { logFinalAnswerPersistenceFailure(state, 'event', error); }
+      }
+      try { await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: '' }); }
+      catch (error) { logFinalAnswerPersistenceFailure(state, 'touch', error); }
       return {
         deferred: false,
         threadId: state.threadId,
@@ -761,6 +769,17 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       catch { logObservationPersistenceFailure(state, 'touch'); }
       throw error;
     });
+  }
+
+  function logFinalAnswerPersistenceFailure(state, stage, error) {
+    try {
+      const normalized = databaseError(error);
+      log('warning', {
+        module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_final_answer', status: 'failed',
+        stage, errorClass: normalized.code, errno: normalized.errno, sqlState: normalized.sqlState,
+        threadId: state.threadId, turnId: state.turnId,
+      });
+    } catch { /* diagnostics must not replace the completed answer */ }
   }
 
   function logObservationPersistenceFailure(state, stage) {
@@ -808,6 +827,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         }
         if (normalized.messageId && normalized.messageId === active.messageId) {
           if (hasOpenWaiter(active)) return { completion: Promise.resolve({ deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId }) };
+          // Taking over the still-running turn of this message: it was submitted
+          // by an earlier attempt, so tell the caller before attaching (a later
+          // storage failure of this attempt must not be retried as a new turn).
+          await options.onStartIntent?.({ binding: active.binding, threadId: active.threadId, messageId: normalized.messageId, startedAt: active.startedAt, takeover: true });
           return { completion: waitForTurn(active, normalized.messageId, { takeover: true, signal: options.signal }) };
         }
         if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', {
