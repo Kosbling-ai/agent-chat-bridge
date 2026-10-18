@@ -7,6 +7,7 @@ import { StoreError } from './errors.mjs';
 import { recoveryOperations } from './recovery.mjs';
 import { rotationOperations } from './rotation.mjs';
 import { steeringOperations } from './steering.mjs';
+import { safeObserver } from '../logger.mjs';
 
 const json = (value) => JSON.stringify(value);
 function canonical(value) {
@@ -21,9 +22,32 @@ function limit(value = 50) { if (!Number.isInteger(value) || value < 1 || value 
 function scope(input) { return [text(input.connectionId, 128), text(input.conversationId)]; }
 function lease(input) { text(input.id, 36); text(input.leaseToken, 36); }
 
-export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, onWriterLost, now = Date.now,
+// Every status value the storage layer writes to bridge_jobs. Hook ordering
+// below probes each non-terminal value by equality, which is equivalent to
+// `status NOT IN (terminal)` only while this list is complete: a new status
+// must be added here (test/storage-job-status.test.mjs enforces it).
+export const BRIDGE_JOB_STATUSES = Object.freeze(['pending', 'running', 'succeeded', 'failed', 'cancelled', 'reply_pending', 'unknown', 'delivery_failed']);
+export const TERMINAL_BRIDGE_JOB_STATUSES = Object.freeze(['succeeded', 'failed', 'cancelled']);
+export const BLOCKING_HOOK_JOB_STATUSES = Object.freeze(BRIDGE_JOB_STATUSES.filter(status => !TERMINAL_BRIDGE_JOB_STATUSES.includes(status)));
+// One bounded ref per status on jobs_conversation_open (connection_id,
+// conversation_id, hook_id, kind, status, sequence) instead of walking the
+// conversation's whole hook history with NOT IN.
+const HOOK_PREDECESSOR_SQL = BLOCKING_HOOK_JOB_STATUSES.map(status => `NOT EXISTS (
+            SELECT 1 FROM bridge_jobs prior
+            WHERE prior.connection_id=j.connection_id AND prior.conversation_id=j.conversation_id
+              AND prior.hook_id=j.hook_id AND prior.kind='hook' AND prior.status='${status}' AND prior.sequence<j.sequence)`).join(' AND ');
+const OUTBOX_PREDECESSOR_SQL = `(j.predecessor_id IS NULL OR EXISTS (
+            SELECT 1 FROM bridge_outbox predecessor WHERE predecessor.id=j.predecessor_id
+              AND predecessor.connection_id=j.connection_id AND predecessor.status='sent'))`;
+// An uncertain send is retried only for these kinds and only within this age.
+const OUTBOX_UNKNOWN_RETRY_MS = 55 * 60 * 1000;
+// Expired send leases are reclassified at most this often (leases last 60 s).
+const OUTBOX_LEASE_EXPIRY_INTERVAL_MS = 5000;
+
+export async function createMysqlStore({ pool, connectionId, operationTimeoutMs = 1800, claimTimeoutMs = 15000, onWriterLost, now = Date.now,
   writerProbeIntervalMs, writerProbeTimeoutMs, writerProbeMaxMisses, log }) {
   text(connectionId, 128);
+  log = safeObserver(log);
   await assertSchemaCurrent(pool);
   // Do not reserve a dedicated connection or use GET_LOCK. The pool owns
   // connection recovery; SQL transactions, unique keys and leases own
@@ -36,6 +60,13 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
     writer.assert();
     return await withConnection(pool, connection => fn(connection), { timeoutMs: operationTimeoutMs, transaction: true });
   };
+  const claimWrite = async (fn) => {
+    writer.assert();
+    return await withConnection(pool, connection => fn(connection), { timeoutMs: claimTimeoutMs, transaction: true });
+  };
+  const pendingClaims = new Map();
+  let outboxLeasesExpiredAt = -Infinity;
+  let expireOutboxLeasesNow = false;
   async function claimThread(c, connectionId, conversationId, agentId, nativeThreadId) {
     if (nativeThreadId == null) return;
     text(nativeThreadId);
@@ -127,45 +158,124 @@ export async function createMysqlStore({ pool, connectionId, operationTimeoutMs 
     const take = limit(input.limit);
     text(input.owner, 128);
     if (!Number.isInteger(input.leaseMs) || input.leaseMs < 100 || input.leaseMs > 300000) throw new StoreError('invalid_lease');
-    return write(async (c) => {
-      let condition;
-      let params;
-      if (table === 'bridge_jobs') {
-        if (!['agent','hook'].includes(input.kind)) throw new StoreError('invalid_job_kind');
-        condition = `j.connection_id=? AND j.kind=? AND (
-          (j.status='pending' AND j.next_attempt_at<=?) OR
-          (j.status='running' AND j.lease_expires_at<=?)
-        ) AND (j.kind<>'hook' OR NOT EXISTS (
-          SELECT 1 FROM bridge_jobs prior
-          WHERE prior.connection_id=j.connection_id AND prior.conversation_id=j.conversation_id
-            AND prior.hook_id=j.hook_id AND prior.kind='hook'
-            AND prior.status NOT IN ('succeeded','failed','cancelled') AND prior.sequence<j.sequence
-        ))`;
-        params = [connectionId,input.kind, now(), now()];
-      } else {
-        // An expired send lease is ambiguous, including after process death.
-        await c.execute("UPDATE bridge_outbox SET status='unknown',lease_token=NULL,lease_owner=NULL WHERE connection_id=? AND status='running' AND lease_expires_at<=? ORDER BY lease_expires_at,id LIMIT 100", [connectionId,now()]);
-        condition = `j.connection_id=? AND ((j.status='pending' AND j.next_attempt_at<=?) OR
-          (j.status='unknown' AND j.kind IN ('create','reply','artifact_send') AND j.first_attempt_at>? AND j.next_attempt_at<=?))
-          AND (j.predecessor_id IS NULL OR EXISTS (
-            SELECT 1 FROM bridge_outbox predecessor WHERE predecessor.id=j.predecessor_id
-              AND predecessor.connection_id=j.connection_id AND predecessor.status='sent'
-          ))`;
-        params = [connectionId,now(), now()-55*60*1000, now()];
+    if (table === 'bridge_jobs' && !['agent','hook'].includes(input.kind)) throw new StoreError('invalid_job_kind');
+    const pendingKey = `${table}:${input.owner}:${table === 'bridge_jobs' ? input.kind : ''}`;
+    const recover = async (pending) => {
+      let observed;
+      try {
+        await withConnection(pool, async (c) => {
+          const placeholders = pending.ids.map(() => '?').join(',');
+          [observed] = await c.execute(`SELECT * FROM ${table}
+            WHERE connection_id=? AND id IN (${placeholders}) FOR UPDATE`, [connectionId,...pending.ids]);
+        }, { timeoutMs: claimTimeoutMs, transaction: true });
+      } catch (error) {
+        // A read-only confirmation may itself lose the COMMIT acknowledgement.
+        // Once its locking read returned, the original claim was resolved and
+        // the captured rows are authoritative; otherwise preserve the claim for
+        // the next poll instead of claiming more work.
+        if (error?.code !== 'commit_unknown' || observed === undefined) throw error;
       }
-      const [rows] = await c.execute(`SELECT j.* FROM ${table} j WHERE ${condition} ORDER BY j.created_at,j.id LIMIT ${take} FOR UPDATE SKIP LOCKED`, params);
-      const result = [];
-      for (const row of rows) {
-        const token = randomUUID();
-        await c.execute(`UPDATE ${table} SET status='running',attempts=attempts+1,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=?${table === 'bridge_outbox' ? ',first_attempt_at=COALESCE(first_attempt_at,?)' : ''} WHERE id=? AND connection_id=?`, [input.owner,token,now()+input.leaseMs,now(),...(table === 'bridge_outbox' ? [now()] : []),row.id,connectionId]);
-        result.push(decode({
-          ...row, status: 'running', attempts: row.attempts + 1,
-          lease_token: token, lease_expires_at: now() + input.leaseMs, lease_owner: input.owner,
-          ...(table === 'bridge_outbox' ? { first_attempt_at: row.first_attempt_at ?? now() } : {}),
-        }));
+      const rowsById = new Map(observed.map(row => [row.id,row]));
+      const identityMatches = pending.ids.map(id => rowsById.get(id)).filter(row => row
+        && row.status === 'running' && row.lease_owner === pending.owner && row.lease_token === pending.token
+        && (table !== 'bridge_jobs' || row.kind === pending.kind));
+      if (identityMatches.length === pending.ids.length) {
+        if (identityMatches.every(row => Number(row.lease_expires_at) > now())) {
+          pendingClaims.delete(pendingKey);
+          log('warning','storage_claim_recovery','recovered',{code:'commit_unknown',reason:pending.error.reason,
+            errorCode:pending.error.errorCode,errno:pending.error.errno,sqlState:pending.error.sqlState,
+            stage:table === 'bridge_jobs' ? 'claim_jobs' : 'claim_outbox',kind:pending.kind,
+            durationMs:Math.max(0,now()-pending.startedAt)});
+          return pending.ids.map(id => decode(rowsById.get(id)));
+        }
+        // The lease can no longer fence execution. Let the normal claim rules
+        // classify the expired row instead of returning stale ownership.
+        pendingClaims.delete(pendingKey);
+        if (table === 'bridge_outbox') expireOutboxLeasesNow = true;
+        return null;
       }
+      if (identityMatches.length === 0) {
+        // The locking read waited for the original transaction and proves that
+        // its token is absent, so that claim did not commit (or is no longer ours).
+        pendingClaims.delete(pendingKey);
+        log('warning','storage_claim_recovery','not_committed',{code:'commit_unknown',reason:pending.error.reason,
+          errorCode:pending.error.errorCode,errno:pending.error.errno,sqlState:pending.error.sqlState,
+          stage:table === 'bridge_jobs' ? 'claim_jobs' : 'claim_outbox',kind:pending.kind,
+          durationMs:Math.max(0,now()-pending.startedAt)});
+        return null;
+      }
+      // Claim updates are atomic. A partial match cannot be safely returned or
+      // replaced, especially for non-idempotent outbox effects.
+      throw pending.error;
+    };
+    const pending = pendingClaims.get(pendingKey);
+    if (pending) {
+      const recovered = await recover(pending);
+      if (recovered) return recovered;
+    }
+    const token = randomUUID();
+    const claimed = { table, owner: input.owner, kind: input.kind, token, ids: [], error: null, startedAt: now() };
+    // A reconciled claim whose lease already expired is reclassified at once.
+    const expireOutboxLeases = table === 'bridge_outbox'
+      && (expireOutboxLeasesNow || claimed.startedAt - outboxLeasesExpiredAt >= OUTBOX_LEASE_EXPIRY_INTERVAL_MS);
+    try {
+      const result = await claimWrite(async (c) => {
+        const at = now();
+        let sql;
+        let params;
+        if (table === 'bridge_jobs') {
+          sql = `SELECT j.id FROM bridge_jobs j WHERE j.connection_id=? AND j.kind=? AND (
+            (j.status='pending' AND j.next_attempt_at<=?) OR
+            (j.status='running' AND j.lease_expires_at<=?)
+          ) AND (j.kind<>'hook' OR (${HOOK_PREDECESSOR_SQL}))
+          ORDER BY j.created_at,j.id LIMIT ${take} FOR UPDATE SKIP LOCKED`;
+          params = [connectionId, input.kind, at, at];
+        } else {
+          // An expired send lease is ambiguous, including after process death.
+          if (expireOutboxLeases) await c.execute("UPDATE bridge_outbox SET status='unknown',lease_token=NULL,lease_owner=NULL WHERE connection_id=? AND status='running' AND lease_expires_at<=? ORDER BY lease_expires_at,id LIMIT 100", [connectionId, at]);
+          // Two bounded branches: due pending rows, and recent uncertain sends on
+          // outbox_unknown_recent. Historic unknown rows are never scanned or locked.
+          sql = `(SELECT j.id,j.created_at FROM bridge_outbox j
+            WHERE j.connection_id=? AND j.status='pending' AND j.next_attempt_at<=? AND ${OUTBOX_PREDECESSOR_SQL}
+            ORDER BY j.created_at,j.id LIMIT ${take} FOR UPDATE SKIP LOCKED)
+          UNION ALL
+          (SELECT j.id,j.created_at FROM bridge_outbox j FORCE INDEX (outbox_unknown_recent)
+            WHERE j.connection_id=? AND j.status='unknown' AND j.first_attempt_at>? AND j.next_attempt_at<=?
+              AND j.kind IN ('create','reply','artifact_send') AND ${OUTBOX_PREDECESSOR_SQL}
+            ORDER BY j.created_at,j.id LIMIT ${take} FOR UPDATE SKIP LOCKED)
+          ORDER BY created_at,id LIMIT ${take}`;
+          params = [connectionId, at, connectionId, at - OUTBOX_UNKNOWN_RETRY_MS, at];
+        }
+        // Claim IDs first; an idle poll returns no rows and no wide metadata.
+        const [candidates] = await c.execute(sql, params);
+        claimed.ids = candidates.map(row => row.id);
+        if (!claimed.ids.length) return [];
+        const placeholders = claimed.ids.map(() => '?').join(',');
+        const leaseExpiresAt = at + input.leaseMs;
+        await c.execute(`UPDATE ${table} SET status='running',attempts=attempts+1,lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=?${table === 'bridge_outbox' ? ',first_attempt_at=COALESCE(first_attempt_at,?)' : ''} WHERE connection_id=? AND id IN (${placeholders})`, [input.owner, token, leaseExpiresAt, at, ...(table === 'bridge_outbox' ? [at] : []), connectionId, ...claimed.ids]);
+        const [rows] = await c.execute(`SELECT * FROM ${table} WHERE connection_id=? AND id IN (${placeholders})`, [connectionId, ...claimed.ids]);
+        const rowsById = new Map(rows.map(row => [row.id, row]));
+        return claimed.ids.map(id => decode({ ...rowsById.get(id), lease_expires_at: leaseExpiresAt }));
+      });
+      if (expireOutboxLeases) { outboxLeasesExpiredAt = claimed.startedAt; expireOutboxLeasesNow = false; }
       return result;
-    });
+    } catch (error) {
+      if (error?.code !== 'commit_unknown') throw error;
+      if (!claimed.ids.length) {
+        log('warning','storage_claim_recovery','empty',{code:'commit_unknown',reason:error.reason,
+          errorCode:error.errorCode,errno:error.errno,sqlState:error.sqlState,
+          stage:table === 'bridge_jobs' ? 'claim_jobs' : 'claim_outbox',kind:input.kind,
+          durationMs:Math.max(0,now()-claimed.startedAt)});
+        return [];
+      }
+      claimed.error = error;
+      pendingClaims.set(pendingKey, claimed);
+      const recovered = await recover(claimed);
+      if (recovered) return recovered;
+      // A confirmed rollback remains a failed poll. Let the communication
+      // runtime apply its bounded retry/backoff budget before claiming again.
+      throw error;
+    }
   }
   const operations = {
     ...resourceOperations({ read, write, now, decode, connectionId }),

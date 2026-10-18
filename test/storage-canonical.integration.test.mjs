@@ -16,7 +16,8 @@ test('real MySQL canonical receipt wins across live/history while recalls and kn
     const changed=await store.acceptInbound({...input('history','history_catchup'),payload:{source:'history_catchup',conversationType:'p2p',text:'changed back and forth'}});
     assert.equal(changed.duplicateCanonical,true);assert.equal(changed.agentJobId,first.agentJobId);
     const [jobs]=await pool.query("SELECT kind,COUNT(*) AS n FROM bridge_jobs WHERE connection_id='c' GROUP BY kind");
-    assert.deepEqual(jobs.map(row=>[row.kind,Number(row.n)]).sort(),[['agent',1],['hook',1]]);
+    // acceptInbound no longer creates agent jobs (46f87d5); only the hook job exists, once.
+    assert.deepEqual(jobs.map(row=>[row.kind,Number(row.n)]).sort(),[['hook',1]]);
     const [[ledger]]=await pool.query("SELECT COUNT(*) AS n FROM bridge_inbox WHERE connection_id='c'");assert.equal(Number(ledger.n),2);
     const recall=await store.acceptInbound({...input('recall'),eventType:'message.recalled',recalledMessageId:'message',agentJob:undefined,passiveContext:false});
     assert.equal(recall.firstReceipt,true);assert.equal(recall.duplicateCanonical,false);assert.equal(recall.agentJobId,null);assert.equal(recall.hookJobIds.length,1);

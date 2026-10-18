@@ -9,6 +9,7 @@ const MIGRATIONS = await Promise.all([
   [3, './migrations/003-forward-runtime.sql'],
   [4, './migrations/004-bot-connection.sql'],
   [5, './migrations/005-sender-union-id.sql'],
+  [6, './migrations/006-query-indexes.sql'],
 ].map(async ([version, path]) => {
   const sql = await readFile(new URL(path, import.meta.url), 'utf8');
   return { version, sql, checksum: createHash('sha256').update(sql).digest('hex') };
@@ -25,6 +26,10 @@ const ASSISTANT_TABLES = [
   'assistant_codex_sessions', 'assistant_codex_events', 'assistant_codex_forward_jobs',
   'assistant_inbound_messages', 'assistant_message_events',
 ];
+
+// Explicit operator command only: online index builds on a large table can
+// exceed the 30-second runtime ceiling.
+const MIGRATION_TIMEOUT_MS = 15 * 60 * 1000;
 
 function statements(sql) { return sql.split(';').map((part) => part.trim()).filter(Boolean); }
 
@@ -75,6 +80,28 @@ async function run004Step(connection, statement, desiredIndexes) {
     if (!actual.length) await connection.query(statement);
     else if (!indexMatches(actual, addIndex)) throw new StoreError('schema_version_mismatch');
   } else throw new StoreError('schema_version_mismatch');
+}
+
+// 006 only adds secondary indexes online. Like 004, an index that already
+// exists with the same definition (for example, created by an operator ahead of
+// the release) is skipped, and a same-named index with another definition stops
+// the migration instead of being replaced.
+const ONLINE_INDEX_SUFFIX = /,\s*ALGORITHM=INPLACE,\s*LOCK=NONE$/i;
+// Metadata-lock wait for the online ALTERs. A long transaction elsewhere must
+// fail this migration quickly rather than queue every reader behind it.
+const MIGRATION_LOCK_WAIT_SECONDS = 10;
+async function runOnlineIndexStep(connection, statement) {
+  const bare = statement.replace(ONLINE_INDEX_SUFFIX, '');
+  const addIndex = bare !== statement ? expectedIndex(bare) : null;
+  if (!addIndex || addIndex.unique) throw new StoreError('schema_version_mismatch');
+  const actual = await index(connection, addIndex.table, addIndex.name);
+  if (!actual.length) await connection.query(statement);
+  else if (!indexMatches(actual, addIndex)) throw new StoreError('schema_version_mismatch');
+}
+async function migrate006(connection, sql) {
+  await connection.query(`SET SESSION lock_wait_timeout = ${MIGRATION_LOCK_WAIT_SECONDS}`);
+  try { for (const statement of statements(sql)) await runOnlineIndexStep(connection, statement); }
+  finally { await connection.query('SET SESSION lock_wait_timeout = DEFAULT'); }
 }
 
 async function migrate004(connection, legacyConnectionId, database) {
@@ -148,6 +175,7 @@ export async function migrate(pool, { legacyConnectionId } = {}) {
       let applied = false;
       for (const migration of MIGRATIONS.slice(versions.length)) {
         if (migration.version === 4) await migrate004(connection, legacyConnectionId, identity.name);
+        else if (migration.version === 6) await migrate006(connection, migration.sql);
         else for (const statement of statements(migration.sql)) await connection.query(statement);
         await connection.execute('INSERT INTO bridge_schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)', [migration.version, migration.checksum, Date.now()]);
         applied = true;
@@ -156,5 +184,5 @@ export async function migrate(pool, { legacyConnectionId } = {}) {
     } finally {
       await connection.query('SELECT RELEASE_LOCK(?)', [lock]);
     }
-  }, { timeoutMs: 30000 });
+  }, { timeoutMs: MIGRATION_TIMEOUT_MS, maintenance: true });
 }

@@ -1,3 +1,38 @@
+const STORAGE_METRICS = {
+  "poolWaitMs": "pool_wait_ms",
+  "beginMs": "begin_ms",
+  "operationMs": "operation_ms",
+  "commitMs": "commit_ms",
+  "rollbackMs": "rollback_ms",
+  "timeoutMs": "timeout_ms",
+  "timeoutOvershootMs": "timeout_overshoot_ms",
+  "dbConnectionId": "db_connection_id",
+  "eventLoopDelayMaxMs": "event_loop_delay_max_ms",
+  "rssMb": "rss_mb",
+  "hostLoad1Milli": "host_load1_milli",
+  "poolConnections": "pool_connections",
+  "poolFree": "pool_free",
+  "poolQueued": "pool_queued",
+  "sampleWindowMs": "sample_window_ms",
+  "cpuUserMs": "cpu_user_ms",
+  "cpuSystemMs": "cpu_system_ms",
+  "diagnosticSuppressed": "diagnostic_suppressed",
+  "dbThreadsConnected": "db_threads_connected",
+  "dbThreadsRunning": "db_threads_running",
+  "dbReadRequests": "db_read_requests",
+  "dbPhysicalReads": "db_physical_reads",
+  "dbPendingReads": "db_pending_reads",
+  "dbPendingWrites": "db_pending_writes",
+  "dbPendingFsyncs": "db_pending_fsyncs",
+  "dbLogWaits": "db_log_waits",
+  "dbRowLockWaits": "db_row_lock_waits",
+  "dbRowLockTimeMs": "db_row_lock_time_ms",
+  "dbUptimeSeconds": "db_uptime_seconds",
+  "droppedEvents": "dropped_events",
+  "droppedEventsTotal": "dropped_events_total",
+  "queuedEvents": "queued_events"
+};
+
 // Only fixed lifecycle fields are accepted; never serialize config, requests,
 // arbitrary Error objects, headers, environment values, or message content.
 export function safeObserver(callback = () => {}) {
@@ -8,9 +43,14 @@ export function safeObserver(callback = () => {}) {
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
   return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, windowMinutes, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
     hookId, eventId, eventType, scopePrefix, statusCode, platformCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
-    decision, cached, openId, permissionProfile, activePermissionProfile, component: eventComponent } = {}) => {
+    decision, cached, openId, permissionProfile, activePermissionProfile, component: eventComponent, transaction, version, applied, ...diagnostics } = {}) => {
     const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
     const boundedInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
+    const storageMetrics = {};
+    for (const [key, name] of Object.entries(STORAGE_METRICS)) {
+      const value = boundedInteger(diagnostics[key], 0, Number.MAX_SAFE_INTEGER);
+      if (value !== undefined) storageMetrics[name] = value;
+    }
     const event = {
       timestamp: new Date().toISOString(), level, module: 'bridge',
       component: identifier(eventComponent, 64) ?? component, operation, status,
@@ -50,6 +90,11 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       // Codex permission profile ids (configured and reported), never other response content.
       ...(identifier(permissionProfile, 128) !== undefined ? { permissionProfile } : {}),
       ...(identifier(activePermissionProfile, 128) !== undefined ? { activePermissionProfile } : {}),
+      ...(typeof transaction === 'boolean' ? { transaction } : {}),
+      // Schema migration result: ledger version and whether a migration was applied.
+      ...(boundedInteger(version, 1, 1_000_000) !== undefined ? { version } : {}),
+      ...(typeof applied === 'boolean' ? { applied } : {}),
+      ...storageMetrics,
     };
     stream.write(`${JSON.stringify(event)}\n`);
     if (level === 'error' && reportError) {

@@ -13,7 +13,15 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  assert.equal((await migrate(pool)).applied,true);assert.equal((await migrate(pool)).applied,false);
  let clock=Date.now();const store=await createMysqlStore({connectionId:'c',pool,now:()=>clock,onWriterLost:async()=>{throw new Error('synthetic observer failure');}});
  try{
- const second=createPoolFromEnvironment(refs);await assert.rejects(createMysqlStore({connectionId:'c',pool:second}),{code:'writer_busy'});await second.end();
+ // Session setup runs once per physical connection (pool 'connection' event): every
+ // pooled connection, including ones opened concurrently, has the 1 s row-lock wait.
+ const held=await Promise.all(Array.from({length:4},()=>pool.getConnection()));
+ try{for(const c of held){const [[row]]=await c.query('SELECT @@SESSION.innodb_lock_wait_timeout AS wait');assert.equal(Number(row.wait),1);}}
+ finally{for(const c of held)c.release();}
+ const [[viaPool]]=await pool.query('SELECT @@SESSION.innodb_lock_wait_timeout AS wait');assert.equal(Number(viaPool.wait),1);
+ assert.equal(await withConnection(pool,async c=>Number((await c.query('SELECT @@SESSION.innodb_lock_wait_timeout AS wait'))[0][0].wait)),1);
+ // fe674e3 removed the advisory writer lock: a second store on the same bot opens normally.
+ const second=createPoolFromEnvironment(refs);await (await createMysqlStore({connectionId:'c',pool:second})).close();
  // Hold the first registration COMMIT while a second registration is in flight.
  // The second must not become visible/claimable before the first commits.
  for (const mode of ['enqueue','inbound']) {
@@ -83,11 +91,10 @@ test('real isolated MySQL: migrations, atomic inbox/jobs, fencing, outbox, sessi
  const start=Date.now();await assert.rejects(withConnection(pool,c=>c.query('SELECT SLEEP(5)'),{timeoutMs:50}),{code:'store_timeout'});assert.ok(Date.now()-start<1000);await assertSchemaCurrent(pool);
  const backlog=Array.from({length:105},(_,i)=>[randomUUID(),'c','chat',`expired-${i}`,'reaction','0'.repeat(64),'{}',randomUUID(),'running',clock-1,clock-1,clock-1,clock,clock]);
  await pool.query('INSERT INTO bridge_outbox (id,connection_id,conversation_id,idempotency_key,kind,payload_hash,payload,platform_uuid,status,first_attempt_at,lease_expires_at,next_attempt_at,created_at,updated_at) VALUES ?',[backlog]);
+ clock+=5000;// expired send leases are reclassified at most every 5 s (0.2.30)
  await store.claimOutbox({owner:'batch',leaseMs:1000});
  const [[remaining]]=await pool.query("SELECT COUNT(*) AS n FROM bridge_outbox WHERE connection_id='c' AND status='running'");assert.equal(Number(remaining.n),5);
- const [[lock]]=await pool.query("SELECT OWNER_THREAD_ID AS owner FROM performance_schema.metadata_locks WHERE OBJECT_TYPE='USER LEVEL LOCK' AND OBJECT_NAME LIKE 'bridge:writer:%'");
- const [[thread]]=await pool.query('SELECT PROCESSLIST_ID AS id FROM performance_schema.threads WHERE THREAD_ID=?',[lock.owner]);
- await pool.query(`KILL CONNECTION ${Number(thread.id)}`);
- await new Promise(r=>setTimeout(r,20));await assert.rejects(store.enqueueJob({kind:'agent',connectionId:'c',conversationId:'x',idempotencyKey:'after-lock-loss',payload:{}}),{code:'writer_lock_lost'});
+ // No writer lock is held any more (fe674e3), so there is no lock connection to kill.
+ const [[locks]]=await pool.query("SELECT IS_USED_LOCK(CONCAT('bridge:writer:',LEFT(SHA2(DATABASE(),256),40))) AS owner");assert.equal(locks.owner,null);
  }finally{await store.close();}
 });
