@@ -5,8 +5,9 @@ import * as sdk from '@larksuiteoapi/node-sdk';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { ConfigError } from './config.mjs';
 import { createPoolFromEnvironment, storageConnectionReferences } from './storage/connection.mjs';
+import { attachStorageDiagnostics } from './storage/diagnostics.mjs';
 import { createMysqlStore } from './storage/store.mjs';
-import { StoreError } from './storage/errors.mjs';
+import { StoreError, databaseError } from './storage/errors.mjs';
 import { migrate } from './storage/migrations.mjs';
 import { createCodexExecutor } from './agents/codex/executor.mjs';
 import { createCodexSessionStore } from './storage/codex-sessions.mjs';
@@ -114,6 +115,7 @@ export async function startService({ config, configPath, env = process.env, log,
   const privateAdmission = config.routing.privateAdmission ? factories.privateAdmission({ settings: config.routing.privateAdmission,
     connectionId: config.feishu.connectionId, token: admissionToken, log }) : undefined;
   const pool = factories.pool(storageConnectionReferences(config.storage), env);
+  const storageDiagnostics = attachStorageDiagnostics(pool, { log });
   let store, executor, userInput, businessCardAction, feishu, communication, forward, catchup, http, media, outbound;
   const cardOperations = new Set();
   let acceptCardOperations = true;
@@ -174,6 +176,7 @@ export async function startService({ config, configPath, env = process.env, log,
     for (const operation of [() => media?.release?.(), () => outbound?.close?.()]) {
       try { await operation(); } catch { failures.push(true); }
     }
+    try { await storageDiagnostics.close(); } catch { failures.push(true); }
     for (const operation of [() => store ? store.close() : pool.end(), () => reporter?.close()]) {
       try { await operation(); } catch { failures.push(true); }
     }
@@ -236,6 +239,7 @@ export async function startService({ config, configPath, env = process.env, log,
   };
   try {
     store = await factories.store({ pool, connectionId: config.feishu.connectionId, onWriterLost,
+      claimTimeoutMs: config.storage.claimTimeoutMs,
       writerProbeIntervalMs: config.storage.writer.probeIntervalMs,
       writerProbeTimeoutMs: config.storage.writer.probeTimeoutMs,
       writerProbeMaxMisses: config.storage.writer.probeMaxMisses,
@@ -348,13 +352,40 @@ export async function startService({ config, configPath, env = process.env, log,
         const business=businessCardAction.handleCardAction(payload);if(business)return business;
         const answered=await userInput.handleCardAction(payload); return answered??feedback.handleCardAction(payload);
       }), log });
-    const readiness = async () => {
+    const transientStoreErrors = new Set(['store_unavailable', 'store_contention', 'store_timeout', 'commit_unknown']);
+    let lastStoreDegraded = false;
+    const inspectHealth = async () => {
       let storeReady = writerHealthy;
-      try { await store.assertCurrent(); } catch { storeReady = false; }
-      const executorStatus=executor.status();
-      const components = { store: storeReady, codex: !executorStatus.closing&&!executorStatus.restartPending&&!executorStatus.fault, feishu: feishu.status().connected, workers: forward.status().running&&communication.status().running };
-      return { ready: !stopping && Object.values(components).every(Boolean), components };
+      let storeFatal = !writerHealthy;
+      let storeError;
+      try { await store.assertCurrent(); }
+      catch (error) {
+        storeReady = false;
+        storeError = databaseError(error);
+        storeFatal ||= !transientStoreErrors.has(storeError.code);
+      }
+      const storeDegraded = !storeReady && !storeFatal;
+      if (storeDegraded !== lastStoreDegraded) {
+        lastStoreDegraded = storeDegraded;
+        log(storeDegraded ? 'warning' : storeReady ? 'info' : 'error', 'storage_health', storeDegraded ? 'degraded' : storeReady ? 'recovered' : 'failed', {
+          ...(storeError ? { code: storeError.code, reason: storeError.reason, errorCode: storeError.errorCode,
+            errno: storeError.errno, sqlState: storeError.sqlState } : {}),
+        });
+      }
+      const executorStatus = executor.status();
+      const communicationStatus = communication.status();
+      const forwardStatus = forward.status();
+      const workerFatal = !forwardStatus.running || !communicationStatus.running;
+      const workerDegraded = communicationStatus.degraded === true || forwardStatus.degraded === true;
+      const components = { store: storeReady, codex: !executorStatus.closing && !executorStatus.restartPending && !executorStatus.fault,
+        feishu: feishu.status().connected, workers: !workerFatal && !workerDegraded };
+      return {
+        readiness: { ready: !stopping && Object.values(components).every(Boolean), components,
+          ...((storeDegraded || workerDegraded) ? { degraded: { store: storeDegraded, workers: workerDegraded } } : {}) },
+        fatalComponents: { store: storeFatal, workers: workerFatal },
+      };
     };
+    const readiness = async () => (await inspectHealth()).readiness;
     const createdHttp = await factories.server({ config, log, readiness, eventRuntime: forward, jobs, inboundTokens });
     if (stopping) {
       await cleanupLateComponent('server', () => createdHttp?.close?.());
@@ -374,10 +405,11 @@ export async function startService({ config, configPath, env = process.env, log,
       if (stopping || healthChecking) return;
       healthChecking = true;
       try {
-        const { components } = await readiness();
+        const { fatalComponents } = await inspectHealth();
         const checkedAt = Date.now();
         for (const component of ['store', 'workers']) {
-          const healthy = components[component];
+          // Slow/unavailable storage stays degraded; only fatal component failures restart.
+          const healthy = !fatalComponents[component];
           if (healthy) unhealthySince.delete(component);
           else if (!unhealthySince.has(component)) unhealthySince.set(component, checkedAt);
         }

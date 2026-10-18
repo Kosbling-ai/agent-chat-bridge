@@ -139,6 +139,9 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const executed = [];
     const runtimeWorker = createForwardRuntime({
       config: { owner: 'runtime-worker', pollMs: 2, leaseMs: 10_000 },
+      // Lease fencing compares the claimed lease expiry with the runtime clock,
+      // so the runtime must share the store's fixture clock.
+      now: () => now,
       jobs: store,
       sessions: {},
       media: { async prepare() { return { status: 'ready', addendum: '（图片路径：safe/runtime.png）' }; } },

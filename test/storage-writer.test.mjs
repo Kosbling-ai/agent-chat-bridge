@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { StoreError } from '../src/storage/errors.mjs';
 import { acquireWriter } from '../src/storage/writer.mjs';
 import { validateConfig } from '../src/config.mjs';
 import { startService } from '../src/service.mjs';
@@ -54,6 +55,8 @@ function serviceDependencies(events, options = {}) {
   let onWriterLost;
   let readiness;
   let workerHealthy = true;
+  let workerDegraded = false;
+  let storeError;
   let codexHealthy = true;
   let outboundEnteredResolve, outboundRelease;
   let serverEnteredResolve, serverRelease;
@@ -64,14 +67,15 @@ function serviceDependencies(events, options = {}) {
     beginStop() { events.push(`${name}-begin-stop`); },
     async ingestCardAction() {},
     async stop() { events.push(`${name}-stop`); if (options.hangWorker === name) await new Promise(() => {}); },
-    status: () => ({ running: workerHealthy }),
+    status: () => ({ running: workerHealthy, degraded: workerDegraded }),
   });
   const forward = worker('forward');
   const communication = worker('communication');
   return {
     controls: {
       get onWriterLost() { return onWriterLost; }, get readiness() { return readiness; },
-      setWorkerHealthy(value) { workerHealthy = value; }, setCodexHealthy(value) { codexHealthy = value; }, outboundEntered, serverEntered,
+      setWorkerHealthy(value) { workerHealthy = value; },
+      setWorkerDegraded(value) { workerDegraded = value; }, setStoreError(value) { storeError = value; }, setCodexHealthy(value) { codexHealthy = value; }, outboundEntered, serverEntered,
       releaseOutbound(value = { async close() { events.push('outbound-close'); } }) { outboundRelease?.(value); },
       releaseServer(value = { server: {}, async close() { events.push('server-close'); } }) { serverRelease?.(value); },
     },
@@ -80,7 +84,7 @@ function serviceDependencies(events, options = {}) {
       store: async input => {
         onWriterLost = input.onWriterLost;
         if (options.loseDuringStartup) queueMicrotask(() => onWriterLost(lostError('connection_error')));
-        return { async assertCurrent() {}, async close() { events.push('store-close'); } };
+        return { async assertCurrent() { if (storeError) throw storeError; }, async close() { events.push('store-close'); } };
       },
       sessions: () => ({}), jobs: () => ({}), inbound: () => ({}),
       executor: () => ({ status: () => ({ closing: !codexHealthy, restartPending: codexHealthy ? null : 'pending', fault: null }), async close() { events.push('executor-close'); } }),
@@ -265,4 +269,60 @@ test('writer probe configuration defaults and validation are explicit', async t 
   }
   assert.doesNotThrow(() => validateConfig({ ...base, runtime: { unhealthyExitMs: 2_147_483_647 } }));
   assert.throws(() => validateConfig({ ...base, runtime: { unhealthyExitMs: 2_147_483_648 } }), { code: 'invalid_runtime_unhealthy_exit' });
+});
+
+
+test('persistent storage degradation reports not ready without restarting active components, then recovers', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-storage-degraded-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events = [], exits = [], logs = [];
+  const fixture = serviceDependencies(events);
+  const config = rawConfig(directory);
+  config.runtime.unhealthyExitMs = 20;
+  config.storage.writer.probeIntervalMs = 5;
+  const service = await startService({ config: validateConfig(config), configPath: join(directory, 'bridge.json'), env,
+    dependencies: fixture.dependencies, log: (...entry) => logs.push(entry),
+    onRestartRequired: async (reason, code) => exits.push({ reason, code }) });
+  t.after(() => service.close());
+  fixture.controls.setStoreError(new StoreError('store_timeout'));
+  fixture.controls.setWorkerDegraded(true);
+  await delay(85);
+  const readiness = await fixture.controls.readiness();
+  assert.equal(readiness.ready, false);
+  assert.deepEqual(readiness.degraded, {store: true, workers: true});
+  assert.deepEqual(exits, []);
+  assert.equal(events.includes('executor-close'), false);
+  assert.equal(events.includes('communication-stop'), false);
+  assert.equal(logs.filter(([,op,status]) => op === 'storage_health' && status === 'degraded').length, 1);
+  fixture.controls.setStoreError(undefined);
+  fixture.controls.setWorkerDegraded(false);
+  await delay(25);
+  assert.equal((await fixture.controls.readiness()).ready, true);
+  assert.deepEqual(exits, []);
+  assert.equal(logs.filter(([,op,status]) => op === 'storage_health' && status === 'recovered').length, 1);
+});
+
+test('schema corruption remains a fatal storage failure rather than indefinite degradation', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-schema-fatal-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const events = [], exits = [];
+  const fixture = serviceDependencies(events);
+  const config = rawConfig(directory);
+  config.runtime.unhealthyExitMs = 20;
+  config.storage.writer.probeIntervalMs = 5;
+  const service = await startService({ config: validateConfig(config), configPath: join(directory, 'bridge.json'), env,
+    dependencies: fixture.dependencies, onRestartRequired: async (reason, code) => exits.push({ reason, code }) });
+  t.after(() => service.close());
+  fixture.controls.setStoreError(new StoreError('schema_version_mismatch'));
+  await delay(70);
+  assert.deepEqual(exits, [{ reason: 'unhealthy:store', code: 1 }]);
+});
+
+test('claim deadline is configurable without weakening ingress or allowing unbounded storage waits', () => {
+  const base = rawConfig('/workspace');
+  assert.equal(validateConfig(base).storage.claimTimeoutMs, 15000);
+  assert.equal(validateConfig({...base, storage:{...base.storage, claimTimeoutMs:30000}}).storage.claimTimeoutMs, 30000);
+  for (const value of [0,999,30001,1.5,'15000',null]) {
+    assert.throws(() => validateConfig({...base,storage:{...base.storage,claimTimeoutMs:value}}), {code:'invalid_storage_claim_timeout'});
+  }
 });

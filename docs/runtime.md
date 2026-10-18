@@ -347,7 +347,11 @@ Migration is explicit; startup only checks the migration ledger. `/health/live` 
 
 The bridge uses the MySQL connection pool for storage operations. Reads use a normal pooled connection. Writes use a short transaction only when several changes must commit together; single-row updates rely on atomic SQL predicates. Unique keys provide idempotency for message, job and outbox keys, while row leases protect claimable work. Every runtime table is scoped by `connection_id`, so independent bot processes do not need a process-wide advisory lock or a dedicated long-lived database connection.
 
-`storage.writer` settings are accepted as deprecated compatibility fields and have no runtime effect. Existing configurations can retain them while migrating; new configurations should omit them. Communication polling treats normalized `store_unavailable`, `store_contention`, and `store_timeout` failures as transient: it remains running in a visible degraded state and retries with bounded exponential backoff from 1 second through 10 seconds. The final backoff is truncated at a hard deadline 30 seconds after the first failure, and no new claim starts at or after that deadline. Six consecutive failures or the deadline, whichever comes first, makes the worker unhealthy; non-transient errors do so immediately. `runtime.unhealthyExitMs` (default 30000 ms) then applies to the Store and unhealthy communication workers through the existing fail-closed non-zero exit path. Codex and Feishu still affect readiness, but their existing restart and reconnect lifecycles are not overridden by this watchdog.
+`storage.writer` fields remain accepted for compatibility; the advisory writer lock is no longer used. Communication polling treats normalized `store_unavailable`, `store_contention`, `store_timeout`, and claim-only `commit_unknown` failures as transient. It remains running but degraded, retries with capped exponential backoff, and recovers automatically. There is no total outage timer or failure count that turns a transient database outage into a fatal worker error. Shutdown interrupts retry waits. Logs report transitions and rate-limit persistent failures.
+
+Readiness reports unavailable storage or degraded workers as not ready, with optional `degraded` details; this does not imply process death. The watchdog separates degradation from fatal errors. `runtime.unhealthyExitMs` still applies to schema mismatches and stopped/faulted workers, not temporary storage connectivity or slow queries. Codex and Feishu continue to affect readiness through their existing lifecycles.
+
+An active task can retry a transient lease-renewal failure only until the end of its last confirmed lease. It never extends ownership based on an uncertain COMMIT, and a definitive lost lease or expiry interrupts that task. Database failure is not permission to perform unowned external side effects.
 
 Restart does not clear queues, replay ambiguous deliveries, change leases, or bypass existing idempotency. The normal durable claim, lease, and deduplication rules decide what work is eligible after the supervisor starts a replacement process.
 
@@ -367,3 +371,64 @@ The callback waits up to two seconds for durable registration before returning `
 A lost app-server connection is an unknown observation, not proof that the native task failed. When a pending forward job is recovered, the executor reads its persisted turn identity and observes that original turn. Native interruption is reported as `CODEX_TURN_INTERRUPTED` (excluded from `/health/tasks.failed`); genuine failure still counts. Missing/unreadable turns remain retryable and must not be treated as permission to rerun business actions.
 
 Operator checklist: back up the configured database before correcting historical rows; deploy the reviewed 0.2.29 commit; run `npm run check` and `npm test`; use the host supervisor's supported restart lifecycle when no turn is active; verify `/health/ready` and `/health/tasks?window_minutes=120`. Rollback: restore the preceding reviewed application commit through the same lifecycle. No DDL/config migration is required. Historical terminal jobs need a separately audited correction after matching their native turn status; retain job status and business receipts, and never mark an interrupted job completed merely to clear an alert.
+
+### Claim deadlines and recovery
+
+A claim only reserves work; it does not call a hook or send a Feishu message.
+When its COMMIT acknowledgement is lost, the store resolves the original row IDs
+and lease token on a new connection before handing any work to a worker. It
+never retries an arbitrary transaction or interprets an uncertain platform send
+as a safe new send. An unresolved claim stays pending for reconciliation rather
+than being replaced by a new claim. Recovery verifies scope, owner, token and
+lease expiry under row locks.
+
+`storage.claimTimeoutMs` sets the background-claim deadline (default 15000 ms, allowed 1000–30000 ms). The short ingress deadline
+is unchanged. A transient failure uses the capped polling backoff above;
+a persistent database outage remains degraded and continues recovery probes. Idle communication
+polling backs off from 100 ms to 1 second, and returns to 100 ms when a poll claims
+work. Long-running model turns do not keep empty polling at the fast cadence. This bounds idle pickup latency without continuous empty transactions.
+
+Storage diagnostics distinguish `commit_timeout` from `commit_error` and retain
+only safe driver code, numeric errno and SQLSTATE. Raw driver messages, SQL and
+credentials are never logged. Readiness is a component snapshot, not proof that
+a particular user message reached Feishu, entered the bridge, or completed.
+
+On macOS, use `ProcessType=Standard` for the bridge and its local MySQL service.
+`Background` is intended for work that yields to user activity and applies CPU
+and I/O resource restrictions; it is a poor fit for a database serving short
+request deadlines. Keep normal MySQL durability settings. Do not disable flushes
+or drop transaction protection to work around deadline failures.
+
+
+### Storage diagnostic events
+
+All service-owned storage calls using `withConnection` produce a
+`storage_operation` warning when they fail or take at least 500 ms. Fast
+successful calls stay quiet. Each event has a random `operation_id`, current or
+failed `stage`, available MySQL `db_connection_id`, total `durationMs`, configured
+`timeout_ms`, and stage durations (`pool_wait_ms`, `setup_ms`, `begin_ms`,
+`operation_ms`, `commit_ms`, `rollback_ms`). Durations use a monotonic clock.
+`operation_ms` includes all SQL and application work inside the callback; it is
+not a per-statement server execution timer. `timeout_overshoot_ms` shows how late
+the JavaScript deadline callback ran. A timeout emits once even if acquisition
+or COMMIT resolves later. Existing safe error class/code/errno/SQLSTATE remain.
+
+At most 20 detailed operation events per bot are emitted per minute. Suppressed
+event counts appear in the next `storage_snapshot`. Snapshots run every 60 seconds
+and on a slow/failing operation at most once per 30 seconds, with only one probe
+in flight. They include event-loop delay (20 ms sampling resolution), process
+RSS and CPU-time deltas, host load, available pool total/free/queued counts, and
+allowlisted MySQL global counters: running/connected threads, buffer reads,
+pending read/write/fsync, log waits, current row-lock waits, cumulative row-lock
+time and server uptime. Server counters cover the whole MySQL instance; compare
+deltas within one uptime epoch, not raw values across restarts. The diagnostic
+query has a 1500 ms deadline and does not recursively instrument itself.
+
+Snapshots and operation phases are evidence for narrowing a bottleneck, not
+proof that a particular SSD or scheduler event caused it. A delayed JavaScript
+callback can inflate observed client-side SQL/COMMIT time. Correlate operation
+time, deadline overshoot, event-loop/process load and server counters before
+attributing a failure. No SQL text, parameters, user content, raw driver errors,
+stack traces, account names or credentials are included. Observer failures and
+rate limits never alter the transaction result; shutdown removes diagnostic
+timers and waits only for the bounded probe already in flight.
