@@ -25,8 +25,9 @@ test('two bots share one MySQL schema without sharing bindings, jobs, context, d
     const otherPool = createPoolFromEnvironment(refs);
     writerB = await createMysqlStore({ pool: otherPool, connectionId: 'BOT-A', now: () => time });
     const thirdPool = createPoolFromEnvironment(refs);
-    try { await assert.rejects(createMysqlStore({ pool: thirdPool, connectionId: 'bot-a' }), { code: 'writer_busy' }); }
-    finally { await thirdPool.end(); }
+    // fe674e3 removed the advisory writer lock; a second process for the same bot
+    // relies on row leases and unique keys instead of being refused at startup.
+    await (await createMysqlStore({ pool: thirdPool, connectionId: 'bot-a' })).close();
 
     const sessionsA = createCodexSessionStore({ pool, schema, connectionId: 'bot-a' });
     const sessionsB = createCodexSessionStore({ pool, schema, connectionId: 'BOT-A' });
@@ -123,7 +124,7 @@ test('two bots share one MySQL schema without sharing bindings, jobs, context, d
       ["SELECT id FROM assistant_inbound_messages WHERE connection_id='bot-a' AND chat_id='same-chat' AND group_context_candidate=1 AND codex_context_forwarded_at IS NULL ORDER BY message_created_at DESC,id DESC LIMIT 5", 'idx_inbound_context'],
       ["SELECT id FROM bridge_jobs WHERE connection_id='bot-a' AND kind='hook' AND status='pending' ORDER BY created_at,id LIMIT 5", 'jobs_claim'],
     ]) {
-      const [[plan]] = await pool.query(`EXPLAIN ${sql}`);
+      const [[plan]] = await pool.query(`EXPLAIN FORMAT=TRADITIONAL ${sql}`);
       assert.match(String(plan.possible_keys), new RegExp(index));
     }
 

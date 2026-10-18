@@ -303,7 +303,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
       value: { desired: false, operation: 'remove', outcome: 'unknown', nextRetryAt: now },
     });
     await store.markRetry({ id: cleanupRun.id, leaseOwner: cleanupOwner.leaseOwner, held: true, errorCode: 'cleanup_fixture' });
-    const [plan] = await pool.query(`EXPLAIN SELECT id FROM assistant_codex_forward_jobs
+    const [plan] = await pool.query(`EXPLAIN FORMAT=TRADITIONAL SELECT id FROM assistant_codex_forward_jobs
       FORCE INDEX (idx_forward_feedback_cleanup)
       WHERE connection_id='fixture' AND feedback_cleanup_pending=1 AND feedback_cleanup_at<=?
         AND status IN ('held','completed','failed','deferred')
