@@ -2,7 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.31` forwards bounded native business-card form values to durable hooks and gives feedback-specific, truthful registration acknowledgements. No additional schema or configuration migration beyond 0.2.30; upgrading from 0.2.29 or earlier still requires migration 006. See [upgrade notes](MIGRATIONS.md).
+Version: `0.2.32` reads fragmented Codex RPC frames in linear time, releases incomplete frames after disconnection, and reports bounded memory-guard and RPC-timeout diagnostics. This prevents large image histories from causing repeated timeout and memory restarts. No schema/config migration or task replay. See [upgrade notes](MIGRATIONS.md#0232-large-codex-rpc-frames).
+
+Version `0.2.31` forwards bounded native business-card form values to durable hooks and gives feedback-specific, truthful registration acknowledgements. No additional schema or configuration migration beyond 0.2.30; upgrading from 0.2.29 or earlier still requires migration 006. See [upgrade notes](MIGRATIONS.md).
 
 Version `0.2.30` keeps the bot running in a degraded state while storage is slow or unavailable instead of restarting it, adds migration 006 (four online indexes; run `migrate` once per database before restarting), cuts idle database traffic from about 90 to about 8 statements per second, adds `storage_operation` / `storage_snapshot` diagnostics and the optional `storage.claimTimeoutMs`, and fixes the 0.2.29 crash when a restart resumes an already interrupted turn. See [0.2.30 query indexes and degraded storage](MIGRATIONS.md#0230-query-indexes-and-degraded-storage). 0.2.28 added the optional per-group reply style `routing.groups[].reply`: with `mode: "text"` a group's human turns get no execution card or Typing, and the answer is a text or post reply to the triggering message (one short line on failure, nothing for a `silentReply` token, optional `ack: "reaction"`). `trigger: "all"` is unchanged and documented alongside it. See [group text replies and trigger all](docs/runtime.md#group-text-replies-and-trigger-all).
 

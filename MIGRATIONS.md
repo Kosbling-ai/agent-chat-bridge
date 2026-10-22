@@ -1,6 +1,6 @@
 # Versions and migrations
 
-Application version: `0.2.31`
+Application version: `0.2.32`
 
 ## 0.2.31 business-card form transport
 
@@ -58,6 +58,20 @@ Version 0.2.9 does not add a database migration.
 `VERSION` is the application release version. Keep package.json, both root package-lock versions, README and CHANGELOG aligned; `npm run version:check` and `npm run check` enforce this. Use an explicit stable `MAJOR.MINOR.PATCH` number, with 0.x denoting ongoing initial development. Bump once per delivery batch, not per fix. Once released, do not move its tag or rewrite its versioned history; subsequent fixes get a new release. Documentation-only corrections need no empty migration or release bump.
 
 Application versions, config `schemaVersion` and numbered database migrations are separate contracts. Changing one does not mechanically increment the others. Startup validates the DB migration ledger and checksum; only the explicit migrate command performs DDL. Applied SQL is immutable. After this initial release, schema changes require a new numbered forward migration and corresponding runner support, not edits to 001. MySQL DDL is not transactionally reversible; do not promise an automatic down migration.
+
+## 0.2.32 large Codex RPC frames
+
+No database/config migration or dependency change. Queue records, native turn IDs, permissions and retry/admission rules are unchanged. Memory limits are not raised. Full-history responses can still require substantial memory; this release removes the quadratic framing overhead, not their payload size.
+
+Production host checklist (Bruce):
+
+1. In `/Users/kosbling/kosbling-automation/agent-chat-bridge`, run `git fetch origin`, then `git merge --ff-only origin/main` after the scoped release is reviewed, checked and authorized for deployment. Run `npm run check`.
+2. Capture `/Users/kosbling/kosbling-automation/kosbling-auto/logs/status.json` and inspect both Bridge logs and active forward jobs. Defer planned restart while a native turn is active. An existing pre-admission timeout loop can recover using the same persisted job; never delete/reset jobs, change session bindings, or replay business operations.
+3. Only from the host's main checkout, send `kill -TERM <bridge-pid>` to the verified `agent-chat-bridge` or `agent-chat-bridge-auth` PID. This is the supported supervisor restart: Bridge shuts down gracefully, exits 0 and `kosbling-auto` restarts that enabled child. Do not restart the runtime or signal unrelated PIDs. An instance already in its automatic restart loop may load this release on its next restart without an extra signal.
+4. Check `curl --noproxy '*' -fsS http://127.0.0.1:18832/health/ready` and port `18833` on this host (verify configured ports first). Observe several former restart cycles, stable Bridge PIDs, bounded RSS and no repeated `rpc_request/timed_out` or `codex_executor/restart_required`. Compare other long-running PIDs with the baseline. Verify any pending job retains its identity and receives at most one native admission; do not send a synthetic business request.
+5. New diagnostics: `rpc_request/timed_out` includes `rpc_method`, `CODEX_RPC_TIMEOUT` and `durationMs`; `memory_guard/restart_pending` includes `CODEX_MEMORY_LIMIT`, `rss_bytes`, `heap_used_bytes`, `rss_limit_bytes`, `heap_limit_bytes`. The eventual idle restart also retains the fixed code.
+
+Rollback: restore the previously recorded Bridge commit and repeat the targeted restart in an idle window. No data rollback or schema operation is required. Rolling back restores the large-history framing bug.
 
 ## 0.2.30 query indexes and degraded storage
 

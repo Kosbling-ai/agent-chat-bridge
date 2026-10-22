@@ -1,4 +1,8 @@
 const STORAGE_METRICS = {
+  "rssBytes": "rss_bytes",
+  "heapUsedBytes": "heap_used_bytes",
+  "rssLimitBytes": "rss_limit_bytes",
+  "heapLimitBytes": "heap_limit_bytes",
   "poolWaitMs": "pool_wait_ms",
   "beginMs": "begin_ms",
   "operationMs": "operation_ms",

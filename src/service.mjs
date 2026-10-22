@@ -294,7 +294,7 @@ export async function startService({ config, configPath, env = process.env, log,
     const groupInstructions=createGroupInstructions({groups:config.routing.groups.filter(group=>group.capabilities.includes('bridge')),configDir:root,log});
     executor=factories.executor({config:executorConfig,sessionStore:sessions,childEnv,log:executorLog,groupInstructions,
       onUserInput:event=>userInput?.open(event),onUserInputClosed:event=>userInput?.expire(event),onRestartRequired:async reason=>{
-      log('warning','codex_executor','restart_required',{code:reason});
+      log('warning','codex_executor','restart_required',{code:'CODEX_MEMORY_LIMIT'});
       await close();
       await onRestartRequired(reason);
     }});
@@ -443,6 +443,10 @@ export function createExecutorLogAdapter(log) {
     errno: event.errno,
     sqlState: event.sqlState,
     durationMs: event.durationMs,
+    rssBytes: event.rssBytes,
+    heapUsedBytes: event.heapUsedBytes,
+    rssLimitBytes: event.rssLimitBytes,
+    heapLimitBytes: event.heapLimitBytes,
     consecutiveFailures: event.consecutiveFailures,
     willRetry: event.willRetry,
     reason: event.reason,

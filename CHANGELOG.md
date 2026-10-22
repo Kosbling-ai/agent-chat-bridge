@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.32] - 2026-10-22
+
+- Assemble fragmented Codex JSON-RPC lines without repeatedly flattening and scanning the accumulated history. Image-heavy resume/read responses now take linear framing work; protocol contents, thread ownership and delivery deduplication are unchanged.
+- Release incomplete frame chunks when their child exits so failed RPCs do not retain historical image payloads until the next start.
+- Log the timed-out RPC method and fixed `CODEX_MEMORY_LIMIT` reason with bounded RSS/heap measurements. No prompts, images or raw errors are logged; memory thresholds and orderly idle-only restart remain unchanged.
+- No database/config migration, dependency update or job/session rewrite.
+
 ## [0.2.31] - 2026-10-18
 
 - Forward native `action.form_value` as optional normalized `event.formValue` to business hooks. Accept JSON objects up to 32 KiB, 256 nodes and depth 6; reject invalid data without ingestion. No form text is added to logs.
