@@ -637,11 +637,11 @@ test('memory guard waits for the native turn and lifecycle barrier before reques
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
     const runtime = fakeRuntime({ completeStarts: false });
-    let check; const restarts = [];
+    let check; const restarts = []; const diagnostics = [];
     const executor = createCodexExecutor({
       config: { ...config(cwd), memoryCheckIntervalMs: 60_000, memoryMaxRssBytes: 10, memoryMaxHeapUsedBytes: 10,
         memoryUsage: () => ({ rss: 20, heapUsed: 5 }) },
-      sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl,
+      sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl, log: (_level, event) => diagnostics.push(event),
       setIntervalImpl(callback) { check = callback; return { unref() {} }; }, clearIntervalImpl() {},
       onRestartRequired: async (reason) => { restarts.push(reason); },
     });
@@ -650,6 +650,9 @@ test('memory guard waits for the native turn and lifecycle barrier before reques
     check();
     assert.equal(executor.status().restartPending, 'rss 20 >= 10');
     assert.deepEqual(restarts, []);
+    const diagnostic = diagnostics.find(event => event.operation === 'memory_guard');
+    assert.equal(diagnostic.error_code, 'CODEX_MEMORY_LIMIT');
+    assert.deepEqual([diagnostic.rssBytes, diagnostic.heapUsedBytes, diagnostic.rssLimitBytes, diagnostic.heapLimitBytes], [20, 5, 10, 10]);
     runtime.children[0].send({ method: 'turn/completed', params: { turnId: 'turn-1', turn: { id: 'turn-1', status: 'completed', items: [] } } });
     await running;
     while (!restarts.length) await new Promise((resolve) => setImmediate(resolve));

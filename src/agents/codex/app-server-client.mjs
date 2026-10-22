@@ -48,7 +48,7 @@ export class CodexAppServerClient {
     this.closing = null;
     this.nextId = 1;
     this.pending = new Map();
-    this.stdoutBuffer = '';
+    this.stdoutChunks = [];
     this.fault = null;
     this.disconnectedChildren = new WeakSet();
     this.childGeneration = 0;
@@ -88,7 +88,7 @@ export class CodexAppServerClient {
     this.childGenerations.set(child,generation);
     this.child = child;
     this.ready = false;
-    this.stdoutBuffer = '';
+    this.stdoutChunks = [];
     child.stdout.setEncoding?.('utf8');
     child.stderr.setEncoding?.('utf8');
     child.stdin.on('error', (error) => { if (this.child === child && !this.closing) this.fail(error, child); });
@@ -116,6 +116,7 @@ export class CodexAppServerClient {
       const timer = setTimeout(() => {
         if (!this.pending.delete(id)) return;
         const error = new Error(`codex app-server ${method} timed out after ${duration}ms`);
+        emitLog(this.log, 'warning', 'rpc_request', 'timed_out', { rpc_method: method, error_code: 'CODEX_RPC_TIMEOUT', durationMs: duration });
         error.code = 'CODEX_RPC_TIMEOUT'; error.outcome = 'unknown'; reject(error); this.fail(error, child);
       }, duration);
       timer.unref?.();
@@ -140,11 +141,16 @@ export class CodexAppServerClient {
   handleStdout(chunk, child) {
     if (this.child !== child) return;
     const generation=this.childGenerations.get(child);
-    this.stdoutBuffer += String(chunk || '');
+    // Scan each incoming chunk once. Flattening and rescanning an accumulating
+    // JSON line on every pipe chunk is quadratic for image-rich thread history.
+    const text = String(chunk || '');
+    let offset = 0;
     let newline;
-    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+    while ((newline = text.indexOf('\n', offset)) !== -1) {
+      this.stdoutChunks.push(text.slice(offset, newline));
+      const line = this.stdoutChunks.join('').trim();
+      this.stdoutChunks = [];
+      offset = newline + 1;
       if (!line) continue;
       let message;
       try { message = JSON.parse(line); }
@@ -161,6 +167,7 @@ export class CodexAppServerClient {
           .finally(release);
       }
     }
+    if (offset < text.length) this.stdoutChunks.push(text.slice(offset));
   }
 
   handleServerRequest(message, child) {
@@ -253,6 +260,7 @@ export class CodexAppServerClient {
   handleExit(error, child) {
     if (this.child !== child) return;
     if (!this.closing) this.fault = 'unexpected_exit';
+    this.stdoutChunks = []; // discard incomplete frames from this child
     this.ready = false; this.child = null; this.rejectAll(error); this.notifyDisconnect(error, child);
   }
 

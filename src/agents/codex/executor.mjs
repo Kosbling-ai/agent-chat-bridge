@@ -1175,6 +1175,9 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     const overHeap = config.memoryMaxHeapUsedBytes && usage.heapUsed >= config.memoryMaxHeapUsedBytes;
     if ((!overRss && !overHeap) || restartPending) return;
     restartPending = [overRss ? `rss ${usage.rss} >= ${config.memoryMaxRssBytes}` : '', overHeap ? `heapUsed ${usage.heapUsed} >= ${config.memoryMaxHeapUsedBytes}` : ''].filter(Boolean).join('; ');
+    try { log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'memory_guard', status: 'restart_pending',
+      error_code: 'CODEX_MEMORY_LIMIT', rssBytes: usage.rss, heapUsedBytes: usage.heapUsed,
+      rssLimitBytes: config.memoryMaxRssBytes, heapLimitBytes: config.memoryMaxHeapUsedBytes }); } catch { /* diagnostics must not affect the memory guard */ }
     maybeNotifyRestart();
   }
   if (Number(config.memoryCheckIntervalMs) >= 1000 && (config.memoryMaxRssBytes || config.memoryMaxHeapUsedBytes)) {
