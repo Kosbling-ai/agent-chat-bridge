@@ -2,7 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.32` reads fragmented Codex RPC frames in linear time, releases incomplete frames after disconnection, and reports bounded memory-guard and RPC-timeout diagnostics. This prevents large image histories from causing repeated timeout and memory restarts. No schema/config migration or task replay. See [upgrade notes](MIGRATIONS.md#0232-large-codex-rpc-frames).
+Version: `0.2.33` adds read-only native execution and scope observations to authenticated event status. A deferred event no longer needs to be mistaken for a finished native turn. Unknown evidence stays unknown; observation does not replay work. No database/config migration. See [upgrade notes](MIGRATIONS.md#0233-event-execution-observation).
+
+Version `0.2.32` reads fragmented Codex RPC frames in linear time, releases incomplete frames after disconnection, and reports bounded memory-guard and RPC-timeout diagnostics. This prevents large image histories from causing repeated timeout and memory restarts. No schema/config migration or task replay. See [upgrade notes](MIGRATIONS.md#0232-large-codex-rpc-frames).
 
 Version `0.2.31` forwards bounded native business-card form values to durable hooks and gives feedback-specific, truthful registration acknowledgements. No additional schema or configuration migration beyond 0.2.30; upgrading from 0.2.29 or earlier still requires migration 006. See [upgrade notes](MIGRATIONS.md).
 

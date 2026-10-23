@@ -1046,6 +1046,50 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
 
   function hasOpenWaiter(state) { return Boolean(state?.waiters?.size); }
 
+  // Read-only observation. The caller supplies identity/target from its durable
+  // job, never from public request fields. A terminal steered job is not proof
+  // that its target turn ended. Also inspect the current binding after rollover.
+  async function observeExecution({ bindingOpenId, chatId, chatType, threadId, turnId, messageId }) {
+    const unknown = { execution: 'unknown', scope: 'unknown' };
+    if (closing) return unknown;
+    const actor = identity({ bindingOpenId, chatId, chatType });
+    const key = bindingKey(actor);
+    const locallyBusy = () => locks.has(key) || activeByBinding.has(key);
+    try {
+      return await client.lifecycle.run(async () => {
+        const binding = await sessionStore.loadBinding(actor);
+        if (!binding?.codexSessionId) return { ...unknown, scope: locallyBusy() ? 'busy' : 'unknown' };
+        const currentId = binding.codexSessionId;
+        if (!turnId && (!threadId || threadId === currentId) && messageId && sessionStore.findAcceptedMessageEvent) {
+          const receipt = await sessionStore.findAcceptedMessageEvent(binding, messageId, { includeInFlight: true });
+          if (['assistant-final:', 'error:', 'user-steer-confirmed:'].some(prefix => receipt?.event_key === `${prefix}${messageId}`)) {
+            turnId = parseDetail(receipt).turnId;
+            if (turnId) threadId = currentId;
+          }
+        }
+        const read = async id => {
+          const response = await client.request('thread/read', { threadId: id, includeTurns: true });
+          return response?.thread?.id === id && Array.isArray(response.thread.turns) ? response.thread : null;
+        };
+        const current = await read(currentId);
+        const target = threadId === currentId ? current : threadId && turnId ? await read(threadId) : null;
+        const terminal = status => ['completed', 'failed', 'interrupted'].includes(status);
+        const targetStatus = target && turnId ? exactTurnSnapshot(target, turnId).status : 'unknown';
+        const execution = terminal(targetStatus) ? 'ended' : targetStatus === 'inProgress' ? 'running' : 'unknown';
+        let scope = 'unknown';
+        const statusType = current?.status?.type || current?.status;
+        if (locallyBusy() || current?.turns.some(turn => turn.status === 'inProgress') || statusType === 'active') scope = 'busy';
+        else if (current && current.turns.every(turn => terminal(turn.status))
+          && (statusType == null || ['idle', 'notLoaded'].includes(statusType))) scope = 'idle';
+        // Another admission or binding rollover during RPC invalidates idle.
+        const latest = await sessionStore.loadBinding(actor);
+        if (latest?.codexSessionId !== currentId) scope = 'unknown';
+        if (locallyBusy()) scope = 'busy';
+        return { execution, scope };
+      });
+    } catch { return unknown; }
+  }
+
   async function inspect({ binding, threadId, turnId }) {
     if (!binding || binding.codexSessionId !== threadId) throw coded('inspection identity does not match binding', 'CODEX_INSPECT_MISMATCH');
     const response = await client.lifecycle.run(() => client.request('thread/read', { threadId, includeTurns: true }));
@@ -1185,7 +1229,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   return Object.freeze({
-    execute, inspect, interrupt, forkBinding, answerUserInput,
+    execute, inspect, observeExecution, interrupt, forkBinding, answerUserInput,
     status: () => ({ ready: client.ready, lifecycleActive: client.lifecycle.active, closing: Boolean(client.closing), fault: client.fault || null, activeTurns: activeByTurn.size, activeTurnResponseWaiters: [...activeByBinding.values()].filter(hasOpenWaiter).length, restartPending: restartPending || null }),
     async close() {
       closing = true;

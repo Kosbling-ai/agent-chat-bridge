@@ -386,3 +386,25 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     if (!pool.pool?._closed) await pool.end();
   }
 });
+
+
+test('scope activity stays inside connection/caller/namespace and includes held or future pending work', { skip: !enabled }, async () => {
+  const pool = createPoolFromEnvironment(refs);
+  try {
+    await migrate(pool);
+    const store = createForwardJobStore({ pool, connectionId: 'scope-observation' });
+    const other = createForwardJobStore({ pool, connectionId: 'scope-other' });
+    const input = { callerId: 'fixture', idempotencyKey: 'scope-active', conversationId: 'chat', messageId: 'scope-active',
+      executionNamespace: 'Scope:A', deliveryMode: 'caller', prompt: 'synthetic', nextAttemptAt: Date.now() + 100000 };
+    await store.upsert(input);
+    assert.deepEqual(await store.scopeActivity({ callerId: 'fixture', executionNamespace: 'Scope:A' }), { busy: true });
+    for (const query of [{ callerId: 'other', executionNamespace: 'Scope:A' }, { callerId: 'fixture', executionNamespace: 'scope:a' },
+      { callerId: 'fixture', executionNamespace: 'Scope:B' }]) assert.deepEqual(await store.scopeActivity(query), { busy: false });
+    assert.deepEqual(await other.scopeActivity({ callerId: 'fixture', executionNamespace: 'Scope:A' }), { busy: false });
+    for (const status of ['running', 'reply_pending', 'held', 'deferred', 'completed', 'failed']) {
+      await pool.execute('UPDATE assistant_codex_forward_jobs SET status=? WHERE connection_id=? AND message_id=?', [status, 'scope-observation', 'scope-active']);
+      assert.deepEqual(await store.scopeActivity({ callerId: 'fixture', executionNamespace: 'Scope:A' }),
+        { busy: ['running', 'reply_pending', 'held'].includes(status) }, status);
+    }
+  } finally { await pool.end(); }
+});

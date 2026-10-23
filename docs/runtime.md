@@ -424,3 +424,18 @@ A lost app-server connection is an unknown observation, not proof that the nativ
 Operator checklist: back up the configured database before correcting historical rows; deploy the reviewed 0.2.29 commit; run `npm run check` and `npm test`; use the host supervisor's supported restart lifecycle when no turn is active; verify `/health/ready` and `/health/tasks?window_minutes=120`. Rollback: restore the preceding reviewed application commit through the same lifecycle. No DDL/config migration is required. Historical terminal jobs need a separately audited correction after matching their native turn status; retain job status and business receipts, and never mark an interrupted job completed merely to clear an alert.
 
 A resumed turn that Codex already reports interrupted or failed, while its caller has stopped waiting (the lease was lost during shutdown), no longer terminates the process with an unhandled rejection (0.2.30). The turn's terminal error is persisted as before; the next attempt reads it and replies with the existing interrupted or failed message without starting another turn.
+
+
+### Event execution observation (0.2.33)
+
+Authenticated `GET /v1/events/:event_id` also returns:
+
+```json
+{"job_id":"...","status":"deferred","updated_at":1234,"execution":{"state":"running"},"scope":{"state":"busy"},"observed_at":1235}
+```
+
+- `execution.state`: `ended`, `running`, or `unknown`. The exact native target must report completed, failed or interrupted for ended. Deferred events track the actual steered turn, not the event job's terminal timestamp. Legacy error jobs may recover their target from their own exact-message durable receipt before native inspection.
+- `scope.state`: `idle`, `busy`, or `unknown`. Scope uses the authenticated producer's durable execution namespace. Pending (including future scheduled), running, reply-pending and held jobs count as busy. Queue reads bracket native inspection. Current-binding active turns/admissions also count as busy; binding changes and missing/unreadable native evidence cannot establish idle.
+- `observed_at`: server epoch milliseconds after observation. This is a read-only snapshot, not a lock, a guarantee against future admissions, or business completion/approval. Consumers must keep their own serialization and authority checks. Old servers omit these fields; absence means unknown.
+
+No prompts, native thread/turn IDs, other callers' scopes or raw error details are returned. Reading status never starts, steers, interrupts or retries a native turn. A native app-server process may start to perform a read when idle shutdown previously closed it.

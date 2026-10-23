@@ -12,6 +12,7 @@ import { deriveExecutionScope, codexBindingOpenId } from '../src/agents/codex/th
 import { createCodexSessionStore } from '../src/storage/codex-sessions.mjs';
 import { outboxRelativeDirectory } from '../src/agents/codex/prompt.mjs';
 import { createForwardRuntime } from '../src/core/forward-runtime.mjs';
+import { startServer } from '../src/server.mjs';
 
 class FakeStream extends EventEmitter {
   setEncoding() {}
@@ -2082,3 +2083,111 @@ for (const [path, status] of [['observation-loss duplicate', 'interrupted'], ['o
     assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 0);
   });
 }
+
+
+test('event HTTP status observes the real executor target and scope instead of treating deferred as ended', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-observe-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const turns = [{ id: 'target-turn', status: 'inProgress', items: [] }];
+  const rpc = fakeRuntime({ readTurns: turns });
+  const scope = 'fixture:scope';
+  const bindingOpenId = deriveExecutionScope('fixture', scope);
+  const sessions = memoryStore([{ feishuOpenId: bindingOpenId, chatId: 'fixture-chat', chatType: 'group', codexSessionId: 'target-thread' }]);
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: sessions, spawnImpl: rpc.spawnImpl });
+  t.after(() => executor.close());
+  let job;
+  let busy = false;
+  let queueError = false;
+  let queueReads = 0;
+  const jobs = {
+    async upsert(value) { job = { ...value, id: 'fixture-job', chatId: value.conversationId, status: 'deferred', updatedAt: 1,
+      result: { execution: { threadId: 'target-thread', turnId: 'target-turn' } } }; return job; },
+    async getByIdempotencyKey({ callerId }) { return job?.callerId === callerId ? job : null; },
+    async scopeActivity(value) { queueReads++; assert.deepEqual(value, { callerId: 'fixture', executionNamespace: scope });
+      if (queueError) throw new Error('private storage detail'); return { busy }; },
+  };
+  const runtime = createForwardRuntime({ jobs, sessions, executor, now: () => 999 });
+  await runtime.registerEvent({ producerId: 'fixture', eventId: 'event-one', scope, type: 'fixture.event',
+    chatId: 'fixture-chat', prompt: 'synthetic', requestHash: 'a'.repeat(64) });
+  const server = await startServer({ config: { listen: { host: '127.0.0.1', port: 0 },
+    hooks: [{ id: 'fixture', inbound: { tokenEnv: 'FIXTURE_TOKEN', scopePrefixes: ['fixture:'], defaultChatId: 'fixture-chat' } }] },
+    eventRuntime: runtime, inboundTokens: { fixture: 'fixture-token' }, log: () => {} });
+  t.after(() => server.close());
+  const url = `http://127.0.0.1:${server.server.address().port}/v1/events/event-one`;
+  const get = async () => (await fetch(url, { headers: { authorization: 'Bearer fixture-token' } })).json();
+  assert.equal((await fetch(url)).status, 401);
+  const running = await get();
+  assert.deepEqual(running, { job_id: 'fixture-job', status: 'deferred', updated_at: 1,
+    execution: { state: 'running' }, scope: { state: 'busy' }, observed_at: 999 });
+  turns[0].status = 'completed';
+  const completed = await get();
+  assert.equal(completed.execution.state, 'ended'); assert.equal(completed.scope.state, 'idle');
+  assert.equal(queueReads, 4, 'scope queue checked before and after each native observation');
+  busy = true;
+  assert.equal((await get()).scope.state, 'busy');
+  busy = false;
+  turns.push({ id: 'another-turn', status: 'inProgress' });
+  assert.equal((await get()).scope.state, 'busy', 'completed target does not hide another native turn');
+  turns[1].status = 'unknown';
+  assert.equal((await get()).scope.state, 'unknown');
+  turns.pop(); turns[0].status = 'interrupted';
+  assert.equal((await get()).execution.state, 'ended');
+  turns[0].id = 'unrelated-turn';
+  assert.equal((await get()).execution.state, 'unknown', 'never substitute the newest turn for target');
+  queueError = true;
+  const missing = await get();
+  assert.equal(missing.execution.state, 'unknown'); assert.equal(missing.scope.state, 'unknown');
+  assert.doesNotMatch(JSON.stringify(missing), /private|target-thread|prompt|fixture:scope/);
+  assert.equal(rpc.calls.some(call => /^(turn\/|thread\/(start|resume|fork|inject))/.test(call.method || '')), false,
+    'status observations only read native threads');
+});
+
+test('execution observation fails closed on absent binding, RPC failure, and binding change during read', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-observe-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const actor = { bindingOpenId: 'fixture-actor', chatId: 'fixture-chat', chatType: 'group', threadId: 'old-thread', turnId: 'target' };
+  const binding = { feishuOpenId: actor.bindingOpenId, chatId: actor.chatId, chatType: actor.chatType, codexSessionId: 'current-thread' };
+  for (const mode of ['missing', 'rpc-failed', 'rollover']) {
+    const sessions = memoryStore(mode === 'missing' ? [] : [binding]);
+    let reads = 0;
+    if (mode === 'rollover') sessions.loadBinding = async () => ({ ...binding, codexSessionId: ++reads === 1 ? 'current-thread' : 'next-thread' });
+    const rpc = fakeRuntime({ readTurns: [{ id: 'target', status: 'completed' }],
+      rejectMethods: mode === 'rpc-failed' ? new Map([['thread/read', { code: -32000, message: 'failure' }]]) : new Map() });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: sessions, spawnImpl: rpc.spawnImpl });
+    try {
+      const result = await executor.observeExecution(actor);
+      assert.equal(result.scope, 'unknown', mode);
+      if (mode !== 'rollover') assert.equal(result.execution, 'unknown', mode);
+      else assert.deepEqual(rpc.calls.filter(call => call.method === 'thread/read').map(call => call.params.threadId), ['current-thread', 'old-thread']);
+    } finally { await executor.close(); }
+  }
+});
+
+
+test('legacy failed job recovers exact native target from its own durable error receipt', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-observe-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const binding = { feishuOpenId: 'fixture-actor', chatId: 'fixture-chat', chatType: 'group', codexSessionId: 'thread-existing' };
+  const sessions = memoryStore([binding]);
+  await sessions.saveCodexRealtimeEvent(binding, { messageId: 'message-one', eventKey: 'error:message-one', eventType: 'error', detail: { turnId: 'target', turnStatus: 'failed' } });
+  const rpc = fakeRuntime({ readTurns: [{ id: 'target', status: 'failed' }] });
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: sessions, spawnImpl: rpc.spawnImpl });
+  t.after(() => executor.close());
+  const input = { bindingOpenId: binding.feishuOpenId, chatId: binding.chatId, chatType: 'group' };
+  assert.deepEqual(await executor.observeExecution({ ...input, messageId: 'message-one' }), { execution: 'ended', scope: 'idle' });
+  assert.equal((await executor.observeExecution({ ...input, messageId: 'message-other' })).execution, 'unknown');
+});
+
+
+test('local active executor prevents idle even when a native read is stale', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-observe-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const rpc = fakeRuntime({ completeStarts: false, readTurns: [{ id: 'turn-1', status: 'completed' }] });
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: memoryStore(), spawnImpl: rpc.spawnImpl });
+  const input = { bindingOpenId: 'fixture-actor', chatId: 'fixture-chat', chatType: 'group', messageId: 'current', prompt: 'synthetic' };
+  const running = executor.execute(input); running.catch(() => {});
+  try {
+    while (executor.status().activeTurns !== 1) await new Promise(resolve => setImmediate(resolve));
+    assert.equal((await executor.observeExecution({ ...input, threadId: 'thread-1', turnId: 'turn-1' })).scope, 'busy');
+  } finally { await executor.close(); await assert.rejects(running); }
+});
