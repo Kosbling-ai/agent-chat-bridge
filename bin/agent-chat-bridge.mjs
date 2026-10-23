@@ -5,8 +5,12 @@ import { readFile } from 'node:fs/promises';
 import { StoreError } from '../src/storage/errors.mjs';
 import { dirname, resolve } from 'node:path';
 import { checkGroupInstructions } from '../src/core/group-instructions.mjs';
+import { checkGroupCodexWorkspaces } from '../src/agents/codex/workspace.mjs';
 
-const SAFE_MIGRATION_CODES = new Set(['legacy_connection_id_required', 'legacy_connection_id_mismatch', 'invalid_legacy_connection_id', 'writer_busy', 'migration_busy', 'schema_version_mismatch']);
+const SAFE_MIGRATION_CODES = new Set(['legacy_connection_id_required', 'legacy_connection_id_mismatch', 'invalid_legacy_connection_id', 'writer_busy', 'migration_busy', 'schema_version_mismatch',
+  // Normalized storage failures, e.g. a metadata-lock wait timeout during an online index build (store_contention),
+  // or a deterministic error such as a missing ALTER/INDEX privilege (store_invalid).
+  'store_contention', 'store_timeout', 'store_unavailable', 'store_invalid']);
 const HELP = `agent-chat-bridge
 
 Usage:
@@ -17,7 +21,7 @@ Usage:
   agent-chat-bridge migrate --config <path> [--legacy-connection-id <original-connection-id>]
 
 An explicit JSON config path is required; no config or .env auto-discovery.
-check-config validates syntax and configured group instruction files; it never resolves environment secrets.
+check-config validates syntax, configured group instruction files and group Codex working directories; it never resolves environment secrets.
 start assembles explicitly configured Feishu, Codex and MySQL components.
 Health-only configuration remains live but readiness returns 503.
 migrate explicitly applies the configured Store schema; start never migrates.
@@ -39,12 +43,15 @@ try {
     if (command === 'check-config') {
       const problems = await checkGroupInstructions(config.routing?.groups ?? [], { configDir: dirname(resolve(path)) });
       for (const problem of problems) log('warning', 'check_config', 'failed', { code: 'invalid_group_instruction_file', ...problem });
+      const workspaceProblems = await checkGroupCodexWorkspaces(config.routing?.groups ?? []);
+      for (const problem of workspaceProblems) log('warning', 'check_config', 'failed', { code: 'invalid_group_codex_workspace', ...problem });
       if (problems.length) throw new ConfigError('invalid_group_instruction_file');
+      if (workspaceProblems.length) throw new ConfigError('invalid_group_codex_workspace');
       log('info', 'check_config', 'succeeded');
     } else if (command === 'migrate') {
       const { migrateService } = await import('../src/service.mjs');
-      await migrateService({ config, legacyConnectionId: extra[1] });
-      log('info', 'migration', 'succeeded');
+      const result = await migrateService({ config, legacyConnectionId: extra[1] });
+      log('info', 'migration', 'succeeded', { version: result?.version, applied: result?.applied });
     } else {
       const { startService } = await import('../src/service.mjs');
       const controller = new AbortController();

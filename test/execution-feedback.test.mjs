@@ -241,9 +241,11 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
     context: { open_chat_id: 'chat-1', open_message_id: 'card-message' },
   };
 
+  job.senderUnionId = 'union-1';
   assert.equal((await feedback.handleCardAction(action)).toast.content, '已请求停止执行');
   assert.deepEqual(stoppedIdentity,{threadId:'thread-1',turnId:'turn-1'});
   assert.equal(authorization.conversationType,'group');
+  assert.deepEqual(authorization.actor, { openId: 'sender-1', unionId: 'union-1' });
   assert.equal((await feedback.handleCardAction(action)).toast.content, '已请求停止执行');
   assert.equal(interrupts, 1);
 
@@ -254,6 +256,23 @@ test('stop callback is fenced to the original sender/card/turn and replay does n
   authorized = false;
   assert.equal((await feedback.handleCardAction(action)).toast.type, 'error');
   assert.equal(interrupts, 1);
+});
+
+test('card authorization carries the job sender union_id only for that sender', async () => {
+  const authorizations = [];
+  const forkJob = { ...jobFixture(), chatType: 'p2p', senderUnionId: 'union-1', status: 'failed', last_error: 'CODEX_THREAD_BUSY',
+    result: { busyFork: { sourceThreadId: 'source-1', bindingOpenId: 'sender-1' }, executionCard: { messageId: 'card-message' } } };
+  const systemJob = { ...jobFixture(), senderOpenId: 'system:task', senderUnionId: 'union-system' };
+  let job = forkJob;
+  const feedback = createExecutionFeedback({ jobs: { async getRun() { return job; }, async beginFork() { return { outcome: 'stale' }; } },
+    sessions: {}, chat: {}, cardClient: {}, executor: {}, authorize: async input => { authorizations.push(input); return true; } });
+  await feedback.handleCardAction({ action: { value: { action: 'fork_busy_session', jobId: forkJob.id, expectedSourceThreadId: 'source-1' } },
+    operator: { open_id: 'sender-1' }, context: { open_chat_id: 'chat-1', open_message_id: 'card-message' } });
+  job = systemJob;
+  await feedback.handleCardAction({ action: { value: { action: 'stop_execution', jobId: systemJob.id, expectedTurnId: 'stale-turn' } },
+    operator: { open_id: 'operator-2' }, context: { open_chat_id: 'chat-1', open_message_id: 'card-message' } });
+  assert.deepEqual(authorizations.map(item => [item.operation, item.actor]),
+    [['fork', { openId: 'sender-1', unionId: 'union-1' }], ['stop', { openId: 'operator-2', unionId: '' }]]);
 });
 
 test('recovery delegates persisted and app reaction cleanup without replaying add', async () => {

@@ -1,12 +1,20 @@
 # agent-chat-bridge
 
+staging 另保留默认关闭的[飞书 Computer Use 授权](docs/computer-use.md)，支持仅当前轮次的应用授权；这些功能尚未发布，旧 staging 草稿版本号以 main 发布历史为准。
+
 [English](README.md) | 简体中文
 
 英文文档和实际代码是主契约；API、配置字段、命令和结构化日志保持英文。
 
-版本：`0.2.27`，当前为未发布开发版；0.2.22 压缩执行卡：可见区只保留答复（运行中为最近一条进展）和状态行，执行过程最多折叠进一个不嵌套的面板，卡片文案键未删改（新增可选键 `processGroup`），已存状态不变。0.2.21 新增 `routing.groups[].codex` 按群覆盖 Codex 权限（`approvalPolicy`、`approvalsReviewer`、`sandbox`），作用于该 `bridge` 群的人类群线程，以及 hook `inbound.defaultChatId` 为该群的业务事件线程；私聊和其它群不变。Codex 完全权限需要 `approvalPolicy: "never"` 与 `sandbox: "danger-full-access"` 同时设置，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.1.1 是此前实现版本。0.2.5 增加多 bot 共用专用 bridge MySQL schema 所需的迁移 004，旧 assistant 数据必须显式指定原 bot 的连接 ID；还可把 Codex 支持的用户提问映射为当前 turn 的独立飞书卡片，由原发送者一次提交多道单选或自由填空。此能力默认禁用，需显式配置 `codex.requestUserInput:true` 才启用；secret 提问会被拒绝，过期或断线后的请求不能恢复。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
+版本：`0.2.32`。修复大图片历史的分段 RPC 数据反复复制与扫描，断线时释放不完整数据，并补齐内存保护与 RPC 超时诊断。不修改数据库、配置、会话或任务重试规则，无需数据迁移。升级只重启 Bridge，步骤见[英文升级说明](MIGRATIONS.md#0232-large-codex-rpc-frames)。
+
+0.2.30。0.2.30 在存储变慢或不可用时让 bot 降级运行而不是重启，新增迁移 006（4 个在线索引，每个库在重启前跑一次 `migrate`），空闲时的数据库语句从每秒约 90 条降到约 8 条，新增 `storage_operation`、`storage_snapshot` 诊断与可选键 `storage.claimTimeoutMs`，并修复 0.2.29 重启接续已中断 turn 时进程退出的问题；升级与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.2.28 新增可选群级键 `routing.groups[].reply`：`mode: "text"` 时该群人类消息轮次不出执行卡、不加 Typing，答复以 text 或 post 回复触发消息，失败只发一行，命中 `silentReply` 不发任何东西，可选 `ack: "reaction"`；`trigger: "all"` 原已支持、行为不变；无数据库迁移，不配置时行为不变，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.2.27 新增可选键 `codex.permissionProfile`，按实例让 Codex 线程用命名 permission profile：建线程、恢复、分叉时传 `permissions` 不传 `sandbox`，Codex 报告的生效 profile 不一致就不用该线程；无数据库迁移，不配置时行为不变，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.2.26 新增可选私聊准入回调 `routing.privateAdmission`：私聊消息落库前先问配置的业务接口，按 open_id 缓存结果，接口不可用即拒，被拒的人只收到一句固定话术；无数据库迁移，不配置时行为不变，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.2.25 为 `routing.groups[].codex` 新增可选 `cwd`（绝对路径，启动与 `check-config` 按全局 `codex.cwd` 的同一规则检查），作用于该 `bridge` 群的人类群线程和结果投递到该群的业务事件线程，记录 cwd 与之不同的老线程在下一轮换新线程；提示词里的「回发文件目录」对所有会话改为绝对路径，无数据库迁移，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.2.24 为不确定的队列认领提交增加有界恢复。0.2.23 新增可选卡片文案键 `commandTitleTemplate`（占位符 `{name}`、`{label}`，缺省 `{name}`，输出不变），用于重写执行卡里只显示程序名的命令行标题，例如 `{label}` 显示「执行命令」，无迁移。0.2.22 压缩执行卡：可见区只保留答复（运行中为最近一条进展）和状态行，执行过程最多折叠进一个不嵌套的面板，卡片文案键未删改（新增可选键 `processGroup`），已存状态不变。0.2.21 新增 `routing.groups[].codex` 按群覆盖 Codex 权限（`approvalPolicy`、`approvalsReviewer`、`sandbox`），作用于该 `bridge` 群的人类群线程，以及 hook `inbound.defaultChatId` 为该群的业务事件线程；私聊和其它群不变。Codex 完全权限需要 `approvalPolicy: "never"` 与 `sandbox: "danger-full-access"` 同时设置，启用与回退步骤见[版本与迁移](MIGRATIONS.zh-CN.md)。0.1.1 是此前实现版本。0.2.5 增加多 bot 共用专用 bridge MySQL schema 所需的迁移 004，旧 assistant 数据必须显式指定原 bot 的连接 ID；还可把 Codex 支持的用户提问映射为当前 turn 的独立飞书卡片，由原发送者一次提交多道单选或自由填空。此能力默认禁用，需显式配置 `codex.requestUserInput:true` 才启用；secret 提问会被拒绝，过期或断线后的请求不能恢复。0.2.4 恢复原业务的 Codex 宿主默认值、执行卡控制器、普通 post/text 回复、Typing、私聊图片和直接附件投递路径。参见英文[更新记录](CHANGELOG.md)、[版本与迁移策略](MIGRATIONS.md)和[staging 流程](docs/zh-CN/staging-workflow.md)。
 
 这是独立的飞书 + Codex bridge。一个进程持有一套飞书 bot/WebSocket 和一个 Codex app-server/executor；MySQL 使用 bridge 自己的 schema。communication worker 负责 hook 和已登记消息 outbox，唯一的 forward worker 负责 Codex 执行、恢复、卡片、Typing、停止和答案/附件投递。
+
+私聊准入三选一：`routing.privateUserIds` 名单、`routing.allowAllPrivateUsers: true` 全放开，或可选的 `routing.privateAdmission` 每条私聊先问配置的业务接口；被拒或接口不可用的消息不落库、不起线程，只回一句固定话术。键、请求/响应形状、缓存与失败语义见英文[私聊准入回调](docs/runtime.md#private-chat-admission-callback)。
+
+可选的 `codex.permissionProfile` 让本实例的 Codex 线程改用命名 permission profile（代替 `codex.sandbox`）：建线程、恢复、分叉时传 `permissions` 不传 `sandbox`，Codex 报告的生效 profile 不一致就不用该线程；前提、互斥规则与回退见英文[按实例的命名权限 profile](docs/runtime.md#named-permission-profile-per-instance)。
 
 群必须显式列在 `routing.groups`。`capabilities` 缺省为 `['bridge','hook']`，也可写 `['bridge']`、`['hook']` 或 `[]`。hook 按自己的订阅过滤，不依赖 Agent 的 @、成员过滤、执行或回复。业务继续以 lark-cli 等查询接口为数据真源，自己负责轮询兜底和 messageId 去重；hook 只是带稳定事件/群/消息标识的轻量通知。
 
@@ -42,5 +50,3 @@ Agent 判断某次群聊触发无需回复时，可以只回一个由操作者�
 `tokens` 缺省 `[]`（即关闭），`card` 缺省 `"delete"`。bridge 不会把 token 告诉 Agent，哨兵约定要以相同字面值写进群指令或工作区规则。Agent 最终答复去掉首尾空白后与某个 token 精确相等（区分大小写，不做前缀或包含匹配）时，bridge 不发文字回复：`"delete"` 撤回执行卡（飞书只允许机器人撤回发送后 24 小时内自己发的消息，群里可能显示「撤回了一条消息」），撤回失败退化为 `"complete"`；`"complete"` 把执行卡改为完成态并显示中性卡片文案 `silentReply`（缺省「已处理，无需回复。」）。哨兵字面值不会展示。任务记为 `completed`，结果中 `silentReply.status` 为 `silent`；卡片既撤不回也改不了时按 `codex.jobMaxAttempts` 重试。私聊、失败或补充转达的任务、非哨兵答复均不受影响；outbox 附件照常发送。bot 自己消息的撤回事件不再转给 hook。升级说明见[中文迁移说明](MIGRATIONS.zh-CN.md)。
 
 迁移或启动前只使用独立 bridge schema 和受控凭证注入。不要把 token 写入 JSON、`.env`、日志或版本控制。迁移边界见[中文说明](MIGRATIONS.zh-CN.md)。
-
-设置 `codex.computerUse: true` 后，可在飞书卡片中处理 [Computer Use 应用授权](docs/computer-use.md)；需要本机已有相应 Codex 运行时。

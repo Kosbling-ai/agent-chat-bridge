@@ -5,10 +5,14 @@ import { buildCodexForwardPrompt, createRecentMentionPrompts, isBotJoinNotice,
   mergeMentionPrompts, normalizeFeishuInput } from '../channels/feishu/input.mjs';
 import { DEFAULT_REPLY_CONTEXT_MAX_CHARS, loadReplySegment } from '../channels/feishu/reply-context.mjs';
 import { createReplyTrigger } from '../channels/feishu/reply-trigger.mjs';
+import { admissionReplyUuid } from './private-admission.mjs';
 import { databaseError } from '../storage/errors.mjs';
 
 const parse=value=>typeof value==='string'?JSON.parse(value):value;
 const sleep=milliseconds=>new Promise(resolve=>{const timer=setTimeout(resolve,milliseconds);timer.unref?.();});
+// Claim acknowledgements can be lost after COMMIT. The store reconciles the
+// original claim by row ID and lease token; an unresolved result is discarded
+// and polled again, and persisted leases prevent executing an unconfirmed claim.
 // Only claim polling is retried here; no hook or platform send has started.
 const TRANSIENT_STORE_ERRORS=new Set(['store_unavailable','store_contention','store_timeout','commit_unknown']);
 const POLL_RETRY_BASE_MS=1000;
@@ -29,9 +33,12 @@ function deliveryErrorCode(error) {
   return 'chat_delivery_failed';
 }
 
-export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,botAppId='',hookTokens={},fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
+export function createCommunicationRuntime({config,store,inbound,forward,chat,outbound,botAppId='',hookTokens={},privateAdmission,fetchImpl=fetch,log=()=>{},now=Date.now,wait=sleep}={}) {
   const connectionId=config.feishu.connectionId; const owner=randomUUID(); const leaseMs=60000;
-  let started=false,stopping=false,healthy=true,worker,degraded=false,consecutiveFailures=0,lastFailureLogAt=0,lastLoggedFailureStage='',wakeWait; const active=new Set(); const processing=new Set(); const successfulClaimStages=new Set();
+  // Configured admission must never silently fall back to an open private chat.
+  if(config.routing.privateAdmission&&typeof privateAdmission?.check!=='function')throw new Error('private_admission_unavailable');
+  const admission=config.routing.privateAdmission?privateAdmission:undefined; const notices=new Set();
+  let started=false,stopping=false,healthy=true,worker,degraded=false,degradedSince=0,lastEscalatedLogAt=-Infinity,consecutiveFailures=0,lastFailureLogAt=0,lastLoggedFailureStage='',wakeWait; const active=new Set(); const processing=new Set(); const successfulClaimStages=new Set();
   const capabilities=group=>group?(group.capabilities??['bridge','hook']):[];
   const maxEventAgeMs=Number(config.codex.maxEventAgeMs??10*60*1000);
   const contextLimit=Number(config.codex.groupContextMessageLimit??50);
@@ -62,10 +69,57 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     catch { log('warning','recall_filter','failed',{code:'outbound_message_lookup_failed'}); return false; }
   }
   const pause=milliseconds=>{let wake;const interrupted=new Promise(resolve=>{wake=resolve;wakeWait=wake;});return Promise.race([wait(milliseconds),interrupted]).finally(()=>{if(wakeWait===wake)wakeWait=undefined;});};
-  function humanAllowed(event,group) {
+  function humanAllowed(event,group,admitted=false) {
     if(event.isApp||event.isSelf||event.actor?.type!=='user')return false;
-    if(event.conversationType==='p2p')return (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId)));
+    if(event.conversationType==='p2p')return (config.routing.privateUserIds.includes(event.actor.openId) || (config.routing.allowAllPrivateUsers === true && Boolean(event.actor.openId)) || (admitted && Boolean(event.actor.openId)));
     return Boolean(group&&capabilities(group).includes('bridge')&&(group.userIds===undefined||group.userIds.includes(event.actor.openId)));
+  }
+  // Best effort: one direct reply, no retry and no outbox row, so a refused
+  // message leaves nothing in the Store.
+  function replyAdmission(event,text) {
+    const task=Promise.resolve().then(()=>{
+      if(typeof chat?.replyMessage!=='function')throw Object.assign(new Error('chat_unavailable'),{code:'private_admission_reply_unavailable'});
+      return chat.replyMessage({messageId:event.messageId,kind:'text',content:{text},uuid:admissionReplyUuid(event.messageId)});
+    }).catch(error=>log('warning','private_admission','reply_failed',{code:typeof error?.code==='string'?error.code:'private_admission_reply_failed',
+      ...(Number.isSafeInteger(error?.platformCode)?{platformCode:error.platformCode}:{})})).finally(()=>notices.delete(task));
+    notices.add(task);
+  }
+  // History events carry no union_id. Recover the sender's last known one from
+  // this bot's own forward jobs (read-only); a failure counts as "unknown".
+  async function recoverUnion(event) {
+    if(typeof store?.findSenderUnionId!=='function'||!admission.shouldLookupUnion(event.actor.openId))return;
+    try {
+      const unionId=await store.findSenderUnionId({connectionId,chatId:event.conversationId,openId:event.actor.openId});
+      if(unionId)admission.learn({openId:event.actor.openId,unionId});
+    } catch(error) { log('warning','private_admission','union_lookup_failed',{code:databaseError(error).code}); }
+  }
+  // Runs before any Store write. undefined means the callback does not apply
+  // (groups, non-human events, listed private users, ordinary recalls).
+  async function admitPrivate(event,context) {
+    admission.learn(event.actor);
+    // Feishu recalls carry neither chat type nor operator; drop only the recall
+    // of a message this bot refused, so it leaves no tombstone or inbox row.
+    if(event.type==='message.recalled'){
+      if(!admission.refused(event.messageId))return undefined;
+      const result={decision:'deny',reason:'recalled_refused',cached:true};
+      admission.report(result,{messageId:event.messageId});
+      return result;
+    }
+    if(event.conversationType!=='p2p'||event.isApp||event.isSelf||event.actor?.type!=='user')return undefined;
+    if(config.routing.privateUserIds.includes(event.actor.openId))return undefined;
+    const known=admission.refused(event.messageId);
+    if(known){
+      const result={...known,cached:true};
+      admission.report(result,{openId:event.actor.openId,messageId:event.messageId});
+      return result;
+    }
+    if(event.source==='history_catchup'&&!event.actor.unionId)await recoverUnion(event);
+    const result=await admission.check({openId:event.actor.openId,unionId:event.actor.unionId,userId:event.actor.userId,
+      chatId:event.conversationId,deadlineAt:context.deadlineAt,messageId:event.messageId});
+    if(result.decision==='allow')return result;
+    if(event.type==='message.received')admission.refuseMessage(event.messageId,result);
+    if(!stopping&&event.source==='live'&&event.type==='message.received'){const text=admission.replyFor(event.actor.openId,result.decision);if(text)replyAdmission(event,text);}
+    return result;
   }
   function stale(event,createdAt) {
     if(!Number.isFinite(maxEventAgeMs)||maxEventAgeMs<=0)return false;
@@ -83,7 +137,14 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       &&((event.conversationType==='p2p')||group?.userIds!==undefined))throw Object.assign(new Error('history_authorization_identity_missing'),{code:'history_authorization_identity_missing'});
     if(event.source==='history_catchup'&&group?.trigger==='mention'&&(event.message?.mentions?.length||0)>0
       &&!event.message.mentions.some(mention=>mention.openId))throw Object.assign(new Error('history_authorization_identity_missing'),{code:'history_authorization_identity_missing'});
-    const agentAllowed=humanAllowed(event,group);
+    let privateAdmitted=false;
+    if(admission){
+      const admitted=await admitPrivate(event,context);
+      if(admitted&&admitted.decision!=='allow')return {admitted:false,decision:admitted.decision};
+      if(context.signal?.aborted)throw new Error('ingress_stopped');
+      privateAdmitted=admitted?.decision==='allow';
+    }
+    const agentAllowed=humanAllowed(event,group,privateAdmitted);
     const mentioned=event.message?.mentions?.some(mention=>mention.openId===config.feishu.botOpenId);
     const normalized=normalizeFeishuInput(event,{botOpenId:config.feishu.botOpenId});
     const attachmentMetadata=extractAttachments(event);
@@ -211,9 +272,13 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     const normalized=databaseError(error);const failedAt=now();consecutiveFailures+=1;successfulClaimStages.clear();
     const transient=TRANSIENT_STORE_ERRORS.has(normalized.code);
     if(!transient){healthy=false;degraded=false;log('error','communication_worker','failed',{code:'worker_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:false});return false;}
+    if(!degraded)degradedSince=failedAt;
     degraded=true;
-    const shouldLog=consecutiveFailures===1||stage!==lastLoggedFailureStage||failedAt-lastFailureLogAt>=DEGRADED_LOG_INTERVAL_MS;
-    if(shouldLog){lastFailureLogAt=failedAt;lastLoggedFailureStage=stage;log('warning','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:true});}
+    // A degradation lasting 5 minutes or more is reported at error level (so
+    // error reporting sees it), still at most once per 5 minutes.
+    const escalate=failedAt-degradedSince>=DEGRADED_LOG_INTERVAL_MS&&failedAt-lastEscalatedLogAt>=DEGRADED_LOG_INTERVAL_MS;
+    const shouldLog=escalate||consecutiveFailures===1||stage!==lastLoggedFailureStage||failedAt-lastFailureLogAt>=DEGRADED_LOG_INTERVAL_MS;
+    if(shouldLog){lastFailureLogAt=failedAt;lastLoggedFailureStage=stage;if(escalate)lastEscalatedLogAt=failedAt;log(escalate?'error':'warning','communication_worker','failed',{code:'worker_poll_failed',stage,errorClass:normalized.code,reason:normalized.reason,errorCode:normalized.errorCode,errno:normalized.errno,sqlState:normalized.sqlState,durationMs,consecutiveFailures,willRetry:true});}
     return true;
   }
   function launch(operation,stage){const promise=operation.catch(error=>{recordStorageFailure(stage,error);}).finally(()=>active.delete(promise));active.add(promise);}
@@ -222,7 +287,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
     successfulClaimStages.add(stage);
     if(successfulClaimStages.size<2)return;
     const recoveredFailures=consecutiveFailures;
-    consecutiveFailures=0;lastFailureLogAt=0;lastLoggedFailureStage='';degraded=false;successfulClaimStages.clear();
+    consecutiveFailures=0;lastFailureLogAt=0;lastLoggedFailureStage='';degraded=false;degradedSince=0;lastEscalatedLogAt=-Infinity;successfulClaimStages.clear();
     log('info','communication_worker','recovered',{code:'worker_recovered',consecutiveFailures:recoveredFailures});
   }
   async function claim(stage,operation){
@@ -260,5 +325,5 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       if (!busy) idleDelayMs = Math.min(1000, idleDelayMs * 2);
     }
   }
-  return Object.freeze({ingest,ingestCardAction,status:()=>({running:started&&!stopping&&healthy,healthy,degraded,consecutiveFailures}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;wakeWait?.();await worker;await Promise.allSettled(active);}});
+  return Object.freeze({ingest,ingestCardAction,status:()=>({running:started&&!stopping&&healthy,healthy,degraded,consecutiveFailures}),start(){if(started)throw new Error('communication_runtime_already_started');started=true;worker=loop();},async stop(){stopping=true;wakeWait?.();await worker;await Promise.allSettled([...active,...notices]);}});
 }

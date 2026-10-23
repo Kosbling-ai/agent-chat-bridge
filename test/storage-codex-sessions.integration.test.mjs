@@ -10,8 +10,8 @@ const refs = Object.fromEntries(['host', 'port', 'user', 'password', 'database']
 test('isolated MySQL migrates and preserves exact scoped Codex session/event queries', { skip: !enabled, timeout: 40_000 }, async () => {
   const pool = createPoolFromEnvironment(refs);
   try {
-    assert.deepEqual(await migrate(pool), { version: 5, applied: true });
-    assert.deepEqual(await assertSchemaCurrent(pool), { version: 5 });
+    assert.deepEqual(await migrate(pool), { version: 6, applied: true });
+    assert.deepEqual(await assertSchemaCurrent(pool), { version: 6 });
     const store = createCodexSessionStore({connectionId:'fixture', pool, schema: process.env.BRIDGE_TEST_DATABASE, now: () => 1000 });
     const binding = { feishuOpenId: 'system:fixture', chatId: 'chat-a', chatType: 'group', codexSessionId: 'thread-a', threadName: 'fixture' };
     await store.saveCodexBinding(binding, { messageId: 'message-a' });
@@ -27,7 +27,7 @@ test('isolated MySQL migrates and preserves exact scoped Codex session/event que
     const otherConnection = createCodexSessionStore({connectionId:'other', pool, schema: process.env.BRIDGE_TEST_DATABASE, now: () => 1000 });
     assert.equal(await otherConnection.loadCodexEvent(binding, 'injection:system-preamble'), null);
 
-    assert.deepEqual(await migrate(pool), { version: 5, applied: false });
-    assert.deepEqual(await assertSchemaCurrent(pool), { version: 5 });
+    assert.deepEqual(await migrate(pool), { version: 6, applied: false });
+    assert.deepEqual(await assertSchemaCurrent(pool), { version: 6 });
   } finally { await pool.end(); }
 });

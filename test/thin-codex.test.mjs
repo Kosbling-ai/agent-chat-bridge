@@ -118,9 +118,14 @@ function memoryStore(initial = []) {
   };
 }
 
-function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false, turnItemsFor = () => [] } = {}) {
+function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkThread, completeStarts = true, raceCompletionBeforeResponse = false, rejectTurnStart = false, archiveTurnStartOnce = false, rejectMethods = new Map(), hangMethods = new Set(), strictThreadLoading = false, resumeDelayMs = 0, archiveResumeThreadIds = new Set(), serverRequestsOnStart = [], resolveServerRequestBeforeResponse = false, turnItemsFor = () => [], resumeCwds = new Map(), startCwd = (params) => params.cwd,
+  // The profile Codex reports on thread/start|resume|fork; by default it echoes `permissions` and adds nothing without it.
+  activeProfile = (params) => (params.permissions ? { id: params.permissions, extends: null } : undefined) } = {}) {
   let threadNumber = 0; let turnNumber = 0;
+  const profileOf = (params) => { const value = activeProfile(params); return value === undefined ? {} : { activePermissionProfile: value }; };
   const children = []; const calls = []; const envs = []; const args = [];
+  // The cwd Codex reports on resume: an explicit fixture value, else the cwd the thread started with.
+  const recordedCwds = new Map(resumeCwds);
   const spawnImpl = (_bin, childArgs, options) => {
     args.push(childArgs); envs.push(options.env);
     const loaded = new Set();
@@ -139,15 +144,19 @@ function fakeRuntime({ resumeTurns = [], readTurns = [], readThread = {}, forkTh
         instance.send({ id: message.id, error: { code: -32602, message: 'SYNTHETIC_SECRET invalid approvalsReviewer' } });
       }
       else if (message.method === 'thread/start') {
-        const id = `thread-${++threadNumber}`; loaded.add(id); respond({ thread: { id } });
+        const id = `thread-${++threadNumber}`; loaded.add(id);
+        const cwd = startCwd(message.params);
+        if (cwd) recordedCwds.set(id, cwd);
+        respond({ thread: { id, ...(cwd ? { cwd } : {}) }, ...profileOf(message.params) });
       } else if (message.method === 'thread/resume') {
         if (archiveResumeThreadIds.has(message.params.threadId)) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: `session ${message.params.threadId} is archived` } })); return; }
-        loaded.add(message.params.threadId); respond({ thread: { id: message.params.threadId, turns: resumeTurns } }, resumeDelayMs);
+        const cwd = recordedCwds.get(message.params.threadId);
+        loaded.add(message.params.threadId); respond({ thread: { id: message.params.threadId, turns: resumeTurns, ...(cwd ? { cwd } : {}) }, ...profileOf(message.params) }, resumeDelayMs);
       }
       else if (message.method === 'thread/read') respond({ thread: { ...readThread, id: message.params.threadId, turns: readTurns } });
       else if (message.method === 'thread/fork') {
         const id = `fork-${++threadNumber}`; loaded.add(id);
-        respond({ thread: forkThread === undefined ? { id, cwd: message.params.cwd, ephemeral: message.params.ephemeral, forkedFromId: message.params.threadId, turns: [] } : forkThread });
+        respond({ thread: forkThread === undefined ? { id, cwd: message.params.cwd, ephemeral: message.params.ephemeral, forkedFromId: message.params.threadId, turns: [] } : forkThread, ...profileOf(message.params) });
       }
       else if (message.method === 'turn/start') {
         if (strictThreadLoading && !loaded.has(message.params.threadId)) { setImmediate(() => instance.send({ id: message.id, error: { code: -32000, message: 'thread was not loaded by this child' } })); return; }
@@ -628,11 +637,11 @@ test('memory guard waits for the native turn and lifecycle barrier before reques
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
     const runtime = fakeRuntime({ completeStarts: false });
-    let check; const restarts = [];
+    let check; const restarts = []; const diagnostics = [];
     const executor = createCodexExecutor({
       config: { ...config(cwd), memoryCheckIntervalMs: 60_000, memoryMaxRssBytes: 10, memoryMaxHeapUsedBytes: 10,
         memoryUsage: () => ({ rss: 20, heapUsed: 5 }) },
-      sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl,
+      sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl, log: (_level, event) => diagnostics.push(event),
       setIntervalImpl(callback) { check = callback; return { unref() {} }; }, clearIntervalImpl() {},
       onRestartRequired: async (reason) => { restarts.push(reason); },
     });
@@ -641,6 +650,9 @@ test('memory guard waits for the native turn and lifecycle barrier before reques
     check();
     assert.equal(executor.status().restartPending, 'rss 20 >= 10');
     assert.deepEqual(restarts, []);
+    const diagnostic = diagnostics.find(event => event.operation === 'memory_guard');
+    assert.equal(diagnostic.error_code, 'CODEX_MEMORY_LIMIT');
+    assert.deepEqual([diagnostic.rssBytes, diagnostic.heapUsedBytes, diagnostic.rssLimitBytes, diagnostic.heapLimitBytes], [20, 5, 10, 10]);
     runtime.children[0].send({ method: 'turn/completed', params: { turnId: 'turn-1', turn: { id: 'turn-1', status: 'completed', items: [] } } });
     await running;
     while (!restarts.length) await new Promise((resolve) => setImmediate(resolve));
@@ -756,7 +768,10 @@ test('an unconfirmed turn start is reported once and never retried inside execut
 
 test('session store uses injected schema and public progress exact identity filter', async () => {
   const calls = [];
-  const pool = { async query(sql, params) { calls.push([sql, params]); return [[]]; } };
+  let released = 0;
+  const connection = { async query(sql, params) { calls.push([sql, params]); return [[]]; }, release() { released += 1; }, destroy() {} };
+  // Reads use a pooled connection under the storage deadline, not raw pool.query.
+  const pool = { async query() { throw new Error('reads must not bypass the storage deadline'); }, async getConnection() { return connection; } };
   const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7 });
   await store.readPublicProgress({ binding: { feishuOpenId: 'system:a', chatId: 'chat-a' }, threadId: 'thread-a', messageId: 'message-a', cursor: 3, limit: 999 });
   await store.readPublicProgress({ binding: { feishuOpenId: 'system:a', chatId: 'chat-a' }, threadId: 'thread-a', messageId: 'message-a', cursor: '9007199254740993', limit: 999 });
@@ -764,6 +779,263 @@ test('session store uses injected schema and public progress exact identity filt
   assert.match(calls[0][0], /feishu_open_id = \? AND chat_id = \? AND codex_session_id = \? AND message_id = \?/);
   assert.deepEqual(calls[0][1], ['fixture', 'system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '3', 250]);
   assert.deepEqual(calls[1][1], ['fixture', 'system:a', 'chat-a', 'thread-a', 'message-a', 0, 0, '9007199254740993', 250]);
+  assert.equal(released, 2);
+});
+
+function gatedSessionPool() {
+  const state = { active: 0, peak: 0, written: [], gates: [], released: 0 };
+  const connection = {
+    async query(sql, params) {
+      state.active += 1; state.peak = Math.max(state.peak, state.active);
+      await new Promise(resolve => state.gates.push(resolve));
+      state.written.push(params[5]); state.active -= 1;
+      return [[]];
+    },
+    release() { state.released += 1; }, destroy() {},
+  };
+  // Writes run through withConnection (deadline + normalized errors), never raw pool.query.
+  const pool = { async query() { throw new Error('writes must use the storage deadline'); }, async getConnection() { return connection; } };
+  return { pool, state };
+}
+async function drainGates(state, settled) {
+  while (!settled()) {
+    if (state.gates.length) state.gates.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+test('session store bounds concurrent realtime event writes and keeps their order', async () => {
+  const { pool, state } = gatedSessionPool();
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const writes = Array.from({ length: 6 }, (_, index) => store.saveCodexRealtimeEvent(binding, { eventKey: `item:turn:${index}`, eventType: 'agent_message' }));
+  for (let index = 0; index < 6; index += 1) {
+    while (state.gates.length === 0) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(state.active <= 2);
+    state.gates.shift()();
+  }
+  await Promise.all(writes);
+  assert.equal(state.peak, 2);
+  assert.deepEqual(state.written, [0, 1, 2, 3, 4, 5].map(index => `item:turn:${index}`));
+  assert.equal(state.released, 6);
+});
+
+test('session store drops only the oldest best-effort events beyond 200 queued and never drops receipts', async () => {
+  const { pool, state } = gatedSessionPool();
+  const logs = [];
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, log: (...entry) => logs.push(entry) });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'public_progress' });
+  const writes = [save('item:turn:held-1'), save('item:turn:held-2')];
+  while (state.active < 2) await new Promise(resolve => setImmediate(resolve));
+  writes.push(save('assistant-final:m'), save('user:m'), save('user-steer-confirmed:m'));
+  for (let index = 0; index < 205; index += 1) writes.push(save(index % 2 ? `agent-delta:turn:${index}` : `public:turn:${index}`));
+  writes.push(save('error:m'));
+  let done = 0;
+  for (const write of writes) write.then(() => { done += 1; });
+  await drainGates(state, () => done === writes.length);
+  const dropped = Array.from({ length: 5 }, (_, index) => index % 2 ? `agent-delta:turn:${index}` : `public:turn:${index}`);
+  for (const key of dropped) assert.equal(state.written.includes(key), false, key);
+  for (const key of ['assistant-final:m', 'user:m', 'user-steer-confirmed:m', 'error:m', 'public:turn:6', 'agent-delta:turn:203']) assert.ok(state.written.includes(key), key);
+  assert.equal(state.written.length, writes.length - 5);
+  assert.equal(state.peak, 2);
+  // Rate-limited: the first drop is logged at once, later ones are counted for the next log.
+  assert.equal(logs.length, 1);
+  assert.deepEqual(logs[0].slice(0, 3), ['warning', 'codex_event_write', 'dropped']);
+  assert.equal(logs[0][3].code, 'codex_event_queue_full');
+  assert.equal(logs[0][3].droppedEvents, 1);
+  assert.equal(logs[0][3].droppedEventsTotal, 1);
+});
+
+test('session store writes have a deadline that frees the slot and normalize driver errors', async () => {
+  let calls = 0;
+  const connection = {
+    async query(sql, params) {
+      calls += 1;
+      if (params[5] === 'item:turn:locked') throw Object.assign(new Error('hidden'), { code: 'ER_LOCK_WAIT_TIMEOUT', errno: 1205, sqlState: 'HY000' });
+      if (String(params[5]).startsWith('item:turn:hung')) return new Promise(() => {});
+      return [[]];
+    },
+    release() {}, destroy() {},
+  };
+  const pool = { async query() { throw new Error('unused'); }, async getConnection() { return connection; } };
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, writeTimeoutMs: 30 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'agent_message' });
+  await assert.rejects(save('item:turn:locked'), { code: 'store_contention', errorCode: 'ER_LOCK_WAIT_TIMEOUT' });
+  // Two hung writes hold both slots only until their deadline; the queued receipt then runs.
+  const hung = [save('item:turn:hung-1'), save('item:turn:hung-2')];
+  const receipt = save('assistant-final:m');
+  for (const write of hung) await assert.rejects(write, { code: 'store_timeout' });
+  await receipt;
+  assert.equal(calls, 4);
+  // params[5] of the binding upsert is thread_name.
+  await assert.rejects(store.saveCodexBinding({ feishuOpenId: 'actor', chatId: 'chat', codexSessionId: 'thread', threadName: 'item:turn:hung-3' }), { code: 'store_timeout' });
+});
+
+test('session admission reads fail with store_timeout instead of returning null', async () => {
+  const pool = { async query() { throw new Error('unused'); }, getConnection: () => new Promise(() => {}) };
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, claimTimeoutMs: 20 });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  await assert.rejects(store.loadBinding({ feishuOpenId: 'actor', chatId: 'chat' }), { code: 'store_timeout' });
+  await assert.rejects(store.findAcceptedMessageEvent(binding, 'message'), { code: 'store_timeout' });
+  await assert.rejects(store.loadSteerEvents(binding, 'message'), { code: 'store_timeout' });
+  await assert.rejects(store.loadCodexEvent(binding, 'injection:system-preamble'), { code: 'store_timeout' });
+  assert.throws(() => createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', claimTimeoutMs: 60_000 }), { code: 'invalid_storage_deadline' });
+  // Execution-card progress polling keeps its own short 1800 ms deadline.
+  const progress = store.readPublicProgress({ binding, threadId: 'thread', messageId: 'message' });
+  progress.catch(() => {});
+  assert.equal(await Promise.race([progress.then(() => 'settled', () => 'settled'), new Promise(resolve => setTimeout(() => resolve('pending'), 200))]), 'pending');
+  await assert.rejects(progress, { code: 'store_timeout' });
+});
+
+test('a session read that times out propagates and never starts a second turn', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-session-timeout-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const store = memoryStore();
+  const runtime = fakeRuntime();
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'timeout-job', prompt: 'work' };
+  await executor.execute(input);
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+  // Remove the receipt so only the failing lookup stands between a retry and a second turn.
+  store.events.splice(0, store.events.length);
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  store.findAcceptedMessageEvent = async () => { throw new StoreError('store_timeout'); };
+  await assert.rejects(executor.execute(input), { code: 'store_timeout' });
+  store.loadBinding = async () => { throw new StoreError('store_timeout'); };
+  await assert.rejects(executor.execute({ ...input, messageId: 'timeout-job-2' }), { code: 'store_timeout' });
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+});
+
+test('a released write slot goes to the oldest receipt first; only best-effort events are dropped, and the counter does not drift', async () => {
+  const { pool, state } = gatedSessionPool();
+  const logs = [];
+  const store = createCodexSessionStore({connectionId:'fixture', pool, schema: 'bridge_dev', now: () => 7, log: (...entry) => logs.push(entry) });
+  const binding = { codexSessionId: 'thread', feishuOpenId: 'actor', chatId: 'chat' };
+  const save = eventKey => store.saveCodexRealtimeEvent(binding, { eventKey, eventType: 'public_progress' });
+  const holdBoth = async (prefix) => {
+    const held = [save(`item:${prefix}:hold-1`), save(`item:${prefix}:hold-2`)];
+    while (state.active < 2) await new Promise(resolve => setImmediate(resolve));
+    return held;
+  };
+  // Phase 1: 200 best-effort writes, then a receipt, then one more best-effort write.
+  const writes = await holdBoth('one');
+  for (let index = 0; index < 200; index += 1) writes.push(save(`public:turn:${index}`));
+  writes.push(save('assistant-final:m'));
+  writes.push(save('public:turn:200'));
+  let done = 0;
+  for (const write of writes) write.then(() => { done += 1; });
+  await drainGates(state, () => done === writes.length);
+  // The 201st queued best-effort write dropped the oldest best-effort one, never the receipt.
+  assert.equal(state.written.includes('public:turn:0'), false);
+  assert.ok(state.written.includes('public:turn:200'));
+  // The receipt took the first released slot, ahead of all queued progress.
+  assert.equal(state.written.indexOf('assistant-final:m'), 2);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][3].droppedEventsTotal, 1);
+  // Phase 2: after draining, nothing is queued; a new best-effort write and a
+  // receipt behind it are both written and nothing more is dropped.
+  const second = await holdBoth('two');
+  second.push(save('public:turn:after-drain'), save('error:m'));
+  let secondDone = 0;
+  for (const write of second) write.then(() => { secondDone += 1; });
+  await drainGates(state, () => secondDone === second.length);
+  assert.ok(state.written.includes('public:turn:after-drain'));
+  assert.ok(state.written.includes('error:m'));
+  assert.ok(state.written.indexOf('error:m') < state.written.indexOf('public:turn:after-drain'));
+  assert.equal(logs.length, 1);
+  assert.equal(state.peak, 2);
+});
+
+test('a completed answer is returned and logged when its receipt and binding touch cannot be stored', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-final-receipt-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  const store = memoryStore();
+  const save = store.saveCodexRealtimeEvent;
+  store.saveCodexRealtimeEvent = async (binding, event) => {
+    if (String(event.eventKey).startsWith('assistant-final:')) throw new StoreError('store_timeout');
+    return save(binding, event);
+  };
+  store.touchCodexBinding = async () => { throw new StoreError('store_contention'); };
+  const logs = [];
+  const runtime = fakeRuntime();
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, log: (level, detail) => logs.push([level, detail]) });
+  t.after(() => executor.close());
+  const result = await executor.execute({ bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'final-receipt', prompt: 'work' });
+  assert.equal(result.answer, 'answer turn-1');
+  const failures = logs.filter(([, detail]) => detail.operation === 'persist_final_answer');
+  assert.deepEqual(failures.map(([level, detail]) => [level, detail.status, detail.stage, detail.errorClass]),
+    [['warning', 'failed', 'event', 'store_timeout'], ['warning', 'failed', 'touch', 'store_contention']]);
+  assert.equal(store.events.some(row => row.event_key.startsWith('assistant-final:')), false);
+});
+
+test('a takeover of a still-running turn signals submission, so a later storage failure is not retried', { timeout: 10000 }, async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-takeover-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const { StoreError } = await import('../src/storage/errors.mjs');
+  const store = memoryStore();
+  const runtime = fakeRuntime({ completeStarts: false });
+  const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'takeover-job', prompt: 'work' };
+  // Attempt 1 submits the turn, then stops waiting (its lease was lost).
+  const controller = new AbortController();
+  const first = executor.execute(input, { signal: controller.signal });
+  while (executor.status().activeTurns !== 1) await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(first, { code: 'CODEX_WAIT_ABORTED' });
+  let clock = 10_000;
+  const job = {
+    id: 'takeover-run', callerId: 'live', chatId: 'chat', chatType: 'p2p', messageId: 'takeover-job',
+    senderOpenId: 'human', deliveryMode: 'caller', executionNamespace: null, prompt: 'work',
+    attempts: 1, status: 'pending', result: {}, createdAt: 1, leaseOwner: '', nextAttemptAt: clock,
+  };
+  const retries = [];
+  const replies = [];
+  let replyPendingCalls = 0;
+  const jobs = {
+    async claimReplyPending() { return []; },
+    async claim({ owner }) {
+      if (job.status !== 'pending' || job.nextAttemptAt > clock) return [];
+      Object.assign(job, { status: 'running', leaseOwner: owner, attempts: job.attempts + 1 });
+      return [{ ...job, result: structuredClone(job.result) }];
+    },
+    async renew() {},
+    async markRetry(value) { retries.push(value); Object.assign(job, { status: 'pending', nextAttemptAt: value.nextAttemptAt, leaseOwner: '' }); },
+    async markReplyPending({ result }) {
+      replyPendingCalls += 1;
+      if (replyPendingCalls === 1) throw new StoreError('store_timeout');
+      replies.push(result);
+      Object.assign(job, { status: 'reply_pending', result });
+    },
+  };
+  const intents = [];
+  const forward = createForwardRuntime({
+    config: { owner: 'owner', pollMs: 1, retryDelayMs: 60_000, maxAttempts: 3 }, jobs, sessions: {}, replies: {}, now: () => clock,
+    executor: { execute: (value, options) => executor.execute(value, { ...options, onStartIntent: intent => { intents.push(intent); return options.onStartIntent?.(intent); } }) },
+  });
+  // Attempt 2 (the forward runtime) attaches to the running turn, which then completes.
+  forward.start();
+  const until = async (condition) => { for (let i = 0; i < 1000 && !condition(); i += 1) await new Promise(resolve => setTimeout(resolve, 2)); };
+  await until(() => intents.length > 0 || executor.status().activeTurns === 0);
+  // The attempt must have attached to the running turn (no new turn) and signalled it.
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
+  if (!intents.length) { await forward.stop(); assert.fail('takeover did not signal submission'); }
+  assert.equal(intents[0].takeover, true);
+  assert.equal(intents[0].messageId, 'takeover-job');
+  runtime.children[0].send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1',
+    turn: { id: 'turn-1', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'done once' }] } } });
+  await until(() => replies.length > 0 || retries.length > 0);
+  clock += 120_000;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await forward.stop();
+  assert.equal(retries.length, 0);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].failed, true);
+  assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 1);
 });
 
 test('migration contains only the two first-ticket production tables', async () => {
@@ -918,16 +1190,19 @@ test('binding remains occupied through shared final persistence and cannot be ro
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
-test('successful finalization requires the binding touch and releases the binding', async () => {
+test('a failed binding touch after a completed turn still returns the answer and releases the binding', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
   try {
     const store = memoryStore();
     store.touchCodexBinding = async () => { throw new Error('synthetic session touch failure'); };
     const runtime = fakeRuntime();
-    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    const logs = [];
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, log: (level, detail) => logs.push([level, detail]) });
     const input = { bindingOpenId: 'system:x', chatId: 'chat', chatType: 'group', messageId: 'job', prompt: 'work', busyPolicy: 'reject' };
     const one = executor.execute(input); const two = executor.execute(input);
-    await assert.rejects(one, /synthetic session touch failure/);
+    // 0.2.30: the turn ran, so its answer is delivered; the touch failure is only logged.
+    assert.equal((await one).answer, 'answer turn-1');
+    assert.ok(logs.some(([level, detail]) => level === 'warning' && detail.operation === 'persist_final_answer' && detail.stage === 'touch'));
     assert.equal((await two).deferred, true);
     while (executor.status().activeTurns) await new Promise((resolve) => setImmediate(resolve));
     assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 1);
@@ -1126,6 +1401,7 @@ for (const path of ['error', 'turn/completed', 'resume']) {
 
 const injectCalls = runtime => runtime.calls.filter(call => call.method === 'thread/inject_items');
 const turnText = (runtime, index) => runtime.calls.filter(call => call.method === 'turn/start')[index].params.input[0].text;
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const groupTurn = messageId => ({ bindingOpenId: 'group:oc_group', chatId: 'oc_group', chatType: 'group', messageId, prompt: 'work' });
 
 test('configured group instructions enter a group thread once per fingerprint, after changes and after compaction', async () => {
@@ -1201,7 +1477,8 @@ test('system task preamble is sent on the first turn and again only when it chan
     const runtime = fakeRuntime({ turnItemsFor: turn => (turn === 3 ? [{ id: 'compact', type: 'contextCompaction' }] : []) });
     const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
     await event(executor, 'e1');
-    assert.match(turnText(runtime, 0), /^【独立系统任务】\n任务：system:[0-9a-f]+\n结果投递群：oc_delivery\n[^\n]+\n回发文件目录：data\/feishu-outbox\/system-[0-9a-f]+\/oc_delivery\n\n【业务事件】\ntype：mail\.inbound$/);
+    assert.match(turnText(runtime, 0), new RegExp(`^【独立系统任务】\\n任务：system:[0-9a-f]+\\n结果投递群：oc_delivery\\n[^\\n]+\\n回发文件目录：${escapeRegExp(cwd)}/data/feishu-outbox/system-[0-9a-f]+/oc_delivery\\n\\n【业务事件】\\ntype：mail\\.inbound$`),
+      'the preamble names the absolute result directory under the bridge workspace');
     await event(executor, 'e2');
     assert.equal(turnText(runtime, 1), '【业务事件】\ntype：mail.inbound');
     await event(executor, 'e3');
@@ -1224,7 +1501,7 @@ test('system task preamble is sent on the first turn and again only when it chan
     const moved = createCodexExecutor({ config: { ...config(cwd), outboxRelativeRoot: 'data/other-outbox' }, sessionStore: store, spawnImpl: movedRuntime.spawnImpl });
     await event(moved, 'e8');
     assert.equal(movedRuntime.calls.find(call => call.method === 'turn/start').params.threadId, 'thread-1');
-    assert.match(turnText(movedRuntime, 0), /^【独立系统任务】[\s\S]*回发文件目录：data\/other-outbox\/system-/, 'a changed result directory is sent to the same thread');
+    assert.match(turnText(movedRuntime, 0), new RegExp(`^【独立系统任务】[\\s\\S]*回发文件目录：${escapeRegExp(cwd)}/data/other-outbox/system-`), 'a changed result directory is sent to the same thread');
     await moved.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
@@ -1247,7 +1524,7 @@ test('replace-mode instructions drop only the default group wording once the thr
     const structural = prompt => {
       assert.match(prompt, /^【飞书群聊上下文】\n/);
       assert.match(prompt, /\nchat_id：oc_group\n/);
-      assert.match(prompt, /\n回发文件目录：data\/feishu-outbox\/oc_group\n说明：需要给当前群回发文件时/);
+      assert.match(prompt, new RegExp(`\\n回发文件目录：${escapeRegExp(cwd)}/data/feishu-outbox/oc_group\\n说明：需要给当前群回发文件时`));
       assert.match(prompt, /\n\n【提到你的消息 来自 Bob（open_id=ou_b）】\n\[msg message_id=m1 chat_id=oc_group\]\nwork$/);
     };
     const appended = await run({ mode: 'append' });
@@ -1368,8 +1645,9 @@ const GLOBAL_POLICY = Object.freeze({ approvalPolicy: 'on-request', approvalsRev
 // The 0.2.20 turn/start parameter set; turn/start never carries a sandbox key.
 const TURN_START_KEYS = ['approvalPolicy', 'approvalsReviewer', 'cwd', 'effort', 'input', 'model', 'threadId'];
 const policyOf = (params) => ({ approvalPolicy: params.approvalPolicy, approvalsReviewer: params.approvalsReviewer, sandbox: params.sandbox });
+const groupCwdOf = (cwd) => join(cwd, 'group-workspace');
 const overrideConfig = (cwd) => ({ ...config(cwd), groupCodexOverrides: new Map([
-  ['chat-custom', { approvalPolicy: 'never', sandbox: 'danger-full-access' }],
+  ['chat-custom', { approvalPolicy: 'never', sandbox: 'danger-full-access', cwd: groupCwdOf(cwd) }],
   ['chat-reviewer', { approvalsReviewer: 'user' }],
 ]) });
 
@@ -1388,14 +1666,22 @@ test('a group codex override reaches thread/start and turn/start of the human an
     assert.deepEqual(policyOf(human.start), FULL_ACCESS);
     assert.deepEqual(policyOf(human.turn), { ...FULL_ACCESS, sandbox: undefined });
     assert.deepEqual(Object.keys(human.turn).sort(), TURN_START_KEYS);
+    assert.equal(human.start.cwd, groupCwdOf(cwd), 'the group cwd replaces the global cwd on thread/start');
+    assert.equal(human.turn.cwd, groupCwdOf(cwd), 'and on every turn/start');
     // A business-event thread whose result chat is the group gets the same override.
     const event = await run({ bindingOpenId: 'system:0123456789abcdef0123456789abcdef', chatId: 'chat-custom', chatType: 'group', messageId: 'm2', senderOpenId: 'system' });
     assert.deepEqual(policyOf(event.start), FULL_ACCESS);
     assert.deepEqual(policyOf(event.turn), { ...FULL_ACCESS, sandbox: undefined });
-    // A reviewer-only override changes the reviewer and keeps the global policy and sandbox.
+    assert.equal(event.start.cwd, groupCwdOf(cwd));
+    assert.equal(event.turn.cwd, groupCwdOf(cwd));
+    // The result directory stays absolute under the global workspace, where attachments are collected.
+    assert.match(event.turn.input[0].text, new RegExp(`\\n回发文件目录：${escapeRegExp(cwd)}/data/feishu-outbox/system-[0-9a-f]+/chat-custom\\n`));
+    // A reviewer-only override changes the reviewer and keeps the global policy, sandbox and cwd.
     const reviewer = await run({ bindingOpenId: 'ou-human', chatId: 'chat-reviewer', chatType: 'group', messageId: 'm3', senderOpenId: 'ou-human' });
     assert.deepEqual(policyOf(reviewer.start), { ...GLOBAL_POLICY, approvalsReviewer: 'user' });
     assert.deepEqual(policyOf(reviewer.turn), { ...GLOBAL_POLICY, approvalsReviewer: 'user', sandbox: undefined });
+    assert.equal(reviewer.start.cwd, cwd);
+    assert.equal(reviewer.turn.cwd, cwd);
     // Another group and a private chat whose id equals the configured group id keep the global settings.
     for (const input of [
       { bindingOpenId: 'ou-human', chatId: 'chat-other', chatType: 'group', messageId: 'm4', senderOpenId: 'ou-human' },
@@ -1405,7 +1691,139 @@ test('a group codex override reaches thread/start and turn/start of the human an
       assert.deepEqual(policyOf(global.start), GLOBAL_POLICY, input.chatType);
       assert.deepEqual(policyOf(global.turn), { ...GLOBAL_POLICY, sandbox: undefined }, input.chatType);
       assert.deepEqual(Object.keys(global.turn).sort(), TURN_START_KEYS, input.chatType);
+      assert.equal(global.start.cwd, cwd, input.chatType);
+      assert.equal(global.turn.cwd, cwd, input.chatType);
     }
+    const privateTurn = runtime.calls.filter((call) => call.method === 'turn/start').at(-1).params;
+    assert.match(privateTurn.input[0].text, new RegExp(`\\n回发文件目录：${escapeRegExp(cwd)}/data/feishu-outbox/chat-custom\\n`), 'a private result directory is absolute');
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+const cwdRolloverLogs = (logs) => logs.filter(([, event]) => event.operation === 'thread_rollover');
+const groupInputFor = (binding, messageId, prompt = 'work') => ({ bindingOpenId: binding.feishuOpenId, chatId: binding.chatId, chatType: binding.chatType, messageId,
+  senderOpenId: 'ou-human', senderName: 'User', prompt, busyPolicy: 'steer', groupChatContext: { chatId: binding.chatId, name: '群名' } });
+
+test('a group thread recorded under another cwd moves once to a new thread that receives the full first-turn context', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old', threadName: 'group', created: false };
+    const event = { feishuOpenId: 'system:0123456789abcdef0123456789abcdef', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old-event', threadName: 'event', created: false };
+    const store = memoryStore([group, event]);
+    const logs = [];
+    const provider = { configured: (chatId) => chatId === 'chat-custom', forChat: async () => ({ text: 'group rules', hash: 'rules-1', mode: 'append', bytes: 11, sources: 1 }) };
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-old', cwd], ['thread-old-event', cwd]]) });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl, groupInstructions: provider, log: (...entry) => logs.push(entry) });
+    const callsOf = (method) => runtime.calls.filter((call) => call.method === method).map((call) => call.params);
+
+    await executor.execute(groupInputFor(group, 'm1'));
+    assert.deepEqual(callsOf('thread/resume').map(({ threadId, cwd: value }) => ({ threadId, cwd: value })), [{ threadId: 'thread-old', cwd: groupCwdOf(cwd) }]);
+    assert.deepEqual(callsOf('thread/start').map(({ cwd: value }) => value), [groupCwdOf(cwd)]);
+    assert.deepEqual(callsOf('turn/start').map(({ threadId, cwd: value }) => ({ threadId, cwd: value })), [{ threadId: 'thread-1', cwd: groupCwdOf(cwd) }]);
+    assert.deepEqual(callsOf('thread/inject_items').map(({ threadId }) => threadId), ['thread-1'], 'group instructions are injected into the new thread');
+    assert.match(turnText(runtime, 0), /^【飞书群聊上下文】\n群名称：群名\n/, 'the new thread receives the first-turn group context');
+    assert.equal((await store.loadBinding(group)).codexSessionId, 'thread-1');
+    assert.ok(store.events.some((row) => row.event_type === 'session_rollover' && JSON.parse(row.detail_json).reason === 'cwd_changed'));
+    assert.deepEqual(cwdRolloverLogs(logs).map(([level, entry]) => [level, entry.status, entry.reason, entry.chat_id]), [['info', 'succeeded', 'cwd_changed', 'chat-custom']]);
+    assert.doesNotMatch(JSON.stringify([logs, store.events.filter((row) => row.event_type === 'session_rollover')]), new RegExp(escapeRegExp(cwd)), 'no path is logged or stored');
+
+    // The next turn stays on the new thread.
+    await executor.execute(groupInputFor(group, 'm2'));
+    assert.equal(callsOf('thread/start').length, 1);
+    assert.equal(callsOf('turn/start').at(-1).threadId, 'thread-1');
+
+    // A business-event thread of the group moves the same way and receives its preamble.
+    await executor.execute(groupInputFor(event, 'e1', '【业务事件】\ntype：mail.inbound'));
+    assert.equal(callsOf('thread/start').length, 2);
+    assert.equal(callsOf('turn/start').at(-1).threadId, 'thread-2');
+    assert.match(turnText(runtime, 2), /^【独立系统任务】\n/);
+    assert.equal((await store.loadBinding(event)).codexSessionId, 'thread-2');
+    await executor.close();
+
+    // After a restart the new threads resume in the configured cwd and are not moved again.
+    const restartedRuntime = fakeRuntime({ resumeCwds: new Map([['thread-1', groupCwdOf(cwd)], ['thread-2', groupCwdOf(cwd)]]) });
+    const restarted = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: store, spawnImpl: restartedRuntime.spawnImpl, groupInstructions: provider, log: (...entry) => logs.push(entry) });
+    await restarted.execute(groupInputFor(group, 'm3'));
+    await restarted.execute(groupInputFor(event, 'e2', '【业务事件】\ntype：mail.inbound'));
+    assert.equal(restartedRuntime.calls.filter((call) => call.method === 'thread/start').length, 0);
+    assert.deepEqual(restartedRuntime.calls.filter((call) => call.method === 'turn/start').map((call) => call.params.threadId), ['thread-1', 'thread-2']);
+    assert.equal(cwdRolloverLogs(logs).length, 2, 'one move each for the human and the event thread, none after the restart');
+    await restarted.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('cwd rollover never applies to a matching cwd, a group without its own cwd or a private chat', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const bindings = [
+      { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-same', threadName: 'same', created: false },
+      { feishuOpenId: 'ou-human', chatId: 'chat-other', chatType: 'group', codexSessionId: 'thread-other', threadName: 'other', created: false },
+      { feishuOpenId: 'ou-human', chatId: 'chat-reviewer', chatType: 'group', codexSessionId: 'thread-reviewer', threadName: 'reviewer', created: false },
+      { feishuOpenId: 'ou-private', chatId: 'chat-custom', chatType: 'p2p', codexSessionId: 'thread-private', threadName: 'private', created: false },
+    ];
+    const logs = [];
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-same', `${groupCwdOf(cwd)}/`], ['thread-other', '/elsewhere'], ['thread-reviewer', '/elsewhere'], ['thread-private', '/elsewhere']]) });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore(bindings), spawnImpl: runtime.spawnImpl, log: (...entry) => logs.push(entry) });
+    for (const [index, binding] of bindings.entries()) await executor.execute(groupInputFor(binding, `m${index}`));
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 0);
+    assert.deepEqual(runtime.calls.filter((call) => call.method === 'turn/start').map((call) => call.params.threadId), bindings.map((binding) => binding.codexSessionId));
+    assert.equal(cwdRolloverLogs(logs).length, 0);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('a known-turn resume keeps observing the old thread and the cwd move happens at the next turn', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old', threadName: 'group', created: false };
+    const store = memoryStore([group]);
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-old', cwd]]), resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    const result = await executor.execute(groupInputFor(group, 'job'), { resume: { threadId: 'thread-old', turnId: 'known', startedAt: Date.now() - 5_000 } });
+    assert.equal(result.answer, 'known');
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 0, 'the observed turn keeps its thread');
+    assert.equal((await store.loadBinding(group)).codexSessionId, 'thread-old');
+    await executor.execute(groupInputFor(group, 'next'));
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/resume').length, 1, 'the loaded thread is not resumed again');
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 1);
+    assert.equal(runtime.calls.find((call) => call.method === 'turn/start').params.threadId, 'thread-1');
+    assert.equal((await store.loadBinding(group)).codexSessionId, 'thread-1');
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('a new thread that reports another cwd stops cwd rollover for that group instead of looping', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-cwd-'));
+  try {
+    const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old', threadName: 'group', created: false };
+    const event = { feishuOpenId: 'system:0123456789abcdef0123456789abcdef', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-old-event', threadName: 'event', created: false };
+    const logs = [];
+    const runtime = fakeRuntime({ resumeCwds: new Map([['thread-old', cwd], ['thread-old-event', cwd]]), startCwd: () => '/reported/elsewhere' });
+    const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore([group, event]), spawnImpl: runtime.spawnImpl, log: (...entry) => logs.push(entry) });
+    await executor.execute(groupInputFor(group, 'm1'));
+    await executor.execute(groupInputFor(group, 'm2'));
+    await executor.execute(groupInputFor(event, 'e1', '【业务事件】\ntype：mail.inbound'));
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/start').length, 1);
+    assert.deepEqual(runtime.calls.filter((call) => call.method === 'turn/start').map((call) => call.params.threadId), ['thread-1', 'thread-1', 'thread-old-event']);
+    assert.deepEqual(cwdRolloverLogs(logs).map(([level, entry]) => [level, entry.status, entry.reason, entry.chat_id]),
+      [['warning', 'skipped', 'cwd_unconfirmed', 'chat-custom'], ['info', 'succeeded', 'cwd_changed', 'chat-custom']]);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('a group with its own cwd announces and collects result files in the global workspace', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-'));
+  try {
+    const runtime = fakeRuntime();
+    const executor = createCodexExecutor({ config: { ...overrideConfig(cwd), allowedGroupChatIds: new Set(['chat-custom']) }, sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl });
+    const directory = join(cwd, outboxRelativeDirectory({ chatId: 'chat-custom', bindingOpenId: 'ou-human' }));
+    mkdirSync(directory, { recursive: true });
+    const attachment = join(directory, 'result.txt'); writeFileSync(attachment, 'fixture');
+    const result = await executor.execute({ bindingOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', messageId: 'm1', senderOpenId: 'ou-human', senderName: 'User', prompt: 'work', busyPolicy: 'steer' });
+    const turn = runtime.calls.find((call) => call.method === 'turn/start').params;
+    assert.equal(turn.cwd, groupCwdOf(cwd));
+    assert.match(turn.input[0].text, new RegExp(`\\n回发文件目录：${escapeRegExp(directory)}\\n`));
+    assert.deepEqual(result.attachments, [attachment]);
     await executor.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
@@ -1426,6 +1844,10 @@ test('a group codex override reaches both thread/resume paths and thread/fork, n
     assert.deepEqual(policyOf(callFor(readyRuntime, 'turn/start', 'thread-group')), { ...FULL_ACCESS, sandbox: undefined });
     assert.deepEqual(policyOf(callFor(readyRuntime, 'thread/resume', 'thread-private')), GLOBAL_POLICY);
     assert.deepEqual(policyOf(callFor(readyRuntime, 'turn/start', 'thread-private')), { ...GLOBAL_POLICY, sandbox: undefined });
+    assert.equal(callFor(readyRuntime, 'thread/resume', 'thread-group').cwd, groupCwdOf(cwd));
+    assert.equal(callFor(readyRuntime, 'turn/start', 'thread-group').cwd, groupCwdOf(cwd));
+    assert.equal(callFor(readyRuntime, 'thread/resume', 'thread-private').cwd, cwd);
+    assert.equal(callFor(readyRuntime, 'turn/start', 'thread-private').cwd, cwd);
     await ready.close();
 
     // Resume of a known turn (prepareKnownResume) starts no new turn.
@@ -1438,6 +1860,8 @@ test('a group codex override reaches both thread/resume paths and thread/fork, n
     assert.equal(knownRuntime.calls.filter((call) => call.method === 'turn/start').length, 0);
     assert.deepEqual(policyOf(callFor(knownRuntime, 'thread/resume', 'thread-group')), FULL_ACCESS);
     assert.deepEqual(policyOf(callFor(knownRuntime, 'thread/resume', 'thread-private')), GLOBAL_POLICY);
+    assert.equal(callFor(knownRuntime, 'thread/resume', 'thread-group').cwd, groupCwdOf(cwd));
+    assert.equal(callFor(knownRuntime, 'thread/resume', 'thread-private').cwd, cwd);
     await known.close();
 
     // Fork keeps every other parameter unchanged.
@@ -1446,9 +1870,315 @@ test('a group codex override reaches both thread/resume paths and thread/fork, n
     for (const binding of [group, privateSameId]) {
       await forker.forkBinding({ binding, expectedSourceThreadId: binding.codexSessionId, onForked: async () => ({ outcome: 'succeeded' }) });
     }
-    const forkParams = (policy, threadId) => ({ cwd, ...policy, model: 'gpt-test', threadId, ephemeral: false, deferGoalContinuation: true, config: { model_reasoning_effort: 'medium' } });
-    assert.deepEqual(callFor(forkRuntime, 'thread/fork', 'thread-group'), forkParams(FULL_ACCESS, 'thread-group'));
-    assert.deepEqual(callFor(forkRuntime, 'thread/fork', 'thread-private'), forkParams(GLOBAL_POLICY, 'thread-private'));
+    const forkParams = (policy, threadId, forkCwd) => ({ cwd: forkCwd, ...policy, model: 'gpt-test', threadId, ephemeral: false, deferGoalContinuation: true, config: { model_reasoning_effort: 'medium' } });
+    assert.deepEqual(callFor(forkRuntime, 'thread/fork', 'thread-group'), forkParams(FULL_ACCESS, 'thread-group', groupCwdOf(cwd)));
+    assert.deepEqual(callFor(forkRuntime, 'thread/fork', 'thread-private'), forkParams(GLOBAL_POLICY, 'thread-private', cwd));
+    await forker.close();
+
+    // Fork verification compares the native cwd with the thread's own cwd: a group
+    // fork that reports the global cwd is unconfirmed, the group cwd is accepted.
+    for (const [forkCwd, accepted] of [[cwd, false], [groupCwdOf(cwd), true]]) {
+      const runtime = fakeRuntime({ forkThread: { id: 'fork-verified', cwd: forkCwd, ephemeral: false, forkedFromId: 'thread-group' } });
+      const executor = createCodexExecutor({ config: overrideConfig(cwd), sessionStore: memoryStore([group]), spawnImpl: runtime.spawnImpl });
+      let commits = 0;
+      const fork = executor.forkBinding({ binding: group, expectedSourceThreadId: 'thread-group', onForked: async () => { commits += 1; return { outcome: 'succeeded' }; } });
+      if (accepted) assert.equal((await fork).targetThreadId, 'fork-verified');
+      else await assert.rejects(fork, { code: 'CODEX_FORK_UNCONFIRMED', outcome: 'unknown' });
+      assert.equal(commits, accepted ? 1 : 0);
+      await executor.close();
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+// 0.2.27 codex.permissionProfile: a named profile replaces the legacy sandbox on thread requests only.
+const PROFILE_START_KEYS = ['approvalPolicy', 'approvalsReviewer', 'config', 'cwd', 'model', 'permissions', 'serviceName', 'threadSource'];
+const PROFILE_RESUME_KEYS = ['approvalPolicy', 'approvalsReviewer', 'config', 'cwd', 'model', 'permissions', 'threadId'];
+const PROFILE_FORK_KEYS = ['approvalPolicy', 'approvalsReviewer', 'config', 'cwd', 'deferGoalContinuation', 'ephemeral', 'model', 'permissions', 'threadId'];
+// The service still maps the default sandbox and network values next to a profile; the executor must ignore them.
+const profileConfig = (cwd) => ({ ...overrideConfig(cwd), permissionProfile: 'operator' });
+const THREAD_OPERATIONS = ['thread_start', 'thread_resume', 'thread_fork'];
+const profileInputFor = (binding, messageId) => ({ bindingOpenId: binding.feishuOpenId, chatId: binding.chatId, chatType: binding.chatType, messageId,
+  senderOpenId: binding.feishuOpenId, senderName: 'User', prompt: 'work', busyPolicy: 'steer' });
+const paramsOf = (runtime, method, threadId) => runtime.calls.find((call) => call.method === method && (threadId === undefined || call.params.threadId === threadId))?.params;
+
+test('a permission profile drops only the legacy network flag from the app-server arguments', () => {
+  assert.deepEqual(codexAppServerArgs({ networkAccess: false, requestUserInput: true }, { requestUserInputFeature: true }),
+    ['app-server', '--listen', 'stdio://', '-c', 'sandbox_workspace_write.network_access=false', '-c', 'shell_environment_policy.inherit=all', '-c', 'features.default_mode_request_user_input=true']);
+  assert.deepEqual(codexAppServerArgs({}), ['app-server', '--listen', 'stdio://', '-c', 'sandbox_workspace_write.network_access=true', '-c', 'shell_environment_policy.inherit=all']);
+  assert.deepEqual(codexAppServerArgs({ permissionProfile: 'operator', networkAccess: false, requestUserInput: true }, { requestUserInputFeature: true }),
+    ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all', '-c', 'features.default_mode_request_user_input=true']);
+  assert.deepEqual(codexAppServerArgs({ permissionProfile: ':workspace', networkAccess: true }), ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all']);
+});
+
+test('a configured permission profile replaces the sandbox on thread/start, both thread/resume paths and thread/fork, never on turn/start', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-profile-'));
+  const group = { feishuOpenId: 'ou-human', chatId: 'chat-custom', chatType: 'group', codexSessionId: 'thread-group', threadName: 'group', created: false };
+  const privateChat = { feishuOpenId: 'ou-private', chatId: 'chat-private', chatType: 'p2p', codexSessionId: 'thread-private', threadName: 'private', created: false };
+  const assertProfileParams = (params, keys, label) => {
+    assert.deepEqual(Object.keys(params).sort(), keys, label);
+    assert.equal(params.permissions, 'operator', label);
+    assert.equal('sandbox' in params, false, `${label} carries no sandbox key`);
+    assert.deepEqual(params.config, { model_reasoning_effort: 'medium' }, label);
+  };
+  try {
+    // thread/start of a new private chat, then its turn.
+    const logs = [];
+    const startRuntime = fakeRuntime();
+    const starter = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore(), spawnImpl: startRuntime.spawnImpl, log: (...entry) => logs.push(entry) });
+    await starter.execute({ ...profileInputFor({ ...privateChat, chatId: 'chat-new' }, 'm1'), prompt: 'hello' });
+    assertProfileParams(paramsOf(startRuntime, 'thread/start'), PROFILE_START_KEYS, 'thread/start');
+    assert.equal(paramsOf(startRuntime, 'thread/start').approvalPolicy, 'on-request');
+    assert.deepEqual(Object.keys(paramsOf(startRuntime, 'turn/start')).sort(), TURN_START_KEYS, 'turn/start keeps the 0.2.20 key set');
+    assert.deepEqual(startRuntime.args[0], ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all']);
+    assert.deepEqual(logs.filter(([, event]) => event.operation === 'app_server_start'), [['info', { module: 'agent-chat-bridge', component: 'codex-app-server',
+      operation: 'app_server_start', status: 'succeeded', permissionProfile: 'operator' }]]);
+    assert.deepEqual(logs.filter(([, event]) => THREAD_OPERATIONS.includes(event.operation)), [['info', { module: 'agent-chat-bridge', component: 'codex-executor',
+      operation: 'thread_start', rpc_method: 'thread/start', permissionProfile: 'operator', activePermissionProfile: 'operator', status: 'succeeded' }]]);
+    await starter.close();
+
+    // thread/resume before a new turn: the group keeps its approval and cwd overrides, never its sandbox.
+    const readyRuntime = fakeRuntime();
+    const ready = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([group, privateChat]), spawnImpl: readyRuntime.spawnImpl });
+    await ready.execute(profileInputFor(group, 'm2'));
+    await ready.execute(profileInputFor(privateChat, 'm3'));
+    assertProfileParams(paramsOf(readyRuntime, 'thread/resume', 'thread-group'), PROFILE_RESUME_KEYS, 'group thread/resume');
+    assert.equal(paramsOf(readyRuntime, 'thread/resume', 'thread-group').approvalPolicy, 'never');
+    assert.equal(paramsOf(readyRuntime, 'thread/resume', 'thread-group').cwd, groupCwdOf(cwd));
+    assertProfileParams(paramsOf(readyRuntime, 'thread/resume', 'thread-private'), PROFILE_RESUME_KEYS, 'private thread/resume');
+    for (const threadId of ['thread-group', 'thread-private']) {
+      const turn = paramsOf(readyRuntime, 'turn/start', threadId);
+      assert.deepEqual(Object.keys(turn).sort(), TURN_START_KEYS, threadId);
+      assert.equal('permissions' in turn || 'sandboxPolicy' in turn || 'sandbox' in turn, false, threadId);
+    }
+    assert.equal(readyRuntime.calls.filter((call) => call.method === 'thread/start').length, 0);
+    await ready.close();
+
+    // thread/resume of a known turn after a restart.
+    const knownRuntime = fakeRuntime({ resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+    const known = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([privateChat]), spawnImpl: knownRuntime.spawnImpl });
+    const result = await known.execute(profileInputFor(privateChat, 'job'), { resume: { threadId: 'thread-private', turnId: 'known', startedAt: Date.now() - 5_000 } });
+    assert.equal(result.answer, 'known');
+    assertProfileParams(paramsOf(knownRuntime, 'thread/resume', 'thread-private'), PROFILE_RESUME_KEYS, 'known-turn thread/resume');
+    assert.equal(knownRuntime.calls.some((call) => call.method === 'turn/start'), false);
+    await known.close();
+
+    // thread/fork.
+    const forkLogs = [];
+    const forkRuntime = fakeRuntime();
+    const forker = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([group]), spawnImpl: forkRuntime.spawnImpl, log: (...entry) => forkLogs.push(entry) });
+    const forked = await forker.forkBinding({ binding: group, expectedSourceThreadId: 'thread-group', onForked: async () => ({ outcome: 'succeeded' }) });
+    assert.equal(forked.targetThreadId, 'fork-1');
+    assertProfileParams(paramsOf(forkRuntime, 'thread/fork'), PROFILE_FORK_KEYS, 'thread/fork');
+    assert.equal(paramsOf(forkRuntime, 'thread/fork').cwd, groupCwdOf(cwd));
+    assert.deepEqual(forkLogs.filter(([, event]) => THREAD_OPERATIONS.includes(event.operation)).map(([level, event]) => [level, event.operation, event.activePermissionProfile]),
+      [['info', 'thread_fork', 'operator']]);
     await forker.close();
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
+
+test('a thread whose reported permission profile differs or is missing is never bound, loaded or given a turn', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-profile-'));
+  const existing = { feishuOpenId: 'ou-human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', threadName: 'p2p', created: false };
+  const turnStarts = (runtime) => runtime.calls.filter((call) => call.method === 'turn/start').length;
+  try {
+    // 'network-timeout' would match the forward runtime's retry words if an id ever reached the message.
+    for (const [reported, actual] of [[{ id: 'other', extends: null }, 'other'], [undefined, ''], [null, ''], [{ id: 'operator ' }, 'operator '], [{ id: 'network-timeout' }, 'network-timeout']]) {
+      const label = JSON.stringify(reported) ?? 'missing';
+      const mismatch = (error) => {
+        assert.equal(error.code, 'CODEX_PERMISSION_PROFILE_MISMATCH', label);
+        return true;
+      };
+      // The message is fixed and carries no id; the ids are fields of the error.
+      const mismatchWithIds = (error) => {
+        mismatch(error);
+        assert.equal(error.message, 'permission profile mismatch', label);
+        assert.equal(error.expected, 'operator', label);
+        assert.equal(error.actual, actual || null, label);
+        return true;
+      };
+      const failureLog = (logs, operation) => {
+        const entries = logs.filter(([, event]) => THREAD_OPERATIONS.includes(event.operation));
+        assert.equal(entries.length, 1, label);
+        const [level, event] = entries[0];
+        assert.equal(level, 'error', label);
+        assert.deepEqual(event, { module: 'agent-chat-bridge', component: 'codex-executor', operation, rpc_method: operation.replace('_', '/'), permissionProfile: 'operator',
+          ...(actual ? { activePermissionProfile: actual } : {}), status: 'failed', error_code: 'CODEX_PERMISSION_PROFILE_MISMATCH' }, label);
+      };
+
+      // thread/start: the new thread is not bound.
+      const startLogs = [];
+      const startRuntime = fakeRuntime({ activeProfile: () => reported });
+      const startStore = memoryStore();
+      const starter = createCodexExecutor({ config: profileConfig(cwd), sessionStore: startStore, spawnImpl: startRuntime.spawnImpl, log: (...entry) => startLogs.push(entry) });
+      await assert.rejects(starter.execute(profileInputFor({ ...existing, chatId: 'chat-new' }, 'm1')), mismatchWithIds);
+      assert.equal(turnStarts(startRuntime), 0, label);
+      assert.equal(startStore.bindings.size, 0, `${label}: no binding is saved`);
+      failureLog(startLogs, 'thread_start');
+      await starter.close();
+
+      // thread/resume before a new turn: the binding is kept but the thread is not used.
+      const resumeLogs = [];
+      const resumeRuntime = fakeRuntime({ activeProfile: () => reported });
+      const resumeStore = memoryStore([existing]);
+      const resumer = createCodexExecutor({ config: profileConfig(cwd), sessionStore: resumeStore, spawnImpl: resumeRuntime.spawnImpl, log: (...entry) => resumeLogs.push(entry) });
+      await assert.rejects(resumer.execute(profileInputFor(existing, 'm2')), mismatchWithIds);
+      assert.equal(turnStarts(resumeRuntime), 0, label);
+      assert.equal(resumeStore.bindings.get('ou-human:chat').codexSessionId, 'thread-existing', label);
+      failureLog(resumeLogs, 'thread_resume');
+      await resumer.close();
+
+      // thread/resume of a known turn.
+      const knownRuntime = fakeRuntime({ activeProfile: () => reported, resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+      const known = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([existing]), spawnImpl: knownRuntime.spawnImpl });
+      await assert.rejects(known.execute(profileInputFor(existing, 'job'), { resume: { threadId: 'thread-existing', turnId: 'known', startedAt: Date.now() - 5_000 } }), mismatch);
+      assert.equal(turnStarts(knownRuntime), 0, label);
+      await known.close();
+
+      // thread/fork: the fork is not committed to the binding.
+      const forkLogs = [];
+      const forkRuntime = fakeRuntime({ activeProfile: () => reported });
+      const forker = createCodexExecutor({ config: profileConfig(cwd), sessionStore: memoryStore([existing]), spawnImpl: forkRuntime.spawnImpl, log: (...entry) => forkLogs.push(entry) });
+      let commits = 0;
+      await assert.rejects(forker.forkBinding({ binding: existing, expectedSourceThreadId: 'thread-existing', onForked: async () => { commits += 1; return { outcome: 'succeeded' }; } }), (error) => {
+        mismatchWithIds(error);
+        assert.equal(error.outcome, undefined, `${label}: a rejected fork is reported as failed, not unknown`);
+        assert.equal(error.forkTargetThreadId, 'fork-1', `${label}: the unused native fork is recorded`);
+        return true;
+      });
+      assert.equal(commits, 0, label);
+      failureLog(forkLogs, 'thread_fork');
+      await forker.close();
+    }
+
+    // The rejected thread was never marked loaded: the next message resumes and checks it again.
+    let reported = { id: 'other' };
+    const runtime = fakeRuntime({ activeProfile: () => reported });
+    // One long-lived child, so a second resume can only come from the executor not marking the thread loaded.
+    const executor = createCodexExecutor({ config: { ...profileConfig(cwd), idleCloseMs: 60_000 }, sessionStore: memoryStore([existing]), spawnImpl: runtime.spawnImpl });
+    await assert.rejects(executor.execute(profileInputFor(existing, 'm1')), { code: 'CODEX_PERMISSION_PROFILE_MISMATCH' });
+    reported = { id: 'operator', extends: null };
+    const result = await executor.execute(profileInputFor(existing, 'm2'));
+    assert.equal(result.threadId, 'thread-existing');
+    assert.equal(runtime.calls.filter((call) => call.method === 'thread/resume' && call.params.threadId === 'thread-existing').length, 2);
+    assert.equal(turnStarts(runtime), 1);
+    assert.equal(runtime.children.length, 1);
+    await executor.close();
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('without a permission profile thread, turn and launch parameters are byte-for-byte those of 0.2.26 and nothing is added to the logs', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-codex-legacy-'));
+  const existing = { feishuOpenId: 'ou-human', chatId: 'chat', chatType: 'p2p', codexSessionId: 'thread-existing', threadName: 'p2p', created: false };
+  const knownBinding = { ...existing, chatId: 'chat-known', codexSessionId: 'thread-known' };
+  const policy = { cwd, approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', sandbox: 'workspace-write', model: 'gpt-test' };
+  const effort = { config: { model_reasoning_effort: 'medium' } };
+  try {
+    const logs = [];
+    const runtime = fakeRuntime({ resumeTurns: [{ id: 'known', status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: 'known' }] }] });
+    const executor = createCodexExecutor({ config: { ...config(cwd), idleCloseMs: 60_000 }, sessionStore: memoryStore([existing, knownBinding]), spawnImpl: runtime.spawnImpl, log: (...entry) => logs.push(entry) });
+    await executor.execute(profileInputFor({ ...existing, chatId: 'chat-new' }, 'm1'));
+    await executor.execute(profileInputFor(existing, 'm2'));
+    await executor.execute(profileInputFor(knownBinding, 'job'), { resume: { threadId: 'thread-known', turnId: 'known', startedAt: Date.now() - 5_000 } });
+    await executor.forkBinding({ binding: existing, expectedSourceThreadId: 'thread-existing', onForked: async () => ({ outcome: 'succeeded' }) });
+    const wire = (method, threadId) => JSON.stringify(paramsOf(runtime, method, threadId));
+    assert.equal(wire('thread/start'), JSON.stringify({ ...policy, serviceName: 'Agent Chat Bridge', threadSource: 'user', ...effort }));
+    assert.equal(wire('thread/resume', 'thread-existing'), JSON.stringify({ ...policy, threadId: 'thread-existing', ...effort }));
+    assert.equal(wire('thread/resume', 'thread-known'), JSON.stringify({ ...policy, threadId: 'thread-known', ...effort }));
+    assert.equal(wire('thread/fork', 'thread-existing'), JSON.stringify({ ...policy, threadId: 'thread-existing', ephemeral: false, deferGoalContinuation: true, ...effort }));
+    for (const turn of runtime.calls.filter((call) => call.method === 'turn/start')) {
+      assert.deepEqual(Object.keys(turn.params), ['threadId', 'input', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'model', 'effort']);
+    }
+    assert.equal(runtime.calls.filter((call) => call.method === 'turn/start').length, 2);
+    assert.deepEqual(runtime.args, [['app-server', '--listen', 'stdio://', '-c', 'sandbox_workspace_write.network_access=false', '-c', 'shell_environment_policy.inherit=all']]);
+    // The complete log output, captured from 0.2.26 running this same sequence: any extra line of any name fails.
+    assert.deepEqual(logs, [['info', { module: 'agent-chat-bridge', component: 'codex-app-server', operation: 'app_server_start', status: 'succeeded' }]]);
+    await executor.close();
+    assert.deepEqual(logs.map(([level, event]) => [level, event.operation, event.status]), [
+      ['info', 'app_server_start', 'succeeded'], ['info', 'app_server_close', 'started'], ['info', 'app_server_close', 'succeeded'],
+    ]);
+    assert.equal(logs.some(([, event]) => THREAD_OPERATIONS.includes(event.operation) || 'permissionProfile' in event || 'activePermissionProfile' in event), false);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+for (const status of ['interrupted', 'failed', 'completed', 'inProgress', 'missing', 'unavailable']) {
+  test(`restart observation-loss recovery reads native ${status} without replay`, { timeout: 10000 }, async t => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-restart-observation-'));
+    t.after(() => rmSync(cwd, { recursive: true, force: true }));
+    const store = memoryStore();
+    const firstRuntime = fakeRuntime({ completeStarts: false });
+    const first = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: firstRuntime.spawnImpl });
+    const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: 'restart-job', prompt: 'work' };
+    const pending = first.execute(input);
+    const rejected = assert.rejects(pending, { code: 'CODEX_OBSERVATION_LOST' });
+    while (!first.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+    await first.close(); await rejected;
+    const errorEvent = store.events.find(row => row.event_key === 'error:restart-job');
+    assert.equal(JSON.parse(errorEvent.detail_json).turnStatus, 'unknown');
+    // Exercise records written by old releases too: unknown was stored as failed.
+    if (status !== 'inProgress') errorEvent.detail_json = JSON.stringify({ errorCode: 'CODEX_OBSERVATION_LOST', turnId: 'turn-1', turnStatus: 'failed' });
+    const native = { id: 'turn-1', status, items: [{ id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'finished once' }] };
+    const runtime = fakeRuntime({ resumeTurns: ['missing', 'unavailable'].includes(status) ? [] : [native],
+      rejectMethods: status === 'unavailable' ? new Map([['thread/resume', { code: -32000, message: 'synthetic unavailable' }]]) : new Map() });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    t.after(() => executor.close());
+    const recovered = executor.execute(input);
+    if (status === 'inProgress') {
+      while (!executor.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+      runtime.children[0].send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1', turn: { ...native, status: 'completed' } } });
+    }
+    if (['completed', 'inProgress'].includes(status)) assert.equal((await recovered).answer, 'finished once');
+    else if (['missing', 'unavailable'].includes(status)) await assert.rejects(recovered, error => error.retryable === true && error.outcome === 'unknown');
+    else {
+      const code = status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED';
+      await assert.rejects(recovered, { code });
+      const duplicate = await executor.execute(input);
+      assert.equal(duplicate.errorCode, code);
+      assert.equal(duplicate.turnStatus, status);
+    }
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 0);
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/steer').length, 0);
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/interrupt').length, 0);
+  });
+}
+
+// 0.2.29 crash: after a restart the job resumes a turn that Codex already
+// reports interrupted/failed while the caller's signal is already aborted
+// (lease lost during shutdown). The observer promise had no handler and the
+// unhandled rejection exited the process. It must end as an ordinary failure.
+for (const [path, status] of [['observation-loss duplicate', 'interrupted'], ['observation-loss duplicate', 'failed'], ['explicit resume', 'interrupted']]) {
+  test(`resuming a ${status} turn through the ${path} path with an aborted caller never leaves an unhandled rejection`, { timeout: 10000 }, async t => {
+    const cwd = mkdtempSync(join(tmpdir(), 'bridge-resume-unhandled-'));
+    t.after(() => rmSync(cwd, { recursive: true, force: true }));
+    const unhandled = [];
+    const onUnhandled = reason => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+    const store = memoryStore();
+    const firstRuntime = fakeRuntime({ completeStarts: false });
+    const first = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: firstRuntime.spawnImpl });
+    const input = { bindingOpenId: 'human', chatId: 'chat', chatType: 'p2p', messageId: `resume-${status}`, prompt: 'work' };
+    const pending = first.execute(input);
+    const rejected = assert.rejects(pending, { code: 'CODEX_OBSERVATION_LOST' });
+    while (!first.status().activeTurns) await new Promise(resolve => setImmediate(resolve));
+    await first.close(); await rejected;
+    const native = { id: 'turn-1', status, items: [] };
+    const runtime = fakeRuntime({ resumeTurns: [native] });
+    const executor = createCodexExecutor({ config: config(cwd), sessionStore: store, spawnImpl: runtime.spawnImpl });
+    t.after(() => executor.close());
+    const options = { signal: AbortSignal.abort() };
+    if (path === 'explicit resume') {
+      const errorEvent = store.events.find(row => row.event_key === `error:${input.messageId}`);
+      options.resume = { threadId: 'thread-1', turnId: 'turn-1', startedAt: Number(JSON.parse(errorEvent.detail_json).startedAt) };
+    }
+    await assert.rejects(executor.execute(input, options), { code: 'CODEX_WAIT_ABORTED' });
+    for (let tick = 0; tick < 5; tick += 1) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.deepEqual(unhandled.map(reason => reason?.code), []);
+    // The terminal state was persisted, so the next attempt ends through the
+    // normal failed/interrupted path instead of replaying the prompt.
+    const code = status === 'interrupted' ? 'CODEX_TURN_INTERRUPTED' : 'CODEX_TURN_FAILED';
+    const duplicate = await executor.execute(input);
+    assert.equal(duplicate.errorCode, code);
+    assert.equal(duplicate.turnStatus, status);
+    assert.equal(runtime.calls.filter(call => call.method === 'turn/start').length, 0);
+  });
+}

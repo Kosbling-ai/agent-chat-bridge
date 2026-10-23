@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createDeltaCoalescer } from '../src/agents/codex/executor.mjs';
 import { createCommunicationRuntime } from '../src/core/communication-runtime.mjs';
 import { createLogger } from '../src/logger.mjs';
-import { StoreError } from '../src/storage/errors.mjs';
+import { DETERMINISTIC_DRIVER_ERRORS, StoreError, databaseError } from '../src/storage/errors.mjs';
 import { createExecutorLogAdapter } from '../src/service.mjs';
 
 const config = {
@@ -100,7 +100,41 @@ test('delta coalescer keeps interleaved items independent', async () => {
   assert.deepEqual(writes, { first: ['a', 'ab'], second: ['x', 'xy'] });
 });
 
-test('communication poll retries a transient store error and recovers', async () => {
+test('delta coalescer spaces full-text rewrites of one key by the minimum interval and always writes the last value', async () => {
+  let clock = 0;
+  const writes = [];
+  const sleeps = [];
+  const persist = createDeltaCoalescer({
+    now: () => clock, minIntervalMs: 500,
+    sleep: async milliseconds => { sleeps.push(milliseconds); clock += milliseconds; },
+    write: async value => { writes.push([clock, value]); clock += 10; },
+  });
+  let text = '';
+  const pending = [];
+  for (let index = 0; index < 50; index += 1) {
+    text += 'x';
+    pending.push(persist('turn:item', text));
+    if (index % 10 === 9) clock += 40;
+  }
+  await Promise.all(pending);
+  assert.equal(writes.length, 2);
+  assert.equal(writes.at(-1)[1], text);
+  for (let index = 1; index < writes.length; index += 1) assert.ok(writes[index][0] - writes[index - 1][0] >= 500);
+  // A delta that arrives just after the last write still waits for the interval.
+  clock += 100;
+  await persist('turn:item', `${text}y`);
+  assert.equal(writes.length, 3);
+  assert.ok(writes[2][0] - writes[1][0] >= 500);
+  assert.equal(writes[2][1], `${text}y`);
+  // Other keys are independent and a clock step backwards cannot stall a write.
+  clock -= 10_000;
+  await persist('turn:other', 'a');
+  await persist('turn:other', 'ab');
+  assert.deepEqual(writes.slice(3).map(entry => entry[1]), ['a', 'ab']);
+  assert.ok(sleeps.every(milliseconds => milliseconds <= 500));
+});
+
+for (const errorCode of ['store_unavailable', 'commit_unknown']) test(`communication poll recovers from ${errorCode} without stopping the worker`, async () => {
   let claims = 0;
   let releaseIdle;
   let releaseRetry;
@@ -108,7 +142,7 @@ test('communication poll retries a transient store error and recovers', async ()
   const logs = [];
   const runtime = createCommunicationRuntime({ config, chat: {}, log: (...entry) => logs.push(entry),
     store: {
-      async claimJobs() { claims += 1; if (claims === 1) throw new StoreError('store_unavailable'); return []; },
+      async claimJobs() { claims += 1; if (claims === 1) throw new StoreError(errorCode); return []; },
       async claimOutbox() { return []; },
     },
     wait: async milliseconds => {
@@ -148,14 +182,14 @@ test('communication poll marks non-transient store errors unhealthy immediately'
   await runtime.stop();
 });
 
-test('communication poll remains degraded through a persistent transient failure with capped backoff', async () => {
+for (const errorCode of ['store_timeout', 'commit_unknown']) test(`communication poll remains degraded through persistent ${errorCode} with capped backoff`, async () => {
   let clock = 0;
   const logs = [];
   const waits = [];
   let blocked = false;
   const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock, log: (...entry) => logs.push(entry),
     store: {
-      async claimJobs() { throw new StoreError('store_timeout'); },
+      async claimJobs() { throw new StoreError(errorCode); },
       async claimOutbox() { throw new Error('unexpected'); },
     },
     wait: async milliseconds => { waits.push(milliseconds); clock += milliseconds; if (waits.length === 8) { blocked = true; await new Promise(() => {}); } },
@@ -191,6 +225,69 @@ test('communication poll logs persistent degradation periodically without stoppi
   assert.equal(logs.length, 2);
   assert.deepEqual(logs.map(entry => entry[3].consecutiveFailures), [1, 11]);
   await runtime.stop();
+});
+
+test('a degradation lasting 5 minutes is logged at error level, still at most once per 5 minutes', async () => {
+  let clock = 0;
+  let claims = 0;
+  const logs = [];
+  let blocked = false;
+  const runtime = createCommunicationRuntime({ config, chat: {}, now: () => clock, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() { claims += 1; throw new StoreError('store_unavailable'); },
+      async claimOutbox() { return []; },
+    },
+    wait: async () => { clock += 30000; if (claims === 41) { blocked = true; await new Promise(() => {}); } },
+  });
+  runtime.start();
+  while (!blocked) await immediate();
+  // t=0 warning; t=5, 10, 15 and 20 minutes error-level, nothing in between.
+  assert.deepEqual(logs.map(entry => [entry[0], entry[3].consecutiveFailures]),
+    [['warning', 1], ['error', 11], ['error', 21], ['error', 31], ['error', 41]]);
+  assert.ok(logs.every(entry => entry[3].code === 'worker_poll_failed' && entry[3].willRetry === true));
+  assert.equal(runtime.status().healthy, true);
+  await runtime.stop();
+});
+
+test('deterministic driver errors are non-transient store_invalid and stop the communication worker', async () => {
+  for (const code of ['ER_PARSE_ERROR', 'ER_BAD_FIELD_ERROR', 'ER_NO_SUCH_TABLE', 'ER_KEY_DOES_NOT_EXITS', 'ER_ACCESS_DENIED_ERROR',
+    'ER_DBACCESS_DENIED_ERROR', 'ER_TABLEACCESS_DENIED_ERROR', 'ER_WRONG_VALUE_COUNT_ON_ROW', 'ER_BAD_NULL_ERROR', 'ER_DATA_TOO_LONG']) {
+    assert.ok(DETERMINISTIC_DRIVER_ERRORS.has(code), code);
+    const normalized = databaseError(Object.assign(new Error('hidden'), { code, errno: 1, sqlState: '42000' }));
+    assert.equal(normalized.code, 'store_invalid', code);
+    assert.equal(normalized.errorCode, code);
+  }
+  assert.equal(databaseError(Object.assign(new Error('x'), { code: 'ER_LOCK_WAIT_TIMEOUT' })).code, 'store_contention');
+  assert.equal(databaseError(Object.assign(new Error('x'), { code: 'ECONNRESET' })).code, 'store_unavailable');
+  assert.equal(databaseError(new TypeError('x')).code, 'store_unavailable');
+  const logs = [];
+  const runtime = createCommunicationRuntime({ config, chat: {}, log: (...entry) => logs.push(entry),
+    store: {
+      async claimJobs() { throw Object.assign(new Error('hidden'), { code: 'ER_KEY_DOES_NOT_EXITS', errno: 1176, sqlState: '42000' }); },
+      async claimOutbox() { return []; },
+    }, wait: async () => {},
+  });
+  runtime.start();
+  while (runtime.status().running) await immediate();
+  assert.equal(runtime.status().healthy, false);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][0], 'error');
+  assert.equal(logs[0][3].code, 'worker_failed');
+  assert.equal(logs[0][3].errorClass, 'store_invalid');
+  assert.equal(logs[0][3].errorCode, 'ER_KEY_DOES_NOT_EXITS');
+  assert.equal(logs[0][3].willRetry, false);
+  await runtime.stop();
+});
+
+test('logger records the migration result fields', () => {
+  const events = [];
+  const log = createLogger({ write: value => events.push(JSON.parse(value)) });
+  log('info', 'migration', 'succeeded', { version: 6, applied: true });
+  log('info', 'migration', 'succeeded', { version: 6, applied: false });
+  log('info', 'migration', 'succeeded', { version: 'six', applied: 'yes' });
+  assert.deepEqual(events.map(event => [event.version, event.applied]), [[6, true], [6, false], [undefined, undefined]]);
+  log('warning', 'codex_event_write', 'dropped', { code: 'codex_event_queue_full', droppedEvents: 3, droppedEventsTotal: 9, queuedEvents: 201 });
+  assert.deepEqual([events[3].dropped_events, events[3].dropped_events_total, events[3].queued_events], [3, 9, 201]);
 });
 
 test('communication poll stop interrupts a retry backoff', async () => {
@@ -238,6 +335,34 @@ test('service executor log adapter forwards only diagnostic allowlist fields', (
     operation: 'persist_delta', status: 'failed', consecutive_failures: 2, durationMs: 23,
     stage: 'write', error_class: 'store_contention', errno: 1205, sql_state: 'HY000', will_retry: true,
   });
+  adapter('info', { operation: 'thread_rollover', status: 'succeeded', reason: 'cwd_changed', chat_id: 'oc_chat', chatId: 'ignored', cwd: '/must/not/appear', oldThreadId: 'thread-old' });
+  assert.deepEqual(events[1], {
+    timestamp: events[1].timestamp, level: 'info', module: 'bridge', component: 'service',
+    operation: 'thread_rollover', status: 'succeeded', reason: 'cwd_changed', chat_id: 'oc_chat',
+  });
+});
+
+for (const stage of ['claimJobs', 'claimOutbox']) test(`uncertain ${stage} acknowledgement does not launch an unconfirmed effect`, async () => {
+  let attempts = 0;
+  let releaseRetry, releaseIdle;
+  let effects = 0;
+  const runtime = createCommunicationRuntime({ config, chat: { sendMessage: async () => { effects++; } },
+    store: {
+      async claimJobs() { if (stage === 'claimJobs' && ++attempts === 1) throw new StoreError('commit_unknown'); return []; },
+      async claimOutbox() { if (stage === 'claimOutbox' && ++attempts === 1) throw new StoreError('commit_unknown'); return []; },
+    },
+    wait: async ms => { if (ms === 1000) await new Promise(r => { releaseRetry = r; }); if (ms === 100) await new Promise(r => { releaseIdle = r; }); },
+  });
+  runtime.start();
+  while (!releaseRetry) await immediate();
+  assert.equal(runtime.status().running, true);
+  assert.equal(runtime.status().degraded, true);
+  releaseRetry();
+  while (!releaseIdle) await immediate();
+  assert.equal(runtime.status().degraded, false);
+  assert.equal(effects, 0);
+  releaseIdle();
+  await runtime.stop();
 });
 
 test('uncertain claim commit recovers without stopping the communication worker', async () => {

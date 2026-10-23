@@ -26,8 +26,10 @@ test('real Store catchup resumes fixed pagination window and replays a committed
       const result = await store.acceptInbound({ connectionId: event.connectionId, conversationId: event.conversationId,
         eventKey: event.eventKey, eventType: event.type, messageId: event.messageId, revision: event.revision,
         payload: event, semanticPayload: feishuEventIdentity(event), policyVersion: 'test',
-        agentJob: { payload: { text: event.message.parsedContent.text } } });
-      ids.add(result.agentJobId);
+        // acceptInbound stopped creating agent jobs in 46f87d5; the durable consumer
+        // job a replay must not duplicate is now the hook job.
+        hooks: [{ hookId: 'catchup-hook', payload: { text: event.message.parsedContent.text } }] });
+      ids.add(result.hookJobIds[0]);
       if (fail) throw new Error('synthetic commit response lost');
     } });
   try {
@@ -39,7 +41,13 @@ test('real Store catchup resumes fixed pagination window and replays a committed
     worker = make(); assert.equal((await worker.runOnce()).failed, 0); await worker.stop();
     assert.equal(ids.size, 2); assert.equal(calls[2].pageToken, 'page2');
     assert.equal(calls[0].startTime, calls[2].startTime); assert.equal(calls[0].endTime, calls[2].endTime);
-    const jobs = await store.claimJobs({ kind: 'agent', owner: 'review', leaseMs: 1000, limit: 10 });
-    assert.equal(jobs.length, 2);
+    // Hook jobs of one conversation are delivered in order: the second becomes
+    // claimable only after the first settles, and each exists exactly once.
+    const [firstJob, ...blocked] = await store.claimJobs({ kind: 'hook', owner: 'review', leaseMs: 1000, limit: 10 });
+    assert.deepEqual(blocked, []);
+    await store.finishJobWithOutbox({ id: firstJob.id, leaseToken: firstJob.leaseToken });
+    const [secondJob, ...rest] = await store.claimJobs({ kind: 'hook', owner: 'review', leaseMs: 1000, limit: 10 });
+    assert.deepEqual(rest, []);
+    assert.deepEqual(new Set([firstJob.id, secondJob.id]), ids);
   } finally { await worker?.stop(); await store.close(); }
 });

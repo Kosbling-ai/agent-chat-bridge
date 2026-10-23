@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 
 export class ConfigError extends Error {
   constructor(code) {
@@ -113,17 +113,56 @@ function silentReply(value, { partial = false } = {}) {
   }
   return Object.freeze(result);
 }
-// Per-group Codex permission switch for threads bound to that group chat (the
-// human group thread and business-event threads whose result chat is this
-// group). Each field replaces the global value and may grant more or less
-// than it; cwd and model stay global. Values are the app-server protocol
-// enums, compared exactly (no trimming).
+// Per-group reply style for human group turns. `mode: "card"` (default) keeps
+// the execution card; `mode: "text"` never creates one and replies to the
+// triggering message with a post or text. `ack: "reaction"` (text mode only)
+// leaves one reaction on the triggering message when the turn starts.
+const GROUP_REPLY_MODES = Object.freeze(['card', 'text']);
+const GROUP_REPLY_ACKS = Object.freeze(['none', 'reaction']);
+// Feishu has no eyes reaction; OnIt ("on it") is the neutral acknowledgement.
+const DEFAULT_REPLY_ACK_EMOJI = 'OnIt';
+function groupReply(value, { processingReactionEmoji } = {}) {
+  object(value, ['mode', 'ack', 'ackEmoji'], 'invalid_group_reply_fields');
+  const mode = value.mode === undefined ? 'card' : value.mode;
+  if (!GROUP_REPLY_MODES.includes(mode)) throw new ConfigError('invalid_group_reply_mode');
+  if (value.ack !== undefined && !GROUP_REPLY_ACKS.includes(value.ack)) throw new ConfigError('invalid_group_reply_ack');
+  if (value.ackEmoji !== undefined && (typeof value.ackEmoji !== 'string' || !/^[A-Za-z0-9_]{1,80}$/.test(value.ackEmoji))) {
+    throw new ConfigError('invalid_group_reply_ack_emoji');
+  }
+  if (mode !== 'text') {
+    if (value.ack !== undefined || value.ackEmoji !== undefined) throw new ConfigError('group_reply_ack_requires_text_mode');
+    return Object.freeze({ mode });
+  }
+  const ack = value.ack ?? 'none';
+  if (ack !== 'reaction') {
+    if (value.ackEmoji !== undefined) throw new ConfigError('group_reply_ack_emoji_requires_reaction');
+    return Object.freeze({ mode, ack });
+  }
+  const ackEmoji = value.ackEmoji ?? DEFAULT_REPLY_ACK_EMOJI;
+  // The processing cleanup removes every app reaction with that emoji.
+  if (ackEmoji === processingReactionEmoji) throw new ConfigError('group_reply_ack_emoji_conflicts_with_processing_reaction');
+  return Object.freeze({ mode, ack, ackEmoji });
+}
+// Per-group Codex switch for threads bound to that group chat (the human group
+// thread and business-event threads whose result chat is this group). Each
+// field replaces the global value and may grant more or less than it; model
+// stays global. Permission values are the app-server protocol enums, compared
+// exactly (no trimming). `cwd` must be an absolute path and is stored
+// normalized; startup and check-config verify the directory with the same
+// checks as the global cwd. A group sandbox cannot be combined with an
+// instance-wide named permission profile (`codex.permissionProfile`).
 const GROUP_APPROVAL_POLICIES = Object.freeze(['untrusted', 'on-request', 'never']);
 const GROUP_APPROVALS_REVIEWERS = Object.freeze(['user', 'auto_review', 'guardian_subagent']);
 const GROUP_SANDBOX_MODES = Object.freeze(['read-only', 'workspace-write', 'danger-full-access']);
-function groupCodex(value) {
-  object(value, ['approvalPolicy', 'approvalsReviewer', 'sandbox'], 'invalid_group_codex_fields');
+function groupCodex(value, { permissionProfile } = {}) {
+  object(value, ['approvalPolicy', 'approvalsReviewer', 'sandbox', 'cwd'], 'invalid_group_codex_fields');
   const result = {};
+  if (value.cwd !== undefined) {
+    if (typeof value.cwd !== 'string' || !value.cwd || value.cwd !== value.cwd.trim() || value.cwd.length > 1024
+      || !isAbsolute(value.cwd) || /[\u0000-\u001f\u007f]/u.test(value.cwd)) throw new ConfigError('invalid_group_codex_cwd');
+    // Normalized once here so the preflight check and the executor use the same value.
+    result.cwd = resolve(value.cwd);
+  }
   if (value.approvalPolicy !== undefined) {
     if (!GROUP_APPROVAL_POLICIES.includes(value.approvalPolicy)) throw new ConfigError('invalid_group_codex_approval_policy');
     result.approvalPolicy = value.approvalPolicy;
@@ -137,7 +176,46 @@ function groupCodex(value) {
     result.sandbox = value.sandbox;
   }
   if (Object.keys(result).length === 0) throw new ConfigError('invalid_group_codex_fields');
+  if (permissionProfile !== undefined && result.sandbox !== undefined) throw new ConfigError('group_codex_sandbox_conflicts_with_permission_profile');
   return Object.freeze(result);
+}
+// Optional named Codex permission profile for the whole instance: the id of a
+// `[permissions.<id>]` table in the Codex home config.toml, or a built-in such
+// as `:workspace`. It replaces the legacy sandbox, so the legacy keys may not
+// appear next to it.
+const PERMISSION_PROFILE_PATTERN = /^:?[A-Za-z0-9][A-Za-z0-9._-]*$/;
+function permissionProfile(codex) {
+  if (typeof codex.permissionProfile !== 'string') throw new ConfigError('invalid_codex_permission_profile');
+  const id = codex.permissionProfile.trim();
+  if (!id || id.length > 128 || !PERMISSION_PROFILE_PATTERN.test(id)) throw new ConfigError('invalid_codex_permission_profile');
+  if (codex.sandbox !== undefined) throw new ConfigError('codex_permission_profile_conflicts_with_sandbox');
+  if (codex.networkAccess !== undefined) throw new ConfigError('codex_permission_profile_conflicts_with_network_access');
+  return id;
+}
+// Optional per-instance private-chat admission callback. The bridge only knows
+// the URL, the token environment name, timings and two fixed reply texts; the
+// business decision stays behind the callback.
+const PRIVATE_ADMISSION_MAX_TEXT = 2000;
+function privateAdmissionText(value) {
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > PRIVATE_ADMISSION_MAX_TEXT) throw new ConfigError('invalid_private_admission_text');
+  return value.trim();
+}
+function privateAdmission(value) {
+  object(value, ['url', 'tokenEnv', 'timeoutMs', 'allowCacheMs', 'denyCacheMs', 'denyText', 'unavailableText'], 'invalid_private_admission_fields');
+  let url;
+  try { url = new URL(typeof value.url === 'string' && value.url.length <= 2048 ? value.url : ''); } catch { throw new ConfigError('invalid_private_admission_url'); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_private_admission_url');
+  const tokenEnv = reference(value.tokenEnv);
+  const timeoutMs = value.timeoutMs === undefined ? 1000 : value.timeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 5000) throw new ConfigError('invalid_private_admission_timeout');
+  const allowCacheMs = value.allowCacheMs === undefined ? 300000 : value.allowCacheMs;
+  const denyCacheMs = value.denyCacheMs === undefined ? 60000 : value.denyCacheMs;
+  for (const ttl of [allowCacheMs, denyCacheMs]) {
+    if (!Number.isSafeInteger(ttl) || ttl < 0 || ttl > 86_400_000) throw new ConfigError('invalid_private_admission_cache');
+  }
+  const denyText = privateAdmissionText(value.denyText);
+  const unavailableText = value.unavailableText === undefined ? denyText : privateAdmissionText(value.unavailableText);
+  return Object.freeze({ url: url.href, tokenEnv, timeoutMs, allowCacheMs, denyCacheMs, denyText, unavailableText });
 }
 function validateRuntime(raw) {
   const enabled = ['runtime', 'storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
@@ -171,7 +249,7 @@ function validateRuntime(raw) {
   object(rawRuntime, ['unhealthyExitMs'], 'invalid_runtime_fields');
   const runtime = { unhealthyExitMs: rawRuntime.unhealthyExitMs ?? 30_000 };
   if (!Number.isSafeInteger(runtime.unhealthyExitMs) || runtime.unhealthyExitMs <= 0 || runtime.unhealthyExitMs > MAX_TIMER_MS) throw new ConfigError('invalid_runtime_unhealthy_exit');
-  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'computerUse', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
+  object(raw.codex, ['bin', 'cwd', 'sharedHome', 'envNames', 'model', 'reasoningEffort', 'idleCloseMs', 'closeGraceMs', 'rpcTimeoutMs', 'turnTimeoutMs', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'requestUserInput', 'computerUse', 'permissionProfile', 'threadNamePrefix', 'rolloverIdleMs', 'rolloverCheckTimeoutMs', 'rolloverOnRulesUpdate', 'rulesFiles', 'memoryCheckIntervalMs', 'memoryMaxRssMb', 'memoryMaxHeapUsedMb', 'steering', 'proxyEnv', 'jobPollMs', 'jobRetryMs', 'jobMaxAttempts', 'maxEventAgeMs', 'groupContextMessageLimit', 'groupContextHours', 'groupContextAttachmentLimit'], 'invalid_codex_fields');
   const codex = { bin: string(raw.codex.bin), cwd: string(raw.codex.cwd), envNames: strings(raw.codex.envNames ?? []).map(codexEnvironmentName) };
   if (raw.codex.sharedHome !== undefined) codex.sharedHome = string(raw.codex.sharedHome);
   if (raw.codex.proxyEnv !== undefined) {
@@ -198,6 +276,7 @@ function validateRuntime(raw) {
   if (typeof codex.requestUserInput !== 'boolean') throw new ConfigError('invalid_codex_request_user_input');
   codex.computerUse = raw.codex.computerUse ?? false;
   if (typeof codex.computerUse !== 'boolean') throw new ConfigError('invalid_codex_computer_use');
+  if (raw.codex.permissionProfile !== undefined) codex.permissionProfile = permissionProfile(raw.codex);
   codex.threadNamePrefix = raw.codex.threadNamePrefix === undefined ? 'bridge' : string(raw.codex.threadNamePrefix);
   codex.steering = raw.codex.steering ?? true;
   if (typeof codex.steering !== 'boolean') throw new ConfigError('invalid_steering_flag');
@@ -265,10 +344,10 @@ function validateRuntime(raw) {
   feishu.mediaBudgetBytes = raw.feishu.mediaBudgetBytes ?? 128 * 1024 * 1024;
   if (raw.feishu.outputBudgetBytes !== undefined && (!Number.isSafeInteger(raw.feishu.outputBudgetBytes) || raw.feishu.outputBudgetBytes < 28 * 1024 * 1024 || raw.feishu.outputBudgetBytes > 1024 * 1024 * 1024)) throw new ConfigError('invalid_output_budget');
   feishu.outputBudgetBytes = raw.feishu.outputBudgetBytes ?? 512 * 1024 * 1024;
-  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
+  object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'privateAdmission', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'codex'], 'invalid_group_fields');
+    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'reply', 'codex'], 'invalid_group_fields');
     const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
     if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
@@ -277,7 +356,7 @@ function validateRuntime(raw) {
     const capabilities=group.capabilities===undefined?['bridge','hook']:strings(group.capabilities);
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
     if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined || group.replyTriggers === true
-      || group.silentReply !== undefined || group.codex !== undefined)) throw new ConfigError('group_context_requires_bridge');
+      || group.silentReply !== undefined || group.reply !== undefined || group.codex !== undefined)) throw new ConfigError('group_context_requires_bridge');
     return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, replyTriggers: group.replyTriggers ?? false, passiveContext: group.passiveContext, capabilities,
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }),
       ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
@@ -286,11 +365,15 @@ function validateRuntime(raw) {
       allowMentionAll: group.allowMentionAll ?? false,
       ...(group.replyContext === undefined ? {} : { replyContext: replyContext(group.replyContext) }),
       ...(group.silentReply === undefined ? {} : { silentReply: silentReply(group.silentReply, { partial: true }) }),
-      ...(group.codex === undefined ? {} : { codex: groupCodex(group.codex) }) };
+      ...(group.reply === undefined ? {} : { reply: groupReply(group.reply, { processingReactionEmoji: feishu.processingReactionEmoji }) }),
+      ...(group.codex === undefined ? {} : { codex: groupCodex(group.codex, { permissionProfile: codex.permissionProfile }) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
   if (typeof allowAllPrivateUsers !== 'boolean' || raw.routing.allowAllPrivateUsers === null) throw new ConfigError('invalid_private_access_policy');
+  // Admitting every private sender would make the callback meaningless.
+  if (raw.routing.privateAdmission !== undefined && allowAllPrivateUsers === true) throw new ConfigError('private_admission_conflicts_with_allow_all');
+  const admission = raw.routing.privateAdmission === undefined ? undefined : privateAdmission(raw.routing.privateAdmission);
   const unlisted = raw.routing.unlistedGroupReply === undefined ? {} : raw.routing.unlistedGroupReply;
   object(unlisted, ['enabled', 'text', 'cooldownMs'], 'invalid_unlisted_group_reply_fields');
   const unlistedGroupReply = { enabled: unlisted.enabled ?? true, text: unlisted.text ?? '这个群暂时还没有 Kosbling Agent 使用权限。如果需要开通，请联系管理员，并提供 chat_id={{chat_id}}。', cooldownMs: unlisted.cooldownMs ?? 600000 };
@@ -299,7 +382,11 @@ function validateRuntime(raw) {
       || unlistedGroupReply.cooldownMs < 0 || unlistedGroupReply.cooldownMs > 86_400_000) throw new ConfigError('invalid_unlisted_group_reply');
   unlistedGroupReply.text = unlistedGroupReply.text.trim();
   const routing = { version: string(raw.routing.version), privateUserIds: strings(raw.routing.privateUserIds), allowAllPrivateUsers, groups, unlistedGroupReply,
-    silentReply: silentReply(raw.routing.silentReply === undefined ? {} : raw.routing.silentReply) };
+    silentReply: silentReply(raw.routing.silentReply === undefined ? {} : raw.routing.silentReply), ...(admission ? { privateAdmission: admission } : {}) };
+  // A text-mode group has no card to recall, so its "no reply" sentinel must be configured.
+  if (groups.some(group => group.reply?.mode === 'text' && !(group.silentReply?.tokens ?? routing.silentReply.tokens).length)) {
+    throw new ConfigError('group_text_reply_requires_silent_reply');
+  }
   if (!Array.isArray(raw.hooks ?? []) || (raw.hooks ?? []).length > 100) throw new ConfigError('invalid_hooks');
   const hooks = (raw.hooks ?? []).map(hook => {
     object(hook, ['id', 'url', 'tokenEnv', 'conversationIds', 'catchupGroupIds', 'inbound'], 'invalid_hook_fields');

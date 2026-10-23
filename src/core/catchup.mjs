@@ -81,20 +81,37 @@ export function createCatchup({ connectionId, botOpenId = '', chat, store, onEve
       version = result.version;
       cursor = value;
     }
+    let opening = null;
     if (!cursor?.window) {
       // Keep seconds exact across restarts; API boundaries are seconds, not ms.
       const endMs = Math.floor(now() / 1000) * 1000;
       const startMs = Math.floor(Math.max(0, cursor ? cursor.throughMs - overlapMs : endMs - initialLookbackMs) / 1000) * 1000;
       if (startMs > endMs) throw failure('catchup_clock_regressed');
-      await save({ schemaVersion: 1, throughMs: cursor?.throughMs ?? startMs, window: { startMs, endMs, pageToken: '' } });
+      const value = { schemaVersion: 1, throughMs: cursor?.throughMs ?? startMs, window: { startMs, endMs, pageToken: '' } };
+      // With a completed cursor, a restart re-derives this same start from the
+      // unchanged throughMs, so opening the window needs no write of its own:
+      // it is saved only once the first page shows more work. A first run has
+      // no throughMs to re-derive from and still saves its window first.
+      if (cursor) opening = value; else await save(value);
     }
-    const tokens = new Set([cursor.window.pageToken]);
+    const tokens = new Set([(opening ?? cursor).window.pageToken]);
     for (let page = 0; page < maxPagesPerConversation; page++) {
       await step(() => wait(500 + Math.floor(Math.max(0, Math.min(1, random())) * 500), controller.signal));
-      const window = cursor.window;
+      const window = (opening ?? cursor).window;
       const result = await step(() => chat.listMessages({ conversationId: conversation.conversationId, pageSize: 50,
         startTime: String(window.startMs / 1000), endTime: String(window.endMs / 1000),
         ...(window.pageToken ? { pageToken: window.pageToken } : {}) }));
+      if (opening) {
+        const value = opening;
+        opening = null;
+        // Idle conversation: one cursor write per run, advancing throughMs.
+        if (Array.isArray(result?.items) && result.items.length === 0 && result.has_more === false) {
+          summary.pages++;
+          await save({ schemaVersion: 1, throughMs: window.endMs, window: null });
+          return;
+        }
+        await save(value);
+      }
       if (!Array.isArray(result?.items) || result.items.length > 50 || typeof result.has_more !== 'boolean'
           || (result.has_more && (typeof result.page_token !== 'string' || !result.page_token
             || result.page_token.length > 512 || tokens.has(result.page_token)))) throw failure('invalid_history_page');

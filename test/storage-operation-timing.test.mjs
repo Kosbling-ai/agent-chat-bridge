@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay, setImmediate as nextTurn } from 'node:timers/promises';
-import { withConnection } from '../src/storage/connection.mjs';
+import { configureSession, SESSION_SETUP_SQL, withConnection } from '../src/storage/connection.mjs';
 import { configureStorageDiagnosticRecorder } from '../src/storage/diagnostics.mjs';
 
 const never = () => new Promise(() => {});
@@ -29,7 +29,7 @@ function capture(pool) {
 }
 
 function assertTimingShape(event, timeoutMs) {
-  for (const field of ['poolWaitMs', 'setupMs', 'beginMs', 'operationMs', 'commitMs',
+  for (const field of ['poolWaitMs', 'beginMs', 'operationMs', 'commitMs',
     'rollbackMs', 'durationMs', 'timeoutOvershootMs']) {
     assert.equal(typeof event[field], 'number', `${field} must be numeric`);
     assert.equal(Number.isSafeInteger(event[field]), true, `${field} must be a safe integer`);
@@ -68,7 +68,6 @@ test('successful operations taking at least 500ms emit one slow event', async ()
 
 for (const scenario of [
   { stage: 'acquire', options: {}, fixture: () => fixture({ acquire: never }), operation: async () => {} },
-  { stage: 'setup', options: {}, fixture: () => fixture({ query: never }), operation: async () => {} },
   { stage: 'begin', options: { transaction: true }, fixture: () => fixture({ beginTransaction: never }), operation: async () => {} },
   { stage: 'operation', options: {}, fixture: () => fixture(), operation: never },
   { stage: 'commit', options: { transaction: true }, fixture: () => fixture({ commit: never }), operation: async () => {} },
@@ -136,16 +135,47 @@ test('completed rollback timing retains the stage of the original failure', asyn
   recorded.detach();
 });
 
-test('late acquisition is destroyed and cannot emit a second diagnostic', async () => {
+test('late acquisition is released unused and cannot emit a second diagnostic', async () => {
   let completeAcquire;
+  const statements = [];
   const acquisition = new Promise(resolve => { completeAcquire = resolve; });
-  const f = fixture({ acquire: () => acquisition });
+  const f = fixture({ acquire: () => acquisition, query: async sql => { statements.push(sql); },
+    beginTransaction: async () => { statements.push('BEGIN'); } });
   const recorded = capture(f.pool);
-  await assert.rejects(withConnection(f.pool, async () => {}, { timeoutMs: 20 }), { code: 'store_timeout' });
+  let ran = false;
+  await assert.rejects(withConnection(f.pool, async () => { ran = true; }, { timeoutMs: 20, transaction: true }), { code: 'store_timeout' });
   assert.equal(recorded.events.length, 1);
+  assert.equal(recorded.events[0].stage, 'acquire');
   completeAcquire(f.connection);
   await nextTurn();
   assert.equal(recorded.events.length, 1);
-  assert.deepEqual(f.counts(), { destroyed: 1, released: 0 });
+  // Nothing ran on it, so it is clean: release instead of forcing a reconnect.
+  assert.deepEqual(statements, []);
+  assert.equal(ran, false);
+  assert.deepEqual(f.counts(), { destroyed: 0, released: 1 });
   recorded.detach();
+});
+
+test('a connection that already ran statements is still destroyed on timeout', async () => {
+  const f = fixture();
+  await assert.rejects(withConnection(f.pool, never, { timeoutMs: 20, transaction: true }), { code: 'store_timeout' });
+  assert.deepEqual(f.counts(), { destroyed: 1, released: 0 });
+});
+
+test('operations send no per-operation session statement; setup runs once per physical connection', async () => {
+  const statements = [];
+  const f = fixture({ query: async sql => { statements.push(sql); } });
+  await withConnection(f.pool, async () => {}, { transaction: true });
+  await withConnection(f.pool, async () => {});
+  assert.deepEqual(statements, []);
+  const issued = [];
+  let destroyed = 0;
+  const physical = { query(sql, callback) { issued.push(sql); callback(null); }, destroy() { destroyed++; } };
+  configureSession(physical);
+  assert.deepEqual(issued, [SESSION_SETUP_SQL]);
+  assert.equal(SESSION_SETUP_SQL, 'SET SESSION innodb_lock_wait_timeout = 1');
+  assert.equal(destroyed, 0);
+  const failing = { query(sql, callback) { callback(Object.assign(new Error('hidden'), { code: 'ECONNRESET' })); }, destroy() { destroyed++; } };
+  configureSession(failing);
+  assert.equal(destroyed, 1);
 });

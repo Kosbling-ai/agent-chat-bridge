@@ -29,6 +29,8 @@ Card text is presentation configuration owned by the bridge. Enabling it does no
 
 Since 0.2.22 the execution card has a single collapsed process panel: `toolGroup` (with `toolGroupRunning` or `toolGroupFinished` as `{activity}`) is its title, or `processGroup` when a finished card has commentary but no tool call; each tool is one list line built from `toolItem` only, and `omitted` is the panel's first line when older lines were dropped. `received` and `progressUnavailable` stay in the visible area of a running card. The execution card no longer shows durations, exit codes or tool-name rows, so `durationLabel`, `durationTemplate`, `exitCodeLabel`, `commandLabel`, `toolLabel` and `fieldTemplate` stay accepted but have no visible effect there. Every existing field keeps its name, so an existing text file needs no change. `processGroup` is new in 0.2.22; remove it from the file before rolling back to 0.2.21, which rejects unknown fields.
 
+Since 0.2.23 a command line with no recognised action (read, search, list files, skill) is titled by `commandTitleTemplate` (default `{name}`, the program name such as `node` or `git status`; `{label}` is `toolCommandExecutionLabel`). Set it to `{label}` to show 「执行命令」 instead of the bare program name, or to `{name} · {label}` for both. A line with a recognised action still shows the action. This closes the earlier gap where program-only lines could not be reworded. `commandTitleTemplate` is new in 0.2.23; remove it from the file before rolling back to 0.2.22, which rejects unknown fields.
+
 Execution-card text and user-input form text are configurable. Tool counts, running counts, durations, exit codes and safe tool/file names come from actual events. Templates customize labels and formatting, not underlying execution state. Model-authored commentary, answers, question/option contents, legacy API reply cards, Typing fallback messages and action-response toasts are outside this facility. Actions, status transitions and backgrounds are unchanged. No database migration is required.
 
 New tool events retain bounded, sanitized presentation metadata, so an active card can re-render their labels with updated wording. Older saved tool entries without metadata retain their recorded title/summary; the process panel and card labels still use current copy. Raw shell text, arguments and tool output are never added to this metadata.
@@ -104,6 +106,7 @@ Example: change only these fields in your bot's existing text file:
 | `commandLabel` | 命令 | — |
 | `toolLabel` | 工具 | — |
 | `toolTitleTemplate` | {name} · {label} | `{name}`, `{label}` |
+| `commandTitleTemplate` | {name} | `{name}`, `{label}` |
 | `fieldTemplate` | {label}：{value} | `{label}`, `{value}` |
 | `readTargetTemplate` | {action} {target} | `{action}`, `{target}` |
 | `readFallbackTemplate` | {action}{file} | `{action}`, `{file}` |

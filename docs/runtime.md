@@ -6,7 +6,7 @@ The implementation is validated with synthetic providers and disposable MySQL. I
 
 ## Routing
 
-Private Agent messages require `routing.privateUserIds` by default. Set `routing.allowAllPrivateUsers: true` to accept any identifiable human sender in a private chat, relying on the Feishu application’s access restrictions. This option defaults to `false`; omitting it preserves the existing allowlist behavior. It does not admit bot/self messages, open unlisted groups, or change hook authentication or Codex execution approvals. Private execution-card actions remain restricted to the original sender. Every authorized group is listed in `routing.groups`; unlisted groups stay closed. `routing.groups[].capabilities` accepts only `bridge` and `hook`, removes duplicates, and defaults to both when omitted. An empty list disables both routes for that group.
+Private Agent messages require `routing.privateUserIds` by default. Set `routing.allowAllPrivateUsers: true` to accept any identifiable human sender in a private chat, relying on the Feishu application’s access restrictions. This option defaults to `false`; omitting it preserves the existing allowlist behavior. It does not admit bot/self messages, open unlisted groups, or change hook authentication or Codex execution approvals. Instead of either list, a bot may ask a business endpoint per sender with [`routing.privateAdmission`](#private-chat-admission-callback). Private execution-card actions remain restricted to the original sender. Every authorized group is listed in `routing.groups`; unlisted groups stay closed. `routing.groups[].capabilities` accepts only `bridge` and `hook`, removes duplicates, and defaults to both when omitted. An empty list disables both routes for that group.
 
 The `bridge` capability permits Agent routing. The existing `trigger` (`mention` or `all`) and optional `userIds` then decide whether a human message starts Codex. The `hook` capability permits hook subscriptions for that group and does not depend on Agent mentions, member filtering, execution, or replies. A message that qualifies for both routes may register both under the same canonical receipt; neither route consumes the other. Replay keeps each target idempotent. A live human mention of the bot in a group that is absent from `routing.groups` receives a fixed reply naming the group `chat_id`, rate-limited per group and speaker; adjust or disable it with `routing.unlistedGroupReply` (`enabled`, `text`, `cooldownMs`).
 
@@ -18,6 +18,97 @@ Recalls of the bot's own messages are filtered for every group: a live `im.messa
 
 Groups previously present only in `hooks[].conversationIds` must now also appear in `routing.groups`; use `capabilities:["hook"]` for a hook-only group. P2P rules are unchanged.
 
+### Group text replies and trigger all
+
+`routing.groups[].reply` (optional, since 0.2.28) selects how a `bridge` group's human turns are answered. Without the key, or with `"mode": "card"`, nothing changes: Typing, the execution card and the card-failure fallback behave as described under [Input and execution](#input-and-execution).
+
+```json
+{ "conversationId": "oc_example", "trigger": "all", "passiveContext": true, "capabilities": ["bridge", "hook"],
+  "silentReply": { "tokens": ["NO_REPLY"] },
+  "reply": { "mode": "text", "ack": "reaction" } }
+```
+
+| Key | Values | Default | Meaning |
+|---|---|---|---|
+| `reply.mode` | `"card"`, `"text"` | `"card"` | `"text"` never creates an execution card and does not add the processing Typing reaction or send `feishu.processingFallbackText`. A text-mode group must have effective `silentReply.tokens` (its own or `routing.silentReply`), otherwise validation and `check-config` fail with `group_text_reply_requires_silent_reply`. |
+| `reply.ack` | `"none"`, `"reaction"` | `"none"` | Text mode only. `"reaction"` adds one reaction to the triggering message when the turn starts (also for a message that is steered into a running turn) and never removes it. It sends no message. |
+| `reply.ackEmoji` | Feishu `emoji_type`, `[A-Za-z0-9_]{1,80}` | `"OnIt"` | Only with `ack: "reaction"`. `OnIt` is Feishu's "on it" reaction: seen and being handled. Feishu has no eyes reaction; `GLANCE` or `Get` are alternatives. It must differ from `feishu.processingReactionEmoji`, whose cleanup removes every app reaction with that emoji. |
+
+The style is recorded on the job as `result.replyMode` when its turn starts (only for a group that has the key) and is reused by retries, recovery after a restart and reply delivery, so a configuration change never switches a job half way. A job without a recorded style that already has an execution card (it started before the group switched to text mode) finishes on that card.
+
+In text mode the final answer is sent as a reply to the triggering message (`im/v1/messages/:message_id/reply`, `reply_in_thread: false`, deterministic `uuid`):
+
+- A completed answer that is one plain line is a `text` message; a line break, a mention, a Markdown link `[label](url)` or Markdown that the post conversion changes (bold, heading, inline code) makes it a `post` built with the same Markdown conversion as the fallback reply. A bare URL is plain text. Long answers are split into 3000-character chunks, each a reply to the same triggering message, still capped by `feishu.maxOutputChars`. `feishu.replyAsPost` does not apply.
+- Mentions: every `<at id|user_id|open_id = "ou_x">Name</at>` spelling (quotes optional, single or double, spaces around `=` allowed, name optional and without `<` or a line break) and `@{ou_x}` become post `at` elements with `user_id` = the open_id and `user_name` = the name when one is given, including inside code blocks. The ID must match `ou_[A-Za-z0-9_-]+`. `<at user_id="all"></at>` still needs `allowMentionAll: true`. A tag that does not match (for example a name containing `<` or a line break) stays text, and any remaining open_id-like token `ou_[A-Za-z0-9_-]{8,}` that is not part of a longer word is replaced with `@成员` in post text, link text and text messages, so an open_id is never shown. A name that is itself an open_id is dropped. The card-mode fallback conversion is unchanged.
+- A failed or interrupted turn sends exactly one `text` line: the bridge failure text with whitespace collapsed and open_ids masked, at most 200 characters.
+- A completed answer equal to a configured `silentReply` token sends nothing; with no card to close the job finishes with `result.silentReply = { status: "silent", card: "none" }` and a `forward_reply` `silent` log with `reason` `card_none`. With `ack: "none"` the turn leaves no trace in the chat; with `ack: "reaction"` only the reaction remains.
+- Only a reply that Feishu rejects because the triggering message was recalled (platform code `230011`) is sent as a new chat message instead, once, logged as a `forward_reply` `reply_rejected` warning with `code` `reply_target_gone`. Every other rejection is not re-sent: it is logged once as `forward_reply` `reply_failed` with the real `code`, `platformCode` and `stage` (`reply`, or `create` with `replyPlatformCode` when the fallback itself failed) and the job returns to `reply_pending`. An unconfirmed reply (timeout, transport error) is not re-sent as a create either; it is retried as the same reply with the same `uuid`.
+- Sent replies are recorded as bot messages, so `replyTriggers` and the recall filter treat them like any other bot reply. Outbox attachments and the attachment-failure notice are unchanged.
+- Business-event jobs, private chats and groups without the key are unchanged.
+- Known limits: there is no stop button and no busy-session fork button in text mode (the busy failure is the one-line text); progress is not shown while the turn runs.
+
+`trigger: "all"` already exists and is unchanged: every message from an authorized human (`actor.type` `user`, matching `userIds` when set) in that group starts a turn without a mention. Messages from bots, other apps and this bot itself never trigger; a message older than `codex.maxEventAgeMs` (default 10 minutes) when processed never triggers, including history catch-up; `replyTriggers` is ignored for such a group. Triggering messages are not stored as passive context for later turns because each one is already its own turn (or is steered into the running one). Combine it with `silentReply` tokens and a workspace rule that answers the exact token when nothing needs to be said.
+
+The bridge contains no business rule for either key; which groups use them is configuration.
+
+### Private-chat admission callback
+
+`routing.privateAdmission` (optional, since 0.2.26) lets one bot admit private senders by asking a business HTTP endpoint instead of a static list. Without the key private chats behave exactly as before.
+
+```json
+"routing": {
+  "allowAllPrivateUsers": false,
+  "privateUserIds": [],
+  "privateAdmission": {
+    "url": "http://127.0.0.1:18820/api/internal/feishu-admission",
+    "tokenEnv": "DASHBOARD_FEISHU_ADMISSION_TOKEN",
+    "timeoutMs": 1000,
+    "allowCacheMs": 300000,
+    "denyCacheMs": 60000,
+    "denyText": "…",
+    "unavailableText": "…"
+  }
+}
+```
+
+| Key | Required | Default | Rule |
+|---|---|---|---|
+| `url` | yes | — | `http://` or `https://`, no user name, password or `#fragment` (`invalid_private_admission_url`) |
+| `tokenEnv` | yes | — | uppercase environment variable name (`invalid_environment_reference`); startup fails with `required_environment_missing` when the variable is missing or empty. `check-config` does not resolve it |
+| `timeoutMs` | no | `1000` | integer 100–5000 (`invalid_private_admission_timeout`) |
+| `allowCacheMs` | no | `300000` | integer 0–86400000 (`invalid_private_admission_cache`) |
+| `denyCacheMs` | no | `60000` | integer 0–86400000; also used for "unavailable" |
+| `denyText` | yes | — | non-empty after trimming, at most 2000 characters (`invalid_private_admission_text`) |
+| `unavailableText` | no | `denyText` | same rule as `denyText` |
+
+Unknown keys fail with `invalid_private_admission_fields`. `allowAllPrivateUsers: true` together with `privateAdmission` fails with `private_admission_conflicts_with_allow_all`. The bridge does not reload its configuration; restart it after a change.
+
+**Who is checked.** Only human messages in private (p2p) chats. A sender listed in `privateUserIds` is admitted without a request. Group messages, business-event jobs, non-human events and every other route are unaffected. Feishu recall events carry neither the chat type nor an operator, so they are not checked: a recall of a message the endpoint explicitly denied (see Refusal) is dropped without any Store write and logged with `reason: "recalled_refused"`; every other recall is stored as before. Private execution-card actions (stop, fork, answer) are authorized by the same cached decision, in addition to the existing original-sender rule; the card handlers pass the union_id recorded on the job, so an action after a restart (empty cache) is checked with it.
+
+**Request.** Before anything is written to the Store the bridge sends
+
+```
+POST <url>
+Authorization: Bearer <value of env[tokenEnv]>
+Content-Type: application/json
+
+{"connectionId":"<feishu.connectionId>","chatId":"<chat_id>","sender":{"openId":"ou_…","unionId":"on_…"|null,"userId":"…"|null}}
+```
+
+with `redirect: "error"` and a timeout of `timeoutMs`. For a live event the timeout is further limited to the 2000 ms ingest deadline minus 250 ms; with no budget left the message is refused as unavailable (`reason: "deadline"`) without a request and without caching. The request uses Node's global `fetch`, which does not apply `HTTP_PROXY`/`HTTPS_PROXY` unless `NODE_USE_ENV_PROXY` is set; keep the URL on loopback.
+
+**Response.** HTTP 200 with a JSON object whose `allowed` is a boolean decides: `true` admits, `false` refuses. `reason` (for example `active`, `not_enabled`, `not_registered`, `no_union_id`) is only logged; `colleagueId` is ignored. Any other status, a timeout, a network error, a body over 4096 characters, invalid JSON or a non-boolean `allowed` is "unavailable" and refuses the message (fail-closed; there is no fail-open option).
+
+**Cache.** Results are kept in memory per open_id: admitted for `allowCacheMs`, refused and unavailable for `denyCacheMs`. Concurrent checks for one sender with the same known union_id share one request. Senders with an existing thread are checked on every message through this cache, so disabling someone takes effect within the cache period; jobs already registered still finish. The bridge remembers the open_id → union_id pair of live events (private or group) and uses it for events that carry none. A history catch-up event whose sender has no remembered union_id first reads the latest non-empty `sender_union_id` of that sender's forward jobs in the same chat from the bridge's own Store (read-only, at most once a minute per sender); a failed lookup logs `private_admission` `union_lookup_failed` and counts as unknown. Without any union_id the request sends `"unionId": null` and the endpoint decides (normally `no_union_id`). A result obtained without a union_id is not reused once a union_id is known. Caches are lost on restart.
+
+**Refusal.** A refused or unavailable message is not stored, creates no hook job, starts no Codex thread and does not make the private chat known to history catch-up. For a live message the bridge replies once with `denyText` or `unavailableText` per cache entry, directly through the Feishu message reply API: no retry, no outbox row, and a uuid derived from the message ID so Feishu drops a second send of the same reply within an hour. A failed reply logs `private_admission` `reply_failed`. Refusals seen by history catch-up get no reply. When the endpoint explicitly denies a message (`allowed: false` with a reason other than `no_union_id`), its message ID is remembered in memory, so a later catch-up observation, redelivery or recall of that message is never admitted after the decision changes; the sender sends a new message instead. Unavailable results (`http_status`, `invalid_response`, `timeout`, `network_error`, `deadline`) and `no_union_id` are not remembered: history catch-up checks the message again, and admits it once the endpoint answers or the union_id is known.
+
+After a bridge or endpoint outage, private messages from already admitted people in chats the bridge has seen before are checked again by history catch-up and processed. A person who has never had a stored private message with this bot, and who writes for the first time during the outage, is not in the catch-up scope and has to send the message again.
+
+**Logs.** Each real request and each refusal (including cached ones) writes one `info` line with `operation: "private_admission"`, `status` equal to `decision` (`allow`, `deny` or `unavailable`), `reason`, `cached` (`true`/`false`), `openId` reduced to its first six characters and the `message_id` being decided; real requests add `durationMs` and, for a non-200 response, `status_code`. A refused `message_id` therefore has no later `forward_*` line. Card-action checks log without `message_id`. Cached admissions are not logged. Unavailable reasons are `http_status`, `invalid_response`, `timeout`, `network_error` and `deadline`; bridge-side refusals use `open_id_missing` and `recalled_refused`. Warnings: `reply_failed`, `union_lookup_failed`. Logs never contain the token, the union_id or message text.
+
+**Boundary.** The bridge knows only the URL, the token reference, the timings and the two texts. Which people are registered, enabled or allowed is decided by the endpoint from its own data; the bridge reads no business database (only its own Store) and stores no business identity. The endpoint must answer quickly, read-only and with exactly this response shape.
+
 ### Per-group Codex permissions
 
 A `bridge` group may replace the global Codex approval and sandbox settings for the threads bound to it. This is a permission switch: a value can grant more or less than the global setting. Codex full access needs both fields:
@@ -27,15 +118,93 @@ A `bridge` group may replace the global Codex approval and sandbox settings for 
   "codex": { "approvalPolicy": "never", "sandbox": "danger-full-access" } }
 ```
 
-`codex.approvalPolicy` accepts `untrusted`, `on-request` or `never`; `codex.approvalsReviewer` accepts `user`, `auto_review` or `guardian_subagent`; `codex.sandbox` accepts `read-only`, `workspace-write` or `danger-full-access`. Values are compared exactly, without trimming. At least one field is required and no other key is accepted. Invalid input fails `check-config` and startup with `invalid_group_codex_fields`, `invalid_group_codex_approval_policy`, `invalid_group_codex_approvals_reviewer` or `invalid_group_codex_sandbox`; the field on a group without the `bridge` capability fails with `group_context_requires_bridge`. Each configured field replaces the global `codex.approvalPolicy`, `codex.approvalsReviewer` or `codex.sandbox` for that group; an omitted field keeps the global value. cwd and model stay global.
+`codex.approvalPolicy` accepts `untrusted`, `on-request` or `never`; `codex.approvalsReviewer` accepts `user`, `auto_review` or `guardian_subagent`; `codex.sandbox` accepts `read-only`, `workspace-write` or `danger-full-access`. Values are compared exactly, without trimming. At least one field is required and no other key is accepted. Invalid input fails `check-config` and startup with `invalid_group_codex_fields`, `invalid_group_codex_approval_policy`, `invalid_group_codex_approvals_reviewer` or `invalid_group_codex_sandbox`; the field on a group without the `bridge` capability fails with `group_context_requires_bridge`. Each configured field replaces the global `codex.approvalPolicy`, `codex.approvalsReviewer` or `codex.sandbox` for that group; an omitted field keeps the global value. The optional `cwd` key is described under [per-group working directory](#per-group-working-directory); the model stays global. An instance with a [named permission profile](#named-permission-profile-per-instance) rejects a group `sandbox` with `group_codex_sandbox_conflicts_with_permission_profile`; the other group fields stay allowed.
 
 Approval policy alone does not give full access. In codex-cli 0.153.4 a call to an MCP tool without annotations such as `readOnlyHint` requires approval. With `on-request` the approval reviewer decides. With `never` while the sandbox is still `workspace-write`, Codex rejects every such call with `MCP tool call requires approval, but approval policy is never`. Only `never` together with `danger-full-access` lets MCP tool calls and shell commands run without approval and without a sandbox.
 
-The override applies to group bindings of that chat id: the human group thread and every business-event thread whose result chat (the hook's `inbound.defaultChatId`) is this group. A private chat never matches, even if its chat id equals a configured group id. Other groups and private chats keep the global settings. The executor sends the approval policy, reviewer and sandbox on `thread/start`, `thread/resume` and `thread/fork`, and the approval policy and reviewer on every `turn/start`. `turn/start` has no `sandbox` parameter; the sandbox set when the bridge's app-server child starts, resumes or forks a thread applies to that thread's later turns.
+The override applies to group bindings of that chat id: the human group thread and every business-event thread whose result chat (the hook's `inbound.defaultChatId`) is this group. A private chat never matches, even if its chat id equals a configured group id. Other groups and private chats keep the global settings. The executor sends the cwd, approval policy, reviewer and sandbox on `thread/start`, `thread/resume` and `thread/fork`, and the cwd, approval policy and reviewer on every `turn/start`. `turn/start` has no `sandbox` parameter; the sandbox set when the bridge's app-server child starts, resumes or forks a thread applies to that thread's later turns.
 
-To enable it, add the `codex` object to the group in the private bridge.json, run `node bin/agent-chat-bridge.mjs check-config --config <path>`, then restart the bridge once. The bridge does not reload configuration while it runs. Existing threads need no rollover: after the restart, the new app-server child resumes each thread with the new settings before its next turn. Removing the field and restarting returns those threads to the global settings in the same way.
+To enable it, add the `codex` object to the group in the private bridge.json, run `node bin/agent-chat-bridge.mjs check-config --config <path>`, then restart the bridge once. The bridge does not reload configuration while it runs. Existing threads need no rollover for permission changes: after the restart, the new app-server child resumes each thread with the new settings before its next turn. Removing the field and restarting returns those threads to the global settings in the same way. A group `cwd` is different: existing threads move to a new thread, see [per-group working directory](#per-group-working-directory).
 
 To roll back to 0.2.20, first remove every `routing.groups[].codex` key: 0.2.20 rejects the key with `invalid_group_fields` at startup. Then switch the binary and restart.
+
+#### Per-group working directory
+
+Since 0.2.25 the same `codex` object accepts an optional `cwd`, alone or with the permission fields:
+
+```json
+{ "conversationId": "oc_example", "trigger": "mention", "passiveContext": true, "capabilities": ["bridge", "hook"],
+  "codex": { "approvalPolicy": "never", "sandbox": "danger-full-access", "cwd": "/absolute/path/to/group-workspace" } }
+```
+
+`cwd` must be an absolute path string of at most 1,024 characters without surrounding whitespace or control characters; anything else fails `check-config` and startup with `invalid_group_codex_cwd`. It is normalized like the global `codex.cwd`. Startup and `check-config` apply the global workspace rules to it: the directory must exist, be owned by the bridge user and not be world-writable. A failure stops startup with `invalid_group_codex_workspace`; each problem is logged with `code`, `chat_id` and `reason` (`missing`, `not_directory`, `world_writable`, `not_owned` or `unreadable`), never the path.
+
+The group's human thread and its business-event threads use this cwd on `thread/start`, `thread/resume`, `thread/fork` and every `turn/start`. Other groups and private chats keep the global `codex.cwd`. The app-server child still starts in the global cwd, and bridge-owned paths stay relative to it: `feishu.cardTextFile`, `.agent-chat-bridge/` outbox and spool, `data/feishu-outbox`, the media inbox and the `codex.rulesFiles` checked for rules rollover. Codex reads `AGENTS.md` from the thread's cwd (and its parents up to the git root) when the thread is created, so an edit takes effect for new threads. A directory outside any git repository makes the thread project-less, so Codex reads only the Codex home `AGENTS.md` and the directory's own `AGENTS.md`; a symbolic link named `AGENTS.md` is read. To carry edits into running human threads as well, keep the same file in the group's `instructionFiles`: group instructions are re-injected when their fingerprint changes. The human thread then holds the file twice; business-event threads never receive group instructions and read the file only from the cwd. Configure `cwd` in the form it should appear: in the isolated test below, Codex kept a symbolic-link cwd as given.
+
+The result-file directory (`回发文件目录`) is announced as an absolute path under the global cwd for every conversation, `<codex.cwd>/data/feishu-outbox/<chat>` (business-event threads: `<codex.cwd>/data/feishu-outbox/system-<hash>/<chat>`), and the bridge collects files there as before. With `workspace-write`, Codex may write only inside the thread's cwd and its configured writable roots, so a group with its own cwd needs a sandbox or approval path that allows writing into the result-file directory; `danger-full-access` does.
+
+Codex keeps the cwd a thread recorded at `thread/start`: `thread/resume` with another cwd does not change `thread.cwd`. The executor therefore records the cwd Codex reports on `thread/start` and on both resume paths (before a new turn, and when it resumes a known turn after a restart). Before the next turn, a thread of a group with its own `cwd` whose recorded cwd differs is replaced through the same rollover path as idle and rules rollovers: a new thread starts in the group `cwd`, the binding moves to it, and the new thread receives the full first-turn context (the group context and group instructions for the human thread, the `【独立系统任务】` preamble for business-event threads). The bridge logs `thread_rollover` with `status` `succeeded`, `reason` `cwd_changed` and `chat_id`, never a path, and stores the usual `session_rollover` events. As with other rollovers, the old thread is not archived. A known-turn resume only records the cwd, so the observed turn keeps its thread; the move happens when the next turn is admitted. Groups without their own `cwd` and private chats never move for this reason. If a newly started thread reports a cwd other than the one requested, a new thread cannot fix the mismatch, so cwd rollover stops for that group until the bridge restarts; a `thread_rollover` warning with `status` `skipped` and `reason` `cwd_unconfirmed` is logged once. A busy-card fork already creates its thread in the group `cwd`.
+
+Observed behavior of codex-cli 0.153.4 in an isolated test (separate `CODEX_HOME`, no login, no model turn; requests sent directly to `codex app-server`):
+
+- `thread/start` with cwd `A` returned `thread.cwd` `A`. With a symbolic-link cwd it returned the link path unchanged in `thread.cwd`, `cwd` and `instructionSources`.
+- A cwd whose `AGENTS.md` is a symbolic link listed `<cwd>/AGENTS.md` in `instructionSources`, and the target's text was recorded in the thread.
+- `thread/resume` of an `A` thread with cwd `B` kept `thread.cwd` `A`. In the same app-server process the response stayed entirely on `A`; in a new process its top-level `cwd`, `runtimeWorkspaceRoots` and `instructionSources` named `B`, while `thread.cwd` stayed `A`, and the rollout recorded no new context for `B`.
+- `turn/start` accepts `cwd` (protocol schema: "Override the working directory for this turn and subsequent turns"); a non-string value is rejected with `expected path string`.
+- `thread/fork` with cwd `B` from an `A` thread returned a new thread with `thread.cwd` `B`; without `cwd` the fork kept `A`.
+
+To enable it, create the directory with mode `700` and its `AGENTS.md`, add `cwd` to the group's `codex` object in the private bridge.json (keep `instructionFiles` as they are), run `check-config`, then restart the bridge once in an idle window. The directory is checked at every start: if it is deleted, becomes world-writable or changes owner, the next start fails as a whole and stops every group and private chat until it is restored or `cwd` is removed. To turn it off, remove `cwd` and restart. To roll back to 0.2.24, remove every `codex.cwd` first: 0.2.24 rejects the key with `invalid_group_codex_fields`. See the 0.2.25 entry in [CHANGELOG](../CHANGELOG.md) for the full operator checklist.
+
+### Named permission profile per instance
+
+Since 0.2.27 one bridge instance may run all of its Codex threads under a named Codex permission profile instead of the legacy sandbox:
+
+```json
+"codex": { "bin": "./codex", "cwd": "./workspace", "envNames": ["PATH", "HOME"],
+  "permissionProfile": "operator", "approvalPolicy": "on-request", "approvalsReviewer": "auto_review" }
+```
+
+`codex.permissionProfile` is optional and has no default. The value is trimmed and must then be 1–128 characters matching `^:?[A-Za-z0-9][A-Za-z0-9._-]*$`: the id of a `[permissions.<id>]` profile in the Codex home `config.toml`, or a built-in such as `:workspace`. Anything else fails `check-config` and startup with `invalid_codex_permission_profile`. `check-config` does not ask Codex whether the profile exists.
+
+When the key is set:
+
+- `thread/start`, both `thread/resume` paths (before a new turn, and for a known turn after a restart) and `thread/fork` send `permissions: "<id>"` and no `sandbox` key. Codex rejects the two together, and a `sandbox` parameter alone selects the legacy mode even when `config.toml` sets `default_permissions`, which is why earlier bridge versions could not use a profile. The cwd, approval policy, reviewer, model and reasoning effort are sent as before. `turn/start` is unchanged and carries neither `permissions` nor `sandboxPolicy`; the profile chosen on the thread applies to its turns.
+- Every `thread/start`, `thread/resume` and `thread/fork` response must report `activePermissionProfile.id` equal to the configured id (fail-closed). Otherwise the request fails with `CODEX_PERMISSION_PROFILE_MISMATCH` and the thread is not used: a new thread is not bound, a resumed thread gets no turn and is resumed and checked again for the next message, and a fork is not committed (the busy card reports a failed fork, the binding stays, and the unused native fork is recorded as the fork target). The error message is the fixed text `permission profile mismatch`; the ids are in the log line, never in the message, so an id can never make the failure look retryable. The message fails like any other thread start or resume failure, and `/health/tasks` counts it under `CODEX_PERMISSION_PROFILE_MISMATCH`. Codex keeps the unused thread until its app-server child closes.
+- Each check logs `operation` `thread_start`, `thread_resume` or `thread_fork` with `rpc_method`, `permissionProfile` and `activePermissionProfile`: `info` with `status` `succeeded` on a match, `error` with `status` `failed` and `code` `CODEX_PERMISSION_PROFILE_MISMATCH` otherwise (a missing or non-identifier reported id is omitted).
+- The app-server child is started without `-c sandbox_workspace_write.network_access=…`; network access comes from the profile's `[permissions.<id>.network]` table. A built-in id such as `:workspace` has no such table: its network follows Codex's built-in default for that profile (codex-cli 0.153.4 reported `networkAccess: false` for `:workspace`), and `codex.networkAccess` cannot be used next to a profile to change it. The other launch arguments are unchanged. The `app_server_start` `info` line carries `permissionProfile`.
+
+The legacy keys cannot appear next to it: `codex.sandbox` fails with `codex_permission_profile_conflicts_with_sandbox` and `codex.networkAccess` with `codex_permission_profile_conflicts_with_network_access`, whatever their values (remove both from a copy of the example), and any `routing.groups[].codex.sandbox` fails with `group_codex_sandbox_conflicts_with_permission_profile`. Group `approvalPolicy`, `approvalsReviewer` and `cwd` overrides stay allowed.
+
+Prerequisites:
+
+- The instance's Codex home (`codex.sharedHome` or `CODEX_HOME`) `config.toml` must define the `[permissions.<id>]` tables and set `default_permissions = "<id>"`. Permission profiles and `sandbox_mode` / `[sandbox_workspace_write]` do not compose; keep only the profile settings in that `config.toml`.
+- The `permissions` thread parameter and `activePermissionProfile` belong to the app-server experimental API of codex-cli 0.153.4. The bridge already initializes with `experimentalApi: true`. Codex marks permission profiles as beta, so re-check this behavior after a Codex upgrade.
+
+Without the key nothing changes: thread, turn and launch parameters and log output are those of 0.2.26.
+
+#### Checking the Codex home and reading failures
+
+Before restarting the bridge, check the Codex home with the same `CODEX_HOME`, from the bridge's `codex.cwd`. Both commands were verified with codex-cli 0.153.4:
+
+- `CODEX_HOME=<codex home> codex sandbox -P <id> -C <codex.cwd> -- /bin/echo ok` must print `ok`. An undefined id exits 1 with `default_permissions refers to undefined profile`.
+- `CODEX_HOME=<codex home> codex features list > /dev/null` must exit 0. With profile tables but no `default_permissions` it exits 1 with `config defines [permissions] profiles but does not set default_permissions`. The `codex sandbox -P` check does not detect this case.
+
+The three failure cases look different from the bridge (codex-cli 0.153.4):
+
+- **Undefined id**, or a profile under which Codex cannot create the thread. Codex rejects the thread request with a JSON-RPC error (`thread/start` with an undefined id gave -32600, `default_permissions refers to undefined profile`). The bridge logs it like any rejected request: `rpc_request` `rejected` with `rpc_method` and `code` `CODEX_RPC_REJECTED`. Codex's text is never logged. It is not a mismatch, and no thread is used.
+- **`CODEX_PERMISSION_PROFILE_MISMATCH`.** Codex accepted the request but reported another profile, or none: it did not apply the requested `permissions`. A likely cause is a Codex upgrade that changed the experimental API. Remove the key (the instance then runs as on 0.2.26) until the Codex version is checked.
+- **Missing `default_permissions`** next to defined profile tables. The bridge sees no error. Because it sends `permissions`, `thread/start` still applies the profile and the check passes. The only signal is the app-server's startup `configWarning` ("Invalid configuration; using defaults."), which the bridge does not log. The bridge's startup `codex features list` probe also fails on such a home, so `codex.requestUserInput` stays unavailable (a configured `true` logs `request_user_input_feature` `unavailable`). Whether Codex still applies the rest of that `config.toml` (for example `project_doc_max_bytes`, `[projects]` or `[features]`) was not verified. Set `default_permissions` anyway, and use the `codex features list` check above.
+
+#### Enabling, verifying and rolling back
+
+1. Deploy or fast-forward the 0.2.27 code first. Instances without the key behave as on 0.2.26. A restart caused by a crash or the memory guard during the next steps then starts with either the old or the new private configuration. 0.2.26 would reject the new key with `invalid_codex_fields`.
+2. Define the profile in the instance's Codex home `config.toml` and run the two checks above. App-server children started by the still-running bridge read the new file but keep the legacy sandbox they request: a `sandbox` parameter overrides `default_permissions`. Finish steps 2–5 in one window.
+3. Back up the private bridge.json. Remove `codex.sandbox` and `codex.networkAccess` (and any group `codex.sandbox`), and add `codex.permissionProfile`.
+4. Run `node bin/agent-chat-bridge.mjs check-config --config <path>` with the 0.2.27 code.
+5. Restart only that bridge (`kill -TERM <bridge-pid>`; its supervisor starts it again).
+6. Verify the `app_server_start` line with `permissionProfile`. After the next message, look for a `thread_start` or `thread_resume` line with `status` `succeeded` and `activePermissionProfile` equal to the id. Existing threads are not rolled over: they are resumed with `permissions` before their next turn, and are used only if Codex then reports the profile as active.
+
+To turn it off, restore the backup (or remove `codex.permissionProfile`), run `check-config` and restart once. To roll back to 0.2.26, remove the key first: 0.2.26 rejects it with `invalid_codex_fields`.
 
 ### Group instructions
 
@@ -103,7 +272,7 @@ Submission is single-use. A submitted card confirms that the bridge accepted the
 
 Ordinary `CODEX_THREAD_BUSY` results fail on the first attempt, including a turn-start result whose native admission outcome is unknown. Once the RPC returns busy, the existing card/reply path reports “会话被其他客户端占用，请释放后重试。原会话绑定保持不变。” without waiting for another claim. Other retryable admission failures use at most `codex.jobMaxAttempts` claims (default 3), spaced by `codex.jobRetryMs` (default 60 seconds; valid range 10 seconds to 30 minutes). The bridge keeps the binding and does not create a replacement thread.
 
-For a busy failure tied to an existing human Feishu binding, the failed card offers “保留历史并新建会话”. Only the original sender can invoke it, and the callback rechecks the bot-scoped job, card, chat, current authorization and frozen source thread. It performs one explicit `thread/fork` with the current bridge cwd and permission defaults, persists the fork, and conditionally switches the binding before releasing that binding's admission lock. It does not resume or interrupt the source, start a turn, or replay the failed message. A native rejection or changed binding leaves the current binding unchanged. An unknown native or database commit result is recorded as unconfirmed and is not retried automatically; an administrator must inspect durable state before deciding what happened. Cross-process active-writer fork support depends on the native Codex implementation and is therefore handled as a normal visible failure rather than assumed.
+For a busy failure tied to an existing human Feishu binding, the failed card offers “保留历史并新建会话”. Only the original sender can invoke it, and the callback rechecks the bot-scoped job, card, chat, current authorization and frozen source thread. It performs one explicit `thread/fork` with the binding's cwd (the group `codex.cwd` when configured, otherwise the global cwd) and permission defaults, persists the fork, and conditionally switches the binding before releasing that binding's admission lock. It does not resume or interrupt the source, start a turn, or replay the failed message. A native rejection or changed binding leaves the current binding unchanged. An unknown native or database commit result is recorded as unconfirmed and is not retried automatically; an administrator must inspect durable state before deciding what happened. Cross-process active-writer fork support depends on the native Codex implementation and is therefore handled as a normal visible failure rather than assumed.
 
 The bridge owns Typing, an execution card, the stop callback, final answer, and attachments for accepted human conversations. The execution card uses the frozen production create/patch controller: the first running card is immediate, later updates are throttled, and final card failure selects the ordinary-message fallback, except for a silent-reply completion, which never falls back to text. Stop is fenced to the original card, message, turn, authorized conversation, and live sender; replay cannot interrupt a newer turn.
 
@@ -111,7 +280,7 @@ The execution card keeps key content visible and folds the process into at most 
 
 The card sidecar stores the original message ID, status, bounded progress entries and stop identity. A transient progress-read failure is retried with bounded exponential backoff without replaying the Codex turn or discarding the cursor. After three consecutive failures the running card indicates that progress is temporarily unavailable; a successful read removes that notice. Lease loss, runtime shutdown and cancellation stop observation, while final-answer delivery remains independent. Card create or patch failure follows the original fallback path; a saved message ID is patched on reply recovery. Legacy unconfirmed card effects written by the previous controller remain held without another platform write.
 
-Ordinary fallback replies use chat create rather than source-message reply. Post mode is the default and uses the production Markdown-to-Feishu conversion with 3000-character chunks; optional text mode uses 1900-character chunks. Both apply `feishu.maxOutputChars` (default 3500) and deterministic UUIDs. Legacy unconfirmed text effects remain held. Live Agent work awaits the production Typing add; a failed add sends `feishu.processingFallbackText`, and final cleanup is best effort. Recovery removes reaction IDs recorded in `assistant_message_events` and app-owned reactions from the first returned page for the configured emoji without replaying an unconfirmed add.
+Ordinary fallback replies use chat create rather than source-message reply (a group with [`reply.mode: "text"`](#group-text-replies-and-trigger-all) replies to the source message instead and has no card). Post mode is the default and uses the production Markdown-to-Feishu conversion with 3000-character chunks; optional text mode uses 1900-character chunks. Both apply `feishu.maxOutputChars` (default 3500) and deterministic UUIDs. Legacy unconfirmed text effects remain held. Live Agent work awaits the production Typing add; a failed add sends `feishu.processingFallbackText`, and final cleanup is best effort. Recovery removes reaction IDs recorded in `assistant_message_events` and app-owned reactions from the first returned page for the configured emoji without replaying an unconfirmed add.
 
 Bridge delivery consumes the executor's attachment paths directly. P2P is allowed; group delivery uses the configured `bridge` capability. Every file is capped at 28 MiB. A successful upload and send removes that file; an individual failure keeps it for manual follow-up and does not block the text reply or other attachments. Legacy unconfirmed attachment intents are not replayed. The final result retains the display answer and `rawAnswer` as internal recovery state; neither results nor attachment files are exposed through HTTP.
 
@@ -157,9 +326,9 @@ Internal bridge delivery status is `waiting`, `pending`, `sent`, `failed`, or `u
 
 Use `examples/bridge.json` for the current shape. Secrets are read only from explicit environment-variable names. `codex.bin` and `codex.cwd` are explicit; only `codex.envNames` plus configured proxy mappings enter the child. Codex lifecycle, RPC/turn timeout, approval/reviewer, sandbox, network, user-input, rollover and memory-guard settings expose the production defaults shown in the example. `codex.jobRetryMs` and `codex.jobMaxAttempts` retain the forward retry limits; the three `codex.groupContext*` settings control passive-message count, age, and per-trigger attachment downloads. Optional `feishu.replyAsPost` and `feishu.maxOutputChars` select the original ordinary reply mode and cap. `feishu.processingReaction`, `processingReactionEmoji`, and `processingFallbackText` control the original live Typing behavior. `feishu.mediaEnabled` controls inbound downloads while preserving metadata, `mediaInboxDir` selects the inbox, `mediaMaxBytes` is a 1-byte to 32-MiB hard per-resource limit defaulting to 32 MiB, and `mediaDownloadTimeoutMs` is a positive-integer download deadline defaulting to 120000 ms. The process uses one Feishu HTTP client and one WebSocket client.
 
-Paths are resolved from the config file. The executable and workspace must satisfy the ownership checks. Codex state defaults to the launching user's shared `~/.codex`. Optional `codex.sharedHome` may select an absolute path or a path beginning with `~/`; if the launch environment also sets `CODEX_HOME`, both must resolve to the same directory or startup fails. The child still receives only explicitly selected environment names and proxy mappings; the production-derived app-server shell policy inherits from that controlled child environment. Approval policy defaults to `on-request`, the reviewer defaults to the installed protocol value `auto_review`, and sandbox defaults to `workspace-write`.
+Paths are resolved from the config file. The executable and workspace must satisfy the ownership checks, and so must every `routing.groups[].codex.cwd`. Codex state defaults to the launching user's shared `~/.codex`. Optional `codex.sharedHome` may select an absolute path or a path beginning with `~/`; if the launch environment also sets `CODEX_HOME`, both must resolve to the same directory or startup fails. The child still receives only explicitly selected environment names and proxy mappings; the production-derived app-server shell policy inherits from that controlled child environment. Approval policy defaults to `on-request`, the reviewer defaults to the installed protocol value `auto_review`, and sandbox defaults to `workspace-write` unless the optional `codex.permissionProfile` selects a [named permission profile](#named-permission-profile-per-instance).
 
-`check-config` validates the JSON contract and reads configured group instruction files; it never resolves environment secrets.
+`check-config` validates the JSON contract, reads configured group instruction files and checks every group `codex.cwd` directory; it never resolves environment secrets.
 
 Run:
 
@@ -178,7 +347,7 @@ Migration is explicit; startup only checks the migration ledger. `/health/live` 
 
 The bridge uses the MySQL connection pool for storage operations. Reads use a normal pooled connection. Writes use a short transaction only when several changes must commit together; single-row updates rely on atomic SQL predicates. Unique keys provide idempotency for message, job and outbox keys, while row leases protect claimable work. Every runtime table is scoped by `connection_id`, so independent bot processes do not need a process-wide advisory lock or a dedicated long-lived database connection.
 
-`storage.writer` fields remain accepted for compatibility; the advisory writer lock is no longer used. Communication polling treats normalized `store_unavailable`, `store_contention`, `store_timeout`, and claim-only `commit_unknown` failures as transient. It remains running but degraded, retries with capped exponential backoff, and recovers automatically. There is no total outage timer or failure count that turns a transient database outage into a fatal worker error. Shutdown interrupts retry waits. Logs report transitions and rate-limit persistent failures.
+`storage.writer` fields remain accepted for compatibility; the advisory writer lock is no longer used. Communication polling treats normalized `store_unavailable`, `store_contention`, `store_timeout`, and claim-only `commit_unknown` failures as transient. It remains running but degraded, retries with capped exponential backoff, and recovers automatically. There is no total outage timer or failure count that turns a transient database outage into a fatal worker error. Shutdown interrupts retry waits. Logs report transitions and rate-limit persistent failures; once a degradation has lasted 5 minutes, the periodic `worker_poll_failed` line is logged at `error` level (at most one per 5 minutes). Deterministic driver errors (parse error, unknown column, missing table or key, denied access, wrong value count, NULL in a NOT NULL column, data too long) are normalized to the non-transient `store_invalid`; the worker stops and the watchdog restarts the process.
 
 Readiness reports unavailable storage or degraded workers as not ready, with optional `degraded` details; this does not imply process death. The watchdog separates degradation from fatal errors. `runtime.unhealthyExitMs` still applies to schema mismatches and stopped/faulted workers, not temporary storage connectivity or slow queries. Codex and Feishu continue to affect readiness through their existing lifecycles.
 
@@ -188,72 +357,70 @@ Restart does not clear queues, replay ambiguous deliveries, change leases, or by
 
 Hook delivery still requires a durable consumer acknowledgement before it returns 204. Internal reply/reaction authorization, byte limits and unknown-write recovery remain enforced. The connected media and outbox components retain their current constraints in [input media](media.md) and [outbound media](outbound-media.md). [Catchup](catchup.md) describes the earlier generation implementation and is historical for the current forward execution path.
 
+### Claim deadlines and recovery
+
+A claim only reserves work; it does not call a hook or send a Feishu message. When its COMMIT acknowledgement is lost, the store resolves the original row IDs and lease token on a new connection before handing any work to a worker. It never retries an arbitrary transaction or interprets an uncertain platform send as a safe new send. An unresolved claim stays pending for reconciliation rather than being replaced by a new claim. Recovery verifies scope, owner, token and lease expiry under row locks, and logs `storage_claim_recovery` with status `recovered`, `not_committed` or `empty`.
+
+`storage.claimTimeoutMs` sets the deadline of the background hook and outbox claims (optional, default 15000 ms, allowed 1000–30000 ms; anything else fails validation with `invalid_storage_claim_timeout`). The same deadline applies to the Codex session reads that gate a turn (see below). Ingress and the other bridge stores keep their 1800 ms deadline. A transient failure uses the capped polling backoff above (1 s doubling to 30 s); a persistent database outage stays degraded and keeps probing. `worker_poll_failed` is logged on the first failure, on a stage change and then at most every 5 minutes; two successful claim stages log `worker_recovered`. Idle communication polling backs off from 100 ms through 200, 400 and 800 ms to 1 second, and returns to 100 ms when a poll claims work, so new hook and outbox work on an idle bot is picked up within about one second.
+
+A storage failure after a hook answered 204, or after a Feishu send, is not recorded as a delivery failure or retried immediately: the durable lease and the platform UUID reconcile it, and the worker records the storage failure (degraded for transient classes).
+
+Storage diagnostics distinguish `commit_timeout` from `commit_error` and retain only safe driver code, numeric errno and SQLSTATE. Raw driver messages, SQL and credentials are never logged. Readiness is a component snapshot, not proof that a particular user message reached Feishu, entered the bridge, or completed.
+
+On macOS, use `ProcessType=Standard` for the bridge and its local MySQL service. `Background` is intended for work that yields to user activity and applies CPU and I/O resource restrictions; it is a poor fit for a database serving short request deadlines. Keep normal MySQL durability settings. Do not disable flushes or drop transaction protection to work around deadline failures.
+
+### Query indexes and polling cost (0.2.30)
+
+Migration `006-query-indexes.sql` adds four secondary indexes online (`ALGORITHM=INPLACE, LOCK=NONE`) and changes no table or existing index:
+
+| table | index | used by |
+|---|---|---|
+| `assistant_codex_events` | `idx_assistant_codex_events_message (connection_id, codex_session_id, message_id, id)` | the accepted-message check before every turn and steer |
+| `assistant_codex_forward_jobs` | `idx_forward_status_finished (connection_id, status, finished_at, id)` | `GET /health/tasks` (forced index) |
+| `bridge_jobs` | `jobs_conversation_open (connection_id, conversation_id, hook_id, kind, status, sequence)` | hook ordering in the hook claim |
+| `bridge_outbox` | `outbox_unknown_recent (connection_id, status, first_attempt_at, next_attempt_at)` | the uncertain-send branch of the outbox claim (forced index) |
+
+The migration skips an index that already exists with the same definition and stops with `schema_version_mismatch` if a same-named index has another definition. It waits at most 10 seconds for a table metadata lock, and the explicit `migrate` command may run up to 15 minutes. 0.2.30 refuses to start until the ledger records version 6.
+
+Polling and query shape:
+
+- Hook and outbox claims select only IDs under `FOR UPDATE SKIP LOCKED`, then update and read back the claimed rows. An idle claim tick (hook claim plus outbox claim) sends 6 statements in 2 short transactions instead of 9, and about 0.3 KB of result metadata instead of about 3.5 KB.
+- The hook claim checks earlier unfinished jobs of the same conversation and hook with one equality probe per non-terminal status (`pending`, `running`, `reply_pending`, `unknown`, `delivery_failed`). This is equivalent to the former `status NOT IN ('succeeded','failed','cancelled')` only while the code writes no other status; `test/storage-job-status.test.mjs` fails when a new status write appears.
+- The outbox claim is two bounded branches: due `pending` rows, and `unknown` sends of kind `create`, `reply` or `artifact_send` first attempted within the last 55 minutes. Older uncertain sends are no longer scanned or locked on every poll. Eligibility and the `created_at, id` order are unchanged.
+- Expired send leases (`running` past `lease_expires_at`) are reclassified as `unknown` at most every 5 seconds per process, and at once after a reconciled claim found its own lease expired. A send whose lease expired can therefore be retried up to 5 seconds later than before.
+- `SET SESSION innodb_lock_wait_timeout = 1` runs once when the pool opens a physical connection instead of before every operation. It now also applies to the Codex session store's connections (their row-lock waits end after 1 s instead of 50 s). A connection that only arrives after an operation's deadline has run nothing, so it is returned to the pool instead of being closed.
+- All Codex session-store SQL goes through `withConnection` and raises normalized `store_*` errors. Before 0.2.30 it had no deadline. The reads that gate a turn (binding, accepted-message check, steer events, injection marker) use `storage.claimTimeoutMs` (15000 ms by default); execution-card progress reads use 1800 ms; binding and event writes use 10 seconds.
+- A forward task whose execution fails with `store_timeout`, `store_unavailable` or `store_contention` before its turn is submitted is retried after `codex` `retryDelayMs` (up to `maxAttempts`) instead of failing at once. "Submitted" means the executor has signalled its start intent (immediately before `turn/start`) or `execute()` has returned. Taking over the still-running turn of the same message (a later attempt in the same process) signals the same way. After that point the same errors are not retried: the job ends with the failure reply and the turn never runs a second time, because the executor's receipt check only finds a non-empty final answer on the binding's current thread and cannot prove that an earlier turn ran. `commit_unknown` is never retried this way.
+- Realtime Codex event writes hold at most two pool connections per process, each for at most the 10 s write deadline; further writes wait in order. Best-effort events (`public:` progress and `agent-delta:` streamed text) beyond 200 queued are dropped oldest first and counted in a `codex_event_write` `dropped` warning (`code:"codex_event_queue_full"`, `dropped_events` since the previous line, `dropped_events_total`, `queued_events`; at most one line per minute). Receipts (`assistant-final:`, `error:`, `user:`, `user-steer-*`) and every other key are never dropped, and a released slot goes to the oldest of them before any queued best-effort event. A completed turn's answer is returned even when its `assistant-final:` receipt or the binding touch fails to store; the executor logs `persist_final_answer` `failed` as a warning. A streamed agent message rewrites its full text at most every 500 ms per item, and its last text is always written.
+- Group-context bookkeeping after a turn updates by primary key and by `(connection_id, message_id)` separately instead of one `OR` across both keys.
+- History catch-up writes the cursor of an idle conversation once per run instead of twice. A conversation without a cursor still saves its first window before reading it; with a cursor, a restart re-derives the same window start from the unchanged `throughMs`, so skipping the opening write loses no message.
+- The readiness probe sends one statement instead of two.
+
+### Storage diagnostic events
+
+Storage calls that go through `withConnection` (all stores, including Codex session reads) log `operation:"storage_operation"` with `status` `slow` (`code:"storage_operation_slow"`, at least 500 ms) or `failed` (`code:"storage_operation_failed"`). Fast successful calls stay quiet. Each event has a random `operation_id`, the current or failed `stage` (`acquire`, `begin`, `operation`, `commit`, `rollback`), `transaction`, the MySQL `db_connection_id` when known, total `durationMs`, the configured `timeout_ms`, and stage durations `pool_wait_ms`, `begin_ms`, `operation_ms`, `commit_ms`, `rollback_ms`. Durations use a monotonic clock. Per-connection session setup runs once when the pool opens a connection; on a new connection its time is part of the first stage that follows acquisition. `operation_ms` includes all SQL and application work inside the callback; it is not a per-statement server execution timer. `timeout_overshoot_ms` shows how late the JavaScript deadline callback ran. A timeout emits once even if acquisition or COMMIT resolves later. Existing safe error fields remain (`error_class`, `reason`, `error_code`, `errno`, `sql_state`). Each event also carries the current pool and process context (`pool_connections`, `pool_free`, `pool_queued`, `event_loop_delay_max_ms`, `rss_mb`, `host_load1_milli`).
+
+At most 20 detailed operation events per bot are emitted per minute. Suppressed event counts appear in the next snapshot as `diagnostic_suppressed`. `operation:"storage_snapshot"` (`status` `captured`, or `unavailable` when the probe fails) runs every 60 seconds and on a slow or failing operation at most once per 30 seconds, with only one probe in flight. It reports `sample_window_ms`, `event_loop_delay_max_ms` (20 ms sampling resolution), `rss_mb`, `cpu_user_ms`, `cpu_system_ms`, `host_load1_milli`, `pool_connections`, `pool_free`, `pool_queued`, and allowlisted MySQL global counters: `db_threads_connected`, `db_threads_running`, `db_read_requests`, `db_physical_reads`, `db_pending_reads`, `db_pending_writes`, `db_pending_fsyncs`, `db_log_waits`, `db_row_lock_waits`, `db_row_lock_time_ms`, `db_uptime_seconds`. Server counters cover the whole MySQL instance (both bots on a shared server); compare deltas within one uptime epoch, not raw values across restarts. The diagnostic query (`SHOW GLOBAL STATUS`, no extra privilege) has a 1500 ms deadline and does not instrument itself.
+
+Snapshots and operation phases are evidence for narrowing a bottleneck, not proof that a particular SSD or scheduler event caused it. A delayed JavaScript callback can inflate observed client-side SQL/COMMIT time. Correlate operation time, deadline overshoot, event-loop/process load and server counters before attributing a failure. No SQL text, parameters, user content, raw driver errors, stack traces, account names or credentials are included. Observer failures and rate limits never alter the transaction result; shutdown removes diagnostic timers and waits only for the bounded probe already in flight.
+
 ## Business card actions
 
 An interactive-card callback whose `value.action` is `business` is routed directly to the hook named by `value.hook_id` when the callback chat is listed in that hook's `conversationIds`. It does not create a Codex job or enter a Codex thread. Unknown hooks and callbacks from chats outside the configured hook scope are acknowledged with `此群未接入该业务` and are not delivered.
 
-The matching hook receives the existing authenticated delivery wrapper `{deliveryId,event}`. Its `event` is the standard Feishu envelope `{schemaVersion:1,channel:'feishu',type:'card.action',connectionId,eventId,chatId,messageId,operatorOpenId,operatorName?,value,occurredAt}`. These fields have the same envelope-level placement as existing `message.received` events; there is no second nested `event` object. The bridge treats business fields inside `value` as opaque. The Feishu event ID is used when present; otherwise the bridge derives a stable SHA-256 ID from the card message, operator, value and action time. Invalid or absent event time is represented as `occurredAt:null`, so replay hashing remains stable. Business-side hook workers must add handling for the `card.action` type; the existing message worker does not reinterpret card actions as received messages.
+The matching hook receives the existing authenticated delivery wrapper `{deliveryId,event}`. Its `event` is the standard Feishu envelope `{schemaVersion:1,channel:'feishu',type:'card.action',connectionId,eventId,chatId,messageId,operatorOpenId,operatorName?,value,formValue?,occurredAt}`. These fields have the same envelope-level placement as existing `message.received` events; there is no second nested `event` object. The bridge treats business fields inside `value` as opaque. The Feishu event ID is used when present; otherwise the bridge derives a stable SHA-256 ID from the card message, operator, value, action time and optional canonical form values (events without forms retain their existing identity). Invalid or absent event time is represented as `occurredAt:null`, so replay hashing remains stable. Business-side hook workers must add handling for the `card.action` type; the existing message worker does not reinterpret card actions as received messages.
+
+Native `action.form_value` is forwarded as `event.formValue`, an optional JSON object limited to 32 KiB encoded UTF-8, 256 nodes, depth 6 and 128-character keys. Non-finite numbers, non-JSON values and prototype-related keys are rejected without ingestion. Form contents are never logged. The consumer must validate its own field schema, card version, operator authorization and business transition.
+
+For `value.kind: "feedback"`, a successful registration returns `意见已记录，等待校验并处理，请稍后查看卡片`; this is not a business approval or processing-complete acknowledgement. A registration failure or the two-second timeout returns `暂未确认意见提交成功，请稍后查看卡片后重试`. A timed-out operation may still be recorded later, and the existing event identity deduplicates retry. Other business action kinds retain their previous responses below.
 
 The callback waits up to two seconds for durable registration before returning `已收到，处理结果稍后更新在卡片上`. A slower registration continues after the toast; a registration failure observed before the response returns `已收到，系统记录延迟，请稍后确认卡片状态` and is error-reported. Delivery is persisted under `card_action:<event_id>` in the existing inbox and hook queue, so callback replays do not create another delivery and transient hook failures use the existing durable retry policy.
 
 
-### Claim deadlines and recovery
+## Restart observation recovery (0.2.29)
 
-A claim only reserves work; it does not call a hook or send a Feishu message.
-When its COMMIT acknowledgement is lost, the store resolves the original row IDs
-and lease token on a new connection before handing any work to a worker. It
-never retries an arbitrary transaction or interprets an uncertain platform send
-as a safe new send. An unresolved claim stays pending for reconciliation rather
-than being replaced by a new claim. Recovery verifies scope, owner, token and
-lease expiry under row locks.
+A lost app-server connection is an unknown observation, not proof that the native task failed. When a pending forward job is recovered, the executor reads its persisted turn identity and observes that original turn. Native interruption is reported as `CODEX_TURN_INTERRUPTED` (excluded from `/health/tasks.failed`); genuine failure still counts. Missing/unreadable turns remain retryable and must not be treated as permission to rerun business actions.
 
-`storage.claimTimeoutMs` sets the background-claim deadline (default 15000 ms, allowed 1000–30000 ms). The short ingress deadline
-is unchanged. A transient failure uses the capped polling backoff above;
-a persistent database outage remains degraded and continues recovery probes. Idle communication
-polling backs off from 100 ms to 1 second, and returns to 100 ms when a poll claims
-work. Long-running model turns do not keep empty polling at the fast cadence. This bounds idle pickup latency without continuous empty transactions.
+Operator checklist: back up the configured database before correcting historical rows; deploy the reviewed 0.2.29 commit; run `npm run check` and `npm test`; use the host supervisor's supported restart lifecycle when no turn is active; verify `/health/ready` and `/health/tasks?window_minutes=120`. Rollback: restore the preceding reviewed application commit through the same lifecycle. No DDL/config migration is required. Historical terminal jobs need a separately audited correction after matching their native turn status; retain job status and business receipts, and never mark an interrupted job completed merely to clear an alert.
 
-Storage diagnostics distinguish `commit_timeout` from `commit_error` and retain
-only safe driver code, numeric errno and SQLSTATE. Raw driver messages, SQL and
-credentials are never logged. Readiness is a component snapshot, not proof that
-a particular user message reached Feishu, entered the bridge, or completed.
-
-On macOS, use `ProcessType=Standard` for the bridge and its local MySQL service.
-`Background` is intended for work that yields to user activity and applies CPU
-and I/O resource restrictions; it is a poor fit for a database serving short
-request deadlines. Keep normal MySQL durability settings. Do not disable flushes
-or drop transaction protection to work around deadline failures.
-
-
-### Storage diagnostic events
-
-All service-owned storage calls using `withConnection` produce a
-`storage_operation` warning when they fail or take at least 500 ms. Fast
-successful calls stay quiet. Each event has a random `operation_id`, current or
-failed `stage`, available MySQL `db_connection_id`, total `durationMs`, configured
-`timeout_ms`, and stage durations (`pool_wait_ms`, `setup_ms`, `begin_ms`,
-`operation_ms`, `commit_ms`, `rollback_ms`). Durations use a monotonic clock.
-`operation_ms` includes all SQL and application work inside the callback; it is
-not a per-statement server execution timer. `timeout_overshoot_ms` shows how late
-the JavaScript deadline callback ran. A timeout emits once even if acquisition
-or COMMIT resolves later. Existing safe error class/code/errno/SQLSTATE remain.
-
-At most 20 detailed operation events per bot are emitted per minute. Suppressed
-event counts appear in the next `storage_snapshot`. Snapshots run every 60 seconds
-and on a slow/failing operation at most once per 30 seconds, with only one probe
-in flight. They include event-loop delay (20 ms sampling resolution), process
-RSS and CPU-time deltas, host load, available pool total/free/queued counts, and
-allowlisted MySQL global counters: running/connected threads, buffer reads,
-pending read/write/fsync, log waits, current row-lock waits, cumulative row-lock
-time and server uptime. Server counters cover the whole MySQL instance; compare
-deltas within one uptime epoch, not raw values across restarts. The diagnostic
-query has a 1500 ms deadline and does not recursively instrument itself.
-
-Snapshots and operation phases are evidence for narrowing a bottleneck, not
-proof that a particular SSD or scheduler event caused it. A delayed JavaScript
-callback can inflate observed client-side SQL/COMMIT time. Correlate operation
-time, deadline overshoot, event-loop/process load and server counters before
-attributing a failure. No SQL text, parameters, user content, raw driver errors,
-stack traces, account names or credentials are included. Observer failures and
-rate limits never alter the transaction result; shutdown removes diagnostic
-timers and waits only for the bounded probe already in flight.
+A resumed turn that Codex already reports interrupted or failed, while its caller has stopped waiting (the lease was lost during shutdown), no longer terminates the process with an unhandled rejection (0.2.30). The turn's terminal error is persisted as before; the next attempt reads it and replies with the existing interrupted or failed message without starting another turn.

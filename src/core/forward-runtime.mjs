@@ -7,9 +7,21 @@ const terminalTurnError = error => ['CODEX_TURN_FAILED', 'CODEX_TURN_INTERRUPTED
 const isBusy = error => error?.code === 'CODEX_THREAD_BUSY';
 const TRANSIENT_LEASE_ERRORS = new Set(['store_unavailable', 'store_contention', 'store_timeout', 'commit_unknown']);
 const DEFINITIVE_LEASE_ERRORS = new Set(['stale_lease', 'forward_lease_lost']);
-const retryableError = error => {
+// Normalized storage failures. They are retried only while the turn has not
+// been submitted: before the executor reaches turn/start (`admitted`) and
+// before execute() resolved (`executed`). Session reads that gate admission
+// fail with these codes when the database is slow or briefly unavailable, and
+// nothing has run yet, so the task is retried later. Once a turn was submitted
+// or completed, a retry could submit the prompt again: the executor's receipt
+// check only sees a non-empty final answer on the binding's current thread.
+// Such a failure keeps the 0.2.29 path (failure reply, no re-execution);
+// unlike 0.2.29, store_timeout is no longer retried there through the generic
+// /timeout/ match. commit_unknown is never retried here.
+const STORE_ERRORS = new Set(['store_unavailable', 'store_contention', 'store_timeout']);
+const retryableError = (error, { submitted = false } = {}) => {
   if (isBusy(error)) return false;
   if (terminalTurnError(error)) return false;
+  if (STORE_ERRORS.has(error?.code)) return !submitted;
   const value = [error?.name, error?.code, error?.cause?.code, error?.message, error?.cause?.message]
     .filter(Boolean).join(' ');
   return /\b(?:AbortError|TimeoutError|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)\b/i.test(value)
@@ -272,6 +284,10 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     let execution = { ...(job.result?.execution || {}) };
     let state;
     let needsDelivery = false;
+    // Set when the executor is about to submit the turn and when execute()
+    // resolved; after either, storage failures are not retried (see above).
+    let admitted = false;
+    let executed = false;
     try {
       const prompt = execution.inputStatus === 'ready' && typeof execution.preparedPrompt === 'string'
         ? execution.preparedPrompt : job.prompt;
@@ -289,7 +305,9 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       const timeout = AbortSignal.timeout(executeTimeoutMs);
       let result;
       try {
-        result = await executor.execute(input, { signal: AbortSignal.any([lease.signal, timeout]) });
+        result = await executor.execute(input, { signal: AbortSignal.any([lease.signal, timeout]),
+          onStartIntent: () => { admitted = true; } });
+        executed = true;
       } catch (error) {
         if (timeout.aborted && !lease.signal.aborted) throw Object.assign(new Error('forward_timeout'), { code: 'CODEX_FORWARD_TIMEOUT', retryable: true });
         throw error;
@@ -321,7 +339,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         throw error;
       }
       lease.assertOwned();
-      if (retryableError(error) && job.attempts < maxAttempts) {
+      if (retryableError(error, { submitted: admitted || executed }) && job.attempts < maxAttempts) {
         const nextRetryAt = now() + retryDelayMs;
         await feedback?.wait?.(job, state).catch(() => {});
         await jobs.markRetry({ id: job.id, leaseOwner: job.leaseOwner,

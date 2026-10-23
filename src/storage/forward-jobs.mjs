@@ -87,7 +87,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
       return read(async connection => {
         const [[result]] = await connection.execute(`WITH candidates AS (
             SELECT id, finished_at, delivery_mode, last_error
-            FROM assistant_codex_forward_jobs FORCE INDEX (idx_forward_status_next)
+            FROM assistant_codex_forward_jobs FORCE INDEX (idx_forward_status_finished)
             WHERE connection_id=? AND status='failed' AND finished_at>=? AND finished_at<=?
             ORDER BY finished_at DESC, id DESC LIMIT 501
           ), ranked AS (
@@ -297,7 +297,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
     patchFeedback(input) {
       const [id, owner] = leaseArgs(input);
       const key = required(input.key, 32);
-      if (!['executionCard', 'typing', 'stop', 'delivery'].includes(key)) throw new StoreError('invalid_store_input');
+      if (!['executionCard', 'typing', 'stop', 'delivery', 'replyMode'].includes(key)) throw new StoreError('invalid_store_input');
       return write(async connection => {
         const at = now();
         const updatesCleanup = key === 'typing';

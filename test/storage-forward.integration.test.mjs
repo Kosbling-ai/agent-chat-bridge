@@ -139,6 +139,9 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
     const executed = [];
     const runtimeWorker = createForwardRuntime({
       config: { owner: 'runtime-worker', pollMs: 2, leaseMs: 10_000 },
+      // Lease fencing compares the claimed lease expiry with the runtime clock,
+      // so the runtime must share the store's fixture clock.
+      now: () => now,
       jobs: store,
       sessions: {},
       media: { async prepare() { return { status: 'ready', addendum: '（图片路径：safe/runtime.png）' }; } },
@@ -303,7 +306,7 @@ test('isolated MySQL preserves forward idempotency, recovery state, and lease fe
       value: { desired: false, operation: 'remove', outcome: 'unknown', nextRetryAt: now },
     });
     await store.markRetry({ id: cleanupRun.id, leaseOwner: cleanupOwner.leaseOwner, held: true, errorCode: 'cleanup_fixture' });
-    const [plan] = await pool.query(`EXPLAIN SELECT id FROM assistant_codex_forward_jobs
+    const [plan] = await pool.query(`EXPLAIN FORMAT=TRADITIONAL SELECT id FROM assistant_codex_forward_jobs
       FORCE INDEX (idx_forward_feedback_cleanup)
       WHERE connection_id='fixture' AND feedback_cleanup_pending=1 AND feedback_cleanup_at<=?
         AND status IN ('held','completed','failed','deferred')

@@ -55,3 +55,17 @@ test('rendering validates metadata again and bounds public output', () => {
   assert.ok(renderPublicToolEntry({ title: 'x'.repeat(150), summary: 'y'.repeat(700) }).title.length <= 100);
   assert.ok(renderPublicToolEntry({ title: 'x', summary: 'y'.repeat(700) }).summary.length <= 500);
 });
+
+test('command title template renames bare program lines only', () => {
+  const project = createPublicProgressProjector();
+  const bare = project('item/started', { item: { id: 'b', type: 'commandExecution', command: 'node run.js', cwd: '/work' } });
+  const acted = project('item/started', { item: {
+    id: 'a', type: 'commandExecution', command: 'cat /work/README.md', cwd: '/work',
+    commandActions: [{ type: 'read', command: 'cat /work/README.md', path: '/work/README.md', name: 'README.md' }],
+  } });
+  assert.equal(renderPublicToolEntry(bare).title, 'node');
+  assert.equal(renderPublicToolEntry(bare, { commandTitleTemplate: '{label}' }).title, '执行命令');
+  assert.equal(renderPublicToolEntry(bare, { commandTitleTemplate: '{name} · {label}' }).title, 'node · 执行命令');
+  assert.equal(renderPublicToolEntry(acted, { commandTitleTemplate: '{label}' }).title, '读取 README.md');
+  assert.equal(renderPublicToolEntry(bare, { commandTitleTemplate: '{label}' }).summary, '命令：node');
+});

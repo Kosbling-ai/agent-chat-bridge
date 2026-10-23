@@ -1,8 +1,24 @@
 # agent-chat-bridge
 
+Staging additionally retains opt-in [Computer Use approvals through Feishu](docs/computer-use.md), including current-turn app grants. These features remain unreleased; main release history below supersedes earlier staging draft version numbers.
+
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.27` is the current unreleased development version. 0.2.22 compacts the execution card: the answer (or latest progress while running) and status stay visible and the process folds into at most one collapsed, non-nested panel; no card text key was removed (one optional key, `processGroup`, was added) and stored state is unchanged. See [the execution-card layout](docs/runtime.md). 0.2.21 adds the optional per-group `routing.groups[].codex` permission override (`approvalPolicy`, `approvalsReviewer`, `sandbox`) for a `bridge` group's human thread and for business-event threads whose hook `inbound.defaultChatId` is that group; Codex full access needs `approvalPolicy: "never"` with `sandbox: "danger-full-access"`. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
+Version: `0.2.32` reads fragmented Codex RPC frames in linear time, releases incomplete frames after disconnection, and reports bounded memory-guard and RPC-timeout diagnostics. This prevents large image histories from causing repeated timeout and memory restarts. No schema/config migration or task replay. See [upgrade notes](MIGRATIONS.md#0232-large-codex-rpc-frames).
+
+Version `0.2.31` forwards bounded native business-card form values to durable hooks and gives feedback-specific, truthful registration acknowledgements. No additional schema or configuration migration beyond 0.2.30; upgrading from 0.2.29 or earlier still requires migration 006. See [upgrade notes](MIGRATIONS.md).
+
+Version `0.2.30` keeps the bot running in a degraded state while storage is slow or unavailable instead of restarting it, adds migration 006 (four online indexes; run `migrate` once per database before restarting), cuts idle database traffic from about 90 to about 8 statements per second, adds `storage_operation` / `storage_snapshot` diagnostics and the optional `storage.claimTimeoutMs`, and fixes the 0.2.29 crash when a restart resumes an already interrupted turn. See [0.2.30 query indexes and degraded storage](MIGRATIONS.md#0230-query-indexes-and-degraded-storage). 0.2.28 added the optional per-group reply style `routing.groups[].reply`: with `mode: "text"` a group's human turns get no execution card or Typing, and the answer is a text or post reply to the triggering message (one short line on failure, nothing for a `silentReply` token, optional `ack: "reaction"`). `trigger: "all"` is unchanged and documented alongside it. See [group text replies and trigger all](docs/runtime.md#group-text-replies-and-trigger-all).
+
+Version `0.2.27` adds the optional per-instance Codex permission profile `codex.permissionProfile`: thread start, resume and fork send `permissions` instead of `sandbox`, and a thread is used only when Codex reports that profile as active (fail-closed). See [named permission profile per instance](docs/runtime.md#named-permission-profile-per-instance). No database migration; configurations without the key are unchanged.
+
+Version `0.2.26` adds the optional private-chat admission callback `routing.privateAdmission`: a bot asks a configured business endpoint whether a private sender may use the Agent before storing the message, caches the answer per open_id, fails closed and replies once with a fixed text to refused senders. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback). No database migration; configurations without the key are unchanged.
+
+Version `0.2.25` adds the optional per-group Codex working directory `routing.groups[].codex.cwd` (absolute path, checked like the global `codex.cwd` by startup and `check-config`) for a `bridge` group's human thread and business-event threads delivering to it, moves a thread recorded under another cwd to a new thread on its next turn, and announces the result-file directory as an absolute path for every conversation. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). No database migration.
+
+Version `0.2.24` adds bounded recovery for uncertain queue-claim commits without replaying business execution. No schema/config migration.
+
+0.2.23 adds the optional card text key `commandTitleTemplate` (placeholders `{name}`, `{label}`; default `{name}`, so output is unchanged) to retitle execution-card command lines that show only a program name, for example `{label}` for 「执行命令」; no migration. 0.2.22 compacts the execution card: the answer (or latest progress while running) and status stay visible and the process folds into at most one collapsed, non-nested panel; no card text key was removed (one optional key, `processGroup`, was added) and stored state is unchanged. See [the execution-card layout](docs/runtime.md). 0.2.21 adds the optional per-group `routing.groups[].codex` permission override (`approvalPolicy`, `approvalsReviewer`, `sandbox`) for a `bridge` group's human thread and for business-event threads whose hook `inbound.defaultChatId` is that group; Codex full access needs `approvalPolicy: "never"` with `sandbox: "danger-full-access"`. See [per-group Codex permissions](docs/runtime.md#per-group-codex-permissions). Version 0.1.1 is the previous implementation. [Changes](CHANGELOG.md), [version and migration policy](MIGRATIONS.md), [staging workflow](docs/staging-workflow.md).
 
 Independent Feishu + Codex bridge process. Business code, Skills/MCP and document/table APIs stay in the Agent environment or hook consumer.
 
@@ -27,6 +43,10 @@ Configure explicit environment references and an owned workspace before migratio
 For an Agent reply that needs to notify someone, write `<at user_id="ou_example1"></at>`, `<at open_id="ou_example1"></at>`, or `@{ou_example1}` in the answer. The bridge sends each valid open_id (`ou_` followed by lowercase letters or digits) as a Feishu post `at` element, including when `feishu.replyAsPost` is `false`. Invalid IDs remain literal text. To let a specific group use `<at user_id="all"></at>`, set `allowMentionAll: true` on that group's `routing.groups[]` entry; the default is `false`, and private chats cannot use it. Interactive cards are unchanged.
 
 The original config.example.json remains a health-only configuration: live=200, ready=503. A complete runtime configuration reports readiness from actual components. Live never means provider readiness.
+
+Private chats admit senders listed in `routing.privateUserIds`, everyone with `routing.allowAllPrivateUsers: true`, or, with the optional `routing.privateAdmission`, whoever a configured business endpoint approves; refused messages are not stored and get one fixed reply. See [private-chat admission callback](docs/runtime.md#private-chat-admission-callback).
+
+An instance may run its Codex threads under a named Codex permission profile with the optional `codex.permissionProfile` instead of `codex.sandbox`; the bridge then sends `permissions` instead of `sandbox` and uses a thread only when Codex reports that profile as active. See [named permission profile per instance](docs/runtime.md#named-permission-profile-per-instance).
 
 For an authorized group, set `routing.groups[].replyTriggers` to `true` to trigger the Agent when a human replies to a message from this bot without `@` (default `false`). Text and cards both qualify; `trigger: "all"` remains unchanged. See [routing and reply context](docs/runtime.md).
 
@@ -61,5 +81,3 @@ An Agent can signal that a group turn needs no answer by replying with an operat
 ### Custom execution-card text
 
 See [per-bot card text](docs/card-text.md) for opt-in, hot-loaded wording that each bot can edit in its workspace.
-
-Opt-in [Computer Use app approvals](docs/computer-use.md) can be answered in Feishu with `codex.computerUse: true`; the installed Codex runtime is required.

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isAbsolute, resolve } from 'node:path';
 import { isScheduledBinding } from './thread-scope.mjs';
 import { canDeliverOutboxAttachments } from './outbox-policy.mjs';
 
@@ -24,8 +25,15 @@ export function outboxRelativeDirectory({ outboxRelativeRoot = 'data/feishu-outb
     ? `${outboxRelativeRoot}/system-${scopeHash(bindingOpenId)}/${chatKey(chatId)}`
     : `${outboxRelativeRoot}/${chatKey(chatId)}`;
 }
-export function systemTaskPreamble({ binding, outboxRelativeRoot }) {
-  const outbox = outboxRelativeDirectory({ outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
+// The directory announced to the Agent. With the bridge workspace (the global
+// codex.cwd, where outbox files are collected) it is absolute, so it stays
+// correct when a thread runs in another cwd; without one it stays relative.
+export function outboxPromptDirectory({ workspace, outboxRelativeRoot, chatId, bindingOpenId }) {
+  const relativeDirectory = outboxRelativeDirectory({ outboxRelativeRoot, chatId, bindingOpenId });
+  return typeof workspace === 'string' && isAbsolute(workspace) ? resolve(workspace, relativeDirectory) : relativeDirectory;
+}
+export function systemTaskPreamble({ binding, workspace, outboxRelativeRoot }) {
+  const outbox = outboxPromptDirectory({ workspace, outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
   return `【独立系统任务】\n任务：${binding.feishuOpenId}\n结果投递群：${binding.chatId}\n本线程仅承接此系统任务，不承接目标群的人工对话。结果由运行时发送到目标群。\n回发文件目录：${outbox}`;
 }
 
@@ -33,12 +41,12 @@ export function systemTaskPreamble({ binding, outboxRelativeRoot }) {
 // groupOpening=false omits only the default group wording (name, description and
 // session note) that replace-mode group instructions supersede; chat_id and the
 // result-file notes are functional and always stay.
-export function buildInitialPrompt({ binding, prompt, groupChatContext, outboxRelativeRoot, allowedGroupChatIds = new Set(), systemPreamble = true, groupOpening = true }) {
+export function buildInitialPrompt({ binding, prompt, groupChatContext, workspace, outboxRelativeRoot, allowedGroupChatIds = new Set(), systemPreamble = true, groupOpening = true }) {
   if (!binding) return prompt;
   if (isScheduledBinding(binding.feishuOpenId)) {
-    return systemPreamble ? `${systemTaskPreamble({ binding, outboxRelativeRoot })}\n\n${prompt}` : prompt;
+    return systemPreamble ? `${systemTaskPreamble({ binding, workspace, outboxRelativeRoot })}\n\n${prompt}` : prompt;
   }
-  const outbox = outboxRelativeDirectory({ outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
+  const outbox = outboxPromptDirectory({ workspace, outboxRelativeRoot, chatId: binding.chatId, bindingOpenId: binding.feishuOpenId });
   if (binding.chatType && binding.chatType !== 'p2p') {
     const context = normalizeGroupChatContext(groupChatContext);
     const lines = [];

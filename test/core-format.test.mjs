@@ -27,6 +27,8 @@ test('prompt integration preserves private cloud permission identity and separat
   const prompt = buildConversationPrompt({ event, text: 'current', newThread: true });
   assert.match(prompt, /对方 open_id：human/);
   assert(!prompt.includes('回发文件目录'), 'do not advertise an unwired output directory');
+  assert.match(buildConversationPrompt({ event, text: 'current', newThread: true, outboxDir: '/srv/bridge/outbox/run' }), /\n回发文件目录：\/srv\/bridge\/outbox\/run\n/);
+  assert(!buildConversationPrompt({ event, text: 'current', newThread: true, outboxDir: 'data/feishu-outbox/chat' }).includes('回发文件目录'), 'a relative directory is never advertised');
   const group = buildConversationPrompt({ event: { ...event, conversationType: 'group' }, text: 'current', context: [{ event: { actor: { openId: 'other' } }, text: 'background' }], newThread: true, group: { name: 'Fixture group' } });
   assert.match(group, /群名称：Fixture group/);
   assert.match(group, /群消息 来自 other（open_id=other）/);

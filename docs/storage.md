@@ -1,6 +1,15 @@
 # Store
 
-MySQL 8.4 is the durable boundary. Migration `001` remains the released communication ledger, `002` contains the Codex binding/event tables, and development migration `003` adds the production-derived forward runtime tables:
+MySQL is the durable boundary: 8.4 is the supported floor, and production runs and is verified on MySQL 9.6 (the 0.2.30 migration and its locking `UNION` claim were exercised on 9.6 only). Migrations are numbered and immutable:
+
+- `001` the released communication ledger (`bridge_*` inbox, jobs, outbox, cursors and related tables).
+- `002` the Codex binding/event tables.
+- `003` the production-derived forward runtime tables (below).
+- `004` a required `connection_id` on the five assistant tables, placed first in their unique, claim, history and context indexes, so several bots can share one bridge database.
+- `005` nullable `sender_union_id` on `assistant_codex_forward_jobs` and `assistant_inbound_messages`.
+- `006` four online secondary indexes: `assistant_codex_events.idx_assistant_codex_events_message`, `assistant_codex_forward_jobs.idx_forward_status_finished`, `bridge_jobs.jobs_conversation_open`, `bridge_outbox.outbox_unknown_recent` (see [query indexes and polling cost](runtime.md#query-indexes-and-polling-cost-0230)).
+
+Migration `003` adds:
 
 - `assistant_codex_forward_jobs`: caller idempotency, conversation/input snapshot, execution namespace, delivery mode, lease, reply-pending state, result, and feedback sidecars.
 - `assistant_inbound_messages`: normalized message facts used by the bounded passive-context read and reply history.

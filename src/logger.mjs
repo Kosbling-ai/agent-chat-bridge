@@ -1,6 +1,9 @@
 const STORAGE_METRICS = {
+  "rssBytes": "rss_bytes",
+  "heapUsedBytes": "heap_used_bytes",
+  "rssLimitBytes": "rss_limit_bytes",
+  "heapLimitBytes": "heap_limit_bytes",
   "poolWaitMs": "pool_wait_ms",
-  "setupMs": "setup_ms",
   "beginMs": "begin_ms",
   "operationMs": "operation_ms",
   "commitMs": "commit_ms",
@@ -28,7 +31,10 @@ const STORAGE_METRICS = {
   "dbLogWaits": "db_log_waits",
   "dbRowLockWaits": "db_row_lock_waits",
   "dbRowLockTimeMs": "db_row_lock_time_ms",
-  "dbUptimeSeconds": "db_uptime_seconds"
+  "dbUptimeSeconds": "db_uptime_seconds",
+  "droppedEvents": "dropped_events",
+  "droppedEventsTotal": "dropped_events_total",
+  "queuedEvents": "queued_events"
 };
 
 // Only fixed lifecycle fields are accepted; never serialize config, requests,
@@ -41,7 +47,7 @@ export function safeObserver(callback = () => {}) {
 export function createLogger(stream = process.stdout, { component = 'service', reportError } = {}) {
   return (level, operation, status, { code, reason, consecutiveMisses, consecutiveFailures, durationMs, windowMinutes, port, rpcMethod, stage, runId, operationId, attempt, maxAttempts, nextRetryAt,
     hookId, eventId, eventType, scopePrefix, statusCode, platformCode, jobId, errorClass, errno, sqlState, willRetry, chatId, messageId, kind, errorCode,
-    component: eventComponent, transaction, ...diagnostics } = {}) => {
+    decision, cached, openId, permissionProfile, activePermissionProfile, component: eventComponent, transaction, version, applied, ...diagnostics } = {}) => {
     const identifier = (value, max = 96) => typeof value === 'string' && value.length <= max && /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : undefined;
     const boundedInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
     const storageMetrics = {};
@@ -81,7 +87,17 @@ export function createLogger(stream = process.stdout, { component = 'service', r
       ...(identifier(messageId, 128) !== undefined ? { message_id: messageId } : {}),
       ...(identifier(kind, 64) !== undefined ? { kind } : {}),
       ...(identifier(errorCode, 64) !== undefined ? { error_code: errorCode } : {}),
+      ...(['allow', 'deny', 'unavailable'].includes(decision) ? { decision } : {}),
+      ...(typeof cached === 'boolean' ? { cached } : {}),
+      // A sender is logged only as the first six characters of its open_id.
+      ...(identifier(openId, 512) !== undefined ? { openId: openId.slice(0, 6) } : {}),
+      // Codex permission profile ids (configured and reported), never other response content.
+      ...(identifier(permissionProfile, 128) !== undefined ? { permissionProfile } : {}),
+      ...(identifier(activePermissionProfile, 128) !== undefined ? { activePermissionProfile } : {}),
       ...(typeof transaction === 'boolean' ? { transaction } : {}),
+      // Schema migration result: ledger version and whether a migration was applied.
+      ...(boundedInteger(version, 1, 1_000_000) !== undefined ? { version } : {}),
+      ...(typeof applied === 'boolean' ? { applied } : {}),
       ...storageMetrics,
     };
     stream.write(`${JSON.stringify(event)}\n`);

@@ -3,9 +3,21 @@ import { unlink } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { canDeliverOutboxAttachments } from '../../agents/codex/outbox-policy.mjs';
 import { adaptLocalMarkdownImages, referencedCollectedLocalImages } from './markdown-images.mjs';
+import { textReplyFor } from '../../core/reply-mode.mjs';
 
 const stableEventKey = value => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
-export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbound, botOpenId, connectionId, workspace, allowedGroupChatIds = new Set(), mentionAllGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, log = () => {} } = {}) {
+const MENTIONS = /<at (?:user_id|open_id)="[^"]*"><\/at>|@\{[^}]*\}/g;
+// Text mode accepts every common at spelling, with or without quotes and a
+// display name: <at user_id="ou_x">Name</at>, <at id=ou_x></at>, @{ou_x}.
+const TEXT_MODE_MENTIONS = /<at\s+(?:id|user_id|open_id)\s*=\s*["']?[A-Za-z0-9_-]+["']?\s*>[^<\n]*<\/at>|@\{[^}\n]*\}/g;
+// Any open_id left in text mode output (an unparsable tag, a bare ID) is masked.
+const OPEN_ID_TEXT = /(?<![A-Za-z0-9_-])ou_[A-Za-z0-9_-]{8,}/g;
+const MASKED_MEMBER = '@成员';
+const FAILURE_LINE_MAX_CHARS = 200;
+// Feishu reply rejections that mean the triggering message is gone; only these
+// fall back to a new chat message. 230011: "The message is recalled."
+const REPLY_TARGET_GONE_CODES = new Set([230011]);
+export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbound, botOpenId, connectionId, workspace, allowedGroupChatIds = new Set(), mentionAllGroupChatIds = new Set(), replyAsPost = true, maxOutputChars = 3500, replyPolicy = () => null, log = () => {} } = {}) {
   async function recordSent(job, messageId, messageType) {
     if (!messageId || !inbound?.recordReply || !botOpenId) return;
     try {
@@ -51,6 +63,7 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbo
       return { sent: previous.filter(item => item.status === 'sent').length,
         status: previous.some(item => item.status === 'failed') ? 'failed' : 'sent' };
     }
+    if (job.sourceMessageId && textReplyFor(job, result, replyPolicy)) return sendTextReply(job, result, control);
     const chunkSize = replyAsPost ? 3000 : 1900;
     const answer = adaptLocalMarkdownImages(result.answer, result.attachments, { workspace });
     const chunks = chunkText(limitText(answer || 'Codex 没有返回可用结论。', maxOutputChars), chunkSize);
@@ -68,6 +81,63 @@ export function createFeishuReplies({ chat, outbound, sendAttachment, jobs, inbo
       sent.push({ messageId, msgType: kind, text: chunk, content: JSON.stringify(content) });
     }
     return { sent: sent.length, status: 'sent', items: sent };
+  }
+
+  // Group text mode: every message replies to the triggering message (no
+  // thread). A completed answer uses text for one plain line and post for
+  // anything with mentions, line breaks or Markdown; a failure is one short
+  // text line. Only a reply rejected because the trigger is gone is sent to
+  // the chat instead; each failed message logs one warning.
+  async function sendTextReply(job, result, control) {
+    const prefix = codexReplyUuidPrefix(job, result);
+    const failed = result.failed === true || ['failed', 'interrupted'].includes(result.turnStatus || result.execution?.terminal);
+    let messages;
+    if (failed) {
+      const text = maskOpenIds(failureLine(result.answer));
+      messages = [{ kind: 'text', content: { text }, text }];
+    } else {
+      const answer = adaptLocalMarkdownImages(result.answer, result.attachments, { workspace });
+      const allowMentionAll = mentionAllGroupChatIds.has(job.chatId);
+      messages = chunkText(limitText(answer || 'Codex 没有返回可用结论。', maxOutputChars), 3000, TEXT_MODE_MENTIONS).map(chunk => {
+        const post = markdownToFeishuPost(chunk, { allowMentionAll, textMode: true });
+        return plainLine(chunk, post) ? { kind: 'text', content: { text: maskOpenIds(chunk) }, text: chunk } : { kind: 'post', content: post, text: chunk };
+      });
+    }
+    const sent = [];
+    for (const [index, message] of messages.entries()) {
+      control.assertLease();
+      const { kind, content } = message;
+      let response;
+      try {
+        response = await chat.replyMessage({ messageId: job.sourceMessageId, kind, content, replyInThread: false,
+          uuid: stableEventKey(`${prefix}:reply:${kind}:${index}`) });
+      } catch (error) {
+        const gone = error?.outcome === 'failed' && error?.code === 'feishu_api_rejected' && REPLY_TARGET_GONE_CODES.has(error?.platformCode);
+        if (!gone) {
+          if (error?.outcome === 'failed') logReplyFailure(job, error, 'reply');
+          throw error;
+        }
+        try {
+          control.assertLease();
+          response = await chat.sendMessage({ conversationId: job.chatId, kind, content,
+            uuid: stableEventKey(`${prefix}:reply-create:${kind}:${index}`) });
+        } catch (createError) {
+          if (createError?.code !== 'forward_lease_lost') logReplyFailure(job, createError, 'create', error.platformCode);
+          throw createError;
+        }
+        log('warning', 'forward_reply', 'reply_rejected', { code: 'reply_target_gone', runId: job.id, platformCode: error.platformCode });
+      }
+      const messageId = response?.message_id || response?.messageId || '';
+      await recordSent(job, messageId, kind);
+      sent.push({ messageId, msgType: kind, text: message.text, content: JSON.stringify(content) });
+    }
+    return { sent: sent.length, status: 'sent', items: sent };
+  }
+
+  function logReplyFailure(job, error, stage, replyPlatformCode) {
+    log('warning', 'forward_reply', 'reply_failed', { code: typeof error?.code === 'string' ? error.code : 'reply_delivery_failed', stage, runId: job.id,
+      ...(Number.isInteger(error?.platformCode) ? { platformCode: error.platformCode } : {}),
+      ...(Number.isInteger(replyPlatformCode) ? { replyPlatformCode } : {}) });
   }
 
   async function sendAttachments(job, result, control) {
@@ -146,7 +216,10 @@ function codexReplyUuidPrefix(job, result = {}) {
   ].join(':'));
 }
 
-export function markdownToFeishuPost(markdown, { allowMentionAll = false } = {}) {
+// textMode (group text replies) also converts mentions inside code, accepts
+// every at spelling with an optional display name and masks any open_id left
+// in text. The default conversion is the original fallback-reply format.
+export function markdownToFeishuPost(markdown, { allowMentionAll = false, textMode = false } = {}) {
   const content = [];
   let inCodeBlock = false;
   for (const rawLine of String(markdown || '').split(/\r?\n/)) {
@@ -161,9 +234,10 @@ export function markdownToFeishuPost(markdown, { allowMentionAll = false } = {})
       content.push([{ tag: 'text', text: ' ' }]);
       continue;
     }
-    content.push(markdownInlineToFeishuElements(line, { allowMentionAll, allowMentions: !isCodeLine }));
+    content.push(markdownInlineToFeishuElements(line, { allowMentionAll, allowMentions: textMode || !isCodeLine, textMode }));
   }
-  return { zh_cn: { title: '', content: content.length ? content : [[{ tag: 'text', text: '' }]] } };
+  const lines = content.length ? content : [[{ tag: 'text', text: '' }]];
+  return { zh_cn: { title: '', content: textMode ? lines.map(line => line.map(maskElement)) : lines } };
 }
 
 function normalizeMarkdownLine(line) {
@@ -174,16 +248,20 @@ function normalizeMarkdownLine(line) {
     .replace(/`([^`]+)`/g, '$1');
 }
 
-function mentionElements(text, { allowMentionAll, allowMentions }) {
+function mentionElements(text, { allowMentionAll, allowMentions, textMode = false }) {
   if (!allowMentions) return [{ tag: 'text', text }];
   const elements = [];
-  const pattern = /<at (user_id|open_id)="([^"]*)"><\/at>|@\{([^}]*)\}/g;
+  const pattern = textMode ? /<at\s+(id|user_id|open_id)\s*=\s*["']?([A-Za-z0-9_-]+)["']?\s*>([^<\n]*)<\/at>|@\{([^}\n]*)\}/g
+    : /<at (user_id|open_id)="([^"]*)"><\/at>|@\{([^}]*)\}/g;
+  const validId = textMode ? /^ou_[A-Za-z0-9_-]+$/ : /^ou_[a-z0-9]+$/;
   let index = 0;
   for (const match of text.matchAll(pattern)) {
-    const id = match[2] ?? match[3];
-    if (!/^ou_[a-z0-9]+$/.test(id) && !(allowMentionAll && match[1] === 'user_id' && id === 'all')) continue;
+    const id = textMode ? match[2] ?? match[4] : match[2] ?? match[3];
+    if (!validId.test(id) && !(allowMentionAll && match[1] === 'user_id' && id === 'all')) continue;
     if (match.index > index) elements.push({ tag: 'text', text: text.slice(index, match.index) });
-    elements.push({ tag: 'at', user_id: id });
+    const label = textMode ? String(match[3] ?? '').trim() : '';
+    const name = label.search(OPEN_ID_TEXT) === -1 ? label : '';
+    elements.push(name ? { tag: 'at', user_id: id, user_name: name } : { tag: 'at', user_id: id });
     index = match.index + match[0].length;
   }
   if (index < text.length) elements.push({ tag: 'text', text: text.slice(index) });
@@ -204,9 +282,9 @@ function markdownInlineToFeishuElements(line, options) {
   return elements.length ? elements : [{ tag: 'text', text: line }];
 }
 
-function chunkText(text, size) {
+function chunkText(text, size, pattern = MENTIONS) {
   const chunks = [];
-  const mentions = /<at (?:user_id|open_id)="[^"]*"><\/at>|@\{[^}]*\}/g;
+  const mentions = new RegExp(pattern.source, 'g');
   for (let index = 0; index < text.length;) {
     let end = Math.min(index + size, text.length);
     mentions.lastIndex = index;
@@ -221,6 +299,27 @@ function chunkText(text, size) {
     index = end;
   }
   return chunks.length ? chunks : [''];
+}
+
+function maskOpenIds(text) {
+  return String(text).replace(OPEN_ID_TEXT, MASKED_MEMBER);
+}
+
+function maskElement(element) {
+  return ['text', 'a'].includes(element.tag) && typeof element.text === 'string' ? { ...element, text: maskOpenIds(element.text) } : element;
+}
+
+// One plain line that a text message shows exactly as the post would.
+function plainLine(chunk, post) {
+  const lines = post.zh_cn.content;
+  return lines.length === 1 && lines[0].length === 1 && lines[0][0].tag === 'text' && lines[0][0].text === chunk
+    && chunk.trim() !== '' && !chunk.includes('<at');
+}
+
+function failureLine(answer) {
+  const line = String(answer || '').replace(/\s+/g, ' ').trim() || '执行未完成，请稍后重试。';
+  const chars = Array.from(line);
+  return chars.length <= FAILURE_LINE_MAX_CHARS ? line : `${chars.slice(0, FAILURE_LINE_MAX_CHARS - 1).join('')}…`;
 }
 
 function limitText(text, max = 12000) {

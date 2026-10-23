@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { validateConfig } from '../src/config.mjs';
@@ -24,7 +24,7 @@ function sessionStore() {
   };
 }
 
-test('service launches the real executor child with mapped config and closes an active turn', { timeout: 15000 }, async t => {
+test('service launches the real executor child with mapped config and closes an active turn', { timeout: 20000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-service-executor-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   let service;
@@ -33,11 +33,12 @@ test('service launches the real executor child with mapped config and closes an 
   const observed = join(directory, 'observed.json');
   await writeFile(child, `#!/usr/bin/env node
 import readline from 'node:readline';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 let turnStarts=0;
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const message=JSON.parse(line);
+ if(['thread/start','thread/resume','turn/start'].includes(message.method)) appendFileSync(process.env.OBSERVED_FILE+'.rpc',JSON.stringify({method:message.method,cwd:message.params.cwd})+'\\n');
  if(message.method==='initialize') { writeFileSync(process.env.OBSERVED_FILE,JSON.stringify(process.env)); send({id:message.id,result:{}}); }
  else if(message.method==='thread/start') send({id:message.id,result:{thread:{id:'thread-1'}}});
  else if(message.method==='thread/resume'&&message.params.threadId==='log-reject') send({id:message.id,error:{code:-32000,message:'active writer SYNTHETIC_SECRET'}});
@@ -48,6 +49,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
 });
 `);
   await chmod(child, 0o755);
+  const groupWorkspace = join(directory, 'group-workspace');
+  await mkdir(groupWorkspace, { mode: 0o700 });
 
   const raw = {
     schemaVersion: 1,
@@ -56,7 +59,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], rulesFiles: ['AGENTS.md'], rolloverOnRulesUpdate: true, computerUse: true },
     feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot', catchup: false },
     routing: { version: '1', privateUserIds: [], groups: [{ conversationId: 'chat', trigger: 'mention', passiveContext: true, capabilities: ['bridge'] },
-      { conversationId: 'chat-full', trigger: 'mention', passiveContext: true, capabilities: ['bridge', 'hook'], codex: { approvalPolicy: 'never', sandbox: 'danger-full-access' } },
+      { conversationId: 'chat-full', trigger: 'mention', passiveContext: true, capabilities: ['bridge', 'hook'], codex: { approvalPolicy: 'never', sandbox: 'danger-full-access', cwd: `${groupWorkspace}/` } },
       { conversationId: 'chat-hook', trigger: 'mention', passiveContext: false, capabilities: ['hook'] }] },
     hooks: [],
   };
@@ -106,12 +109,21 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await forwardInstance.recover();
   assert.equal(forwardJob.status,'completed');
   assert.equal(forwardJob.result.rawAnswer,'done');
-  const active = executorInstance.execute({bindingOpenId:'other-human',chatId:'chat',chatType:'group',messageId:'active',prompt:'work',busyPolicy:'steer'}).catch(error=>error);
+  const active = executorInstance.execute({bindingOpenId:'other-human',chatId:'chat-full',chatType:'group',messageId:'active',prompt:'work',busyPolicy:'steer'}).catch(error=>error);
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try { await access(`${observed}.turn`); break; }
     catch { await new Promise(resolve => setTimeout(resolve, 5)); }
   }
   await access(`${observed}.turn`);
+  const readRpc = async () => (await readFile(`${observed}.rpc`, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line));
+  for (let attempt = 0; attempt < 100 && (await readRpc()).filter(call => call.method === 'turn/start').length < 2; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  // The plain group keeps the global cwd; the group with its own cwd uses it for thread/start and turn/start.
+  assert.deepEqual(await readRpc(), [
+    { method: 'thread/start', cwd: directory }, { method: 'turn/start', cwd: directory },
+    { method: 'thread/start', cwd: groupWorkspace }, { method: 'turn/start', cwd: groupWorkspace },
+  ]);
   const childEnv = JSON.parse(await readFile(observed, 'utf8'));
   assert.equal(childEnv.UNSELECTED_SECRET, undefined);
   assert.equal(childEnv.HOME, undefined);
@@ -126,12 +138,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal(executorConfig.approvalsReviewer, 'auto_review');
   assert.equal(executorConfig.sandbox, 'workspace-write');
   assert.equal(executorConfig.networkAccess, true);
+  assert.equal(executorConfig.permissionProfile, undefined);
   assert.equal(executorConfig.rolloverCheckTimeoutMs, 30_000);
   assert.equal(executorConfig.memoryCheckIntervalMs, 60_000);
   assert.equal(executorConfig.memoryMaxRssBytes, 1536 * 1024 * 1024);
   assert.equal(executorConfig.memoryMaxHeapUsedBytes, 1024 * 1024 * 1024);
   assert.deepEqual([...executorConfig.allowedGroupChatIds].sort(), ['chat', 'chat-full']);
-  assert.deepEqual(executorConfig.groupCodexOverrides, new Map([['chat-full', { approvalPolicy: 'never', sandbox: 'danger-full-access' }]]));
+  assert.deepEqual(executorConfig.groupCodexOverrides, new Map([['chat-full', { approvalPolicy: 'never', sandbox: 'danger-full-access', cwd: groupWorkspace }]]));
+  assert.equal(executorConfig.cwd, directory);
   assert.equal(forwardConfig.executeTimeoutMs, 12 * 60 * 60 * 1000 + 10_000);
   assert.equal(forwardConfig.retryDelayMs, 60_000);
   assert.equal(forwardConfig.maxAttempts, 3);
@@ -147,6 +161,76 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const rpcLog = logEvents.find(event => event.operation === 'rpc_request');
   assert.deepEqual({code:rpcLog.code,rpcMethod:rpcLog.rpc_method}, {code:'CODEX_THREAD_BUSY',rpcMethod:'thread/resume'});
   assert.equal(JSON.stringify(logEvents).includes('SYNTHETIC_SECRET'), false);
+  assert.equal(logEvents.some(event => 'permissionProfile' in event || 'activePermissionProfile' in event), false, 'no profile, no profile log fields');
   await service.close();
   assert.equal((await active).code,'CODEX_OBSERVATION_LOST');
+});
+
+test('service maps codex.permissionProfile to the executor, the app-server arguments, thread requests and the logs', { timeout: 20000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-service-profile-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let service;
+  t.after(async () => service?.close());
+  const child = join(directory, 'codex-fixture.mjs');
+  const observed = join(directory, 'observed.jsonl');
+  // The fixture reports `permissions` back as the active profile, like app-server 0.153.4 with experimentalApi.
+  // It rejects turn/start after recording it, so no completion notification can race the turn registration.
+  await writeFile(child, `#!/usr/bin/env node
+import readline from 'node:readline';
+import { appendFileSync } from 'node:fs';
+const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
+if(process.argv[2]==='app-server') appendFileSync(process.env.OBSERVED_FILE,JSON.stringify({argv:process.argv.slice(2)})+'\\n');
+readline.createInterface({input:process.stdin}).on('line',line=>{
+ const message=JSON.parse(line);
+ if(message.method!=='initialize') appendFileSync(process.env.OBSERVED_FILE,JSON.stringify({method:message.method,params:message.params})+'\\n');
+ const profile=message.params?.permissions?{activePermissionProfile:{id:message.params.permissions,extends:null}}:{};
+ if(message.method==='thread/start') send({id:message.id,result:{thread:{id:'thread-1',cwd:message.params.cwd},...profile}});
+ else if(message.method==='turn/start') send({id:message.id,error:{code:-32000,message:'synthetic turn rejection'}});
+ else send({id:message.id,result:{}});
+});
+`);
+  await chmod(child, 0o755);
+  const raw = {
+    schemaVersion: 1,
+    listen: { host: '127.0.0.1', port: 0 },
+    storage: { hostEnv: 'DB_HOST', portEnv: 'DB_PORT', userEnv: 'DB_USER', passwordEnv: 'DB_PASSWORD', databaseEnv: 'DB_DATABASE' },
+    codex: { bin: child, cwd: directory, envNames: ['PATH', 'OBSERVED_FILE'], permissionProfile: 'operator' },
+    feishu: { connectionId: 'fixture', appIdEnv: 'APP_ID', appSecretEnv: 'APP_SECRET', botOpenId: 'bot', catchup: false },
+    routing: { version: '1', privateUserIds: ['human'], groups: [] },
+    hooks: [],
+  };
+  const env = { DB_HOST: 'unused', DB_PORT: '3306', DB_USER: 'unused', DB_PASSWORD: 'unused', DB_DATABASE: 'unused',
+    APP_ID: 'app', APP_SECRET: 'secret', PATH: process.env.PATH, HOME: directory, OBSERVED_FILE: observed };
+  let executorConfig;
+  let executorInstance;
+  const logEvents = [];
+  const inertWorker = { start() {}, beginStop() {}, async ingestCardAction() {}, async stop() {}, status: () => ({ running: true }) };
+  service = await startService({ config: validateConfig(raw), configPath: join(directory, 'bridge.json'), env,
+    log: createLogger({ write(value) { logEvents.push(JSON.parse(value)); } }), dependencies: {
+    pool: () => ({ async query() {}, async end() {} }),
+    store: async () => ({ async assertCurrent() {}, async close() {} }),
+    sessions: () => sessionStore(),
+    jobs: () => ({}), inbound: () => ({}), feedback: () => ({}), replies: () => ({}),
+    communication: () => inertWorker, forward: () => inertWorker,
+    executor: input => { executorConfig = input.config; executorInstance = createCodexExecutor(input); return executorInstance; },
+    media: async () => ({}), typing: () => ({}), outbound: async () => ({}), chat: () => ({}),
+    sdk: { Client: class {}, WSClient: class {}, defaultHttpInstance: {} },
+    feishu: () => ({ async start() {}, async stop() {}, status: () => ({ connected: true }) }),
+  } });
+  assert.equal(executorConfig.permissionProfile, 'operator');
+  await assert.rejects(executorInstance.execute({ bindingOpenId: 'human', chatId: 'chat-private', chatType: 'p2p', messageId: 'message-1', prompt: 'work', busyPolicy: 'reject' }),
+    { code: 'CODEX_TURN_START_UNCONFIRMED', rpcMethod: 'turn/start' }, 'the thread passed the profile check and reached turn/start');
+  const records = (await readFile(observed, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line));
+  assert.deepEqual(records.find(record => record.argv).argv, ['app-server', '--listen', 'stdio://', '-c', 'shell_environment_policy.inherit=all']);
+  const start = records.find(record => record.method === 'thread/start').params;
+  assert.equal(start.permissions, 'operator');
+  assert.equal('sandbox' in start, false);
+  const turn = records.find(record => record.method === 'turn/start').params;
+  assert.deepEqual(Object.keys(turn).sort(), ['approvalPolicy', 'approvalsReviewer', 'cwd', 'input', 'threadId']);
+  const started = logEvents.find(event => event.operation === 'app_server_start');
+  assert.deepEqual({ status: started.status, permissionProfile: started.permissionProfile }, { status: 'succeeded', permissionProfile: 'operator' });
+  const confirmed = logEvents.find(event => event.operation === 'thread_start');
+  assert.deepEqual({ level: confirmed.level, status: confirmed.status, rpcMethod: confirmed.rpc_method, permissionProfile: confirmed.permissionProfile,
+    activePermissionProfile: confirmed.activePermissionProfile }, { level: 'info', status: 'succeeded', rpcMethod: 'thread/start', permissionProfile: 'operator', activePermissionProfile: 'operator' });
+  await service.close();
 });

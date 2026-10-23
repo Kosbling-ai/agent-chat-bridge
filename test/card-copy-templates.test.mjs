@@ -49,3 +49,16 @@ test('missing tool summary follows hot-loaded state text instead of storing an o
   current={...current,running:'忙碌'};await card.update();
   assert.equal(content.body.elements.find(x=>x.tag==='collapsible_panel').elements[0].content,'- 检查 · 忙碌');
 });
+
+test('commandTitleTemplate accepts partial placeholders and rejects unknown ones', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'card-command-title-')); t.after(() => rm(root, { recursive:true, force:true }));
+  const file = join(root, 'copy.json'), get = createCardTextProvider({file});
+  assert.equal(DEFAULT_CARD_TEXT.commandTitleTemplate, '{name}');
+  for (const value of ['{label}', '{name} · {label}']) {
+    await writeFile(file, JSON.stringify({commandTitleTemplate:value})); assert.equal((await get()).commandTitleTemplate, value);
+  }
+  const valid = await get();
+  for (const value of ['{unknown}', '{name} {title}']) {
+    await writeFile(file, JSON.stringify({commandTitleTemplate:value})); assert.deepEqual(await get(), valid);
+  }
+});

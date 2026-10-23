@@ -28,32 +28,46 @@ const INJECTION_STALE = Symbol('injection_stale');
 const fingerprint = (value) => createHash('sha256').update(String(value)).digest('hex');
 const humanGroupBinding = (binding) => Boolean(binding?.chatType && binding.chatType !== 'p2p' && !isScheduledBinding(binding.feishuOpenId));
 
-export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now } = {}) {
+const sleepFor = (milliseconds) => new Promise((resolve) => { const timer = setTimeout(resolve, milliseconds); timer.unref?.(); });
+// Coalesces full-text rewrites per key. With `minIntervalMs`, two writes for
+// the same key start at least that far apart; updates in between collapse into
+// the latest value, and the last value is always written.
+export function createDeltaCoalescer({ write, onError = () => {}, now = Date.now, minIntervalMs = 0, sleep = sleepFor } = {}) {
   if (typeof write !== 'function') throw new Error('delta writer is required');
   const entries = new Map();
   return (key, value) => {
-    const current = entries.get(key);
-    if (current) {
-      current.value = value;
-      current.pending = true;
-      return current.promise;
+    let entry = entries.get(key);
+    if (entry?.running) {
+      entry.value = value;
+      entry.pending = true;
+      return entry.promise;
     }
-    const entry = { value, pending: false, promise: null };
-    entries.set(key, entry);
+    if (!entry) { entry = { lastStartedAt: undefined, idleTimer: undefined }; entries.set(key, entry); }
+    clearTimeout(entry.idleTimer);
+    entry.value = value;
+    entry.pending = true;
+    entry.running = true;
     entry.promise = (async () => {
-      while (true) {
+      while (entry.pending) {
+        // Bounded by the interval itself, so a clock step backwards cannot stall writes.
+        const remaining = entry.lastStartedAt === undefined ? 0 : Math.min(minIntervalMs, minIntervalMs - (now() - entry.lastStartedAt));
+        if (remaining > 0) await sleep(remaining);
         entry.pending = false;
         const snapshot = entry.value;
         const startedAt = now();
+        entry.lastStartedAt = startedAt;
         try { await write(snapshot); }
         catch (error) {
           try { Promise.resolve(onError(error, Math.max(0, now() - startedAt), snapshot)).catch((_observerError) => {}); }
           catch { /* observability never alters delta coalescing */ }
         }
-        if (entry.pending) continue;
-        entries.delete(key);
-        return;
       }
+      entry.running = false;
+      if (minIntervalMs <= 0) { entries.delete(key); return; }
+      // Remember the last write for one interval so a delta arriving just after
+      // a write still waits; then forget the key.
+      entry.idleTimer = setTimeout(() => { if (!entry.running && entries.get(key) === entry) entries.delete(key); }, minIntervalMs);
+      entry.idleTimer.unref?.();
     })();
     return entry.promise;
   };
@@ -169,12 +183,21 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   const resolvedUserInputs = new Set();
   const loadedThreads = new Set();
   const injectedContext = new Map();
+  // Thread id -> cwd Codex reported for it on start or resume (bounded). Codex
+  // keeps the cwd a thread recorded at start; thread/resume does not move it.
+  const threadCwds = new Map();
+  // Group cwds for which a newly started thread reported another cwd; such a
+  // mismatch cannot be fixed by a new thread, so cwd rollover stops for them.
+  const unconfirmedCwds = new Set();
   let memoryTimer;
   let closing = false;
   let restartPending = '';
   let restartNotified = false;
   const persistDelta = createDeltaCoalescer({
     now,
+    // A streamed agent message rewrites its full accumulated text (up to 12000
+    // characters) on each write; at most two such rewrites per second per item.
+    minIntervalMs: 500,
     write: ({ state, event }) => sessionStore.saveCodexRealtimeEvent(state.binding, event),
     onError: (error, durationMs, snapshot) => log('warning', {
       module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_delta', status: 'failed',
@@ -211,33 +234,76 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     return { feishuOpenId, chatId, chatType };
   }
 
-  // A configured group may switch the Codex approval and sandbox settings for
-  // every thread bound to that group chat: the human group thread and
-  // business-event threads whose result chat is the group. Only group bindings
-  // match, so a private chat whose id equals a configured group id keeps the
-  // global settings.
+  // A configured group may switch the Codex working directory, approval and
+  // sandbox settings for every thread bound to that group chat: the human group
+  // thread and business-event threads whose result chat is the group. Only
+  // group bindings match, so a private chat whose id equals a configured group
+  // id keeps the global settings.
   const groupCodexOverrides = new Map(config.groupCodexOverrides || []);
+  const groupCwdFor = (binding) => (binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId)?.cwd : undefined) || '';
+  const sameCwd = (left, right) => resolve(left) === resolve(right);
+  function rememberThreadCwd(threadId, value) {
+    const cwd = trim(value);
+    if (!threadId || !cwd) return;
+    threadCwds.delete(threadId);
+    threadCwds.set(threadId, cwd);
+    if (threadCwds.size > 2000) threadCwds.delete(threadCwds.keys().next().value);
+  }
+  // A named permission profile (`codex.permissionProfile`) replaces the legacy
+  // sandbox on every thread of this instance. The app-server rejects
+  // `permissions` together with `sandbox`, and a `sandbox` alone would select
+  // the legacy mode instead of the profile, so the key is left out entirely.
+  const permissionProfile = trim(config.permissionProfile);
   function codexPolicyFor(binding) {
     const override = binding?.chatType === 'group' ? groupCodexOverrides.get(binding.chatId) : undefined;
-    return {
+    const policy = {
+      cwd: override?.cwd || config.cwd,
       approvalPolicy: normalizeApprovalPolicy(override?.approvalPolicy || config.approvalPolicy),
       approvalsReviewer: normalizeApprovalsReviewer(override?.approvalsReviewer || config.approvalsReviewer),
-      sandbox: override?.sandbox || config.sandbox || 'workspace-write',
     };
+    if (permissionProfile) policy.permissions = permissionProfile;
+    else policy.sandbox = override?.sandbox || config.sandbox || 'workspace-write';
+    return policy;
+  }
+
+  // With a profile configured, a started, resumed or forked thread is used only
+  // when Codex reports that profile as active; otherwise the thread is not
+  // loaded, bound or given a turn (fail-closed). Without a profile nothing is
+  // checked or logged.
+  function confirmPermissionProfile(rpcMethod, response) {
+    if (!permissionProfile) return;
+    const reported = response?.activePermissionProfile?.id;
+    // Compared untruncated; only the logged and reported copy is bounded.
+    const active = typeof reported === 'string' ? reported.slice(0, 128) : '';
+    const event = { module: 'agent-chat-bridge', component: 'codex-executor', operation: rpcMethod.replace('/', '_'), rpc_method: rpcMethod,
+      permissionProfile, ...(active ? { activePermissionProfile: active } : {}) };
+    if (reported === permissionProfile) {
+      try { log('info', { ...event, status: 'succeeded' }); } catch { /* logging is observational */ }
+      return;
+    }
+    try { log('error', { ...event, status: 'failed', error_code: 'CODEX_PERMISSION_PROFILE_MISMATCH' }); } catch { /* logging is observational */ }
+    // A fixed message: retry classification matches words in messages, and a
+    // profile id must never turn this rejection into a retry. The ids travel as fields.
+    const error = coded('permission profile mismatch', 'CODEX_PERMISSION_PROFILE_MISMATCH');
+    error.expected = permissionProfile;
+    error.actual = active || null;
+    throw error;
   }
 
   // turn/start has no `sandbox` parameter (its `sandboxPolicy` is a structured
-  // policy object). The sandbox chosen on thread start, resume or fork stays in
-  // force for later turns, and every turn runs on a thread this app-server
-  // child started, resumed or forked through threadDefaults.
+  // policy object) and never carries `permissions`. The sandbox or permission
+  // profile chosen on thread start, resume or fork stays in force for later
+  // turns, and every turn runs on a thread this app-server
+  // child started, resumed or forked through threadDefaults. The cwd is sent on
+  // every turn as well, because thread/resume does not move the cwd a thread
+  // recorded when it started.
   function turnPolicyFor(binding) {
-    const { approvalPolicy, approvalsReviewer } = codexPolicyFor(binding);
-    return { approvalPolicy, approvalsReviewer };
+    const { cwd, approvalPolicy, approvalsReviewer } = codexPolicyFor(binding);
+    return { cwd, approvalPolicy, approvalsReviewer };
   }
 
   function threadDefaults(extra = {}, binding) {
     return {
-      cwd: config.cwd,
       ...codexPolicyFor(binding),
       ...(config.model ? { model: config.model } : {}),
       ...extra,
@@ -252,7 +318,15 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }, actor));
     const threadId = trim(response?.thread?.id);
     if (!threadId) throw coded('Codex did not return a thread id', 'CODEX_THREAD_START_UNCONFIRMED', { outcome: 'unknown' });
+    confirmPermissionProfile('thread/start', response);
     loadedThreads.add(threadId);
+    const reportedCwd = trim(response?.thread?.cwd);
+    rememberThreadCwd(threadId, reportedCwd);
+    const groupCwd = groupCwdFor(actor);
+    if (groupCwd && reportedCwd && !sameCwd(reportedCwd, groupCwd) && !unconfirmedCwds.has(resolve(groupCwd))) {
+      unconfirmedCwds.add(resolve(groupCwd));
+      log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'thread_rollover', status: 'skipped', reason: 'cwd_unconfirmed', chat_id: actor.chatId });
+    }
     return { threadId, threadName: buildThreadName(actor) };
   }
 
@@ -277,6 +351,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       response = await client.request('thread/resume', threadDefaults({ threadId: binding.codexSessionId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      confirmPermissionProfile('thread/resume', response);
+      rememberThreadCwd(binding.codexSessionId, response?.thread?.cwd);
     } catch (error) {
       if (error?.code === 'CODEX_THREAD_BUSY' && error.outcome === 'rejected') {
         error.phase = 'pre_admission';
@@ -428,7 +504,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   // Replace-mode instructions supersede the default group wording only once the
   // thread actually holds them; otherwise the default wording stays.
   async function initialPrompt(binding, input, instructionMode = '') {
-    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
+    // The result-file directory is announced as an absolute path under the
+    // global workspace, where collectOutboxAttachments scans it, so it stays
+    // correct whatever cwd the thread runs in.
+    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
     if (!isScheduledBinding(binding.feishuOpenId)) return { prompt: buildInitialPrompt(options) };
     const hash = fingerprint(systemTaskPreamble(options));
     let present = false;
@@ -445,7 +524,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     }
     if (key.startsWith('error:')) {
       const detail = parseDetail(event);
-      return { failed: true, errorCode: detail.errorCode === 'CODEX_USAGE_LIMIT_EXCEEDED' ? detail.errorCode : 'CODEX_TURN_FAILED', turnStatus: detail.turnStatus === 'interrupted' ? 'interrupted' : 'failed', deferred: false, duplicate: true, reason: 'duplicate_error', threadId: binding.codexSessionId, turnId, answer: 'Codex 会话失败。' };
+      return { failed: true, errorCode: detail.turnStatus === 'interrupted' || detail.errorCode === 'CODEX_TURN_INTERRUPTED' ? 'CODEX_TURN_INTERRUPTED' : ['CODEX_USAGE_LIMIT_EXCEEDED', 'CODEX_SERVER_OVERLOADED'].includes(detail.errorCode) ? detail.errorCode : 'CODEX_TURN_FAILED', turnStatus: detail.turnStatus === 'interrupted' || detail.errorCode === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed', deferred: false, duplicate: true, reason: 'duplicate_error', threadId: binding.codexSessionId, turnId, answer: 'Codex 会话失败。' };
     }
     return { deferred: true, accepted: key.startsWith('user-steer-confirmed:'), duplicate: true, reason: 'duplicate_message', threadId: binding.codexSessionId, turnId };
   }
@@ -699,8 +778,16 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   function finalizeTurn(state) {
     return state.completed.then(async ({ turn }) => {
       const answer = finalAnswer(turn) || state.lastAgentMessage;
-      if (answer) await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `assistant-final:${state.messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId } });
-      await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: '' });
+      // The turn has run: its answer is returned even when the receipt or the
+      // binding touch cannot be stored (slow or unavailable storage). A storage
+      // error here must neither discard the answer nor make the caller retry,
+      // which could submit the prompt again.
+      if (answer) {
+        try { await sessionStore.saveCodexRealtimeEvent(state.binding, { messageId: state.messageId, eventKey: `assistant-final:${state.messageId || stableKey(answer)}`, eventType: 'agent_message', role: 'assistant', title: 'Codex 回复', text: answer, createdAt: now(), detail: { phase: 'final_answer', turnId: state.turnId } }); }
+        catch (error) { logFinalAnswerPersistenceFailure(state, 'event', error); }
+      }
+      try { await sessionStore.touchCodexBinding(state.binding, { messageId: state.messageId, lastError: '' }); }
+      catch (error) { logFinalAnswerPersistenceFailure(state, 'touch', error); }
       return {
         deferred: false,
         threadId: state.threadId,
@@ -716,7 +803,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         eventType: 'error', role: 'activity',
         title: '执行失败',
         text: error.message, createdAt: now(),
-        detail: { errorCode: error.code, turnId: state.turnId, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
+        detail: { errorCode: error.code, turnId: state.turnId, startedAt: state.startedAt, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : error.outcome === 'unknown' ? 'unknown' : 'failed' },
       };
       try { await sessionStore.saveCodexRealtimeEvent(state.binding, observationEvent); }
       catch { logObservationPersistenceFailure(state, 'event'); }
@@ -724,6 +811,17 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       catch { logObservationPersistenceFailure(state, 'touch'); }
       throw error;
     });
+  }
+
+  function logFinalAnswerPersistenceFailure(state, stage, error) {
+    try {
+      const normalized = databaseError(error);
+      log('warning', {
+        module: 'agent-chat-bridge', component: 'codex-executor', operation: 'persist_final_answer', status: 'failed',
+        stage, errorClass: normalized.code, errno: normalized.errno, sqlState: normalized.sqlState,
+        threadId: state.threadId, turnId: state.turnId,
+      });
+    } catch { /* diagnostics must not replace the completed answer */ }
   }
 
   function logObservationPersistenceFailure(state, stage) {
@@ -771,6 +869,10 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         }
         if (normalized.messageId && normalized.messageId === active.messageId) {
           if (hasOpenWaiter(active)) return { completion: Promise.resolve({ deferred: true, accepted: true, rootMessageId: active.messageId, threadId: active.threadId, turnId: active.turnId }) };
+          // Taking over the still-running turn of this message: it was submitted
+          // by an earlier attempt, so tell the caller before attaching (a later
+          // storage failure of this attempt must not be retried as a new turn).
+          await options.onStartIntent?.({ binding: active.binding, threadId: active.threadId, messageId: normalized.messageId, startedAt: active.startedAt, takeover: true });
           return { completion: waitForTurn(active, normalized.messageId, { takeover: true, signal: options.signal }) };
         }
         if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', {
@@ -781,7 +883,21 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       let binding = await ensureBinding(actor, normalized.messageId);
       const duplicate = await sessionStore.findAcceptedMessageEvent(binding, normalized.messageId);
-      if (duplicate) return { completion: Promise.resolve(duplicateResult(binding, duplicate)) };
+      if (duplicate) {
+        const detail = parseDetail(duplicate);
+        // A disconnect records lost observation, not a native terminal failure.
+        // Re-observe the exact admitted turn; never submit the prompt a second time.
+        if (String(duplicate.event_key || '').startsWith('error:')
+            && (detail.errorCode === 'CODEX_OBSERVATION_LOST' || detail.turnStatus === 'unknown')) {
+          const turnId = trim(detail.turnId);
+          const startedAt = Number(detail.startedAt || duplicate.created_at || duplicate.createdAt);
+          if (!turnId || !Number.isFinite(startedAt) || startedAt <= 0) {
+            throw coded('persisted observation has no confirmed turn identity', 'CODEX_OBSERVATION_LOST', { retryable: true, outcome: 'unknown' });
+          }
+          return { state: await prepareKnownResume(binding, normalized, { threadId: binding.codexSessionId, turnId, startedAt }) };
+        }
+        return { completion: Promise.resolve(duplicateResult(binding, duplicate)) };
+      }
       const reconciled = await reconcileSteer(binding, normalized.messageId, normalized.prompt);
       if (reconciled) return { completion: Promise.resolve(reconciled) };
       binding = await maybeRollover(binding, normalized.messageId);
@@ -795,7 +911,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       let admission = startAdmission(binding.codexSessionId, normalized.messageId);
       try {
         response = await client.request('turn/start', {
-          threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
+          threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments),
           ...turnPolicyFor(binding),
           ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
         });
@@ -810,7 +926,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           await persistUser(binding, normalized, 'user', prompt);
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
-            threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments), cwd: config.cwd,
+            threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments),
             ...turnPolicyFor(binding),
             ...(config.model ? { model: config.model } : {}), ...(config.reasoningEffort ? { effort: config.reasoningEffort } : {}),
           }).catch((failure) => { startingByThread.delete(admission.threadId); admission.reject(failure); throw failure; });
@@ -852,13 +968,33 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   async function ensureBindingThreadReadyWithArchiveRecovery(binding, messageId) {
-    try { await ensureThreadReady(binding); return binding; }
+    let ready = binding;
+    try { await ensureThreadReady(binding); }
     catch (error) {
       if (error?.code !== 'CODEX_THREAD_ARCHIVED') throw error;
-      const next = await rolloverArchivedBinding(binding, messageId, error);
-      await ensureThreadReady(next);
-      return next;
+      ready = await rolloverArchivedBinding(binding, messageId, error);
+      await ensureThreadReady(ready);
     }
+    return rolloverForCwdChange(ready, messageId);
+  }
+
+  // A thread of a group with its own cwd that Codex recorded under another cwd
+  // (for example, started before the group cwd was configured) moves to a new
+  // thread before its next turn, so the work runs in, and AGENTS.md is read
+  // from, the configured directory. The new thread receives the full first-turn
+  // context. Groups without a cwd and private chats never take this path. A
+  // known-turn resume only records the cwd; the move happens on the next turn
+  // admission so an observed turn keeps its thread.
+  async function rolloverForCwdChange(binding, messageId) {
+    const expected = groupCwdFor(binding);
+    const recorded = threadCwds.get(binding.codexSessionId);
+    if (!expected || !recorded || sameCwd(recorded, expected) || unconfirmedCwds.has(resolve(expected))) return binding;
+    const next = await rollover(binding, messageId, 'cwd_changed', {
+      outText: 'Codex 工作目录已调整，后续飞书消息承接到新 Codex 会话。',
+      inText: '因 Codex 工作目录已调整，本会话开始承接后续飞书消息。',
+    });
+    log('info', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'thread_rollover', status: 'succeeded', reason: 'cwd_changed', chat_id: binding.chatId });
+    return next;
   }
 
   function rolloverArchivedBinding(binding, messageId, error) {
@@ -884,6 +1020,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     try {
       const response = await client.request('thread/resume', threadDefaults({ threadId: resume.threadId,
         ...(config.reasoningEffort ? { config: { model_reasoning_effort: config.reasoningEffort } } : {}) }, binding));
+      confirmPermissionProfile('thread/resume', response);
+      rememberThreadCwd(resume.threadId, response?.thread?.cwd);
       snapshot = exactTurnSnapshot(response?.thread, resume.turnId);
       const otherActiveIds = inProgressTurnIds(response?.thread).filter((turnId) => turnId !== resume.turnId);
       if (snapshot.status !== 'unknown' && otherActiveIds.length === 0) loadedThreads.add(resume.threadId);
@@ -922,12 +1060,19 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       if (takeover && messageId && messageId !== state.messageId) {
         await sessionStore.saveCodexRealtimeEvent(state.binding, {
           messageId, eventKey: `error:${messageId}`, eventType: 'error', role: 'activity', title: '执行失败',
-          text: error.message, createdAt: now(), detail: { errorCode: error.code, turnId: state.turnId, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : 'failed' },
+          text: error.message, createdAt: now(), detail: { errorCode: error.code, turnId: state.turnId, startedAt: state.startedAt, takeover: true, turnStatus: error.code === 'CODEX_TURN_INTERRUPTED' ? 'interrupted' : error.outcome === 'unknown' ? 'unknown' : 'failed' },
         }).catch((_error) => {});
         await sessionStore.touchCodexBinding(state.binding, { messageId, lastError: error.message }).catch((_error) => {});
       }
       throw error;
     });
+    // A caller whose signal is already aborted never observes `completion`.
+    // Without this handler, a turn already settled as interrupted or failed (a
+    // known resume after restart, with the lease lost during shutdown) rejected
+    // it unhandled and exited the process. The turn still ends through
+    // finalizeTurn, which persists its terminal error; the next attempt reads it
+    // and replies with the normal failure instead of replaying the prompt.
+    completion.catch((_error) => {});
     if (!signal) {
       try { return await completion; } finally { state.waiters.delete(waiter); }
     }
@@ -986,9 +1131,15 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       }
       const thread = response?.thread;
       const targetThreadId = trim(thread?.id);
-      if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(config.cwd)
+      if (!targetThreadId || targetThreadId === sourceThreadId || !trim(thread?.cwd) || resolve(trim(thread.cwd)) !== resolve(codexPolicyFor(actor).cwd)
         || thread?.ephemeral === true || (thread?.forkedFromId && thread.forkedFromId !== sourceThreadId)) {
         throw coded('fork response could not be verified', 'CODEX_FORK_UNCONFIRMED', { outcome: 'unknown' });
+      }
+      try { confirmPermissionProfile('thread/fork', response); }
+      catch (error) {
+        // The native fork exists but is not used; record it for the operator like a failed commit.
+        error.forkTargetThreadId = targetThreadId;
+        throw error;
       }
       let committed;
       try { committed = await onForked({ sourceThreadId, targetThreadId }); }
@@ -1066,6 +1217,9 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     const overHeap = config.memoryMaxHeapUsedBytes && usage.heapUsed >= config.memoryMaxHeapUsedBytes;
     if ((!overRss && !overHeap) || restartPending) return;
     restartPending = [overRss ? `rss ${usage.rss} >= ${config.memoryMaxRssBytes}` : '', overHeap ? `heapUsed ${usage.heapUsed} >= ${config.memoryMaxHeapUsedBytes}` : ''].filter(Boolean).join('; ');
+    try { log('warning', { module: 'agent-chat-bridge', component: 'codex-executor', operation: 'memory_guard', status: 'restart_pending',
+      error_code: 'CODEX_MEMORY_LIMIT', rssBytes: usage.rss, heapUsedBytes: usage.heapUsed,
+      rssLimitBytes: config.memoryMaxRssBytes, heapLimitBytes: config.memoryMaxHeapUsedBytes }); } catch { /* diagnostics must not affect the memory guard */ }
     maybeNotifyRestart();
   }
   if (Number(config.memoryCheckIntervalMs) >= 1000 && (config.memoryMaxRssBytes || config.memoryMaxHeapUsedBytes)) {
