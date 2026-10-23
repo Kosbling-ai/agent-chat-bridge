@@ -146,7 +146,8 @@ export async function startServer({ config, log, readiness, eventRuntime, jobs, 
         eventLog.type = result.type;
         eventLog.scopePrefix = authenticated.hook.inbound.scopePrefixes.find(prefix => result.scope?.startsWith(prefix));
         responseStatus = 200;
-        reply(response, 200, { job_id: result.jobId, status: result.status, updated_at: result.updatedAt });
+        reply(response, 200, { job_id: result.jobId, status: result.status, updated_at: result.updatedAt,
+          ...(result.observation ? { execution: result.observation.execution, scope: result.observation.scope, observed_at: result.observation.observed_at } : {}) });
       } else if (request.method !== 'GET') {
         responseStatus = 405;
         reply(response, 405, { error: 'method_not_allowed' });

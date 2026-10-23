@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.33] - 2026-10-23
+
+- Add authenticated event status observations for the exact native target turn and its current scope, including deferred steering targets. Queue snapshots include pending, running, reply-pending and held work.
+- Fail closed for missing bindings, missing targets, unknown turns, storage/native errors and concurrent binding changes. Do not expose prompts, native IDs or other caller scopes.
+- No database/config migration, dependency change, admission change or task replay.
+
 ## [0.2.32] - 2026-10-22
 
 - Assemble fragmented Codex JSON-RPC lines without repeatedly flattening and scanning the accumulated history. Image-heavy resume/read responses now take linear framing work; protocol contents, thread ownership and delivery deduplication are unchanged.

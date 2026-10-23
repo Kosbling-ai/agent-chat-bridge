@@ -137,14 +137,25 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   async function getEvent({ producerId, eventId }) {
     const messageId = eventMessageId(producerId, eventId);
     const job = await jobs.getByIdempotencyKey({ callerId: producerId, idempotencyKey: eventIdempotencyKey(producerId, eventId) });
-    return job?.messageId === messageId
-      ? {
-          jobId: job.id,
-          status: job.status,
-          updatedAt: job.updatedAt,
-          type: job.result?.businessEvent?.type,
-          scope: job.executionNamespace,
-        } : null;
+    if (job?.messageId !== messageId || job.callerId !== producerId) return null;
+    const observation = { execution: { state: 'unknown' }, scope: { state: 'unknown' }, observed_at: now() };
+    try {
+      const scope = job.executionNamespace;
+      if (scope && typeof jobs.scopeActivity === 'function' && typeof executor.observeExecution === 'function') {
+        const before = await jobs.scopeActivity({ callerId: producerId, executionNamespace: scope });
+        const native = await executor.observeExecution({ bindingOpenId: deriveExecutionScope(producerId, scope),
+          chatId: job.chatId, chatType: job.chatType, messageId: job.messageId,
+          threadId: job.result?.execution?.threadId || job.result?.threadId,
+          turnId: job.result?.execution?.turnId || job.result?.turnId });
+        const after = await jobs.scopeActivity({ callerId: producerId, executionNamespace: scope });
+        observation.execution.state = ['ended', 'running'].includes(native.execution) ? native.execution : 'unknown';
+        observation.scope.state = before.busy === true || after.busy === true || native.scope === 'busy' ? 'busy'
+          : before.busy === false && after.busy === false && native.scope === 'idle' ? 'idle' : 'unknown';
+      }
+    } catch { /* Missing storage/native evidence is never idle or ended. */ }
+    observation.observed_at = now();
+    return { jobId: job.id, status: job.status, updatedAt: job.updatedAt,
+      type: job.result?.businessEvent?.type, scope: job.executionNamespace, observation };
   }
 
   async function prepareRegistered(job) {

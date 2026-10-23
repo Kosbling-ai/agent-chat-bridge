@@ -1,6 +1,6 @@
 # Versions and migrations
 
-Application version: `0.2.32`
+Application version: `0.2.33`
 
 ## 0.2.31 business-card form transport
 
@@ -321,3 +321,17 @@ For rollback, stop the bridge before selecting the previous code version. Reuse 
 ## Source publication
 
 A release commit records version and changes; an annotated `v0.1.0` tag may identify its exact source snapshot once publication is authorized. Public GitHub source, a GitHub release, npm publication and production deployment are separate actions. Keep `private: true`; do not deploy, publish npm packages or claim real-platform acceptance merely because source was pushed.
+
+
+## 0.2.33 event execution observation
+
+No database/config migration, dependency change or job replay. `GET /v1/events/:event_id` gains `execution.state`, `scope.state` and `observed_at`. Consumers must treat absent or unknown evidence as unverified; a deferred job is not itself native completion. These are snapshots, not an exclusive execution lease or proof of business completion.
+
+Production host checklist (Bruce):
+
+1. In `/Users/kosbling/kosbling-automation/agent-chat-bridge`, deploy the reviewed 0.2.33 commit from the shared remote, then run `npm test`, `npm run check` and `npm run version:check`. No migrate command is required. Follow the configured supervisor's supported restart lifecycle in an idle window; do not start a second bot WebSocket owner.
+2. Confirm configured instances recover `/health/ready`. Read an existing owned event using its hook bearer, without logging the bearer. Verify a running/deferred target reports running/busy, then ended/idle after its native target and all same-scope work end. Other active scopes must not block this one; missing evidence must remain unknown. Do not create a business operation just for verification.
+3. Confirm the dependent consumer uses both native-ended and scope-idle evidence before recovery and still checks its own current business version and authorization. HTTP success, job completion or idle scope does not authorize business writes.
+4. Roll back to the recorded 0.2.32 commit through the same targeted supervisor restart if needed. No data rollback; consumers must fail closed when the observation fields disappear.
+
+Local verification includes the real HTTP handler, forward runtime and Codex executor against a synthetic RPC child. The isolated MySQL suite verifies exact scope/caller/connection matching; it requires a local Docker daemon and must not run against production credentials.

@@ -166,6 +166,16 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
       const keyHash = hash(`${required(callerId, 128)}\0${required(idempotencyKey, 512)}`);
       return getBy('request_key_hash', keyHash);
     },
+    scopeActivity({ callerId, executionNamespace }) {
+      return read(async connection => {
+        const [rows] = await connection.execute(`SELECT /*+ MAX_EXECUTION_TIME(1500) */ 1 AS active
+          FROM assistant_codex_forward_jobs
+          WHERE connection_id=? AND BINARY caller_id=? AND BINARY execution_namespace=?
+            AND status IN ('pending','running','reply_pending','held') LIMIT 1`,
+        [connectionId, required(callerId, 128), required(executionNamespace, 191)]);
+        return { busy: rows.length > 0 };
+      });
+    },
     loadRecoverable(input = {}) {
       const take = Math.max(1, Math.min(5, Number(input.limit || 1)));
       return read(async connection => {
