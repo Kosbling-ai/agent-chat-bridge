@@ -355,3 +355,31 @@ test('instruction modes differ only in the injected note and replace mode drops 
   const system = { feishuOpenId: 'system:x', chatId: 'oc_r', chatType: 'group', created: true };
   assert.match(buildInitialPrompt({ ...options, binding: system, groupOpening: false }), /^【独立系统任务】/);
 });
+
+test('shared context reads only configured members and preserves source group on cross-group entries', async () => {
+  const group = id => ({ conversationId: id, trigger: 'mention', passiveContext: true, capabilities: ['bridge'] });
+  const config = validateConfig({ ...base, routing: { ...base.routing, groups: [group('first'), { ...group('second'), sharedConversationId: 'first' }, group('other')] } });
+  const reads = []; const forwarded = [];
+  const runtime = createCommunicationRuntime({ config, store: { acceptInbound: async () => ({ duplicate: false }) },
+    inbound: { async loadRecentGroupContext({ chatId }) { reads.push(chatId); return [{ messageId: `context-${chatId}`, prompt: `context ${chatId}`, createdAt: T0 - 1 }]; } },
+    forward: { async handleMessage(input) { forwarded.push(input); return { execution: { terminal: 'completed' } }; } }, chat: {}, now: () => T0 + 1000 });
+  await runtime.ingest({ connectionId: 'test', source: 'live', eventKey: 'trigger', type: 'message.received', conversationId: 'second', conversationType: 'group', messageId: 'trigger', occurredAt: T0,
+    actor: { type: 'user', openId: 'alice' }, message: { kind: 'text', content: JSON.stringify({ text: '<at>bot</at> proceed' }), mentions: [{ openId: 'bot', key: '<at>bot</at>' }] } });
+  await new Promise(setImmediate);
+  assert.deepEqual(reads.sort(), ['first', 'second']);
+  assert.equal(forwarded[0].message.conversationId, 'second');
+  assert.match(forwarded[0].prompt, /message_id=context-first chat_id=first/);
+  assert.doesNotMatch(forwarded[0].prompt, /context other/);
+});
+
+test('shared config rejects unknown anchors and workspace/permission conflicts', () => {
+  const group = id => ({ ...base.routing.groups[0], conversationId: id });
+  const raw = { ...base, routing: { ...base.routing, groups: [group('first'), { ...group('second'), sharedConversationId: 'missing' }] } };
+  assert.throws(() => validateConfig(raw), { code: 'invalid_shared_conversation' });
+  raw.routing.groups[1].sharedConversationId = 'first';
+  raw.routing.groups[1].codex = { approvalPolicy: 'never', sandbox: 'danger-full-access' };
+  assert.throws(() => validateConfig(raw), { code: 'shared_conversation_codex_conflict' });
+  delete raw.routing.groups[1].codex;
+  assert.equal(validateConfig(raw).routing.groups[1].sharedConversationId, 'first');
+  assert.throws(() => validateConfig({ ...raw, conversationInput: { tokenEnv: 'TOKEN', chatIds: ['other'] } }), { code: 'invalid_conversation_input_chats' });
+});

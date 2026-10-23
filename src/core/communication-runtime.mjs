@@ -1,3 +1,4 @@
+import { conversationChatId } from '../agents/codex/thread-scope.mjs';
 import { randomUUID } from 'node:crypto';
 import { feishuEventIdentity } from '../channels/feishu/normalize.mjs';
 import { extractAttachments } from '../channels/feishu/media.mjs';
@@ -46,6 +47,7 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
   const contextAttachmentLimit=Number(config.codex.groupContextAttachmentLimit??10);
   const contextEnabled=contextLimit>0&&contextWindowMs>0;
   const recent=createRecentMentionPrompts({now});
+  const sharedConversations=new Map(config.routing.groups.filter(group=>group.sharedConversationId).map(group=>[group.conversationId,group.sharedConversationId]));
   const botReply=createReplyTrigger({inbound,chat,botOpenId:config.feishu.botOpenId,botAppId,now,log});
   const unlistedReplies=new Map();
   async function replyUnlistedGroup(event) {
@@ -175,10 +177,13 @@ export function createCommunicationRuntime({config,store,inbound,forward,chat,ou
       &&event.actor?.type==='user'&&!event.isApp&&!event.isSelf&&config.routing.unlistedGroupReply?.enabled&&!receipt.duplicate)await replyUnlistedGroup(event);
     if(!triggered||!forward)return receipt;
     launchForward((async()=>{
-      const memoryEntries=event.conversationType==='group'&&contextEnabled?recent.take(normalized.chatId):[];
-      const persistedEntries=event.conversationType==='group'&&group?.passiveContext&&contextEnabled&&inbound
-        ? await inbound.loadRecentGroupContext({connectionId,chatId:normalized.chatId,beforeMs:normalized.createdAt,windowMs:contextWindowMs,
-          limit:contextLimit,excludeMessageIds:[normalized.messageId]}) : [];
+      const anchor=conversationChatId(normalized.chatId,normalized.chatType,sharedConversations);
+      const contextGroups=normalized.chatType==='group'?config.routing.groups.filter(candidate=>candidate.passiveContext&&capabilities(candidate).includes('bridge')
+        &&conversationChatId(candidate.conversationId,'group',sharedConversations)===anchor):[];
+      const memoryEntries=contextEnabled?contextGroups.flatMap(candidate=>recent.take(candidate.conversationId).map(entry=>candidate.conversationId===normalized.chatId?entry:{...entry,chatId:candidate.conversationId})):[];
+      const persistedEntries=contextEnabled&&inbound?(await Promise.all(contextGroups.map(async candidate=>(await inbound.loadRecentGroupContext({connectionId,
+        chatId:candidate.conversationId,beforeMs:normalized.createdAt,windowMs:contextWindowMs,limit:contextLimit,excludeMessageIds:[normalized.messageId]}))
+          .map(entry=>candidate.conversationId===normalized.chatId?entry:{...entry,chatId:candidate.conversationId})))).flat():[];
       const contextEntries=contextEnabled?mergeContextEntries(persistedEntries,memoryEntries).slice(-contextLimit):[];
       const mediaResolvable=normalized.messageType!=='text';
       if(!normalized.text&&!contextEntries.length&&!mediaResolvable)return;

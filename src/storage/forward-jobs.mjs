@@ -409,7 +409,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
         const result = parse(found.result_json);
         const candidate = result.busyFork;
         if (found.status !== 'failed' || found.last_error !== 'CODEX_THREAD_BUSY' || found.message_id !== messageId
-          || found.chat_id !== chatId || result.executionCard?.messageId !== cardMessageId
+          || (candidate?.chatId || found.chat_id) !== chatId || result.executionCard?.messageId !== cardMessageId
           || candidate?.sourceThreadId !== sourceThreadId || candidate?.bindingOpenId !== bindingOpenId) return { outcome: 'stale' };
         if (result.fork) return { outcome: 'replay', fork: result.fork };
         const [[binding]] = await connection.execute(`SELECT codex_session_id FROM assistant_codex_sessions
@@ -653,7 +653,7 @@ export function createForwardJobStore({ pool, connectionId, now = Date.now, oper
           FROM assistant_codex_events
           WHERE connection_id=? AND feishu_open_id=? AND chat_id=? AND codex_session_id=? AND message_id=? AND id>?
             AND event_type IN ('public_progress','agent_message','error','session_rollover')
-          ORDER BY id LIMIT ${take}`, [connectionId,execution.bindingOpenId, found.chat_id, execution.threadId, found.message_id, after]);
+          ORDER BY id LIMIT ${take}`, [connectionId,execution.bindingOpenId, execution.bindingChatId || found.chat_id, execution.threadId, found.message_id, after]);
         return rows.map(item => {
           const progress = item.event_type === 'public_progress' ? parse(item.detail_json) : undefined;
           const payload = { role: item.role, title: item.title, text: item.text, ...(progress ? { progress } : {}) };

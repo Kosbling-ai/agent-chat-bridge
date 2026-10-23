@@ -2191,3 +2191,89 @@ test('local active executor prevents idle even when a native read is stale', asy
     assert.equal((await executor.observeExecution({ ...input, threadId: 'thread-1', turnId: 'turn-1' })).scope, 'busy');
   } finally { await executor.close(); await assert.rejects(running); }
 });
+
+test('shared groups and quiet prompts resume one native thread while ordinary groups stay isolated', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-shared-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  mkdirSync(join(cwd, 'home'));
+  for (const chatId of ['first', 'second']) {
+    mkdirSync(join(cwd, 'data/feishu-outbox', chatId), { recursive: true });
+    writeFileSync(join(cwd, 'data/feishu-outbox', chatId, `${chatId}.txt`), chatId);
+  }
+  const runtime = fakeRuntime(); const store = memoryStore();
+  const executor = createCodexExecutor({ config: { ...config(cwd), sharedConversations: new Map([['second', 'first']]), allowedGroupChatIds: new Set(['first', 'second']) }, sessionStore: store, spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const run = (chatId, id, internalPrompt = false) => executor.execute({ chatId, chatType: 'group', bindingOpenId: codexBindingOpenId({ chatId, chatType: 'group' }), messageId: id, prompt: `source ${chatId}`, groupChatContext: { chatId }, internalPrompt });
+  const a = await run('first', 'a'); const b = await run('second', 'b'); const wake = await run('first', 'wake', true); const other = await run('other', 'other');
+  assert.deepEqual(a.attachments, [join(cwd, 'data/feishu-outbox/first/first.txt')]);
+  assert.deepEqual(b.attachments, [join(cwd, 'data/feishu-outbox/second/second.txt')]);
+  assert.equal(a.threadId, b.threadId); assert.equal(b.threadId, wake.threadId); assert.notEqual(a.threadId, other.threadId);
+  assert.equal(store.bindings.size, 2);
+  const inputs = runtime.calls.filter(c => c.method === 'turn/start').map(c => c.params.input[0].text);
+  assert.match(inputs[1], /feishu-outbox\/second/); assert.doesNotMatch(inputs[1], /feishu-outbox\/first/);
+});
+
+test('cross-group input waits for current turn so reply and file destinations cannot mix', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-shared-active-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true })); mkdirSync(join(cwd, 'home'));
+  const runtime = fakeRuntime({ completeStarts: false });
+  const executor = createCodexExecutor({ config: { ...config(cwd), sharedConversations: new Map([['second', 'first']]) }, sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const run = (chatId, id) => executor.execute({ chatId, chatType: 'group', bindingOpenId: codexBindingOpenId({ chatId, chatType: 'group' }), messageId: id, prompt: id });
+  const first = run('first', 'a');
+  while (!runtime.calls.some(c => c.method === 'turn/start')) await new Promise(setImmediate);
+  await new Promise(r => setTimeout(r, 10));
+  const second = run('second', 'b');
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(runtime.calls.filter(c => c.method === 'turn/start').length, 1);
+  assert.equal(runtime.calls.filter(c => c.method === 'turn/steer').length, 0);
+  const finish = (id) => runtime.children.at(-1).send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: id, turn: { id, status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: id }] } } });
+  finish('turn-1'); await first;
+  while (runtime.calls.filter(c => c.method === 'turn/start').length < 2) await new Promise(setImmediate);
+  await new Promise(r => setTimeout(r, 10)); finish('turn-2');
+  assert.equal((await second).threadId, 'thread-1');
+});
+
+test('human input during a same-group quiet inspection gets a separate ordinary reply turn', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-shared-active-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true })); mkdirSync(join(cwd, 'home'));
+  const runtime = fakeRuntime({ completeStarts: false });
+  const executor = createCodexExecutor({ config: { ...config(cwd), sharedConversations: new Map([['second', 'first']]) }, sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const run = (chatId, id, internalPrompt = false) => executor.execute({ internalPrompt, chatId, chatType: 'group', bindingOpenId: codexBindingOpenId({ chatId, chatType: 'group' }), messageId: id, prompt: id });
+  const first = run('first', 'a', true);
+  while (!runtime.calls.some(c => c.method === 'turn/start')) await new Promise(setImmediate);
+  await new Promise(r => setTimeout(r, 10));
+  const second = run('first', 'b');
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(runtime.calls.filter(c => c.method === 'turn/start').length, 1);
+  assert.equal(runtime.calls.filter(c => c.method === 'turn/steer').length, 0);
+  const finish = (id) => runtime.children.at(-1).send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: id, turn: { id, status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: id }] } } });
+  finish('turn-1'); await first;
+  while (runtime.calls.filter(c => c.method === 'turn/start').length < 2) await new Promise(setImmediate);
+  await new Promise(r => setTimeout(r, 10)); finish('turn-2');
+  assert.equal((await second).threadId, 'thread-1');
+});
+
+test('aborted cross-group wait cannot start a late turn after the first completes', async t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'bridge-shared-active-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true })); mkdirSync(join(cwd, 'home'));
+  const runtime = fakeRuntime({ completeStarts: false });
+  const executor = createCodexExecutor({ config: { ...config(cwd), sharedConversations: new Map([['second', 'first']]) }, sessionStore: memoryStore(), spawnImpl: runtime.spawnImpl });
+  t.after(() => executor.close());
+  const controller = new AbortController();
+  const run = (chatId, id, options = {}) => executor.execute({ chatId, chatType: 'group', bindingOpenId: codexBindingOpenId({ chatId, chatType: 'group' }), messageId: id, prompt: id }, options);
+  const first = run('first', 'a');
+  while (!runtime.calls.some(c => c.method === 'turn/start')) await new Promise(setImmediate);
+  await new Promise(r => setTimeout(r, 10));
+  const second = run('second', 'b', { signal: controller.signal });
+  const rejection = assert.rejects(second, { code: 'CODEX_WAIT_ABORTED' });
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(runtime.calls.filter(c => c.method === 'turn/start').length, 1);
+  assert.equal(runtime.calls.filter(c => c.method === 'turn/steer').length, 0);
+  const finish = (id) => runtime.children.at(-1).send({ method: 'turn/completed', params: { threadId: 'thread-1', turnId: id, turn: { id, status: 'completed', items: [{ type: 'agentMessage', phase: 'final_answer', text: id }] } } });
+  controller.abort(); await rejection;
+  finish('turn-1'); await first;
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(runtime.calls.filter(c => c.method === 'turn/start').length, 1);
+});

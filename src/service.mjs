@@ -107,6 +107,8 @@ export async function startService({ config, configPath, env = process.env, log,
   if (new Set(Object.values(inboundTokens)).size !== Object.keys(inboundTokens).length) {
     throw new ConfigError('duplicate_inbound_token');
   }
+  const conversationInputToken = config.conversationInput ? secret(env, config.conversationInput.tokenEnv) : undefined;
+  const sharedConversations = new Map(config.routing.groups.filter(group => group.sharedConversationId).map(group => [group.conversationId, group.sharedConversationId]));
   const admissionToken = config.routing.privateAdmission ? secret(env, config.routing.privateAdmission.tokenEnv) : undefined;
   const credentials = { appId: secret(env, config.feishu.appIdEnv), appSecret: secret(env, config.feishu.appSecretEnv) };
   const reporter = config.errorReporting ? createErrorReporter({ url: config.errorReporting.url, token: secret(env, config.errorReporting.tokenEnv), warn: log }) : undefined;
@@ -287,6 +289,7 @@ export async function startService({ config, configPath, env = process.env, log,
       allowedGroupChatIds,
       // Keyed by external Feishu chat id; a Map keeps ids such as "__proto__" inert.
       // A group cwd arrives validated and normalized from the configuration.
+      sharedConversations,
       groupCodexOverrides: new Map(config.routing.groups
         .filter(group => group.capabilities.includes('bridge') && group.codex)
         .map(group => [group.conversationId, group.codex])),
@@ -334,8 +337,11 @@ export async function startService({ config, configPath, env = process.env, log,
     const typing=factories.typing({chat,inbound,enabled:config.feishu.processingReaction,
       emoji:config.feishu.processingReactionEmoji,fallbackText:config.feishu.processingFallbackText,log});
     const feedback=factories.feedback({jobs,sessions,chat,typing,cardClient:client,inbound,botOpenId:config.feishu.botOpenId,authorize:stopAuthorize,executor,workspace:cwd,
-      runAsync:runCardOperation,config:{executionCardIntervalMs:1000,displayName:config.feishu.displayName,cardTextProvider,replyPolicy},log});
+      runAsync:runCardOperation,config:{sharedConversations,executionCardIntervalMs:1000,displayName:config.feishu.displayName,cardTextProvider,replyPolicy},log});
     forward=factories.forward({config:{
+      sharedConversations, groups: config.routing.groups,
+      groupContextWindowMs: config.codex.groupContextHours * 60 * 60 * 1000,
+      groupContextMessageLimit: config.codex.groupContextMessageLimit,
       steering:config.codex.steering,
       pollMs:config.codex.jobPollMs,
       retryDelayMs:config.codex.jobRetryMs,
@@ -386,7 +392,7 @@ export async function startService({ config, configPath, env = process.env, log,
       };
     };
     const readiness = async () => (await inspectHealth()).readiness;
-    const createdHttp = await factories.server({ config, log, readiness, eventRuntime: forward, jobs, inboundTokens });
+    const createdHttp = await factories.server({ config, log, readiness, eventRuntime: forward, jobs, inboundTokens, conversationInputToken });
     if (stopping) {
       await cleanupLateComponent('server', () => createdHttp?.close?.());
       throw stoppedError();

@@ -151,3 +151,22 @@ test('event keys isolate delimiters, case, and maximum identifiers', async () =>
   assert.equal((await runtime.getEvent({ producerId: variants[4].producerId, eventId: variants[4].eventId })).jobId,
     registered[4].jobId);
 });
+
+test('ordinary scheduled prompt uses shared group identity, retains source, and never auto-delivers or starts a card', async t => {
+  const jobs = eventJobs(); const executions = []; let cards = 0; let deliveries = 0; const reads = [];
+  const runtime = createForwardRuntime({ config: { sharedConversations: new Map([['second', 'first']]), groups: [
+    { conversationId: 'first', passiveContext: true, capabilities: ['bridge'] }, { conversationId: 'second', passiveContext: true, capabilities: ['bridge'] },
+    { conversationId: 'other', passiveContext: true, capabilities: ['bridge'] }] }, jobs, sessions: {},
+    inbound: { async loadRecentGroupContext({ chatId }) { reads.push(chatId); return [{ messageId: chatId, prompt: 'recent', createdAt: 1 }]; }, async markForwarded() {} },
+    executor: { async execute(input) { executions.push(input); return { answer: 'quiet', threadId: 'thread', turnId: 'turn' }; } },
+    feedback: { async start() { cards++; } }, replies: { async deliver() { deliveries++; } } });
+  t.after(() => runtime.stop());
+  const result = await runtime.registerConversationPrompt({ requestId: 'tick-1', chatId: 'second', prompt: 'check', requestHash: 'hash' });
+  for (let count = 0; count < 100 && jobs.job.status !== 'completed'; count++) await new Promise(setImmediate);
+  assert.match(result.bindingOpenId, /^group:/); assert.equal(jobs.registeredInput.executionNamespace, '');
+  assert.equal(jobs.registeredInput.sourceMessageId, null); assert.equal(jobs.registeredInput.deliveryMode, 'caller');
+  assert.equal(executions[0].chatId, 'second'); assert.equal(executions[0].internalPrompt, true);
+  assert.match(executions[0].prompt, /不构成审批或授权/); assert.match(executions[0].prompt, /chat_id=first/);
+  assert.doesNotMatch(executions[0].prompt, /【业务事件】|【独立系统任务】/);
+  assert.deepEqual(reads.sort(), ['first', 'second']); assert.equal(cards, 0); assert.equal(deliveries, 0);
+});

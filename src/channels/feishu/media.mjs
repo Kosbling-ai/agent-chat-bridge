@@ -43,7 +43,7 @@ export function stringifyPostContent(value) {
   return '';
 }
 export function extractMessageText(event) {
-  if (!['text', 'post'].includes(event.message?.kind)) return '';
+  if (!['text', 'post'].includes(event?.message?.kind)) return '';
   try {
     const content = JSON.parse(event.message.content || '{}');
     if (typeof content.text === 'string') return content.text;
@@ -102,6 +102,7 @@ function postAttachments(event, content) {
   return attachments;
 }
 export function extractAttachments(event) {
+  if (!event) return [];
   const content = safeJson(event?.message?.content);
   return event?.message?.kind === 'post' ? postAttachments(event, content) : directAttachments(event, content);
 }

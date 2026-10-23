@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.34] - 2026-10-23
+
+- Allow configured groups to share one ordinary Codex conversation while retaining source-group replies, attachments and authorization. Only configured members contribute passive context.
+- Add an independently authenticated ordinary-conversation prompt endpoint for external scheduling; reuse existing durable forwarding and native threads, without a business event namespace or automatic group notifications.
+- Shared groups use the anchor workspace, instructions and permissions. Conflicting member policy is rejected; defaults remain unchanged. No schema or dependency change.
+
 ## [0.2.33] - 2026-10-23
 
 - Add authenticated event status observations for the exact native target turn and its current scope, including deferred steering targets. Queue snapshots include pending, running, reply-pending and held work.

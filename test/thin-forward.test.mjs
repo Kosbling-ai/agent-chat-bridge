@@ -1139,3 +1139,20 @@ test('a storage failure after execute resolved is not retried even without a sta
   assert.equal(replies.length, 1);
   assert.equal(replies[0].result.failed, true);
 });
+
+test('quiet inspection prepares image-only context without a human event and retains failed image context for retry', async () => {
+  const entries = [ { messageId: 'photo', prompt: '', attachments: [{ fileKey: 'image', kind: 'image' }] },
+    { messageId: 'failed-photo', prompt: '', attachments: [{ fileKey: 'failed', kind: 'image' }] } ];
+  const jobs = memoryJobs({ status: 'pending', chatType: 'group', executionNamespace: '', deliveryMode: 'caller', prompt: 'inspect', contextEntries: entries,
+    result: { inputEvent: null, contextAttachmentLimit: 10 } });
+  let sentEntries; let preparedEvent; let executed;
+  const runtime = createForwardRuntime({ config: { pollMs: 1 }, jobs, sessions: {},
+    media: { async prepare(event, options) { preparedEvent = event; assert.deepEqual(options.contextEntries, entries); return { status: 'ready', addendum: 'image ready', attachments: [
+      { messageId: 'photo', fileKey: 'image', kind: 'image', status: 'downloaded', path: '/safe/photo.png' },
+      { messageId: 'failed-photo', fileKey: 'failed', kind: 'image', status: 'failed' }] }; } },
+    inbound: { async markForwarded({ entries }) { sentEntries = entries; } },
+    executor: { async execute(input) { executed = input; return { threadId: 'thread', turnId: 'turn', answer: 'quiet' }; } }, replies: {} });
+  runtime.start(); await flush(); await runtime.stop();
+  assert.equal(preparedEvent, null); assert.equal(executed.attachments[0].path, '/safe/photo.png');
+  assert.match(executed.prompt, /image ready/); assert.deepEqual(sentEntries.map(entry => entry.messageId), ['photo']);
+});
