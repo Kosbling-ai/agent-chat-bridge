@@ -2,7 +2,7 @@
 
 [English](MIGRATIONS.md) | [中文入口](README.zh-CN.md)
 
-应用版本：`0.2.33`。英文 `MIGRATIONS.md` 是完整主契约。
+应用版本：`0.2.34`。英文 `MIGRATIONS.md` 是完整主契约。
 
 0.2.33 无数据库/配置迁移。事件状态新增原生执行与同范围空闲证据；未知不代表结束，deferred 不代表目标回合已结束。升级、只读验收与回退见英文 0.2.33 检查清单。
 
@@ -51,3 +51,14 @@
 ## 0.2.32 大历史读取修复
 
 无需数据库或配置迁移，不改写任务、会话或重试规则。使用受管子服务重启，仅更新两个 Bridge；不要重启整个 runtime。完整检查、验证与回退步骤见[英文清单](MIGRATIONS.md#0232-large-codex-rpc-frames)。
+
+
+## 0.2.34 shared ordinary conversations
+
+No database migration or dependency change. Config schemaVersion remains 1. Optional settings are `routing.groups[].sharedConversationId` and `conversationInput: { tokenEnv, chatIds }`.
+
+1. Review the intended shared groups. Use an existing configured group as the anchor. Anchor instructions govern the shared thread; remove member instruction overrides and make Codex workspace/permission settings identical. Sharing explicitly makes both groups' context available to this thread.
+2. Set a dedicated secret reference for conversationInput; allow only intended target groups. Configure scheduling in the existing instance supervisor, not in a new bridge scheduler. Do not reuse business-event hooks.
+3. Run `npm test`, `npm run check`, and `npm run version:check` in the release checkout. Restart via the instance supervisor; never launch a second WebSocket owner.
+4. Verify two group messages resume the same native thread, source replies/files remain in their original group, a third group stays isolated, and a prompt POST returns 202 without a group execution card. Verify actual work through the normal Agent tools before enabling recurring prompts.
+5. Rollback: disable the external schedule, remove the optional config keys, then restore 0.2.33 via the supported restart lifecycle. Shared-thread history is retained on the anchor; do not delete business records. The second group's old binding is deliberately not rewritten.

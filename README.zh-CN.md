@@ -1,6 +1,8 @@
 # agent-chat-bridge
 
-[English](README.md) | 简体中文
+[English](README.md)
+
+版本 `0.2.34` 支持多个配置群共享普通 Codex 会话，并提供独立认证的静默定时提示入口。无新增业务流程或数据库迁移。 | 简体中文
 
 当前版本 `0.2.33`：事件查询增加原生回合和同范围队列的只读状态核验；`deferred` 不等于执行结束。证据缺失返回未知，不重跑任务。无数据库或配置迁移，详见英文迁移文档。
 
@@ -50,3 +52,28 @@ Agent 判断某次群聊触发无需回复时，可以只回一个由操作者�
 `tokens` 缺省 `[]`（即关闭），`card` 缺省 `"delete"`。bridge 不会把 token 告诉 Agent，哨兵约定要以相同字面值写进群指令或工作区规则。Agent 最终答复去掉首尾空白后与某个 token 精确相等（区分大小写，不做前缀或包含匹配）时，bridge 不发文字回复：`"delete"` 撤回执行卡（飞书只允许机器人撤回发送后 24 小时内自己发的消息，群里可能显示「撤回了一条消息」），撤回失败退化为 `"complete"`；`"complete"` 把执行卡改为完成态并显示中性卡片文案 `silentReply`（缺省「已处理，无需回复。」）。哨兵字面值不会展示。任务记为 `completed`，结果中 `silentReply.status` 为 `silent`；卡片既撤不回也改不了时按 `codex.jobMaxAttempts` 重试。私聊、失败或补充转达的任务、非哨兵答复均不受影响；outbox 附件照常发送。bot 自己消息的撤回事件不再转给 hook。升级说明见[中文迁移说明](MIGRATIONS.zh-CN.md)。
 
 迁移或启动前只使用独立 bridge schema 和受控凭证注入。不要把 token 写入 JSON、`.env`、日志或版本控制。迁移边界见[中文说明](MIGRATIONS.zh-CN.md)。
+
+
+### Shared ordinary conversations (0.2.34)
+
+Set `sharedConversationId` on a bridge-enabled group to the `conversationId` of another configured bridge-enabled group. Both use the anchor's ordinary Codex thread. Source-group routing, member authorization and reply destination remain unchanged. Only members of this explicit shared set contribute passive history; unrelated groups remain isolated. Instructions belong on the anchor, and all members must have identical Codex workspace/permission overrides. Existing bindings are preserved; changing this option does not migrate or delete old history.
+
+```json
+{
+  "routing": {
+    "groups": [
+      { "conversationId": "oc_first", "trigger": "mention", "replyTriggers": true, "passiveContext": true, "capabilities": ["bridge"] },
+      { "conversationId": "oc_second", "sharedConversationId": "oc_first", "trigger": "mention", "replyTriggers": true, "passiveContext": true, "capabilities": ["bridge"] }
+    ]
+  },
+  "conversationInput": { "tokenEnv": "BRIDGE_CONVERSATION_INPUT_TOKEN", "chatIds": ["oc_first"] }
+}
+```
+
+The excerpt supplements the normal instance config. The token is resolved from the host environment; never put its value in config or logs.
+
+An external scheduler may POST `/v1/conversations/prompts` with `Authorization: Bearer <token>` and JSON `{ "request_id": "check-20261023T1200", "chat_id": "oc_first", "prompt": "Review recent information; act only when useful." }`. The request ID is 1–128 ASCII letters/digits/dot/underscore/colon/hyphen (starts alphanumeric), and prompt is 1–8000 characters. A 202 returns `job_id`, `binding_open_id`, `deduplicated`; it means accepted, not completed. Exact retries reuse the durable job; the same ID with changed content returns 409. Forbidden chat IDs return 403.
+
+This is an ordinary group-thread turn, not a system-event thread. Recent unforwarded passive messages from configured shared groups are included with source metadata. Internal prompts do not impersonate a person or grant business approval. They never automatically post execution cards or final answers: the Agent uses its normal messaging capability only for meaningful progress. The bridge does not add a scheduler; a 30-minute cadence, prompt text, and business behavior belong to the caller's configuration and Skill.
+
+Concurrent input from another source group, and scheduled prompts during an active turn, continue after that turn in the same chat so replies/files cannot be delivered to the previous source group. Same-source human steering keeps its existing behavior.

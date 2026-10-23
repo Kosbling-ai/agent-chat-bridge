@@ -1,3 +1,4 @@
+import { conversationChatId, codexBindingOpenId } from './thread-scope.mjs';
 import { codexTurnError } from './turn-error.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
@@ -14,6 +15,19 @@ import { databaseError } from '../../storage/errors.mjs';
 
 const textInput = (text) => ({ type: 'text', text, text_elements: [] });
 const trim = (value) => String(value || '').trim();
+function callerAbortError() { return coded('caller stopped waiting', 'CODEX_WAIT_ABORTED', { outcome: 'unknown' }); }
+function checkCallerSignal(signal) { if (signal?.aborted) throw callerAbortError(); }
+function waitWithSignal(promise, signal) {
+  if (!signal) return promise;
+  checkCallerSignal(signal);
+  return new Promise((resolve, reject) => {
+    const abort = () => { cleanup(); reject(callerAbortError()); };
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+  });
+}
+
 const limitText = (value, max) => String(value || '').slice(0, max || undefined);
 const stableKey = (value) => createHash('sha1').update(String(value || '')).digest('hex').slice(0, 24);
 const bindingKey = ({ feishuOpenId, chatId }) => `${feishuOpenId || 'unknown'}:${chatId || 'unknown'}`;
@@ -226,9 +240,11 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   }
 
   function identity(input) {
-    const feishuOpenId = trim(input.bindingOpenId);
-    const chatId = trim(input.chatId);
     const chatType = trim(input.chatType) || 'p2p';
+    const sourceChatId = trim(input.chatId);
+    const shared = !isScheduledBinding(input.bindingOpenId);
+    const chatId = shared ? conversationChatId(sourceChatId, chatType, config.sharedConversations) : sourceChatId;
+    const feishuOpenId = chatId !== sourceChatId ? codexBindingOpenId({ chatId, chatType }) : trim(input.bindingOpenId);
     if (!feishuOpenId || !chatId) throw coded('missing binding/chat identity', 'CODEX_INVALID_INPUT');
     return { feishuOpenId, chatId, chatType };
   }
@@ -506,7 +522,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     // The result-file directory is announced as an absolute path under the
     // global workspace, where collectOutboxAttachments scans it, so it stays
     // correct whatever cwd the thread runs in.
-    const options = { binding, prompt: input.prompt, groupChatContext: input.groupChatContext, workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
+    const options = { binding: { ...binding, chatId: input.chatId || binding.chatId }, prompt: input.prompt, groupChatContext: input.groupChatContext, workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, groupOpening: instructionMode !== 'replace' };
     if (!isScheduledBinding(binding.feishuOpenId)) return { prompt: buildInitialPrompt(options) };
     const hash = fingerprint(systemTaskPreamble(options));
     let present = false;
@@ -610,7 +626,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
     let resolveCompletion; let rejectCompletion;
     let timeoutTimer;
     const state = {
-      binding, threadId: binding.codexSessionId, turnId, messageId: input.messageId,
+      binding, internalPrompt: input.internalPrompt === true, sourceChatId: input.chatId || binding.chatId, threadId: binding.codexSessionId, turnId, messageId: input.messageId,
       startedAt, outboxScanFromMs: startedAt, itemText: new Map(), publicProgress: createPublicProgressProjector(),
       lastAgentMessage: '', pendingSteerId: null, settled: false, stopRequested: false,
       userInput: null,
@@ -752,7 +768,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         turnId: state.turnId,
         answer: limitText(answer, config.maxOutputChars || 3500),
         rawAnswer: answer,
-        attachments: collectOutboxAttachments(state.binding, state.outboxScanFromMs, { workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, log }),
+        attachments: collectOutboxAttachments({ ...state.binding, chatId: state.sourceChatId }, state.outboxScanFromMs, { workspace: config.cwd, outboxRelativeRoot: config.outboxRelativeRoot, allowedGroupChatIds: config.allowedGroupChatIds, log }),
       };
     }, async (error) => {
       const observationEvent = {
@@ -794,11 +810,25 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
   async function execute(input, options = {}) {
     if (closing) throw coded('executor is closing', 'CODEX_EXECUTOR_CLOSING', { retryable: true });
     const actor = identity(input);
+    // A cancelled caller may still observe an already-admitted native turn so
+    // its terminal receipt is persisted. It must never admit new work.
+    let observeAborted = false;
+    if (options.signal?.aborted) {
+      const existing = await sessionStore.loadBinding(actor);
+      if (existing?.codexSessionId) {
+        const accepted = await sessionStore.findAcceptedMessageEvent(existing, trim(input.messageId));
+        const detail = accepted ? parseDetail(accepted) : {};
+        observeAborted = Boolean(options.resume || (String(accepted?.event_key || '').startsWith('error:')
+          && (detail.errorCode === 'CODEX_OBSERVATION_LOST' || detail.turnStatus === 'unknown')));
+      }
+      if (!observeAborted) checkCallerSignal(options.signal);
+    }
     const normalized = { ...input, prompt: String(input.prompt || ''), messageId: trim(input.messageId), busyPolicy: input.busyPolicy || 'steer' };
     if (!normalized.prompt.trim()) throw coded('empty prompt', 'CODEX_INVALID_INPUT');
     if (!['steer', 'reject'].includes(normalized.busyPolicy)) throw coded('invalid busy policy', 'CODEX_INVALID_INPUT');
     return client.lifecycle.run(async () => {
       const routed = await withKeyLock(bindingKey(actor), async () => {
+      if (!observeAborted) checkCallerSignal(options.signal);
       if (options.resume) {
         const binding = await sessionStore.loadBinding(actor);
         if (!binding?.codexSessionId) throw coded('resume has no durable binding', 'CODEX_RESUME_MISMATCH');
@@ -836,7 +866,11 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
         if (normalized.busyPolicy === 'reject') throw coded('binding already has an active turn', 'CODEX_THREAD_BUSY', {
           retryable: true, outcome: 'rejected', phase: 'pre_admission', busyOrigin: 'local',
         });
-        if (active.settled) return { afterFinal: active.finalized, restart: { input: normalized } };
+        // A different source group (or a quiet inspection) must not have its
+        // answer/files delivered by the first group's active turn. Continue
+        // the same native chat after that turn, using existing wait mechanics.
+        if (active.settled || active.sourceChatId !== normalized.chatId || active.internalPrompt || normalized.internalPrompt)
+          return { afterFinal: active.finalized, restart: { input: normalized } };
         return { completion: steer(active, normalized, { signal: options.signal }).then((result) => result?.restart ? execute(result.input, options) : result) };
       }
       let binding = await ensureBinding(actor, normalized.messageId);
@@ -864,7 +898,9 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       let prompt = initial.prompt;
       await persistUser(binding, normalized, 'user', prompt);
       const startedAt = now();
+      checkCallerSignal(options.signal);
       await options.onStartIntent?.({ binding, threadId: binding.codexSessionId, messageId: normalized.messageId, startedAt });
+      checkCallerSignal(options.signal);
       let response;
       let admission = startAdmission(binding.codexSessionId, normalized.messageId);
       try {
@@ -882,6 +918,7 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
           initial = await initialPrompt(binding, normalized, await ensureGroupInstructions(binding));
           prompt = initial.prompt;
           await persistUser(binding, normalized, 'user', prompt);
+          checkCallerSignal(options.signal);
           admission = startAdmission(binding.codexSessionId, normalized.messageId);
           response = await client.request('turn/start', {
             threadId: binding.codexSessionId, input: buildTurnInput(prompt, normalized.attachments),
@@ -917,7 +954,8 @@ export function createCodexExecutor({ config, sessionStore, childEnv = {}, log =
       return { completion: waitForTurn(state, normalized.messageId, { created: binding.created, signal: options.signal }) };
       });
       if (routed.restart) {
-        if (routed.afterFinal) await routed.afterFinal.catch((_error) => {});
+        if (routed.afterFinal) await waitWithSignal(routed.afterFinal.catch((_error) => {}), options.signal);
+        checkCallerSignal(options.signal);
         return execute(routed.restart.input, options);
       }
       if (routed.state) return publicResult(await waitForTurn(routed.state, normalized.messageId, { created: false, signal: options.signal }));

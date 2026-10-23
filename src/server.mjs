@@ -95,7 +95,7 @@ export function canonicalJsonHash(value) {
   return createHash('sha256').update(JSON.stringify(canonicalize(value))).digest('hex');
 }
 
-export async function startServer({ config, log, readiness, eventRuntime, jobs, inboundTokens = {} }) {
+export async function startServer({ config, log, readiness, eventRuntime, jobs, inboundTokens = {}, conversationInputToken }) {
   log = safeObserver(log);
   const inboundHooks = (config.hooks || []).filter(hook => hook.inbound).map(hook => ({ hook, token: inboundTokens[hook.id] }));
   let stopping = false;
@@ -114,7 +114,23 @@ export async function startServer({ config, log, readiness, eventRuntime, jobs, 
     try {
       const url = new URL(request.url, 'http://bridge.invalid');
       const eventMatch = /^\/v1\/events\/([^/]+)$/.exec(url.pathname);
-      if (request.method === 'POST' && url.pathname === '/v1/events') {
+      if (request.method === 'POST' && url.pathname === '/v1/conversations/prompts') {
+        if (!config.conversationInput) throw new HttpError(404, 'not_found');
+        authenticate(request, [{ token: conversationInputToken }]);
+        const body = await readJson(request);
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || Object.keys(body).some(key => !['request_id', 'chat_id', 'prompt'].includes(key))) throw new HttpError(400, 'invalid_request');
+        const requestId = string(body.request_id, 128);
+        if (!EVENT_ID.test(requestId)) throw new HttpError(400, 'invalid_request_id');
+        const chatId = string(body.chat_id, 255);
+        const prompt = string(body.prompt, 8000);
+        if (!config.conversationInput.chatIds.includes(chatId)) throw new HttpError(403, 'chat_forbidden');
+        if (!eventRuntime?.registerConversationPrompt) throw new HttpError(503, 'service_unavailable');
+        let result;
+        try { result = await eventRuntime.registerConversationPrompt({ requestId, chatId, prompt, requestHash: canonicalJsonHash(body) }); }
+        catch (error) { if (error?.code === 'job_conflict') throw new HttpError(409, 'request_conflict'); throw error; }
+        reply(response, 202, { job_id: result.jobId, binding_open_id: result.bindingOpenId, deduplicated: result.deduplicated });
+      } else if (request.method === 'POST' && url.pathname === '/v1/events') {
         const authenticated = authenticate(request, inboundHooks);
         const event = normalizeEvent(await readJson(request));
         eventLog = { hookId: authenticated.hook.id, eventId: event.eventId, type: event.type };

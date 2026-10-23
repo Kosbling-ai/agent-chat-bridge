@@ -1,6 +1,6 @@
 # Versions and migrations
 
-Application version: `0.2.33`
+Application version: `0.2.34`
 
 ## 0.2.31 business-card form transport
 
@@ -335,3 +335,14 @@ Production host checklist (Bruce):
 4. Roll back to the recorded 0.2.32 commit through the same targeted supervisor restart if needed. No data rollback; consumers must fail closed when the observation fields disappear.
 
 Local verification includes the real HTTP handler, forward runtime and Codex executor against a synthetic RPC child. The isolated MySQL suite verifies exact scope/caller/connection matching; it requires a local Docker daemon and must not run against production credentials.
+
+
+## 0.2.34 shared ordinary conversations
+
+No database migration or dependency change. Config schemaVersion remains 1. Optional settings are `routing.groups[].sharedConversationId` and `conversationInput: { tokenEnv, chatIds }`.
+
+1. Review the intended shared groups. Use an existing configured group as the anchor. Anchor instructions govern the shared thread; remove member instruction overrides and make Codex workspace/permission settings identical. Sharing explicitly makes both groups' context available to this thread.
+2. Set a dedicated secret reference for conversationInput; allow only intended target groups. Configure scheduling in the existing instance supervisor, not in a new bridge scheduler. Do not reuse business-event hooks.
+3. Run `npm test`, `npm run check`, and `npm run version:check` in the release checkout. Restart via the instance supervisor; never launch a second WebSocket owner.
+4. Verify two group messages resume the same native thread, source replies/files remain in their original group, a third group stays isolated, and a prompt POST returns 202 without a group execution card. Verify actual work through the normal Agent tools before enabling recurring prompts.
+5. Rollback: disable the external schedule, remove the optional config keys, then restore 0.2.33 via the supported restart lifecycle. Shared-thread history is retained on the anchor; do not delete business records. The second group's old binding is deliberately not rewritten.

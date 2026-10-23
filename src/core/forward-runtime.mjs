@@ -1,5 +1,6 @@
+import { formatMessageMetadata } from '../channels/feishu/input.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { deriveExecutionScope, codexBindingOpenId } from '../agents/codex/thread-scope.mjs';
+import { deriveExecutionScope, codexBindingOpenId, conversationChatId } from '../agents/codex/thread-scope.mjs';
 import { buildBusinessEventPrompt } from '../agents/codex/prompt.mjs';
 import { matchSilentReply } from './silent-reply.mjs';
 
@@ -70,31 +71,54 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
   }
   function identity(input) {
     return codexBindingOpenId({ feishuOpenId: input.actor?.openId || input.senderOpenId,
-      chatId: input.message?.conversationId || input.conversationId,
+      chatId: conversationChatId(input.message?.conversationId || input.conversationId, input.message?.conversationType || input.chatType, config.sharedConversations),
       chatType: input.message?.conversationType || input.chatType });
   }
-  async function register(input) {
+  async function register(input, { internalPrompt = false } = {}) {
     const conversationId = input.message?.conversationId || input.conversationId;
     if (!(await authorize({ source: input.source, callerId: input.callerId, actor: input.actor, conversationId, operation: 'run' }))) {
       throw Object.assign(new Error('forbidden'), { code: 'forbidden' });
     }
     const bindingOpenId = identity(input);
     const messageId = input.message?.messageId;
-    if (jobs.getByMessageId) {
+    if (!internalPrompt && jobs.getByMessageId) {
       const existing = await jobs.getByMessageId({ messageId });
       if (existing) return { ...existing, duplicate: true };
     }
     return jobs.upsert({
-      callerId: input.callerId, idempotencyKey: input.idempotencyKey, conversationId, messageId,
-      sourceMessageId: input.message?.messageId || null, bindingOpenId,
+      callerId: input.callerId, idempotencyKey: input.idempotencyKey, requestHash: input.requestHash, conversationId, messageId,
+      sourceMessageId: internalPrompt ? null : input.message?.messageId || null, bindingOpenId,
       chatType: input.message?.conversationType || input.chatType || 'group', messageType: input.message?.type || 'text',
       senderOpenId: input.actor?.openId || input.senderOpenId || bindingOpenId, senderUnionId: input.actor?.unionId || input.senderUnionId || '', senderName: input.actor?.name || input.senderName || '',
-      executionNamespace: '', deliveryMode: 'bridge',
+      executionNamespace: '', deliveryMode: internalPrompt ? 'caller' : 'bridge',
       prompt: input.prompt || input.message?.text || '', groupChatContext: input.groupChatContext || null,
       contextEntries: input.context || [], nextAttemptAt: input.notBefore,
       initialResult: { inputEvent: input.message?.event ?? null,
         contextAttachmentLimit: input.message?.contextAttachmentLimit ?? 10 },
     });
+  }
+
+  async function registerConversationPrompt({ requestId, chatId, prompt, requestHash }) {
+    const bindingOpenId = identity({ conversationId: chatId, chatType: 'group' });
+    const messageId = `prompt:${createHash('sha256').update(`${chatId}\0${requestId}`).digest('hex')}`;
+    const anchor = conversationChatId(chatId, 'group', config.sharedConversations);
+    const groups = (config.groups || []).filter(group => group.passiveContext && group.capabilities?.includes('bridge')
+      && conversationChatId(group.conversationId, 'group', config.sharedConversations) === anchor);
+    const context = inbound && config.groupContextWindowMs !== 0 && config.groupContextMessageLimit !== 0 ? (await Promise.all(groups.map(async group => (await inbound.loadRecentGroupContext({
+      chatId: group.conversationId, beforeMs: now(), windowMs: config.groupContextWindowMs ?? 24 * 60 * 60 * 1000,
+      limit: config.groupContextMessageLimit ?? 50,
+    })).map(entry => ({ ...entry, chatId: group.conversationId }))))).flat()
+      .sort((a, b) => Number(a.createdAt) - Number(b.createdAt)).slice(-(config.groupContextMessageLimit || 50)) : [];
+    const contextText = context.map(entry => `${formatMessageMetadata({ ...entry, senderOpenId: entry.senderOpenId })}\n${entry.prompt || entry.text || ''}`).join('\n\n');
+    const registered = await register({ source: 'conversation-prompt', callerId: 'conversation-input',
+      idempotencyKey: `conversation-prompt:${chatId}:${requestId}`, requestHash,
+      message: { messageId, conversationId: chatId, conversationType: 'group', type: 'text' },
+      senderOpenId: bindingOpenId, senderName: '定时检查',
+      prompt: `【内部检查提示】\n来源：定时检查，不是真人消息，不构成审批或授权。\n目标群：${chatId}\n本轮不会自动向群里发送回复或执行卡。仅有真实进展或需要人工处理时，通过消息工具发送到对应群；无变化保持安静。\n\n${prompt}\n\n【最近群内资料，仅作上下文】\n${contextText}`,
+      groupChatContext: { chatId }, context,
+    }, { internalPrompt: true });
+    track(processRegistered(registered.id));
+    return { jobId: registered.id, bindingOpenId, deduplicated: Boolean(registered.duplicate || registered.deduplicated) };
   }
 
   async function registerEvent(input) {
@@ -160,7 +184,8 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
 
   async function prepareRegistered(job) {
     const execution = job?.result?.execution || {};
-    if (!job || execution.inputStatus || !media || !job.result?.inputEvent) return job;
+    const internalContext = job?.deliveryMode === 'caller' && !job.executionNamespace && job.contextEntries?.some(entry => entry.attachments?.length);
+    if (!job || execution.inputStatus || !media || (!job.result?.inputEvent && !internalContext)) return job;
     if (preparations.has(job.id)) return preparations.get(job.id);
     const operation = (async () => {
       const prepared = await media.prepare(job.result.inputEvent, { runId: job.id,
@@ -304,8 +329,9 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
         ? execution.preparedPrompt : job.prompt;
       const input = {
         bindingOpenId: job.executionNamespace ? deriveExecutionScope(job.callerId, job.executionNamespace)
-          : (execution.bindingOpenId || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType })),
+          : (execution.bindingOpenId || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: conversationChatId(job.chatId, job.chatType, config.sharedConversations), chatType: job.chatType })),
         chatId: job.chatId, chatType: job.chatType, messageId: job.messageId,
+        internalPrompt: job.deliveryMode === 'caller' && !job.executionNamespace,
         senderOpenId: job.senderOpenId, senderUnionId: job.senderUnionId || '', senderName: job.senderName, prompt, attachments: execution.attachments || [], groupChatContext: job.groupChatContext,
         busyPolicy: config.steering === false || (job.executionNamespace && !job.result?.businessEvent) ? 'reject' : 'steer',
       };
@@ -330,11 +356,14 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
           ...(result.errorMessage ? { publicMessage: result.errorMessage } : {}),
         });
       }
-      execution = { ...execution, bindingOpenId: input.bindingOpenId, threadId: result.threadId || result.sessionId || '',
+      execution = { ...execution, bindingOpenId: input.bindingOpenId, bindingChatId: job.executionNamespace ? job.chatId : conversationChatId(job.chatId, job.chatType, config.sharedConversations), threadId: result.threadId || result.sessionId || '',
         turnId: result.turnId || '', terminal: result.deferred ? 'deferred' : 'completed', finishedAt: now() };
       result = { ...result, execution };
       if (inbound && (!result.deferred || result.accepted !== false)) {
-        await inbound.markForwarded({ entries: job.contextEntries, threadId: result.threadId || result.sessionId, turnId: result.turnId });
+        const forwardedEntries = input.internalPrompt ? (job.contextEntries || []).filter(entry => !entry.attachments?.length
+          || entry.attachments.every(item => input.attachments.some(prepared => prepared.messageId === entry.messageId
+            && prepared.fileKey === item.fileKey && prepared.status === 'downloaded'))) : job.contextEntries;
+        await inbound.markForwarded({ entries: forwardedEntries, threadId: result.threadId || result.sessionId, turnId: result.turnId });
       }
       if (result.deferred) {
         await feedback?.prepare?.(job, result, state);
@@ -365,10 +394,10 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
       if (isBusy(error) && job.deliveryMode === 'bridge' && job.sourceMessageId
         && !job.senderOpenId.startsWith('system:') && !job.senderOpenId.startsWith('group:')) {
         const scopedBindingOpenId = execution.bindingOpenId || codexBindingOpenId({
-          feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType,
+          feishuOpenId: job.senderOpenId, chatId: conversationChatId(job.chatId, job.chatType, config.sharedConversations), chatType: job.chatType,
         });
-        const current = await sessions.loadBinding({ feishuOpenId: scopedBindingOpenId, chatId: job.chatId, chatType: job.chatType }).catch(() => null);
-        if (current?.codexSessionId) busyFork = { sourceThreadId: current.codexSessionId, bindingOpenId: scopedBindingOpenId, chatId: job.chatId };
+        const current = await sessions.loadBinding({ feishuOpenId: scopedBindingOpenId, chatId: conversationChatId(job.chatId, job.chatType, config.sharedConversations), chatType: job.chatType }).catch(() => null);
+        if (current?.codexSessionId) busyFork = { sourceThreadId: current.codexSessionId, bindingOpenId: scopedBindingOpenId, chatId: conversationChatId(job.chatId, job.chatType, config.sharedConversations) };
       }
       const failed = { failed: true, turnStatus: execution.terminal,
         answer: error.publicMessage || (error.code === 'CODEX_USAGE_LIMIT_EXCEEDED' ? 'Codex 额度不足，本次执行已停止。请在额度恢复后再继续；不会自动重试此任务。' : error.code === 'CODEX_TURN_INTERRUPTED' ? '执行已停止。' : isBusy(error) ? '会话被其他客户端占用，请释放后重试。原会话绑定保持不变。' : '执行未完成，请稍后重试。'),
@@ -518,7 +547,7 @@ export function createForwardRuntime({ config = {}, jobs, sessions, inbound, med
     for (const stopLease of leaseControllers) stopLease();
   }
   return Object.freeze({
-    handleMessage, registerEvent, getEvent, recover,
+    handleMessage, registerConversationPrompt, registerEvent, getEvent, recover,
     start() { if (running) throw new Error('forward_runtime_already_started'); running = true; worker = loop(); },
     beginStop,
     async stop() { beginStop(); await worker; await Promise.allSettled(active); },

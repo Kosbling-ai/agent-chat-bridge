@@ -19,3 +19,8 @@ export function codexBindingOpenId({ feishuOpenId, chatId, chatType }) {
   }
   return feishuOpenId;
 }
+
+// Shared identities never change the source chat or reply destination.
+export function conversationChatId(chatId, chatType, sharedConversations = new Map()) {
+  return chatType === 'group' ? (sharedConversations.get(chatId) || chatId) : chatId;
+}

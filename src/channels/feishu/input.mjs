@@ -120,7 +120,7 @@ export function buildCodexForwardPrompt({ chatType, currentPrompt = '', mergedPr
   }
   const parts = recentPrompts.filter(entry => entry.prompt).map(entry => groupEntry('群消息',
     identityLabel(entry.senderName, entry.senderOpenId, entry.senderUnionId),
-    formatMessageMetadata({ messageId: entry.messageId, parentId: entry.parentId, rootId: entry.rootId,
+    formatMessageMetadata({ messageId: entry.messageId, chatId: entry.chatId, parentId: entry.parentId, rootId: entry.rootId,
       senderOpenId: entry.senderOpenId, createdAt: entry.messageCreatedAt || entry.createdAt }), entry.prompt));
   // The triggering message is always identified, even when it has no text body.
   const body = currentPrompt || (parts.length ? '' : mergedPrompt);

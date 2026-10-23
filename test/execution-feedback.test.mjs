@@ -413,3 +413,16 @@ test('ordinary finish still renders the answer when silent replies are configure
   assert.equal(effects.some(([name]) => name === 'delete'), false);
   assert.match(JSON.stringify(effects.find(([name]) => name === 'patch')[1]), /NO_REPLY please/);
 });
+
+test('shared member stop resolves anchor binding but authorizes the original source group', async () => {
+  const job = jobFixture(); job.result.execution = { bindingOpenId: 'group:anchor' }; job.result.executionCard.turnId = 'turn-1';
+  let binding; let authorization; let interrupted = 0;
+  const feedback = createExecutionFeedback({ config: { sharedConversations: new Map([['chat-1', 'anchor']]) },
+    jobs: { async getRun() { return job; }, async beginStop() { return { outcome: 'new', stop: { threadId: 'thread-1', turnId: 'turn-1', messageId: job.messageId, actor: job.senderOpenId, outcome: 'pending' } }; }, async finishStop() {} },
+    sessions: { async loadBinding(input) { binding = input; return { codexSessionId: 'thread-1' }; } }, chat: {}, cardClient: {},
+    executor: { async interrupt() { interrupted++; return { status: 'requested' }; } },
+    authorize: async input => { authorization = input; return true; } });
+  const result = await feedback.handleCardAction({ action: { value: { action: 'stop_execution', jobId: job.id, expectedTurnId: 'turn-1' } }, operator: { open_id: 'sender-1' }, context: { open_chat_id: 'chat-1', open_message_id: 'card-message' } });
+  assert.equal(result.toast.content, '已请求停止执行'); assert.equal(interrupted, 1);
+  assert.equal(binding.chatId, 'anchor'); assert.equal(binding.feishuOpenId, 'group:anchor'); assert.equal(authorization.conversationId, 'chat-1');
+});

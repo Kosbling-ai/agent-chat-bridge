@@ -2,7 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Version: `0.2.33` adds read-only native execution and scope observations to authenticated event status. A deferred event no longer needs to be mistaken for a finished native turn. Unknown evidence stays unknown; observation does not replay work. No database/config migration. See [upgrade notes](MIGRATIONS.md#0233-event-execution-observation).
+Version: `0.2.34` shares configured groups in one ordinary Codex conversation and adds an independently authenticated quiet prompt endpoint for external scheduling. No new business workflow or database migration.
+
+Version `0.2.33` adds read-only native execution and scope observations to authenticated event status. A deferred event no longer needs to be mistaken for a finished native turn. Unknown evidence stays unknown; observation does not replay work. No database/config migration. See [upgrade notes](MIGRATIONS.md#0233-event-execution-observation).
 
 Version `0.2.32` reads fragmented Codex RPC frames in linear time, releases incomplete frames after disconnection, and reports bounded memory-guard and RPC-timeout diagnostics. This prevents large image histories from causing repeated timeout and memory restarts. No schema/config migration or task replay. See [upgrade notes](MIGRATIONS.md#0232-large-codex-rpc-frames).
 
@@ -81,3 +83,28 @@ An Agent can signal that a group turn needs no answer by replying with an operat
 ### Custom execution-card text
 
 See [per-bot card text](docs/card-text.md) for opt-in, hot-loaded wording that each bot can edit in its workspace.
+
+
+### Shared ordinary conversations (0.2.34)
+
+Set `sharedConversationId` on a bridge-enabled group to the `conversationId` of another configured bridge-enabled group. Both use the anchor's ordinary Codex thread. Source-group routing, member authorization and reply destination remain unchanged. Only members of this explicit shared set contribute passive history; unrelated groups remain isolated. Instructions belong on the anchor, and all members must have identical Codex workspace/permission overrides. Existing bindings are preserved; changing this option does not migrate or delete old history.
+
+```json
+{
+  "routing": {
+    "groups": [
+      { "conversationId": "oc_first", "trigger": "mention", "replyTriggers": true, "passiveContext": true, "capabilities": ["bridge"] },
+      { "conversationId": "oc_second", "sharedConversationId": "oc_first", "trigger": "mention", "replyTriggers": true, "passiveContext": true, "capabilities": ["bridge"] }
+    ]
+  },
+  "conversationInput": { "tokenEnv": "BRIDGE_CONVERSATION_INPUT_TOKEN", "chatIds": ["oc_first"] }
+}
+```
+
+The excerpt supplements the normal instance config. The token is resolved from the host environment; never put its value in config or logs.
+
+An external scheduler may POST `/v1/conversations/prompts` with `Authorization: Bearer <token>` and JSON `{ "request_id": "check-20261023T1200", "chat_id": "oc_first", "prompt": "Review recent information; act only when useful." }`. The request ID is 1–128 ASCII letters/digits/dot/underscore/colon/hyphen (starts alphanumeric), and prompt is 1–8000 characters. A 202 returns `job_id`, `binding_open_id`, `deduplicated`; it means accepted, not completed. Exact retries reuse the durable job; the same ID with changed content returns 409. Forbidden chat IDs return 403.
+
+This is an ordinary group-thread turn, not a system-event thread. Recent unforwarded passive messages from configured shared groups are included with source metadata. Internal prompts do not impersonate a person or grant business approval. They never automatically post execution cards or final answers: the Agent uses its normal messaging capability only for meaningful progress. The bridge does not add a scheduler; a 30-minute cadence, prompt text, and business behavior belong to the caller's configuration and Skill.
+
+Concurrent input from another source group, and scheduled prompts during an active turn, continue after that turn in the same chat so replies/files cannot be delivered to the previous source group. Same-source human steering keeps its existing behavior.

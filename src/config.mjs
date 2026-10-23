@@ -23,7 +23,7 @@ export function isLoopback(host) {
 }
 
 export function validateConfig(raw) {
-  object(raw, ['schemaVersion', 'listen', 'runtime', 'storage', 'codex', 'feishu', 'routing', 'hooks', 'errorReporting'], 'invalid_config_fields');
+  object(raw, ['schemaVersion', 'listen', 'runtime', 'storage', 'codex', 'feishu', 'routing', 'hooks', 'errorReporting', 'conversationInput'], 'invalid_config_fields');
   if (raw.schemaVersion !== 1) throw new ConfigError('unsupported_config_version');
   const listen = raw.listen === undefined ? {} : raw.listen;
   object(listen, ['host', 'port', 'allowRemote'], 'invalid_listen_fields');
@@ -220,7 +220,7 @@ function privateAdmission(value) {
 function validateRuntime(raw) {
   const enabled = ['runtime', 'storage', 'codex', 'feishu', 'routing'].some(key => raw[key] !== undefined);
   if (!enabled) {
-    if (raw.hooks !== undefined || raw.errorReporting !== undefined) throw new ConfigError('runtime_components_required');
+    if (raw.hooks !== undefined || raw.errorReporting !== undefined || raw.conversationInput !== undefined) throw new ConfigError('runtime_components_required');
     return { components: {} };
   }
   for (const key of ['storage', 'codex', 'feishu', 'routing']) if (!raw[key]) throw new ConfigError('runtime_components_required');
@@ -345,7 +345,7 @@ function validateRuntime(raw) {
   object(raw.routing, ['version', 'privateUserIds', 'allowAllPrivateUsers', 'privateAdmission', 'groups', 'unlistedGroupReply', 'silentReply'], 'invalid_routing_fields');
   if (!Array.isArray(raw.routing.groups) || raw.routing.groups.length > 1000) throw new ConfigError('invalid_group_scope');
   const groups = raw.routing.groups.map(group => {
-    object(group, ['conversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'reply', 'codex'], 'invalid_group_fields');
+    object(group, ['conversationId', 'sharedConversationId', 'userIds', 'trigger', 'replyTriggers', 'passiveContext', 'name', 'description', 'capabilities', 'instructionFiles', 'instructionText', 'instructionMode', 'replyContext', 'allowMentionAll', 'silentReply', 'reply', 'codex'], 'invalid_group_fields');
     const instructed = group.instructionFiles !== undefined || group.instructionText !== undefined;
     if (group.instructionMode !== undefined && (!instructed || !['append', 'replace'].includes(group.instructionMode))) throw new ConfigError('invalid_group_instruction_mode');
     if (!['mention', 'all'].includes(group.trigger) || typeof group.passiveContext !== 'boolean') throw new ConfigError('invalid_group_policy');
@@ -355,7 +355,7 @@ function validateRuntime(raw) {
     if(capabilities.some(value=>!['bridge','hook'].includes(value)))throw new ConfigError('invalid_group_capabilities');
     if (!capabilities.includes('bridge') && (instructed || group.instructionMode !== undefined || group.replyContext !== undefined || group.replyTriggers === true
       || group.silentReply !== undefined || group.reply !== undefined || group.codex !== undefined)) throw new ConfigError('group_context_requires_bridge');
-    return { conversationId: identifier(group.conversationId, 255), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, replyTriggers: group.replyTriggers ?? false, passiveContext: group.passiveContext, capabilities,
+    return { conversationId: identifier(group.conversationId, 255), ...(group.sharedConversationId === undefined ? {} : { sharedConversationId: identifier(group.sharedConversationId, 255) }), ...(group.userIds === undefined ? {} : { userIds: strings(group.userIds) }), trigger: group.trigger, replyTriggers: group.replyTriggers ?? false, passiveContext: group.passiveContext, capabilities,
       ...(group.name === undefined ? {} : { name: string(group.name) }), ...(group.description === undefined ? {} : { description: string(group.description) }),
       ...(group.instructionFiles === undefined ? {} : { instructionFiles: instructionFiles(group.instructionFiles) }),
       ...(group.instructionText === undefined ? {} : { instructionText: instructionText(group.instructionText) }),
@@ -367,6 +367,22 @@ function validateRuntime(raw) {
       ...(group.codex === undefined ? {} : { codex: groupCodex(group.codex, { permissionProfile: codex.permissionProfile }) }) };
   });
   if (new Set(groups.map(g => g.conversationId)).size !== groups.length) throw new ConfigError('duplicate_group');
+  for (const group of groups.filter(group => group.sharedConversationId)) {
+    const anchor = groups.find(item => item.conversationId === group.sharedConversationId);
+    if (!anchor || !group.capabilities.includes('bridge') || !anchor.capabilities.includes('bridge')
+      || (anchor.sharedConversationId && anchor.sharedConversationId !== anchor.conversationId)) throw new ConfigError('invalid_shared_conversation');
+    // One native thread has one workspace and permission policy. The anchor
+    // supplies its instructions; member groups must not override that policy.
+    if (JSON.stringify(group.codex || {}) !== JSON.stringify(anchor.codex || {})) throw new ConfigError('shared_conversation_codex_conflict');
+    if (group.conversationId !== anchor.conversationId && (group.instructionFiles || group.instructionText)) throw new ConfigError('shared_conversation_instructions_on_member');
+  }
+  let conversationInput;
+  if (raw.conversationInput !== undefined) {
+    object(raw.conversationInput, ['tokenEnv', 'chatIds'], 'invalid_conversation_input');
+    const chatIds = strings(raw.conversationInput.chatIds);
+    if (!chatIds.length || chatIds.some(id => !groups.some(group => group.conversationId === id && group.capabilities.includes('bridge')))) throw new ConfigError('invalid_conversation_input_chats');
+    conversationInput = { tokenEnv: reference(raw.conversationInput.tokenEnv), chatIds };
+  }
   const allowAllPrivateUsers = raw.routing.allowAllPrivateUsers ?? false;
   if (typeof allowAllPrivateUsers !== 'boolean' || raw.routing.allowAllPrivateUsers === null) throw new ConfigError('invalid_private_access_policy');
   // Admitting every private sender would make the callback meaningless.
@@ -423,7 +439,7 @@ function validateRuntime(raw) {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) throw new ConfigError('invalid_error_reporting');
     errorReporting = { url: url.href, tokenEnv: reference(raw.errorReporting.tokenEnv) };
   }
-  return { components: { runtime, storage, codex, feishu, routing, hooks, ...(errorReporting ? { errorReporting } : {}) } };
+  return { components: { runtime, storage, codex, feishu, routing, hooks, ...(conversationInput ? { conversationInput } : {}), ...(errorReporting ? { errorReporting } : {}) } };
 }
 
 export async function loadConfig(path) {

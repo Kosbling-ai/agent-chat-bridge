@@ -1,3 +1,4 @@
+import { conversationChatId } from '../../agents/codex/thread-scope.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { ExecutionCard, observeExecutionCard } from './execution-card.mjs';
 import { codexBindingOpenId } from '../../agents/codex/thread-scope.mjs';
@@ -17,8 +18,9 @@ const productionCardState = saved => {
 
 export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClient, inbound, botOpenId, authorize = async () => true,
   executor, workspace, runAsync = operation => { Promise.resolve().then(operation).catch(() => {}); }, config = {}, log = () => {}, now = Date.now } = {}) {
+  const bindingChatId = job => job.executionNamespace ? job.chatId : conversationChatId(job.chatId, job.chatType, config.sharedConversations);
   const bindingOpenId = (job, result = job.result || {}) => result.execution?.bindingOpenId
-    || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: job.chatId, chatType: job.chatType });
+    || codexBindingOpenId({ feishuOpenId: job.senderOpenId, chatId: bindingChatId(job), chatType: job.chatType });
   const resolveReply = typeof config.replyPolicy === 'function' ? config.replyPolicy : () => null;
   // Group text mode: no execution card and no processing Typing. The style is
   // recorded on the job when its turn starts; a job that already has a card
@@ -77,7 +79,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       intervalMs: config.executionCardIntervalMs || 1000,
       persist: persistCard ? value => persist(job, state, 'executionCard', value) : async () => {},
       audit: event => sessions?.saveCodexRealtimeEvent?.({
-        feishuOpenId: bindingOpenId(job, state.result), chatId: job.chatId, chatType: job.chatType,
+        feishuOpenId: bindingOpenId(job, state.result), chatId: bindingChatId(job), chatType: job.chatType,
         codexSessionId: state.result.execution?.threadId || event.threadId || '',
       }, {
         messageId: job.messageId, eventKey: `feedback:${job.id}:${event.status}:${now()}`,
@@ -136,12 +138,12 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       load: async next => {
         state.control.assertOwned?.();
         const bound = execution.threadId ? null : await sessions.loadBinding({
-          feishuOpenId: execution.bindingOpenId || bindingOpenId(job, state.result), chatId: job.chatId, chatType: job.chatType,
+          feishuOpenId: execution.bindingOpenId || bindingOpenId(job, state.result), chatId: bindingChatId(job), chatType: job.chatType,
         });
         const threadId = execution.threadId || bound?.codexSessionId;
         if (!threadId) return [];
         const rows = await sessions.readPublicProgress({
-          binding: { feishuOpenId: bindingOpenId(job, state.result), chatId: job.chatId },
+          binding: { feishuOpenId: bindingOpenId(job, state.result), chatId: bindingChatId(job) },
           threadId, messageId: job.messageId, cursor: next, limit: 100,
         });
         state.control.assertOwned?.();
@@ -286,7 +288,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
         return toast('没有切换该会话的权限', 'error');
       }
       const begun = await jobs.beginFork({ id: job.id, sourceThreadId: candidate.sourceThreadId,
-        bindingOpenId: candidate.bindingOpenId, chatId: job.chatId, messageId: job.messageId,
+        bindingOpenId: candidate.bindingOpenId, chatId: bindingChatId(job), messageId: job.messageId,
         cardMessageId, actor: operator, operationId: randomUUID() });
       if (['not_found','stale'].includes(begun.outcome)) return toast('该卡片已失效');
       if (begun.fork?.status === 'succeeded') return toast('已保留历史并切换到新会话，请继续发送消息');
@@ -297,7 +299,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
       runAsync(async () => {
         try {
           const completed = await executor.forkBinding({
-            binding: { feishuOpenId: candidate.bindingOpenId, chatId: job.chatId, chatType: job.chatType },
+            binding: { feishuOpenId: candidate.bindingOpenId, chatId: bindingChatId(job), chatType: job.chatType },
             expectedSourceThreadId: candidate.sourceThreadId,
             onForked: ({ targetThreadId }) => jobs.finishFork({ id: job.id, operationId: begun.fork.operationId,
               status: 'succeeded', targetThreadId }),
@@ -334,7 +336,7 @@ export function createExecutionFeedback({ jobs, sessions, chat, typing, cardClie
     const execution = job.result?.execution || {};
     const turnId = execution.turnId || job.result?.executionCard?.turnId || '';
     if (!turnId || turnId !== value.expectedTurnId) return toast('该卡片已失效');
-    const binding = await sessions.loadBinding({ feishuOpenId: bindingOpenId(job), chatId: job.chatId, chatType: job.chatType });
+    const binding = await sessions.loadBinding({ feishuOpenId: bindingOpenId(job), chatId: bindingChatId(job), chatType: job.chatType });
     const threadId = execution.threadId || binding?.codexSessionId || '';
     if (!threadId) return toast('该卡片已失效');
     const begun = await jobs.beginStop({ id: job.id, threadId, turnId, bindingThreadId: binding.codexSessionId,
